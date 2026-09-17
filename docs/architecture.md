@@ -252,6 +252,14 @@ operator controls and the audit trail still apply. Every tick records a
 one is queued. Every autonomous entry must carry both a stop loss and a take
 profit; unbracketed proposals are rejected before the command layer sees them.
 
+While a managed position is open the tick reviews it instead of hunting for
+entries: the model answers `hold` (the bracket stands) or `close` (flatten),
+with its own constrained schema. Closes are risk-reducing but the loop cannot
+churn: the ticket must match a reviewed managed position, the close goes
+through the same guarded staged-close path as the control surface, and a
+position younger than `VEYRA_AUTOPILOT_MIN_HOLD_SECS` (default 300) — or one
+whose age the terminal does not report — is refused.
+
 ### Console
 
 `console/` is a TanStack Start application served by a supervised Vite

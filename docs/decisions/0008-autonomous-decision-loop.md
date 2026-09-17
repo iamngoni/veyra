@@ -50,7 +50,11 @@ owner approval of both execution controls.
   (symbol allowlist, per-order and total volume caps, one open order by
   default, duplicate window), and both operator switches still gate real
   money.
-- Exit management is currently limited to the bracket attached at entry
-  (broker-side SL/TP); active position management is a later iteration.
+- Exit management is the entry bracket plus a per-tick position review
+  (amended 2026-09-18): while a managed position is open the loop asks for
+  `hold` or `close` with its own constrained schema, guarded by a minimum
+  hold (default 300 s), verified position age from the terminal, and the same
+  staged-close path as the control surface. Trailing stops and break-even
+  moves are a later iteration.
 - Model latency and cost scale with cadence; the balanced tier answers a tick
   in a few seconds and every tick is visible in the console and audit trail.

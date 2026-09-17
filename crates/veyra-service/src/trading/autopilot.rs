@@ -12,6 +12,14 @@
 //! immediately. Every autonomous entry must carry both a stop loss and a take
 //! profit; an unbracketed proposal is rejected before the command layer sees
 //! it.
+//!
+//! While a Veyra-managed position is open the tick reviews it instead of
+//! looking for entries: the model may `hold` (the bracket stands) or `close`
+//! (flatten). Autonomous closes are risk-reducing but never instant: the
+//! ticket must match a reviewed managed position, the shared staged close
+//! re-validates it against the latest snapshot, and a position younger than
+//! `VEYRA_AUTOPILOT_MIN_HOLD_SECS` — or one whose age cannot be verified — is
+//! refused so the loop cannot churn in and out of the same trade.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -21,14 +29,15 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::audit::{AuditEvent, AuditKind};
 use crate::broker::Symbol;
+use crate::broker::ea::{ORDER_MAGIC, PositionPayload};
 use crate::config::ConfigError;
-use crate::control::{StagedExecution, queue_staged_order};
+use crate::control::{StagedClose, StagedExecution, queue_staged_close, queue_staged_order};
 use crate::jev::{
     Answer, ChoiceOptions, Instructions, JevRequest, JevRuntime, NoulCriteria, Question,
     ScoreLevels, State as JevState,
 };
 use crate::market::{Candle, CandleRequest, CandleSeries, Timeframe};
-use crate::model::ModelTier;
+use crate::model::{AnswerFormat, ModelTier};
 use crate::risk::AccountFacts;
 use crate::trading::intent::TradeIntentDraft;
 use crate::trading::pipeline::{PipelineOutcome, evaluate_proposal};
@@ -45,6 +54,10 @@ const DEFAULT_BARS: u16 = 48;
 const MIN_BARS: u16 = 10;
 /// How many recent candles are embedded in the model input.
 const RECENT_CANDLES: usize = 12;
+/// Default minimum position age before an autonomous close is allowed.
+const DEFAULT_MIN_HOLD_SECS: u64 = 300;
+/// Largest minimum-hold window the parser accepts.
+const MAX_MIN_HOLD_SECS: u64 = 86_400;
 
 /// Whether the loop consults the configured judgement engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +97,7 @@ pub struct AutopilotSettings {
     tier: ModelTier,
     interval: Duration,
     jev: JevPreference,
+    min_hold: Duration,
 }
 
 impl AutopilotSettings {
@@ -112,6 +126,7 @@ impl AutopilotSettings {
         let tier_raw = optional(&mut source, "VEYRA_AUTOPILOT_TIER");
         let interval_raw = optional(&mut source, "VEYRA_AUTOPILOT_INTERVAL_SECS");
         let jev_raw = optional(&mut source, "VEYRA_AUTOPILOT_JEV");
+        let min_hold_raw = optional(&mut source, "VEYRA_AUTOPILOT_MIN_HOLD_SECS");
 
         if enabled_raw.is_empty()
             && symbol_raw.is_empty()
@@ -120,6 +135,7 @@ impl AutopilotSettings {
             && tier_raw.is_empty()
             && interval_raw.is_empty()
             && jev_raw.is_empty()
+            && min_hold_raw.is_empty()
         {
             return Ok(None);
         }
@@ -194,6 +210,20 @@ impl AutopilotSettings {
                 })?
             }
         };
+        let min_hold = match min_hold_raw.as_str() {
+            "" => Duration::from_secs(DEFAULT_MIN_HOLD_SECS),
+            other => {
+                let invalid = || ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_AUTOPILOT_MIN_HOLD_SECS",
+                    reason: "must be an integer number of seconds from 0 through 86400",
+                };
+                let secs = other.parse::<u64>().map_err(|_| invalid())?;
+                if secs > MAX_MIN_HOLD_SECS {
+                    return Err(invalid());
+                }
+                Duration::from_secs(secs)
+            }
+        };
 
         Ok(Some(Self {
             enabled,
@@ -203,6 +233,7 @@ impl AutopilotSettings {
             tier,
             interval,
             jev,
+            min_hold,
         }))
     }
 
@@ -240,6 +271,12 @@ impl AutopilotSettings {
     pub fn jev(&self) -> JevPreference {
         self.jev
     }
+
+    /// Minimum position age before the loop may close it; zero disables the
+    /// guard, which is only appropriate in tests.
+    pub fn min_hold(&self) -> Duration {
+        self.min_hold
+    }
 }
 
 fn optional(
@@ -267,6 +304,13 @@ pub enum TickOutcome {
     },
     /// The model proposed no trade.
     NoTrade,
+    /// The reviewer chose to keep the open position and its bracket.
+    Held,
+    /// The reviewer asked to close; the close command was queued.
+    CloseQueued {
+        /// Identifier of the queued close command.
+        command: String,
+    },
     /// The gate or the stop policy rejected the proposal.
     Rejected {
         /// Stable rejection code.
@@ -366,6 +410,22 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         },
     };
 
+    // While a Veyra-managed position is open, review it instead of hunting
+    // for entries: the open-order cap would reject any entry anyway, and the
+    // position needs a lifecycle decision.
+    let positions = managed_positions(state);
+    if !positions.is_empty() {
+        return review_positions(
+            state,
+            settings,
+            model,
+            &series,
+            &positions,
+            judgements.as_ref(),
+        )
+        .await;
+    }
+
     let input = proposal_input(&series, account, judgements.as_ref());
     let instructions = proposal_instructions(state, &series, account);
     match evaluate_proposal(
@@ -442,6 +502,393 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             }
         }
     }
+}
+
+/// One Veyra-managed position as the review needs it.
+#[derive(Debug, Clone, PartialEq)]
+struct ManagedPosition {
+    ticket: i64,
+    side: &'static str,
+    lots: f64,
+    entry: f64,
+    profit: f64,
+    stop_loss: f64,
+    take_profit: f64,
+    opened_at: i64,
+}
+
+/// Managed positions from the latest completed snapshot.
+///
+/// Like the control surface, this reads the provider's retained state
+/// directly; a second broker implementation replaces this one mapping.
+fn managed_positions(state: &AppState) -> Vec<ManagedPosition> {
+    state
+        .broker()
+        .and_then(|broker| broker.ea_link())
+        .and_then(|link| link.last_account())
+        .map(|snapshot| {
+            snapshot
+                .positions
+                .iter()
+                .filter(|position| position.magic == ORDER_MAGIC)
+                .map(managed_from_payload)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn managed_from_payload(position: &PositionPayload) -> ManagedPosition {
+    use crate::broker::ea::PositionKind;
+    ManagedPosition {
+        ticket: position.ticket,
+        side: match position.kind {
+            PositionKind::Buy
+            | PositionKind::BuyLimit
+            | PositionKind::BuyStop
+            | PositionKind::BuyStopLimit => "buy",
+            PositionKind::Sell
+            | PositionKind::SellLimit
+            | PositionKind::SellStop
+            | PositionKind::SellStopLimit => "sell",
+        },
+        lots: position.lots,
+        entry: position.price,
+        profit: position.profit,
+        stop_loss: position.stop_loss,
+        take_profit: position.take_profit,
+        opened_at: position.opened_at,
+    }
+}
+
+/// Position age in seconds when both broker timestamps allow it.
+fn position_age_secs(server_time: i64, opened_at: i64) -> Option<u64> {
+    if server_time <= 0 || opened_at <= 0 || server_time < opened_at {
+        return None;
+    }
+    u64::try_from(server_time - opened_at).ok()
+}
+
+/// The reviewer's parsed decision.
+#[derive(Debug, Clone, PartialEq)]
+enum ReviewDecision {
+    /// Keep the position and its bracket.
+    Hold,
+    /// Flatten the given ticket.
+    Close(i64),
+}
+
+/// Parses the constrained review answer.
+fn parse_review(value: &serde_json::Value) -> Result<ReviewDecision, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Answer {
+        action: String,
+        #[serde(default)]
+        ticket: Option<i64>,
+    }
+    let answer: Answer = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid review answer: {error}"))?;
+    match answer.action.as_str() {
+        "hold" => Ok(ReviewDecision::Hold),
+        "close" => match answer.ticket {
+            Some(ticket) if ticket > 0 => Ok(ReviewDecision::Close(ticket)),
+            _ => Err("close requires a positive ticket".to_owned()),
+        },
+        other => Err(format!("unknown review action `{other}`")),
+    }
+}
+
+/// Schema the reviewer answers with.
+fn review_format() -> AnswerFormat {
+    AnswerFormat {
+        name: "veyra_position_review".to_owned(),
+        schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action"],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["hold", "close"],
+                    "description": "hold keeps the entry bracket; close flattens the ticket now"
+                },
+                "ticket": {
+                    "type": ["integer", "null"],
+                    "description": "the position to close; required when action is close"
+                }
+            }
+        }),
+    }
+}
+
+/// Reviews the open managed position: hold, or close when the entry thesis no
+/// longer holds.
+async fn review_positions(
+    state: &AppState,
+    settings: &AutopilotSettings,
+    model: &crate::model::ModelRuntime,
+    series: &CandleSeries,
+    positions: &[ManagedPosition],
+    judgements: Option<&Value>,
+) -> TickOutcome {
+    let instructions = review_instructions(series, positions);
+    let input = review_input(state, series, positions, judgements);
+    let answer = match model
+        .engine()
+        .answer(crate::model::DecisionRequest {
+            instructions,
+            input,
+            format: review_format(),
+            tier: settings.tier(),
+        })
+        .await
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            let reason = format!("model unavailable: {error}");
+            record(
+                state,
+                "unavailable",
+                Some(series.symbol()),
+                None,
+                Some(&reason),
+            )
+            .await;
+            return TickOutcome::Unavailable { reason };
+        }
+    };
+
+    let decision = match parse_review(&answer.value) {
+        Ok(decision) => decision,
+        Err(reason) => {
+            record_position(state, "close_rejected", series, None, Some(&reason)).await;
+            return TickOutcome::Rejected {
+                code: "invalid_review",
+            };
+        }
+    };
+
+    match decision {
+        ReviewDecision::Hold => {
+            record_position(state, "held", series, Some(positions[0].ticket), None).await;
+            TickOutcome::Held
+        }
+        ReviewDecision::Close(ticket) => {
+            let Some(position) = positions.iter().find(|position| position.ticket == ticket) else {
+                record_position(
+                    state,
+                    "close_rejected",
+                    series,
+                    Some(ticket),
+                    Some("unknown_ticket"),
+                )
+                .await;
+                return TickOutcome::Rejected {
+                    code: "unknown_ticket",
+                };
+            };
+            let snapshot_server_time = state
+                .broker()
+                .and_then(|broker| broker.ea_link())
+                .and_then(|link| link.last_account())
+                .map(|snapshot| snapshot.server_time)
+                .unwrap_or(0);
+            match position_age_secs(snapshot_server_time, position.opened_at) {
+                Some(age) if age >= settings.min_hold().as_secs() => {}
+                Some(_) => {
+                    record_position(
+                        state,
+                        "close_rejected",
+                        series,
+                        Some(ticket),
+                        Some("position_too_young"),
+                    )
+                    .await;
+                    return TickOutcome::Rejected {
+                        code: "position_too_young",
+                    };
+                }
+                None => {
+                    record_position(
+                        state,
+                        "close_rejected",
+                        series,
+                        Some(ticket),
+                        Some("position_age_unknown"),
+                    )
+                    .await;
+                    return TickOutcome::Rejected {
+                        code: "position_age_unknown",
+                    };
+                }
+            }
+            match queue_staged_close(state, ticket).await {
+                StagedClose::Queued { command, ticket } => {
+                    record_position(state, "close_queued", series, Some(ticket), None).await;
+                    TickOutcome::CloseQueued {
+                        command: command.to_string(),
+                    }
+                }
+                StagedClose::TradingDisabled => {
+                    record_position(
+                        state,
+                        "close_rejected",
+                        series,
+                        Some(ticket),
+                        Some("trading_disabled"),
+                    )
+                    .await;
+                    TickOutcome::Rejected {
+                        code: "trading_disabled",
+                    }
+                }
+                StagedClose::ChannelUnavailable => {
+                    let reason = "command channel unavailable".to_owned();
+                    record_position(state, "unavailable", series, Some(ticket), Some(&reason))
+                        .await;
+                    TickOutcome::Unavailable { reason }
+                }
+                StagedClose::NoPositions | StagedClose::UnknownTicket => {
+                    record_position(
+                        state,
+                        "close_rejected",
+                        series,
+                        Some(ticket),
+                        Some("stale_position"),
+                    )
+                    .await;
+                    TickOutcome::Rejected {
+                        code: "stale_position",
+                    }
+                }
+                StagedClose::NotVeyra => {
+                    record_position(
+                        state,
+                        "close_rejected",
+                        series,
+                        Some(ticket),
+                        Some("not_a_veyra_position"),
+                    )
+                    .await;
+                    TickOutcome::Rejected {
+                        code: "not_a_veyra_position",
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Instructions for the hold-or-close review.
+fn review_instructions(series: &CandleSeries, positions: &[ManagedPosition]) -> String {
+    let tickets: Vec<String> = positions
+        .iter()
+        .map(|position| position.ticket.to_string())
+        .collect();
+    format!(
+        "You are the analyst for Veyra, a single-instrument trading bot. Your open {symbol}          {timeframe} position(s) (ticket(s) {tickets}) were entered by this bot with a stop loss          and take profit attached.
+         Decide for the reported position: `hold` keeps the entry bracket and lets the plan play          out; `close` flattens the ticket now because the thesis that justified the entry is no          longer supported by the latest candles and judgements.
+         Closing costs the spread and abandons the bracket, so hold unless the evidence has          genuinely shifted; do not close merely because the position shows a small loss — the          attached stop defines the risk.
+         Answer with the provided schema only, including the ticket when you close.",
+        symbol = series.symbol().as_str(),
+        timeframe = series.timeframe().as_str(),
+        tickets = tickets.join(", ")
+    )
+}
+
+/// Model input for the review: the same market block plus the position and
+/// its bracket.
+fn review_input(
+    state: &AppState,
+    series: &CandleSeries,
+    positions: &[ManagedPosition],
+    judgements: Option<&Value>,
+) -> String {
+    let recent: Vec<Value> = series
+        .candles()
+        .iter()
+        .rev()
+        .take(RECENT_CANDLES)
+        .collect::<Vec<&Candle>>()
+        .into_iter()
+        .rev()
+        .map(|candle| {
+            json!({
+                "t": candle.time(),
+                "o": candle.open(),
+                "h": candle.high(),
+                "l": candle.low(),
+                "c": candle.close()
+            })
+        })
+        .collect();
+
+    let server_time = state
+        .broker()
+        .and_then(|broker| broker.ea_link())
+        .and_then(|link| link.last_account())
+        .map(|snapshot| snapshot.server_time)
+        .unwrap_or(0);
+    let open_positions: Vec<Value> = positions
+        .iter()
+        .map(|position| {
+            json!({
+                "ticket": position.ticket,
+                "side": position.side,
+                "lots": position.lots,
+                "entry": position.entry,
+                "profit": position.profit,
+                "stop_loss": position.stop_loss,
+                "take_profit": position.take_profit,
+                "age_secs": position_age_secs(server_time, position.opened_at)
+            })
+        })
+        .collect();
+
+    let mut input = json!({
+        "symbol": series.symbol().as_str(),
+        "timeframe": series.timeframe().as_str(),
+        "market": {
+            "bars": series.candles().len(),
+            "last_close": series.last().map(|candle| candle.close()),
+            "window_high": window_high(series),
+            "window_low": window_low(series),
+            "change_pct": change_pct(series),
+            "recent": recent
+        },
+        "open_positions": open_positions
+    });
+    if let Some(judgements) = judgements {
+        input["judgements"] = judgements.clone();
+    }
+    input.to_string()
+}
+
+/// Records one review decision; best-effort and bounded in size.
+async fn record_position(
+    state: &AppState,
+    outcome: &'static str,
+    series: &CandleSeries,
+    ticket: Option<i64>,
+    reason: Option<&str>,
+) {
+    let Some(audit) = state.audit() else {
+        return;
+    };
+    let mut payload = json!({
+        "outcome": outcome,
+        "origin": "autopilot_review",
+        "symbol": series.symbol().as_str()
+    });
+    if let Some(ticket) = ticket {
+        payload["ticket"] = json!(ticket);
+    }
+    if let Some(reason) = reason {
+        payload["reason"] = json!(reason);
+    }
+    audit
+        .try_record(AuditEvent::new(AuditKind::ProposalEvaluated, payload))
+        .await;
 }
 
 /// Records one decision attempt; best-effort and bounded in size.
@@ -694,7 +1141,7 @@ mod tests {
 
     use super::*;
     use crate::audit::{AuditRuntime, MemoryTrail};
-    use crate::broker::ea::CommandKind;
+    use crate::broker::ea::{AccountSnapshotPayload, CommandKind};
     use crate::broker::{AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName};
     use crate::config::ServiceConfig;
     use crate::jev::{
@@ -1014,6 +1461,7 @@ mod tests {
         assert_eq!(defaults.tier(), ModelTier::Balanced);
         assert_eq!(defaults.interval(), Duration::from_secs(300));
         assert_eq!(defaults.jev(), JevPreference::Auto);
+        assert_eq!(defaults.min_hold(), Duration::from_secs(300));
         assert!(defaults.symbol().is_none());
 
         let custom = settings_from(|name| match name {
@@ -1024,9 +1472,11 @@ mod tests {
             "VEYRA_AUTOPILOT_TIER" => Ok("reasoning".to_owned()),
             "VEYRA_AUTOPILOT_INTERVAL_SECS" => Ok("60".to_owned()),
             "VEYRA_AUTOPILOT_JEV" => Ok("off".to_owned()),
+            "VEYRA_AUTOPILOT_MIN_HOLD_SECS" => Ok("0".to_owned()),
             _ => Err(ConfigError::MissingEnvironmentVariable { name }),
         });
         assert!(custom.enabled());
+        assert_eq!(custom.min_hold(), Duration::ZERO);
         assert_eq!(custom.symbol().expect("symbol").as_str(), "gbpusd");
         assert_eq!(custom.timeframe(), Timeframe::H4);
         assert_eq!(custom.bars(), 96);
@@ -1048,6 +1498,8 @@ mod tests {
             ("VEYRA_AUTOPILOT_INTERVAL_SECS", "29"),
             ("VEYRA_AUTOPILOT_INTERVAL_SECS", "many"),
             ("VEYRA_AUTOPILOT_JEV", "always"),
+            ("VEYRA_AUTOPILOT_MIN_HOLD_SECS", "86401"),
+            ("VEYRA_AUTOPILOT_MIN_HOLD_SECS", "-5"),
         ] {
             let error = AutopilotSettings::from_source(|requested| match requested {
                 _ if requested == name => Ok(value.to_owned()),
@@ -1526,6 +1978,308 @@ mod tests {
         );
         assert!(market_narrative(&empty).contains("no closed candles"));
         assert_eq!(change_pct(&empty), 0.0);
+    }
+
+    fn managed_snapshot(ticket: i64, opened_at: i64, server_time: i64) -> AccountSnapshotPayload {
+        AccountSnapshotPayload {
+            balance: 20.57,
+            equity: 20.57,
+            free_margin: 20.0,
+            orders: 1,
+            lots: 0.01,
+            positions: vec![crate::broker::ea::PositionPayload {
+                ticket,
+                symbol: "EURUSD".to_owned(),
+                kind: crate::broker::ea::PositionKind::Sell,
+                lots: 0.01,
+                price: 1.14757,
+                profit: -0.2,
+                stop_loss: 1.1497,
+                take_profit: 1.14554,
+                opened_at,
+                magic: crate::broker::ea::ORDER_MAGIC,
+            }],
+            positions_truncated: false,
+            server_time,
+        }
+    }
+
+    #[test]
+    fn review_answers_parse_strictly() {
+        assert_eq!(
+            parse_review(&json!({"action": "hold"})).expect("hold parses"),
+            ReviewDecision::Hold
+        );
+        assert_eq!(
+            parse_review(&json!({"action": "hold", "ticket": 42})).expect("stray ticket tolerated"),
+            ReviewDecision::Hold
+        );
+        assert_eq!(
+            parse_review(&json!({"action": "close", "ticket": 42})).expect("close parses"),
+            ReviewDecision::Close(42)
+        );
+        assert!(parse_review(&json!({"action": "close"})).is_err());
+        assert!(parse_review(&json!({"action": "close", "ticket": 0})).is_err());
+        assert!(parse_review(&json!({"action": "flatten"})).is_err());
+        assert!(parse_review(&json!({"action": "hold", "extra": true})).is_err());
+    }
+
+    #[actix_web::test]
+    async fn review_holds_when_the_analyst_holds() {
+        let engine = StubEngine::answering(json!({"action": "hold"}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot(10650805, 1_758_000_000, 1_758_003_600));
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::Held);
+        assert_eq!(outcomes(&harness.trail), vec!["held".to_owned()]);
+        let request = &engine.requests()[0];
+        assert!(
+            request.instructions.contains("10650805"),
+            "the reviewer sees the ticket"
+        );
+        let input: Value = serde_json::from_str(&request.input).expect("input is JSON");
+        assert_eq!(input["open_positions"][0]["ticket"], 10650805);
+        assert_eq!(input["open_positions"][0]["age_secs"], 3600);
+        assert_eq!(input["open_positions"][0]["stop_loss"], 1.1497);
+    }
+
+    #[actix_web::test]
+    async fn review_refuses_young_or_unverifiable_positions() {
+        // Younger than the minimum hold.
+        let engine = StubEngine::answering(json!({"action": "close", "ticket": 10650805}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot(10650805, 1_758_003_540, 1_758_003_600));
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "position_too_young"
+            }
+        );
+        assert_eq!(outcomes(&harness.trail), vec!["close_rejected".to_owned()]);
+
+        // Age cannot be verified.
+        let engine = StubEngine::answering(json!({"action": "close", "ticket": 7}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot(7, 0, 1_758_003_600));
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "position_age_unknown"
+            }
+        );
+
+        // An unknown ticket is refused before any command exists.
+        let engine = StubEngine::answering(json!({"action": "close", "ticket": 999}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot(10650805, 1_758_000_000, 1_758_003_600));
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "unknown_ticket"
+            }
+        );
+    }
+
+    #[actix_web::test]
+    async fn review_queues_closes_for_old_positions() {
+        let engine = StubEngine::answering(json!({"action": "close", "ticket": 10650805}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot(10650805, 1_758_000_000, 1_758_003_600));
+
+        let outcome = tick(&harness.state).await;
+        match outcome {
+            TickOutcome::CloseQueued { command } => {
+                assert!(!command.is_empty());
+            }
+            other => panic!("expected a queued close, got {other:?}"),
+        }
+        assert!(outcomes(&harness.trail).contains(&"close_queued".to_owned()));
+        let kinds: Vec<&str> = harness
+            .trail
+            .events()
+            .iter()
+            .map(|event| event.kind().as_str())
+            .collect();
+        assert!(kinds.contains(&"command_queued"));
+        let link = harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link");
+        assert!(link.has_pending(CommandKind::CloseOrder));
+    }
+
+    #[actix_web::test]
+    async fn review_respects_the_service_switch_and_zero_min_hold() {
+        // Switch off: the close is refused and nothing queues.
+        let engine = StubEngine::answering(json!({"action": "close", "ticket": 10650805}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            }),
+            None,
+            false,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot(10650805, 1_758_000_000, 1_758_003_600));
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "trading_disabled"
+            }
+        );
+
+        // Zero minimum hold removes the age gate (tests only).
+        let settings = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_MIN_HOLD_SECS" => Ok("0".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        let engine = StubEngine::answering(json!({"action": "close", "ticket": 42}));
+        let harness = build_harness(
+            settings,
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot(42, 1_758_003_599, 1_758_003_600));
+        assert!(matches!(
+            tick(&harness.state).await,
+            TickOutcome::CloseQueued { .. }
+        ));
+    }
+
+    #[actix_web::test]
+    async fn entry_path_runs_when_only_foreign_positions_are_open() {
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let mut snapshot = managed_snapshot(1, 1_758_000_000, 1_758_003_600);
+        snapshot.positions[0].magic = 0; // manual position
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(snapshot);
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        let request = &engine.requests()[0];
+        assert!(
+            request.instructions.contains("Decide whether to open"),
+            "the entry prompt ran, not the review prompt"
+        );
     }
 
     #[actix_web::test]

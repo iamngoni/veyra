@@ -77,6 +77,10 @@
       judgements → one structured proposal → risk gate → staged execution, on
       a configurable cadence, disabled by default, audited every tick — proven
       live end to end against the real terminal.
+- [x] Position review: while a managed position is open, the loop asks for
+      `hold` or `close` with its own constrained schema, guarded by a minimum
+      hold (`VEYRA_AUTOPILOT_MIN_HOLD_SECS`, default 300 s), verified position
+      age, and the same staged-close path as the control surface.
 - [x] `close_order` for Veyra-owned positions: only tickets from the latest
       completed `account_snapshot` that carry the Veyra magic number are
       accepted, and the terminal re-validates before a dry run or close —

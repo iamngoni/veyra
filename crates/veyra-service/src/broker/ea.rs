@@ -154,6 +154,11 @@ pub struct PositionPayload {
     /// none. Absent on older terminals that do not report it.
     #[serde(rename = "tp", default)]
     pub take_profit: f64,
+    /// Position open time (broker server seconds), or zero when the terminal
+    /// does not report it. The autopilot refuses to close positions whose age
+    /// it cannot verify.
+    #[serde(rename = "openedAt", default)]
+    pub opened_at: i64,
 }
 
 /// Order kinds the terminal can report.
@@ -244,6 +249,9 @@ impl AccountSnapshotPayload {
                         "position {name} must be a finite, non-negative price (zero means none)"
                     ));
                 }
+            }
+            if position.opened_at < 0 {
+                return Err("position openedAt must be non-negative".to_owned());
             }
         }
         Ok(())
@@ -1201,6 +1209,20 @@ impl EaLink {
         }
     }
 
+    /// Retains a validated snapshot as if its acknowledgement had completed.
+    ///
+    /// Test-only hatch so module tests can build account state without the
+    /// poll round trip; production state always flows through [`Self::apply_ack`].
+    #[cfg(test)]
+    pub(crate) fn retain_snapshot(&self, payload: AccountSnapshotPayload) {
+        self.with_last_account(|slot| {
+            *slot = Some(StoredAccount {
+                payload,
+                at: SystemTime::now(),
+            });
+        });
+    }
+
     /// Latest validated `account_snapshot` acknowledgement, if any.
     ///
     /// `None` until the first snapshot command completes. Read-only callers
@@ -1831,6 +1853,7 @@ mod tests {
             profit: -0.42,
             stop_loss: 1.085,
             take_profit: 1.105,
+            opened_at: 1_758_000_000,
             magic,
         }
     }

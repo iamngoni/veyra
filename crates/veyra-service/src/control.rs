@@ -22,8 +22,8 @@ use crate::AppState;
 use crate::audit::{AuditEvent, AuditKind};
 use crate::broker::Symbol;
 use crate::broker::ea::{
-    CommandId, CommandKind, CommandPayload, CommandState, EaCloseRequest, EaLink, EaModifyRequest,
-    EaOrderRequest, ORDER_MAGIC,
+    CommandId as EaCommandId, CommandKind, CommandPayload, CommandState, EaCloseRequest, EaLink,
+    EaModifyRequest, EaOrderRequest, ORDER_MAGIC,
 };
 use crate::market::{CandleRequest, Timeframe};
 use crate::risk::RiskDecision;
@@ -360,7 +360,7 @@ pub enum StagedExecution {
     /// The order command was queued and audited; poll it by id.
     Queued {
         /// Identifier of the queued command.
-        command: CommandId,
+        command: EaCommandId,
         /// Identifier of the approved intent the command carries.
         intent_id: String,
     },
@@ -416,32 +416,91 @@ pub struct CloseRequest {
 /// can never be closed through this route. The terminal re-validates the
 /// ticket and reports a dry run while its live-orders input is disabled.
 pub async fn close_position(state: Data<AppState>, body: web::Json<CloseRequest>) -> HttpResponse {
-    let Some(link) = command_link(&state) else {
+    if command_link(&state).is_none() {
         return HttpResponse::ServiceUnavailable()
             .json(json!({ "error": "command_channel_unavailable" }));
-    };
+    }
     if !state.config().trading_enabled() {
         return HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }));
     }
     if body.ticket <= 0 {
         return HttpResponse::BadRequest().json(json!({ "error": "invalid_ticket" }));
     }
+    match queue_staged_close(&state, body.ticket).await {
+        StagedClose::Queued { command, ticket } => HttpResponse::Ok().json(json!({
+            "command": "close_order",
+            "command_id": command.to_string(),
+            "ticket": ticket,
+            "status": "pending"
+        })),
+        StagedClose::TradingDisabled => {
+            HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }))
+        }
+        StagedClose::ChannelUnavailable => HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "command_channel_unavailable" })),
+        StagedClose::NoPositions => {
+            HttpResponse::Conflict().json(json!({ "error": "position_state_unavailable" }))
+        }
+        StagedClose::UnknownTicket => {
+            HttpResponse::NotFound().json(json!({ "error": "unknown_position" }))
+        }
+        StagedClose::NotVeyra => {
+            HttpResponse::Conflict().json(json!({ "error": "not_a_veyra_position" }))
+        }
+    }
+}
+
+/// Outcome of handing one ticket to the close path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StagedClose {
+    /// The close command was queued and audited; poll it by id.
+    Queued {
+        /// Identifier of the queued command.
+        command: EaCommandId,
+        /// Ticket being closed.
+        ticket: i64,
+    },
+    /// The operator switch is off; nothing was queued.
+    TradingDisabled,
+    /// The active broker exposes no command channel.
+    ChannelUnavailable,
+    /// No completed account snapshot is retained yet.
+    NoPositions,
+    /// The ticket is not in the latest completed snapshot.
+    UnknownTicket,
+    /// The ticket exists but is not Veyra-owned.
+    NotVeyra,
+}
+
+/// Queues one close for a ticket from the latest completed snapshot.
+///
+/// The single close path shared by the control surface and the autonomous
+/// loop: only tickets carrying the Veyra magic number in the retained
+/// snapshot are accepted, and the terminal re-validates before acting, so a
+/// manually placed position can never be closed through either caller.
+pub async fn queue_staged_close(state: &AppState, ticket: i64) -> StagedClose {
+    let Some(link) = command_link(state) else {
+        return StagedClose::ChannelUnavailable;
+    };
+    if !state.config().trading_enabled() {
+        return StagedClose::TradingDisabled;
+    }
     let Some(snapshot) = link.last_account() else {
-        return HttpResponse::Conflict().json(json!({ "error": "position_state_unavailable" }));
+        return StagedClose::NoPositions;
     };
     let Some(position) = snapshot
         .positions
         .iter()
-        .find(|position| position.ticket == body.ticket)
+        .find(|position| position.ticket == ticket)
     else {
-        return HttpResponse::NotFound().json(json!({ "error": "unknown_position" }));
+        return StagedClose::UnknownTicket;
     };
     if position.magic != ORDER_MAGIC {
-        return HttpResponse::Conflict().json(json!({ "error": "not_a_veyra_position" }));
+        return StagedClose::NotVeyra;
     }
     let command = link.enqueue_close(EaCloseRequest::new(position.ticket, position.magic));
     audit(
-        &state,
+        state,
         AuditKind::CommandQueued,
         json!({
             "command_id": command.to_string(),
@@ -450,12 +509,10 @@ pub async fn close_position(state: Data<AppState>, body: web::Json<CloseRequest>
         }),
     )
     .await;
-    HttpResponse::Ok().json(json!({
-        "command": "close_order",
-        "command_id": command.to_string(),
-        "ticket": position.ticket,
-        "status": "pending"
-    }))
+    StagedClose::Queued {
+        command,
+        ticket: position.ticket,
+    }
 }
 
 /// Body of `POST /intents/modify`.
@@ -625,7 +682,7 @@ pub async fn command_status(state: Data<AppState>, id: web::Path<String>) -> Htt
         return HttpResponse::ServiceUnavailable()
             .json(json!({ "error": "command_channel_unavailable" }));
     };
-    let Some(command_id) = CommandId::parse(id.as_str()) else {
+    let Some(command_id) = EaCommandId::parse(id.as_str()) else {
         return HttpResponse::BadRequest().json(json!({ "error": "invalid_command_id" }));
     };
     let Some(record) = link.command(command_id) else {

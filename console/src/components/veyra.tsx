@@ -308,6 +308,9 @@ const outcomeTone: Record<string, string> = {
   queued: 'text-emerald-300',
   approved_dry_run: 'text-cyan-300',
   no_trade: 'text-slate-400',
+  held: 'text-sky-300',
+  close_queued: 'text-amber-300',
+  close_rejected: 'text-rose-300',
   rejected: 'text-amber-300',
   unavailable: 'text-rose-300',
 }
@@ -315,7 +318,13 @@ const outcomeTone: Record<string, string> = {
 function payloadSummary(event: FeedEvent): string {
   const payload = event.payload ?? {}
   if (event.kind === 'proposal_evaluated') {
-    const parts = [payload.outcome, payload.side, payload.volume, payload.reason].filter(Boolean)
+    const parts = [
+      payload.outcome,
+      payload.side,
+      payload.volume,
+      payload.ticket ? `#${payload.ticket}` : undefined,
+      payload.reason,
+    ].filter(Boolean)
     return parts.join(' · ')
   }
   if (event.kind === 'broker_snapshot') {
