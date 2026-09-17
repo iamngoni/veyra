@@ -130,5 +130,10 @@ roadmap's staged-rollout checklist first.
 
 - The alert probe posts to any endpoint accepting a JSON `text` body
   (Slack, Discord, ntfy).
+- Off-machine backups upload each fresh dump to the R2 bucket named by
+  `VEYRA_BACKUP_R2_BUCKET` through the `wrangler` CLI; the target machine
+  needs `wrangler` logged in to the same Cloudflare account (and
+  `VEYRA_WRANGLER_BIN` pointing at the binary if nvm's node is not on the
+  launchd PATH). The alert probe warns when the last upload is over a day old.
 - Logs, backups, and the alert state all live under `~/Library/...` and are
   recreated on first run; nothing outside `.env` is machine-specific.

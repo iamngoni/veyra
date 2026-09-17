@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -166,6 +167,25 @@ def main() -> int:
                 if not value and key != "trading_enabled":
                     severity = "warn"
     state["controls"] = controls
+
+    # A configured off-machine backup that silently stops running is the
+    # classic failure; the local marker is refreshed on every upload.
+    if env.get("VEYRA_BACKUP_R2_BUCKET", "").strip():
+        marker = (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "veyra"
+            / "backups"
+            / ".last-remote-upload"
+        )
+        if marker.exists():
+            age_hours = (time.time() - marker.stat().st_mtime) / 3600.0
+            if age_hours > 26.0:
+                findings.append(
+                    f"Off-machine backup is stale: last upload {age_hours:.0f}h ago"
+                )
+                severity = "warn"
 
     try:
         events = http_json(f"/events?after={state.get('cursor', 0)}&wait_ms=0")

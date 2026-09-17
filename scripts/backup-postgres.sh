@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
-# Backs up the Veyra audit database with pg_dump, verifies the archive, and
-# prunes old generations. launchd runs this daily via cc.antonlabs.veyra.backup.
+# Backs up the Veyra audit database with pg_dump, verifies the archive,
+# prunes old generations, and uploads each fresh dump off-machine to R2 via
+# `wrangler` when a bucket is configured. launchd runs this daily via
+# cc.antonlabs.veyra.backup.
 #
 # The dump is written to a .partial file, verified with `pg_restore --list`
 # (an archive that cannot be listed cannot be restored), and only then moved
 # into place, so a failed or corrupt run never replaces a good generation.
+# The remote upload is best-effort: a network or auth failure never fails the
+# local backup, it only logs. Remote pruning is deliberately absent (dumps are
+# tiny); use an R2 lifecycle rule if that ever matters.
 # Tunables, also used by tests:
 #   VEYRA_BACKUP_DIR=... VEYRA_BACKUP_GENERATIONS=2 scripts/backup-postgres.sh
 #
 # PostgreSQL tools come from Homebrew's postgresql@17 by default; point
 # VEYRA_PG_BIN elsewhere (or have pg_dump/pg_restore on PATH) if that moves.
+# `VEYRA_WRANGLER_BIN` should point at wrangler (its directory is added to
+# PATH so the node shebang resolves under launchd).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -70,3 +77,24 @@ ls -1t "$BACKUP_DIR"/veyra-*.dump 2>/dev/null | tail -n +"$((GENERATIONS + 1))" 
   rm -f "$old"
   echo "pruned $old"
 done
+
+# Off-machine copy: best-effort, never fails the local backup.
+REMOTE_BUCKET="${VEYRA_BACKUP_R2_BUCKET:-}"
+if [ -n "$REMOTE_BUCKET" ]; then
+  wrangler_bin="${VEYRA_WRANGLER_BIN:-}"
+  if [ -z "$wrangler_bin" ]; then
+    wrangler_bin="$(command -v wrangler 2>/dev/null || true)"
+  fi
+  if [ -z "$wrangler_bin" ] || [ ! -x "$wrangler_bin" ]; then
+    echo "wrangler not found; skipping off-machine upload of $(basename "$target")" >&2
+  else
+    # The wrangler shebang resolves node via PATH; launchd starts minimal.
+    export PATH="$(dirname "$wrangler_bin"):$PATH"
+    if "$wrangler_bin" r2 object put "$REMOTE_BUCKET/$(basename "$target")" --file "$target" --remote >/dev/null 2>&1; then
+      date +%s > "$BACKUP_DIR/.last-remote-upload"
+      echo "uploaded $(basename "$target") to r2://$REMOTE_BUCKET"
+    else
+      echo "off-machine upload failed for $(basename "$target"); the local dump is intact" >&2
+    fi
+  fi
+fi

@@ -174,7 +174,10 @@
       prerequisite on the target (verified on this machine: 16 pass, 0 fail);
       `scripts/check.sh` is the single local gate for the Rust workspace and
       the console.
-- [ ] Durable 24/7 host or VPS, managed secrets, off-machine backups, and
-      remote monitoring.
+- [x] Off-machine backups: every fresh dump uploads to R2
+      (`VEYRA_BACKUP_R2_BUCKET`) through the authenticated `wrangler` CLI —
+      proven live (byte-identical retrieval of an uploaded dump, launchd-path
+      run included), with a freshness marker the alert probe watches.
+- [ ] Durable 24/7 host or VPS, managed secrets, and remote monitoring.
 - [ ] Versioned deployment pipeline.
 - [ ] Staged rollout: local → paper account → minimal live exposure only after explicit owner approval.

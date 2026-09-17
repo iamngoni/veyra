@@ -38,8 +38,9 @@ This repository contains the first tested, safe service slice:
   POST per finding to `VEYRA_ALERT_WEBHOOK` — Slack, Discord, or ntfy all
   accept the payload. Without a webhook it logs to `~/Library/Logs/veyra`.
 - 24/7 supervision: launchd agents for the terminal, tunnel, service, console,
-  alert probe, hourly log rotation, and daily verified audit backups with
-  crash restart on the service, tunnel, and console (ADR 0005).
+  alert probe, hourly log rotation, and daily verified audit backups (kept
+  locally and uploaded off-machine to R2) with crash restart on the service,
+  tunnel, and console (ADR 0005).
 - Durable audit trail in PostgreSQL (SQLx migrations, append-only
   `audit_events`, loopback `GET /audit`) — commands, acknowledgements, and
   broker snapshots survive restarts. Configure `VEYRA_DATABASE_URL`; a

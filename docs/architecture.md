@@ -230,6 +230,10 @@ copy-truncates logs under `~/Library/Logs/veyra` above 5 MiB, keeping three
 generations. The backup agent dumps PostgreSQL in custom format, verifies the
 archive with `pg_restore --list` before it replaces the previous generation,
 keeps the newest fourteen dumps under `~/Library/Application Support/veyra/backups`,
+uploads each fresh dump off-machine to an R2 bucket through the authenticated
+`wrangler` CLI when `VEYRA_BACKUP_R2_BUCKET` is set (best-effort; a network or
+auth failure never fails the local backup, and the alert probe warns when the
+upload marker is more than a day old),
 and runs once at load plus daily at 03:30. `/ready` reports broker and audit
 health, degrading instead of hiding an unhealthy dependency; the audit probe
 is bounded at two seconds, so a wedged database degrades the answer instead

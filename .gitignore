@@ -20,3 +20,6 @@
 # Python artifacts (alert probe bytecode)
 __pycache__/
 *.pyc
+# Wrangler CLI local emulation state
+.wrangler/
+node_modules/.mf/
