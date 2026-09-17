@@ -1,0 +1,148 @@
+//! Parses environment input once, before any listener is opened.
+//! Bind addresses are IP literals, not DNS names; invalid input fails startup.
+
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+};
+
+/// Configuration failures name the setting without echoing its raw value.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigError {
+    /// Required input is absent, blank, or not valid Unicode.
+    #[error("missing or unreadable environment variable: {name}")]
+    MissingEnvironmentVariable {
+        /// Setting that must be supplied.
+        name: &'static str,
+    },
+    /// Input cannot be converted into a valid runtime setting.
+    #[error("invalid environment variable `{name}`: {reason}")]
+    InvalidEnvironmentVariable {
+        /// Setting that must be corrected.
+        name: &'static str,
+        /// Non-sensitive acceptance rule.
+        reason: &'static str,
+    },
+}
+
+/// Deployment label; it does not grant execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Environment {
+    /// Production deployment.
+    Production,
+    /// Pre-production deployment.
+    Staging,
+    /// Local development.
+    Development,
+}
+
+impl fmt::Display for Environment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Production => "production",
+            Self::Staging => "staging",
+            Self::Development => "development",
+        })
+    }
+}
+
+impl FromStr for Environment {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "production" => Ok(Self::Production),
+            "staging" => Ok(Self::Staging),
+            "development" => Ok(Self::Development),
+            _ => Err(ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_ENV",
+                reason: "must be production, staging, or development",
+            }),
+        }
+    }
+}
+
+/// Non-privileged TCP port. No deserializer can bypass the constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Port(u16);
+
+impl Port {
+    /// Parses an integer in 1024..=65535; rejects whitespace and port zero.
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        let invalid = || ConfigError::InvalidEnvironmentVariable {
+            name: "VEYRA_BIND_PORT",
+            reason: "must be an integer from 1024 through 65535",
+        };
+        let port = value.parse::<u16>().map_err(|_| invalid())?;
+        if port < 1024 {
+            return Err(invalid());
+        }
+        Ok(Self(port))
+    }
+
+    /// Returns the accepted TCP port.
+    pub fn value(self) -> u16 {
+        self.0
+    }
+}
+
+/// Immutable startup settings with a parsed IPv4 or IPv6 socket address.
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    address: SocketAddr,
+    environment: Environment,
+}
+
+impl ServiceConfig {
+    /// Reads required process settings. A `.env` file is not loaded implicitly.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_source(|name| {
+            std::env::var(name).map_err(|_| ConfigError::MissingEnvironmentVariable { name })
+        })
+    }
+
+    /// Parses an injected settings source; invalid or missing values fail closed.
+    pub fn from_source(
+        mut source: impl FnMut(&'static str) -> Result<String, ConfigError>,
+    ) -> Result<Self, ConfigError> {
+        let host = read("VEYRA_BIND_HOST", &mut source)?
+            .parse::<IpAddr>()
+            .map_err(|_| ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_BIND_HOST",
+                reason: "must be an IPv4 or IPv6 literal",
+            })?;
+        let port = Port::parse(&read("VEYRA_BIND_PORT", &mut source)?)?;
+        let environment = read("VEYRA_ENV", &mut source)?.parse()?;
+        Ok(Self {
+            address: SocketAddr::new(host, port.value()),
+            environment,
+        })
+    }
+
+    /// Returns a validated bind address; IPv6 requires no string concatenation.
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Returns the deployment label, not a trading permission.
+    pub fn environment(&self) -> Environment {
+        self.environment
+    }
+
+    /// Execution is unavailable: no broker adapter is compiled into this service.
+    pub fn trading_enabled(&self) -> bool {
+        false
+    }
+}
+
+fn read(
+    name: &'static str,
+    source: &mut impl FnMut(&'static str) -> Result<String, ConfigError>,
+) -> Result<String, ConfigError> {
+    let value = source(name)?;
+    if value.trim().is_empty() {
+        return Err(ConfigError::MissingEnvironmentVariable { name });
+    }
+    Ok(value)
+}

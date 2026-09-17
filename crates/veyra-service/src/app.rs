@@ -1,0 +1,25 @@
+//! HTTP assembly shared by the process and integration tests.
+//! Only read-only diagnostic routes are registered; no execution API exists.
+
+use crate::AppState;
+use actix_web::{App, Error, body::BoxBody, dev, web};
+
+/// Creates the complete diagnostic application with non-cacheable responses.
+pub fn create_app(
+    state: AppState,
+) -> App<
+    impl dev::ServiceFactory<
+        dev::ServiceRequest,
+        Config = (),
+        Response = dev::ServiceResponse<BoxBody>,
+        Error = Error,
+        InitError = (),
+    >,
+> {
+    App::new()
+        .app_data(web::Data::new(state))
+        .wrap(actix_web::middleware::DefaultHeaders::new().add(("Cache-Control", "no-store")))
+        .service(crate::routes::health)
+        .service(crate::routes::readiness)
+        .service(crate::routes::status)
+}
