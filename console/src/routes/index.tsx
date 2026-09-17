@@ -18,7 +18,7 @@ import { useEventFeed, usePoll } from '../lib/hooks'
 
 export const Route = createFileRoute('/')({ component: Dashboard })
 
-function Dashboard() {
+export function Dashboard() {
   const { data: status } = usePoll(api.status, 5000)
   const { data: account, error: accountError } = usePoll(api.account, 5000)
   const { data: commands } = usePoll(() => api.commands(25), 10000)

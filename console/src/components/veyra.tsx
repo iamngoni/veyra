@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { ReactNode } from 'react'
 
 import type {
@@ -12,6 +13,14 @@ import type {
   Status,
 } from '../lib/api'
 import { VEYRA_MAGIC } from '../lib/api'
+import {
+  commandTone,
+  detailRows,
+  isRoutine,
+  kindTone,
+  outcomeTone,
+  payloadSummary,
+} from '../lib/format'
 import { clockTime, money, relativeTime } from '../lib/hooks'
 
 /* ---------- primitives ---------- */
@@ -357,36 +366,53 @@ export function MetricsPanel({ metrics, error }: { metrics?: Metrics; error?: st
 
 /* ---------- commands ---------- */
 
-const commandTone: Record<CommandRecord['status'], string> = {
-  pending: 'text-sky-400',
-  completed: 'text-emerald-400',
-  failed: 'text-rose-400',
-}
-
 export function CommandsPanel({ commands }: { commands?: CommandRecord[] }) {
+  const [expandedId, setExpandedId] = useState<string | undefined>(undefined)
   return (
     <Panel title="Commands" detail={`${commands?.length ?? 0} recent`}>
       {!commands || commands.length === 0 ? (
         <div className="p-3 text-xs text-slate-500">No commands yet.</div>
       ) : (
         <ul className="divide-y divide-slate-800/60">
-          {commands.map((command) => (
-            <li key={command.id} className="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
-              <div className="flex min-w-0 items-center gap-2">
-                <span className="rounded bg-slate-800/80 px-1.5 py-0.5 font-mono text-[10px] text-slate-300">
-                  {command.kind}
-                </span>
-                <span className="truncate font-mono text-[10px] text-slate-500">{command.id.slice(0, 8)}</span>
-                {command.summary ? (
-                  <span className="truncate font-mono text-[10px] text-slate-400">{JSON.stringify(command.summary)}</span>
+          {commands.map((command) => {
+            const expanded = command.id === expandedId
+            return (
+              <li key={command.id}>
+                <button
+                  type="button"
+                  onClick={() => setExpandedId(expanded ? undefined : command.id)}
+                  aria-expanded={expanded}
+                  className={`flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-xs transition-colors ${
+                    expanded ? 'bg-slate-800/50' : 'hover:bg-slate-800/20'
+                  }`}
+                >
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className="rounded bg-slate-800/80 px-1.5 py-0.5 font-mono text-[10px] text-slate-300">
+                      {command.kind}
+                    </span>
+                    <span className="truncate font-mono text-[10px] text-slate-500">{command.id.slice(0, 8)}</span>
+                    {command.summary ? (
+                      <span className="truncate font-mono text-[10px] text-slate-400">
+                        {JSON.stringify(command.summary)}
+                      </span>
+                    ) : null}
+                    {command.reason ? <span className="truncate text-[10px] text-rose-300">{command.reason}</span> : null}
+                  </span>
+                  <span className={`shrink-0 text-[10px] uppercase tracking-wider ${commandTone[command.status]}`}>
+                    {command.status}
+                  </span>
+                </button>
+                {expanded ? (
+                  <div className="space-y-1 border-t border-slate-800/60 bg-slate-900/50 px-3 py-2">
+                    <div className="font-mono text-[10px] text-slate-500">id {command.id}</div>
+                    <pre className="max-h-40 overflow-auto rounded bg-black/30 p-2 font-mono text-[10px] leading-relaxed text-slate-400">
+                      {JSON.stringify({ summary: command.summary ?? null, reason: command.reason ?? null }, null, 2)}
+                    </pre>
+                  </div>
                 ) : null}
-                {command.reason ? <span className="truncate text-[10px] text-rose-300">{command.reason}</span> : null}
-              </div>
-              <span className={`shrink-0 text-[10px] uppercase tracking-wider ${commandTone[command.status]}`}>
-                {command.status}
-              </span>
-            </li>
-          ))}
+              </li>
+            )
+          })}
         </ul>
       )}
     </Panel>
@@ -394,64 +420,6 @@ export function CommandsPanel({ commands }: { commands?: CommandRecord[] }) {
 }
 
 /* ---------- activity feed ---------- */
-
-const kindTone: Record<string, string> = {
-  proposal_evaluated: 'text-violet-300 bg-violet-500/10',
-  command_queued: 'text-sky-300 bg-sky-500/10',
-  command_completed: 'text-emerald-300 bg-emerald-500/10',
-  command_failed: 'text-rose-300 bg-rose-500/10',
-  broker_snapshot: 'text-slate-400 bg-slate-700/30',
-  position_closed: 'text-cyan-300 bg-cyan-500/10',
-  service_started: 'text-amber-300 bg-amber-500/10',
-  reconciliation_drift: 'text-rose-300 bg-rose-500/15',
-}
-
-const outcomeTone: Record<string, string> = {
-  queued: 'text-emerald-300',
-  approved_dry_run: 'text-cyan-300',
-  no_trade: 'text-slate-400',
-  held: 'text-sky-300',
-  break_even: 'text-emerald-300',
-  break_even_rejected: 'text-rose-300',
-  close_queued: 'text-amber-300',
-  close_rejected: 'text-rose-300',
-  rejected: 'text-amber-300',
-  unavailable: 'text-rose-300',
-}
-
-function payloadSummary(event: FeedEvent): string {
-  const payload = event.payload ?? {}
-  if (event.kind === 'proposal_evaluated') {
-    const parts = [
-      payload.outcome,
-      payload.side,
-      payload.volume,
-      payload.ticket ? `#${payload.ticket}` : undefined,
-      payload.reason,
-    ].filter(Boolean)
-    return parts.join(' · ')
-  }
-  if (event.kind === 'broker_snapshot') {
-    return `orders=${payload.orders} lots=${payload.lots}`
-  }
-  if (event.kind === 'position_closed') {
-    const profit = Number(payload.profit ?? 0)
-    return `ticket ${payload.ticket} ${payload.symbol} ${payload.kind} · P/L ${profit >= 0 ? '+' : ''}${profit.toFixed(2)}`
-  }
-  return JSON.stringify(payload)
-}
-
-/// High-frequency plumbing the focus mode hides: snapshots and the read-only
-/// commands the loop issues every cycle. Decisions, orders, and lifecycle
-/// events always show.
-function isRoutine(event: FeedEvent): boolean {
-  if (event.kind === 'broker_snapshot') return true
-  if (event.kind === 'command_queued' || event.kind === 'command_completed') {
-    const kind = String(event.payload?.kind ?? '')
-    return kind === 'account_snapshot' || kind === 'rates' || kind === 'ping'
-  }
-  return false
-}
 
 export function ActivityFeed({
   events,
@@ -464,13 +432,18 @@ export function ActivityFeed({
   focus: boolean
   onFocusChange: (focus: boolean) => void
 }) {
+  const [selectedSeq, setSelectedSeq] = useState<number | undefined>(undefined)
   const visible = focus ? events.filter((event) => !isRoutine(event)) : events
+
   return (
     <Panel
       title="Activity"
       className="min-h-[320px]"
       detail={
         <span className="flex items-center gap-3">
+          <span className="hidden text-[10px] uppercase tracking-wider text-slate-600 sm:inline">
+            click a row for detail
+          </span>
           <button
             type="button"
             onClick={() => onFocusChange(!focus)}
@@ -498,26 +471,59 @@ export function ActivityFeed({
         <ul className="divide-y divide-slate-800/40">
           {visible.map((event) => {
             const outcome = typeof event.payload?.outcome === 'string' ? event.payload.outcome : undefined
+            const expanded = event.seq === selectedSeq
             return (
-              <li key={event.seq} className="flex items-start gap-2 px-3 py-1.5 text-xs">
-                <span className="w-14 shrink-0 pt-0.5 font-mono text-[10px] text-slate-500">
-                  {clockTime(event.at_ms)}
-                </span>
-                <span
-                  className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] ${
-                    kindTone[event.kind] ?? 'bg-slate-700/30 text-slate-300'
-                  }`}
-                >
-                  {event.kind}
-                </span>
-                <span
-                  className={`min-w-0 flex-1 truncate font-mono text-[11px] ${
-                    outcome ? (outcomeTone[outcome] ?? 'text-slate-300') : 'text-slate-300'
-                  }`}
+              <li key={event.seq}>
+                <button
+                  type="button"
+                  onClick={() => setSelectedSeq(expanded ? undefined : event.seq)}
+                  aria-expanded={expanded}
                   title={JSON.stringify(event.payload)}
+                  className={`flex w-full items-start gap-2 px-3 py-1.5 text-left text-xs transition-colors ${
+                    expanded ? 'bg-slate-800/50' : 'hover:bg-slate-800/20'
+                  }`}
                 >
-                  {payloadSummary(event)}
-                </span>
+                  <span className="w-14 shrink-0 pt-0.5 font-mono text-[10px] text-slate-500">
+                    {clockTime(event.at_ms)}
+                  </span>
+                  <span
+                    className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] ${
+                      kindTone[event.kind] ?? 'bg-slate-700/30 text-slate-300'
+                    }`}
+                  >
+                    {event.kind}
+                  </span>
+                  <span
+                    className={`min-w-0 flex-1 truncate font-mono text-[11px] ${
+                      outcome ? (outcomeTone[outcome] ?? 'text-slate-300') : 'text-slate-300'
+                    }`}
+                  >
+                    {payloadSummary(event)}
+                  </span>
+                </button>
+                {expanded ? (
+                  <div className="space-y-1.5 border-t border-slate-800/60 bg-slate-900/50 px-3 py-2">
+                    <div className="flex items-center justify-between font-mono text-[10px] text-slate-500">
+                      <span>
+                        #{event.seq} · {new Date(event.at_ms).toISOString()}
+                      </span>
+                      <span>{relativeTime(event.at_ms)}</span>
+                    </div>
+                    <div className="space-y-1">
+                      {detailRows(event.payload ?? {}).map((row) => (
+                        <div key={row.label} className="grid grid-cols-[8rem_1fr] gap-x-3">
+                          <span className="font-mono text-[10px] uppercase tracking-wider text-slate-500">
+                            {row.label}
+                          </span>
+                          <span className="min-w-0 break-words font-mono text-[11px] text-slate-300">{row.value}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <pre className="max-h-40 overflow-auto rounded bg-black/30 p-2 font-mono text-[10px] leading-relaxed text-slate-400">
+                      {JSON.stringify(event.payload ?? {}, null, 2)}
+                    </pre>
+                  </div>
+                ) : null}
               </li>
             )
           })}

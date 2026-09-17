@@ -21,6 +21,8 @@ cargo coverage
 if [ -d console/node_modules ]; then
   echo "== console typecheck"
   (cd console && npm run --silent typecheck)
+  echo "== console tests"
+  (cd console && npm run --silent test:coverage)
   echo "== console build"
   (cd console && npm run --silent build)
 else
