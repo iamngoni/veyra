@@ -20,6 +20,12 @@
 //! re-validates it against the latest snapshot, and a position younger than
 //! `VEYRA_AUTOPILOT_MIN_HOLD_SECS` — or one whose age cannot be verified — is
 //! refused so the loop cannot churn in and out of the same trade.
+//!
+//! Before any review, deterministic stop policies run: break-even
+//! (`VEYRA_AUTOPILOT_BREAKEVEN_R`) and trailing (`VEYRA_AUTOPILOT_TRAIL_R`),
+//! expressed as multiples of the entry risk. The most protective candidate
+//! wins, stops only ever move in the favourable direction, and improvements
+//! smaller than a tenth of the entry risk are suppressed to bound churn.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -102,6 +108,7 @@ pub struct AutopilotSettings {
     jev: JevPreference,
     min_hold: Duration,
     breakeven_r: f64,
+    trail_r: f64,
 }
 
 impl AutopilotSettings {
@@ -132,6 +139,7 @@ impl AutopilotSettings {
         let jev_raw = optional(&mut source, "VEYRA_AUTOPILOT_JEV");
         let min_hold_raw = optional(&mut source, "VEYRA_AUTOPILOT_MIN_HOLD_SECS");
         let breakeven_raw = optional(&mut source, "VEYRA_AUTOPILOT_BREAKEVEN_R");
+        let trail_raw = optional(&mut source, "VEYRA_AUTOPILOT_TRAIL_R");
 
         if enabled_raw.is_empty()
             && symbol_raw.is_empty()
@@ -142,6 +150,7 @@ impl AutopilotSettings {
             && jev_raw.is_empty()
             && min_hold_raw.is_empty()
             && breakeven_raw.is_empty()
+            && trail_raw.is_empty()
         {
             return Ok(None);
         }
@@ -231,20 +240,24 @@ impl AutopilotSettings {
             }
         };
 
-        let breakeven_r = match breakeven_raw.as_str() {
-            "" => 0.0,
-            other => {
-                let invalid = || ConfigError::InvalidEnvironmentVariable {
-                    name: "VEYRA_AUTOPILOT_BREAKEVEN_R",
-                    reason: "must be a number from 0 through 10 (0 disables the policy)",
-                };
-                let value = other.parse::<f64>().map_err(|_| invalid())?;
-                if !value.is_finite() || !(0.0..=10.0).contains(&value) {
-                    return Err(invalid());
+        let multiple = |name: &'static str, raw: &str| -> Result<f64, ConfigError> {
+            match raw {
+                "" => Ok(0.0),
+                other => {
+                    let invalid = || ConfigError::InvalidEnvironmentVariable {
+                        name,
+                        reason: "must be a number from 0 through 10 (0 disables the policy)",
+                    };
+                    let value = other.parse::<f64>().map_err(|_| invalid())?;
+                    if !value.is_finite() || !(0.0..=10.0).contains(&value) {
+                        return Err(invalid());
+                    }
+                    Ok(value)
                 }
-                value
             }
         };
+        let breakeven_r = multiple("VEYRA_AUTOPILOT_BREAKEVEN_R", &breakeven_raw)?;
+        let trail_r = multiple("VEYRA_AUTOPILOT_TRAIL_R", &trail_raw)?;
 
         Ok(Some(Self {
             enabled,
@@ -256,6 +269,7 @@ impl AutopilotSettings {
             jev,
             min_hold,
             breakeven_r,
+            trail_r,
         }))
     }
 
@@ -304,6 +318,12 @@ impl AutopilotSettings {
     /// zero disables the policy.
     pub fn breakeven_r(&self) -> f64 {
         self.breakeven_r
+    }
+
+    /// Distance kept behind the best favourable price once trailing starts,
+    /// as a multiple of the entry risk; zero disables the policy.
+    pub fn trail_r(&self) -> f64 {
+        self.trail_r
     }
 }
 
@@ -451,9 +471,14 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         // Capital preservation first: one action per tick, and moving the
         // stop is cheaper and safer than any entry or exit decision.
         if state.config().trading_enabled()
-            && let Some((ticket, stop)) = break_even_plan(&positions, settings.breakeven_r())
+            && let Some(plan) = stop_plan(
+                &positions,
+                settings.breakeven_r(),
+                settings.trail_r(),
+                state.stop_basis(),
+            )
         {
-            return move_to_break_even(state, &series, ticket, stop).await;
+            return move_stop(state, &series, plan).await;
         }
         return review_positions(
             state,
@@ -620,39 +645,166 @@ fn managed_from_payload(position: &PositionPayload) -> ManagedPosition {
     }
 }
 
-/// Break-even plan for the first position that has travelled at least `r`
-/// times its entry risk in favour while its stop still sits behind the entry.
+/// Which policy produced a stop move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopMoveKind {
+    /// The stop moved to the entry price.
+    BreakEven,
+    /// The stop trailed behind the best favourable price.
+    Trail,
+}
+
+impl StopMoveKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BreakEven => "break_even",
+            Self::Trail => "trailing_stop",
+        }
+    }
+}
+
+/// A planned stop change for one position.
+#[derive(Debug, Clone, PartialEq)]
+struct StopMove {
+    ticket: i64,
+    stop: f64,
+    kind: StopMoveKind,
+}
+
+/// Smallest improvement worth another modify round trip, as a fraction of the
+/// entry risk; keeps a trailing stop from re-submitting every tick.
+const STOP_MIN_STEP_RATIO: f64 = 0.1;
+
+/// Entry-risk memory for the stop policies.
 ///
-/// Deterministic capital preservation: when it fires, the stop moves to the
-/// entry price, so a trade that reached the target distance can no longer
-/// turn into a loss. Positions without a stop, without a reported current
-/// price, or already protected at break-even are skipped.
-fn break_even_plan(positions: &[ManagedPosition], r: f64) -> Option<(i64, f64)> {
-    if !r.is_finite() || r <= 0.0 {
+/// The terminal reports a position's *current* stop, so once break-even or
+/// trailing has moved it, the distance the trade originally risked is no
+/// longer derivable from one payload. The first observation of each ticket —
+/// while its stop still sits behind the entry — is remembered here and used
+/// as the risk basis for every later decision. A ticket first seen after a
+/// move (for example across a service restart) has no basis and is left
+/// alone until it closes. Tickets that are no longer open are dropped.
+#[derive(Debug, Default)]
+pub struct StopBasis {
+    risks: std::sync::Mutex<std::collections::HashMap<i64, f64>>,
+}
+
+impl StopBasis {
+    /// Records the first observed risk for every live position.
+    fn observe(&self, positions: &[ManagedPosition]) {
+        let mut risks = match self.risks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        risks.retain(|ticket, _| positions.iter().any(|position| position.ticket == *ticket));
+        for position in positions {
+            if risks.contains_key(&position.ticket)
+                || position.stop_loss <= 0.0
+                || position.entry <= 0.0
+            {
+                continue;
+            }
+            let observed = (position.entry - position.stop_loss).abs();
+            if observed > 0.0 {
+                risks.insert(position.ticket, observed);
+            }
+        }
+    }
+
+    /// Remembered entry risk for one ticket.
+    fn risk(&self, ticket: i64) -> Option<f64> {
+        let risks = match self.risks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        risks.get(&ticket).copied()
+    }
+}
+
+/// Plans the most protective stop change for the first eligible position.
+///
+/// Two deterministic policies feed one decision: break-even (the stop moves
+/// to the entry price once the trade has travelled `breakeven_r` times its
+/// entry risk in favour) and trailing (`trail_r` times the risk is kept
+/// behind the best favourable price once that distance is exceeded). The
+/// winner is the most protective candidate that also improves the current
+/// stop by at least one step, so stops never move backwards and churn is
+/// bounded. Positions without a stop, without a current price, or that have
+/// not moved in favour are skipped.
+fn stop_plan(
+    positions: &[ManagedPosition],
+    breakeven_r: f64,
+    trail_r: f64,
+    basis: &StopBasis,
+) -> Option<StopMove> {
+    let breakeven_enabled = breakeven_r.is_finite() && breakeven_r > 0.0;
+    let trail_enabled = trail_r.is_finite() && trail_r > 0.0;
+    if !breakeven_enabled && !trail_enabled {
         return None;
     }
+    basis.observe(positions);
     for position in positions {
         if position.stop_loss <= 0.0 || position.current <= 0.0 || position.entry <= 0.0 {
             continue;
         }
-        let risk = (position.entry - position.stop_loss).abs();
+        let Some(risk) = basis.risk(position.ticket) else {
+            continue;
+        };
         if risk <= 0.0 {
             continue;
         }
-        let (favourable, already_protected) = match position.side {
-            ManagedSide::Buy => (
-                position.current - position.entry,
-                position.stop_loss >= position.entry,
-            ),
-            ManagedSide::Sell => (
-                position.entry - position.current,
-                position.stop_loss <= position.entry,
-            ),
+        let (favourable, long) = match position.side {
+            ManagedSide::Buy => (position.current - position.entry, true),
+            ManagedSide::Sell => (position.entry - position.current, false),
         };
-        if already_protected || favourable < r * risk {
+        if favourable <= 0.0 {
             continue;
         }
-        return Some((position.ticket, position.entry));
+        let mut candidates: Vec<(f64, StopMoveKind)> = Vec::new();
+        if breakeven_enabled && favourable >= breakeven_r * risk {
+            candidates.push((position.entry, StopMoveKind::BreakEven));
+        }
+        if trail_enabled && favourable >= trail_r * risk {
+            let trailing = if long {
+                position.current - trail_r * risk
+            } else {
+                position.current + trail_r * risk
+            };
+            candidates.push((trailing, StopMoveKind::Trail));
+        }
+
+        let min_step = risk * STOP_MIN_STEP_RATIO;
+        let mut best: Option<(f64, StopMoveKind)> = None;
+        for (candidate, kind) in candidates {
+            let improves = if long {
+                candidate >= position.stop_loss + min_step
+            } else {
+                candidate <= position.stop_loss - min_step
+            };
+            if !improves {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((current, _)) => {
+                    if long {
+                        candidate > current
+                    } else {
+                        candidate < current
+                    }
+                }
+            };
+            if better {
+                best = Some((candidate, kind));
+            }
+        }
+        if let Some((stop, kind)) = best {
+            return Some(StopMove {
+                ticket: position.ticket,
+                stop,
+                kind,
+            });
+        }
     }
     None
 }
@@ -913,16 +1065,19 @@ async fn review_positions(
     }
 }
 
-/// Moves one reviewed position's stop to its entry price.
-async fn move_to_break_even(
-    state: &AppState,
-    series: &CandleSeries,
-    ticket: i64,
-    stop: f64,
-) -> TickOutcome {
-    match queue_staged_modify(state, ticket, Some(stop), None).await {
+/// Submits one planned stop change through the shared modify path.
+async fn move_stop(state: &AppState, series: &CandleSeries, plan: StopMove) -> TickOutcome {
+    match queue_staged_modify(state, plan.ticket, Some(plan.stop), None).await {
         StagedModify::Queued { command, ticket } => {
-            record_position(state, "break_even", "autopilot", series, Some(ticket), None).await;
+            record_position(
+                state,
+                plan.kind.as_str(),
+                "autopilot",
+                series,
+                Some(ticket),
+                None,
+            )
+            .await;
             TickOutcome::StopMoved {
                 command: command.to_string(),
             }
@@ -930,10 +1085,10 @@ async fn move_to_break_even(
         StagedModify::TradingDisabled => {
             record_position(
                 state,
-                "break_even_rejected",
+                "stop_rejected",
                 "autopilot",
                 series,
-                Some(ticket),
+                Some(plan.ticket),
                 Some("trading_disabled"),
             )
             .await;
@@ -945,10 +1100,10 @@ async fn move_to_break_even(
             let reason = "command channel unavailable".to_owned();
             record_position(
                 state,
-                "break_even_rejected",
+                "stop_rejected",
                 "autopilot",
                 series,
-                Some(ticket),
+                Some(plan.ticket),
                 Some(&reason),
             )
             .await;
@@ -957,10 +1112,10 @@ async fn move_to_break_even(
         StagedModify::NoPositions | StagedModify::UnknownTicket => {
             record_position(
                 state,
-                "break_even_rejected",
+                "stop_rejected",
                 "autopilot",
                 series,
-                Some(ticket),
+                Some(plan.ticket),
                 Some("stale_position"),
             )
             .await;
@@ -971,10 +1126,10 @@ async fn move_to_break_even(
         StagedModify::NotVeyra => {
             record_position(
                 state,
-                "break_even_rejected",
+                "stop_rejected",
                 "autopilot",
                 series,
-                Some(ticket),
+                Some(plan.ticket),
                 Some("not_a_veyra_position"),
             )
             .await;
@@ -1670,6 +1825,7 @@ mod tests {
         assert_eq!(defaults.jev(), JevPreference::Auto);
         assert_eq!(defaults.min_hold(), Duration::from_secs(300));
         assert_eq!(defaults.breakeven_r(), 0.0, "break-even is opt-in");
+        assert_eq!(defaults.trail_r(), 0.0, "trailing is opt-in");
         assert!(defaults.symbol().is_none());
 
         let custom = settings_from(|name| match name {
@@ -1682,11 +1838,13 @@ mod tests {
             "VEYRA_AUTOPILOT_JEV" => Ok("off".to_owned()),
             "VEYRA_AUTOPILOT_MIN_HOLD_SECS" => Ok("0".to_owned()),
             "VEYRA_AUTOPILOT_BREAKEVEN_R" => Ok("1.5".to_owned()),
+            "VEYRA_AUTOPILOT_TRAIL_R" => Ok("2".to_owned()),
             _ => Err(ConfigError::MissingEnvironmentVariable { name }),
         });
         assert!(custom.enabled());
         assert_eq!(custom.min_hold(), Duration::ZERO);
         assert_eq!(custom.breakeven_r(), 1.5);
+        assert_eq!(custom.trail_r(), 2.0);
         assert_eq!(custom.symbol().expect("symbol").as_str(), "gbpusd");
         assert_eq!(custom.timeframe(), Timeframe::H4);
         assert_eq!(custom.bars(), 96);
@@ -1713,6 +1871,8 @@ mod tests {
             ("VEYRA_AUTOPILOT_BREAKEVEN_R", "-1"),
             ("VEYRA_AUTOPILOT_BREAKEVEN_R", "10.5"),
             ("VEYRA_AUTOPILOT_BREAKEVEN_R", "soon"),
+            ("VEYRA_AUTOPILOT_TRAIL_R", "11"),
+            ("VEYRA_AUTOPILOT_TRAIL_R", "trail"),
         ] {
             let error = AutopilotSettings::from_source(|requested| match requested {
                 _ if requested == name => Ok(value.to_owned()),
@@ -2520,74 +2680,146 @@ mod tests {
         }
     }
 
+    fn planned(ticket: i64, stop: f64, kind: StopMoveKind) -> Option<StopMove> {
+        Some(StopMove { ticket, stop, kind })
+    }
+
     #[test]
-    fn break_even_fires_only_at_r_with_a_stop_behind_the_entry() {
+    fn stop_plan_breaks_even_only_at_r_with_a_stop_behind_the_entry() {
         // Sell: risk 1.14757-1.1497 = 20 pips; at exactly 1R the plan fires.
         let at_r = managed_position(ManagedSide::Sell, 1.14757, 1.1497, 1.14544);
         assert_eq!(
-            break_even_plan(std::slice::from_ref(&at_r), 1.0),
-            Some((1, 1.14757))
+            stop_plan(std::slice::from_ref(&at_r), 1.0, 0.0, &StopBasis::default()),
+            planned(1, 1.14757, StopMoveKind::BreakEven)
         );
         assert_eq!(
-            break_even_plan(std::slice::from_ref(&at_r), 0.5),
-            Some((1, 1.14757)),
+            stop_plan(std::slice::from_ref(&at_r), 0.5, 0.0, &StopBasis::default()),
+            planned(1, 1.14757, StopMoveKind::BreakEven),
             "a lower multiple fires sooner"
         );
         assert_eq!(
-            break_even_plan(
+            stop_plan(
                 &[managed_position(ManagedSide::Sell, 1.14757, 1.1497, 1.1470)],
-                1.0
+                1.0,
+                0.0,
+                &StopBasis::default()
             ),
             None,
             "below R nothing moves"
         );
         assert_eq!(
-            break_even_plan(
+            stop_plan(
                 &[managed_position(
                     ManagedSide::Sell,
                     1.14757,
                     1.14757,
                     1.14544
                 )],
-                1.0
+                1.0,
+                0.0,
+                &StopBasis::default()
             ),
             None,
             "already at break-even"
         );
         assert_eq!(
-            break_even_plan(
+            stop_plan(
                 &[managed_position(ManagedSide::Sell, 1.14757, 0.0, 1.14544)],
-                1.0
+                1.0,
+                0.0,
+                &StopBasis::default()
             ),
             None,
             "without a stop there is no risk to reference"
         );
         assert_eq!(
-            break_even_plan(
+            stop_plan(
                 &[managed_position(ManagedSide::Sell, 1.14757, 1.1497, 0.0)],
-                1.0
+                1.0,
+                0.0,
+                &StopBasis::default()
             ),
             None,
             "without a current price nothing moves"
         );
         assert_eq!(
-            break_even_plan(std::slice::from_ref(&at_r), 0.0),
+            stop_plan(std::slice::from_ref(&at_r), 0.0, 0.0, &StopBasis::default()),
             None,
             "zero disables the policy"
         );
         // Buy: symmetric.
         assert_eq!(
-            break_even_plan(
+            stop_plan(
                 &[managed_position(
                     ManagedSide::Buy,
                     1.14757,
                     1.14544,
                     1.14971
                 )],
-                1.0
+                1.0,
+                0.0,
+                &StopBasis::default()
             ),
-            Some((1, 1.14757))
+            planned(1, 1.14757, StopMoveKind::BreakEven)
         );
+    }
+
+    #[test]
+    fn stop_plan_trails_behind_the_best_price_and_only_moves_forward() {
+        let risk = 1.1497 - 1.14757;
+        // At 2R in favour the trail candidate beats break-even.
+        let at_2r = managed_position(ManagedSide::Sell, 1.14757, 1.1497, 1.14757 - 2.0 * risk);
+        let planned = stop_plan(
+            std::slice::from_ref(&at_2r),
+            1.0,
+            1.0,
+            &StopBasis::default(),
+        )
+        .expect("trail fires");
+        assert_eq!(planned.kind, StopMoveKind::Trail);
+        assert!(
+            (planned.stop - (1.14757 - risk)).abs() < 1e-9,
+            "one risk unit behind the price"
+        );
+
+        // At exactly 1R both candidates coincide; break-even wins the tie.
+        let at_r = managed_position(ManagedSide::Sell, 1.14757, 1.1497, 1.14757 - risk);
+        assert_eq!(
+            stop_plan(std::slice::from_ref(&at_r), 1.0, 1.0, &StopBasis::default())
+                .expect("plan")
+                .kind,
+            StopMoveKind::BreakEven
+        );
+
+        // The original risk is remembered the first time the ticket is seen,
+        // so trailing still works after break-even has moved the stop to the
+        // entry: a 0.05R improvement is not worth a round trip, but 0.2R is.
+        let basis = StopBasis::default();
+        let initial = managed_position(ManagedSide::Sell, 1.14757, 1.1497, 1.14757 - 0.5 * risk);
+        assert_eq!(
+            stop_plan(std::slice::from_ref(&initial), 1.0, 1.0, &basis),
+            None,
+            "half an R does nothing, but seeds the basis"
+        );
+        let small = managed_position(ManagedSide::Sell, 1.14757, 1.14757, 1.14757 - 1.05 * risk);
+        assert_eq!(
+            stop_plan(std::slice::from_ref(&small), 1.0, 1.0, &basis),
+            None
+        );
+        let enough = managed_position(ManagedSide::Sell, 1.14757, 1.14757, 1.14757 - 1.2 * risk);
+        let ratcheted =
+            stop_plan(std::slice::from_ref(&enough), 1.0, 1.0, &basis).expect("trail ratchets");
+        assert_eq!(ratcheted.kind, StopMoveKind::Trail);
+        assert!(
+            ratcheted.stop < 1.14757,
+            "the stop is more protective than entry"
+        );
+
+        // Buy: symmetric trail.
+        let buy = managed_position(ManagedSide::Buy, 1.14757, 1.14544, 1.14757 + 2.0 * risk);
+        let bought = stop_plan(&[buy], 1.0, 1.0, &StopBasis::default()).expect("buy trail fires");
+        assert_eq!(bought.kind, StopMoveKind::Trail);
+        assert!((bought.stop - (1.14757 + risk)).abs() < 1e-9);
     }
 
     #[actix_web::test]
@@ -2631,6 +2863,46 @@ mod tests {
             "the deterministic plan acts before the model is consulted"
         );
         assert!(outcomes(&harness.trail).contains(&"break_even".to_owned()));
+
+        // Trailing enabled: at 2R the stop trails instead, audited as
+        // `trailing_stop`, and the reviewer is not consulted.
+        let trail_settings = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_BREAKEVEN_R" => Ok("1.0".to_owned()),
+            "VEYRA_AUTOPILOT_TRAIL_R" => Ok("1.0".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        let engine = StubEngine::answering(json!({"action": "hold"}));
+        let harness = build_harness(
+            trail_settings,
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let risk = 1.1497 - 1.14757;
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot_at(
+                10650805,
+                1_758_000_000,
+                1_758_003_600,
+                1.14757 - 2.0 * risk,
+            ));
+        assert!(matches!(
+            tick(&harness.state).await,
+            TickOutcome::StopMoved { .. }
+        ));
+        assert!(outcomes(&harness.trail).contains(&"trailing_stop".to_owned()));
+        assert!(engine.requests().is_empty());
         let link = harness
             .state
             .broker()
@@ -2680,6 +2952,11 @@ mod tests {
 
     #[actix_web::test]
     async fn break_even_reports_every_guard() {
+        let plan = |ticket: i64| StopMove {
+            ticket,
+            stop: 1.14757,
+            kind: StopMoveKind::BreakEven,
+        };
         let series = CandleSeries::from_validated(
             Symbol::parse("EURUSD").expect("symbol"),
             Timeframe::H4,
@@ -2702,7 +2979,7 @@ mod tests {
         // The service switch is off.
         let harness = build_harness(enabled_settings(), None, feed(), None, false, true);
         assert_eq!(
-            move_to_break_even(&harness.state, &series, 10650805, 1.14757).await,
+            move_stop(&harness.state, &series, plan(10650805)).await,
             TickOutcome::Rejected {
                 code: "trading_disabled"
             }
@@ -2712,14 +2989,14 @@ mod tests {
         let no_broker = AppState::new(config(true), None, None, gate())
             .with_autopilot(Some(enabled_settings()));
         assert!(matches!(
-            move_to_break_even(&no_broker, &series, 1, 1.0).await,
+            move_stop(&no_broker, &series, plan(1)).await,
             TickOutcome::Unavailable { .. }
         ));
 
         // No completed snapshot has been retained.
         let harness = build_harness(enabled_settings(), None, feed(), None, true, false);
         assert_eq!(
-            move_to_break_even(&harness.state, &series, 1, 1.0).await,
+            move_stop(&harness.state, &series, plan(1)).await,
             TickOutcome::Rejected {
                 code: "stale_position"
             }
@@ -2735,7 +3012,7 @@ mod tests {
             .expect("link")
             .retain_snapshot(managed_snapshot(7, 1_758_000_000, 1_758_003_600));
         assert_eq!(
-            move_to_break_even(&harness.state, &series, 999, 1.0).await,
+            move_stop(&harness.state, &series, plan(999)).await,
             TickOutcome::Rejected {
                 code: "stale_position"
             }
@@ -2753,13 +3030,13 @@ mod tests {
             .expect("link")
             .retain_snapshot(manual);
         assert_eq!(
-            move_to_break_even(&harness.state, &series, 7, 1.0).await,
+            move_stop(&harness.state, &series, plan(7)).await,
             TickOutcome::Rejected {
                 code: "not_a_veyra_position"
             }
         );
         assert!(
-            outcomes(&harness.trail).contains(&"break_even_rejected".to_owned()),
+            outcomes(&harness.trail).contains(&"stop_rejected".to_owned()),
             "refusals are audited"
         );
     }

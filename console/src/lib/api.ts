@@ -13,6 +13,10 @@ export type AutopilotStatus = {
   bars: number
   symbol: string | null
   jev: string
+  /** Break-even multiple of the entry risk; zero when disabled. */
+  breakeven_r: number
+  /** Trailing distance in multiples of the entry risk; zero when disabled. */
+  trail_r: number
 }
 
 export type Status = {

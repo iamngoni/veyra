@@ -253,11 +253,16 @@ one is queued. Every autonomous entry must carry both a stop loss and a take
 profit; unbracketed proposals are rejected before the command layer sees them.
 
 While a managed position is open the tick first applies the deterministic
-break-even policy (with `VEYRA_AUTOPILOT_BREAKEVEN_R`, default off): once the
-trade has travelled that multiple of its entry risk in favour, the stop moves
-to the entry price through the shared staged-modify path, so a trade that
-reached the target distance can no longer turn into a loss. When break-even
-does not apply, the tick reviews the position instead of hunting for entries:
+stop policies (break-even with `VEYRA_AUTOPILOT_BREAKEVEN_R` and trailing with
+`VEYRA_AUTOPILOT_TRAIL_R`, both off by default, both expressed as multiples of
+the entry risk): the most protective candidate wins, stops only ever move in
+the favourable direction, and improvements smaller than a tenth of the entry
+risk are suppressed, all through the shared staged-modify path. Because the
+terminal only reports a position's *current* stop, the service remembers each
+ticket's original risk — observed the first time it appears with its stop
+behind the entry — and a position first seen after a move is left alone until
+it closes. When no stop policy applies, the tick reviews the position instead
+of hunting for entries:
 the model answers `hold` (the bracket stands) or `close` (flatten), with its
 own constrained schema. Closes are risk-reducing but the loop cannot
 churn: the ticket must match a reviewed managed position, the close goes

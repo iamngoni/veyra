@@ -50,12 +50,15 @@ owner approval of both execution controls.
   (symbol allowlist, per-order and total volume caps, one open order by
   default, duplicate window), and both operator switches still gate real
   money.
-- Exit management is the entry bracket plus, in order: a deterministic
-  break-even policy (amended 2026-09-18: `VEYRA_AUTOPILOT_BREAKEVEN_R`, off
-  by default, moves the stop to the entry price once the trade has travelled
-  that multiple of its entry risk in favour, through the shared staged-modify
-  path) and a per-tick position review (`hold`/`close`, guarded by a minimum
-  hold, verified position age, and the shared staged-close path). Trailing
-  stops beyond a single break-even step remain a later iteration.
+- Exit management is the entry bracket plus, in order: deterministic stop
+  policies and a per-tick position review (amended 2026-09-18). The stop
+  policies are break-even (`VEYRA_AUTOPILOT_BREAKEVEN_R`) and trailing
+  (`VEYRA_AUTOPILOT_TRAIL_R`), expressed as multiples of the entry risk; the
+  most protective candidate wins, stops only ever move in the favourable
+  direction, and small improvements are suppressed. The terminal reports only
+  a position's current stop, so the service remembers each ticket's original
+  risk from its first observation. The review asks for `hold` or `close`,
+  guarded by a minimum hold, verified position age, and the shared
+  staged-close path.
 - Model latency and cost scale with cadence; the balanced tier answers a tick
   in a few seconds and every tick is visible in the console and audit trail.

@@ -244,6 +244,16 @@ export function AutopilotPanel({ status }: { status?: Status['autopilot'] }) {
         <Field label="Model tier" value={status?.tier ?? '—'} />
         <Field label="Judgements" value={status?.jev ?? '—'} />
         <Field label="Symbol" value={status?.symbol ?? 'chart symbol'} />
+        <Field
+          label="Stops"
+          value={
+            status && (status.breakeven_r > 0 || status.trail_r > 0)
+              ? [status.breakeven_r > 0 ? `BE ${status.breakeven_r}R` : null, status.trail_r > 0 ? `trail ${status.trail_r}R` : null]
+                  .filter(Boolean)
+                  .join(' · ')
+              : 'bracket only'
+          }
+        />
       </div>
       <div className="border-t border-slate-800/80 px-3 py-2 text-[11px] leading-relaxed text-slate-500">
         Every entry carries both stops, passes the deterministic risk gate, and still needs both armed switches

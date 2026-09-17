@@ -162,6 +162,8 @@ async fn status_reports_autopilot_configuration() {
     assert_eq!(body["autopilot"]["bars"], 48);
     assert_eq!(body["autopilot"]["interval_secs"], 300);
     assert_eq!(body["autopilot"]["jev"], "auto");
+    assert_eq!(body["autopilot"]["breakeven_r"], 0.0);
+    assert_eq!(body["autopilot"]["trail_r"], 0.0);
 }
 
 #[actix_web::test]

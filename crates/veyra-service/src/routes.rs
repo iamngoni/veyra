@@ -141,7 +141,9 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
             "tier": settings.tier().as_str(),
             "bars": settings.bars(),
             "symbol": settings.symbol().map(|symbol| symbol.as_str()),
-            "jev": settings.jev().as_str()
+            "jev": settings.jev().as_str(),
+            "breakeven_r": settings.breakeven_r(),
+            "trail_r": settings.trail_r()
         })
     });
     let model_provider = state.model().map(|runtime| runtime.provider().as_str());

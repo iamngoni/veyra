@@ -81,10 +81,12 @@
       `hold` or `close` with its own constrained schema, guarded by a minimum
       hold (`VEYRA_AUTOPILOT_MIN_HOLD_SECS`, default 300 s), verified position
       age, and the same staged-close path as the control surface.
-- [x] Break-even policy: `VEYRA_AUTOPILOT_BREAKEVEN_R` moves the stop to the
+- [x] Stop policies: `VEYRA_AUTOPILOT_BREAKEVEN_R` moves the stop to the
       entry price once the trade has travelled that multiple of its entry
-      risk in favour, through the shared staged-modify path (off by default;
-      enabled at 1R in the live environment).
+      risk in favour, and `VEYRA_AUTOPILOT_TRAIL_R` then keeps it that far
+      behind the best price; the most protective candidate wins, stops never
+      move backwards, and an entry-risk memory supplies the basis after a move
+      (off by default; both enabled at 1R in the live environment).
 - [x] `close_order` for Veyra-owned positions: only tickets from the latest
       completed `account_snapshot` that carry the Veyra magic number are
       accepted, and the terminal re-validates before a dry run or close —

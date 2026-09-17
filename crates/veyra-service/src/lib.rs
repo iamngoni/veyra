@@ -21,6 +21,8 @@ pub mod server;
 pub mod store;
 pub mod trading;
 
+use std::sync::Arc;
+
 use audit::AuditRuntime;
 use broker::BrokerRuntime;
 use config::ServiceConfig;
@@ -28,7 +30,7 @@ use jev::JevRuntime;
 use market::MarketRuntime;
 use model::ModelRuntime;
 use risk::RiskGate;
-use trading::autopilot::AutopilotSettings;
+use trading::autopilot::{AutopilotSettings, StopBasis};
 
 /// Immutable runtime state shared by HTTP handlers.
 #[derive(Debug, Clone)]
@@ -41,6 +43,7 @@ pub struct AppState {
     jev: Option<JevRuntime>,
     audit: Option<AuditRuntime>,
     risk: RiskGate,
+    stop_basis: Arc<StopBasis>,
 }
 
 impl AppState {
@@ -60,6 +63,7 @@ impl AppState {
             jev: None,
             audit: None,
             risk,
+            stop_basis: Arc::new(StopBasis::default()),
         }
     }
 
@@ -105,6 +109,12 @@ impl AppState {
     /// Returns the autonomous loop settings, if any were configured.
     pub fn autopilot(&self) -> Option<&AutopilotSettings> {
         self.autopilot.as_ref()
+    }
+
+    /// Entry-risk memory shared by the autopilot's stop policies; survives
+    /// across ticks for the lifetime of the process.
+    pub fn stop_basis(&self) -> &Arc<StopBasis> {
+        &self.stop_basis
     }
 
     /// Returns the active model integration, if one is configured.
