@@ -599,6 +599,22 @@ pub struct CommandRecord {
     pub state: CommandState,
 }
 
+/// One command as listed for operators: identity, lifecycle, and a bounded
+/// result summary that never carries raw account balances.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListedCommand {
+    /// Identifier.
+    pub id: CommandId,
+    /// Requested kind.
+    pub kind: CommandKind,
+    /// Lifecycle status: pending, completed, or failed.
+    pub status: &'static str,
+    /// Bounded result summary for completed commands.
+    pub summary: Option<Value>,
+    /// Non-sensitive failure reason for failed commands.
+    pub reason: Option<String>,
+}
+
 /// Acknowledgement sent by the EA.
 #[derive(Debug, Deserialize)]
 struct EaAck {
@@ -897,6 +913,40 @@ impl EaLink {
                     kind: command.kind,
                     state: command.state.clone(),
                 })
+        })
+    }
+
+    /// Newest-first commands for the control surface, capped at `limit`.
+    pub fn recent_commands(&self, limit: usize) -> Vec<ListedCommand> {
+        self.with_commands(|queue| {
+            queue
+                .iter()
+                .rev()
+                .take(limit)
+                .map(|command| match &command.state {
+                    CommandState::Pending => ListedCommand {
+                        id: command.id,
+                        kind: command.kind,
+                        status: "pending",
+                        summary: None,
+                        reason: None,
+                    },
+                    CommandState::Completed { payload } => ListedCommand {
+                        id: command.id,
+                        kind: command.kind,
+                        status: "completed",
+                        summary: Some(completed_summary(payload)),
+                        reason: None,
+                    },
+                    CommandState::Failed { reason } => ListedCommand {
+                        id: command.id,
+                        kind: command.kind,
+                        status: "failed",
+                        summary: None,
+                        reason: Some(reason.clone()),
+                    },
+                })
+                .collect()
         })
     }
 
@@ -1639,6 +1689,54 @@ mod tests {
             }
             other => panic!("unexpected state: {other:?}"),
         }
+    }
+
+    #[test]
+    fn recent_commands_list_lifecycle_and_summaries() {
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(15),
+        );
+        let pending = link.enqueue(CommandKind::Ping);
+        let completed = link.enqueue(CommandKind::AccountSnapshot);
+        link.apply_ack(&EaAck {
+            id: completed,
+            ok: true,
+            data: Some(serde_json::json!({
+                "balance": 20.57,
+                "equity": 20.57,
+                "freeMargin": 20.57,
+                "orders": 1,
+                "lots": 0.01,
+                "positions": [],
+                "positionsTruncated": false,
+                "serverTime": 1_758_000_000
+            })),
+            error: None,
+        });
+        let failed = link.enqueue(CommandKind::Ping);
+        link.apply_ack(&EaAck {
+            id: failed,
+            ok: false,
+            data: None,
+            error: Some("terminal busy".to_owned()),
+        });
+
+        let listed = link.recent_commands(10);
+        assert_eq!(listed.len(), 3, "newest first");
+        assert_eq!(listed[0].id, failed);
+        assert_eq!(listed[0].status, "failed");
+        assert_eq!(listed[0].reason.as_deref(), Some("terminal busy"));
+        assert_eq!(listed[1].id, completed);
+        assert_eq!(listed[1].status, "completed");
+        let summary = listed[1].summary.as_ref().expect("summary");
+        assert_eq!(summary["orders"], 1);
+        assert_eq!(summary["lots"], 0.01);
+        assert_eq!(listed[2].id, pending);
+        assert_eq!(listed[2].status, "pending");
+
+        assert_eq!(link.recent_commands(1).len(), 1, "the cap applies");
     }
 
     #[test]

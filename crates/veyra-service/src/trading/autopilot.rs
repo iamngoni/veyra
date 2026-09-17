@@ -637,9 +637,10 @@ fn proposal_instructions(state: &AppState, series: &CandleSeries, account: Accou
          Answer with the provided schema only. Choose `none` unless the evidence is clear and \
          one-sided; answering none is normal and expected when the market is ambiguous.\n\
          Constraints: at most one open position at a time (`{open_orders}` order(s) already open \
-         with {open_lots} lots); if you open, use a market order with volume at most {max_volume} \
-         lots and include both `stop_loss` and `take_profit` as absolute prices bracketing the \
-         entry. A deterministic risk gate will reject anything outside the configured limits, and \
+         with {open_lots} lots); if you open, use a market order \u{2014} omit `price` entirely \u{2014} \
+         with volume at most {max_volume} lots, and include both `stop_loss` and `take_profit` as \
+         absolute prices bracketing the entry. Omit `comment` entirely (the bot annotates orders \
+         itself). A deterministic risk gate will reject anything outside the configured limits, and \
          rejections are expected outcomes, not errors.",
         symbol = series.symbol().as_str(),
         timeframe = series.timeframe().as_str(),

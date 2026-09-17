@@ -8,8 +8,11 @@
 //! while a configured-but-unusable database fails startup, so a missing trail
 //! is never mistaken for an empty one.
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -144,16 +147,119 @@ pub trait AuditTrail: Send + Sync + fmt::Debug + 'static {
     async fn prune(&self, keep_days: u32) -> Result<u64, AuditError>;
 }
 
+/// Bounded number of recent events retained in memory for live feeds.
+const FEED_CAPACITY: usize = 512;
+
+/// How often a long-poll feed checks the buffer for new events.
+const FEED_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// One event as seen by live feeds: a monotonic sequence number plus the
+/// event contents. Sequence numbers start at 1 and survive buffer eviction as
+/// a cursor; a client older than the buffer is simply handed the tail.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedEvent {
+    /// Monotonic sequence number; `after` cursors compare against this.
+    pub seq: u64,
+    /// Unix milliseconds at record time.
+    pub at_ms: u64,
+    /// Event category.
+    pub kind: AuditKind,
+    /// Bounded JSON payload.
+    pub payload: Value,
+}
+
+/// In-memory ring of the most recent events, shared by every feed reader.
+#[derive(Debug)]
+struct EventFeed {
+    events: Mutex<VecDeque<FeedEvent>>,
+    next_seq: AtomicU64,
+}
+
+impl EventFeed {
+    fn new() -> Self {
+        Self {
+            events: Mutex::new(VecDeque::with_capacity(FEED_CAPACITY)),
+            next_seq: AtomicU64::new(1),
+        }
+    }
+
+    fn publish(&self, kind: AuditKind, payload: &Value) {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        if let Ok(mut events) = self.events.lock() {
+            events.push_back(FeedEvent {
+                seq,
+                at_ms,
+                kind,
+                payload: payload.clone(),
+            });
+            while events.len() > FEED_CAPACITY {
+                events.pop_front();
+            }
+        }
+    }
+
+    /// Events strictly after `after`, oldest first, at most `limit`.
+    fn after(&self, after: u64, limit: usize) -> Vec<FeedEvent> {
+        self.events
+            .lock()
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| event.seq > after)
+                    .take(limit)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Sequence number of the most recent event (zero before any).
+    fn latest(&self) -> u64 {
+        self.next_seq.load(Ordering::SeqCst).saturating_sub(1)
+    }
+}
+
 /// Active audit integration.
 #[derive(Debug, Clone)]
 pub struct AuditRuntime {
     trail: Arc<dyn AuditTrail>,
+    feed: Arc<EventFeed>,
 }
 
 impl AuditRuntime {
     /// Wraps a storage implementation.
     pub fn new(trail: Arc<dyn AuditTrail>) -> Self {
-        Self { trail }
+        Self {
+            trail,
+            feed: Arc::new(EventFeed::new()),
+        }
+    }
+
+    /// Sequence number of the most recent recorded event (zero before any).
+    pub fn feed_latest(&self) -> u64 {
+        self.feed.latest()
+    }
+
+    /// Returns events after `after`, waiting up to `wait` for the first one
+    /// when none is buffered yet. Long-poll friendly: the caller decides the
+    /// window and always gets an answer.
+    pub async fn feed_after(&self, after: u64, limit: usize, wait: Duration) -> Vec<FeedEvent> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let events = self.feed.after(after, limit);
+            if !events.is_empty() {
+                return events;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Vec::new();
+            }
+            actix_web::rt::time::sleep(FEED_POLL_INTERVAL.min(remaining)).await;
+        }
     }
 
     /// Provider identifier of the active implementation.
@@ -167,8 +273,10 @@ impl AuditRuntime {
     }
 
     /// Appends an event best-effort: failures are logged, never propagated, so
-    /// an audit hiccup can not block or fail a command.
+    /// an audit hiccup can not block or fail a command. The event also enters
+    /// the in-memory feed for live readers, whether or not storage accepts it.
     pub async fn try_record(&self, event: AuditEvent) {
+        self.feed.publish(event.kind(), event.payload());
         if let Err(error) = self.trail.record(event).await {
             tracing::warn!(%error, "audit write failed");
         }

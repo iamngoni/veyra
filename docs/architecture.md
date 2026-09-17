@@ -209,11 +209,11 @@ durable storage.
 
 ## Hosting (24/7)
 
-The stack runs unattended on this Mac through five launchd agents rendered
+The stack runs unattended on this Mac through six launchd agents rendered
 from portable templates (`scripts/launchd/`) by `scripts/install-launchd.sh`:
 the MT4 terminal at login, the named Cloudflare tunnel, the service (via
 `scripts/run-service.sh`, which sources `.env` and execs the release binary),
-hourly log rotation, and a daily verified audit-trail backup. Tunnel and
+hourly log rotation, a daily verified audit-trail backup, and the console. Tunnel and
 service carry `KeepAlive`, so a crash recovers without a session; the terminal
 deliberately does not, so a clean quit stays quit. The rotation agent
 copy-truncates logs under `~/Library/Logs/veyra` above 5 MiB, keeping three
@@ -225,6 +225,37 @@ health, degrading instead of hiding an unhealthy dependency. Secrets remain
 in `.env`; plists carry only absolute paths. Exactly one supervised instance
 owns ports 8080 and 7801, and the installer stops stray session-bound
 processes first. See ADR 0005.
+
+### Autonomy (autopilot)
+
+`trading/autopilot.rs` runs one decision tick per configured interval
+(`VEYRA_AUTOPILOT_*`, disabled by default; the first tick lands one interval
+after startup): it resolves the symbol (configured or the chart's), fetches a
+closed-candle window through the market feed, optionally asks Jev for
+calibrated judgements over the same state, then asks the decision engine for
+one structured proposal with the account facts embedded. The proposal passes
+`normalize_proposal` (two narrow tolerances: a reference `price` echoed on a
+market order and an embellished `comment` are dropped, and a decline carrying
+a stray `intent` is treated as a decline — none of these change execution
+meaning), then the strict draft parser, then the risk gate. Approvals go
+through the same `queue_staged_order` path as the control surface, so both
+operator controls and the audit trail still apply. Every tick records a
+`proposal_evaluated` audit event with its outcome — `no_trade`, `rejected`,
+`approved_dry_run`, `queued`, or `unavailable` — plus the command events when
+one is queued. Every autonomous entry must carry both a stop loss and a take
+profit; unbracketed proposals are rejected before the command layer sees them.
+
+### Console
+
+`console/` is a TanStack Start application served by a supervised Vite
+preview process on `http://127.0.0.1:3000`. It reads only the loopback control
+surface, proxying `/api` so the browser never needs cross-origin access:
+`/status` and `/account` for state, `/events` (cursor long-poll over an
+in-memory ring of recent audit events) for the activity feed, `/commands` for
+command lifecycle, `/reconciliation`, and `/market/candles` for the chart.
+`/account` exposes owner-facing money fields (balance, equity, positions) and
+is loopback-only by design; exposing it beyond loopback requires
+authentication first.
 
 ## Testing strategy
 

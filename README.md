@@ -24,9 +24,17 @@ This repository contains the first tested, safe service slice:
   session, volume/order caps, duplicate suppression) in front of every intent,
   plus broker-side order validation (`order_check`) that never sends an order —
   proven live (retcode 0 for a valid request, 129 for a wrong-side limit).
-- 24/7 supervision: launchd agents for the terminal, tunnel, service, hourly
-  log rotation, and daily verified audit backups with crash restart on the
-  service and tunnel, proven by `SIGKILL` (ADR 0005).
+- Autonomous operation: an **autopilot** loop gathers closed candles, optional
+  Jev judgements, one structured model proposal, the deterministic gate, and
+  the same staged execution as the control surface — live-proven with the
+  first autonomous order (EURUSD 0.01 sell, ticket 10650805, executed with
+  retcode 0 after explicit owner approval of both switches).
+- An **operations console** (TanStack Start) on `http://127.0.0.1:3000`:
+  account and positions, a streaming activity feed, recent commands, and the
+  current market window.
+- 24/7 supervision: launchd agents for the terminal, tunnel, service, console,
+  hourly log rotation, and daily verified audit backups with crash restart on
+  the service, tunnel, and console (ADR 0005).
 - Durable audit trail in PostgreSQL (SQLx migrations, append-only
   `audit_events`, loopback `GET /audit`) — commands, acknowledgements, and
   broker snapshots survive restarts. Configure `VEYRA_DATABASE_URL`; a
@@ -72,9 +80,14 @@ daily to `~/Library/Application Support/veyra/backups`):
 
 ```sh
 cargo build --release
+(cd console && npm install && npm run build) # one-time console build
 ./scripts/install-launchd.sh                 # render + bootstrap the agents
 ./scripts/install-launchd.sh --uninstall     # remove them again
 ```
+
+The supervised stack includes the console on `http://127.0.0.1:3000`; it
+proxies `/api` to the loopback service, so nothing is exposed beyond this
+machine.
 
 After changing code, rebuild and restart the supervised service:
 `cargo build --release && launchctl kickstart -k gui/$(id -u)/cc.antonlabs.veyra.service`

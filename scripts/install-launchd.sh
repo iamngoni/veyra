@@ -21,6 +21,7 @@ LABELS=(
   cc.antonlabs.veyra.service
   cc.antonlabs.veyra.logrotate
   cc.antonlabs.veyra.backup
+  cc.antonlabs.veyra.console
 )
 
 uninstall() {

@@ -65,9 +65,18 @@
       intent can queue `open_order`, which the terminal validates and reports
       as a **dry run** unless a second, operator-set input arms live order
       placement. Proven live end to end without sending an order.
-- [ ] Live order placement: requires `VEYRA_TRADING_ENABLED=true` **and** an EA
-      recompiled with `InAllowLiveOrders = true` — awaiting explicit owner
-      approval.
+- [x] Live order placement: both controls enabled after explicit owner
+      approval (EA compiled with `InAllowLiveOrders = true` through
+      `VEYRA_EA_ALLOW_LIVE`, service `VEYRA_TRADING_ENABLED=true`), proven by
+      the first autonomous order — EURUSD 0.01 sell, ticket 10650805, retcode
+      0, placed 2026-09-17 by the autopilot with no human in the loop.
+- [x] Market data: a read-only `rates` command returns closed candles from the
+      terminal; `GET /market/candles` exposes the validated series, proven
+      live (EURUSD H4, oldest-first, forming bar excluded).
+- [x] Autonomous loop (`trading/autopilot.rs`): candles → optional Jev
+      judgements → one structured proposal → risk gate → staged execution, on
+      a configurable cadence, disabled by default, audited every tick — proven
+      live end to end against the real terminal.
 - [x] `close_order` for Veyra-owned positions: only tickets from the latest
       completed `account_snapshot` that carry the Veyra magic number are
       accepted, and the terminal re-validates before a dry run or close —
@@ -112,10 +121,12 @@
 
 ## Phase 6 — console
 
-- TanStack Start + TypeScript + React + Tailwind + shadcn/ui.
-- Authentication, authorization, and audit trails.
-- Position, decision, risk, and incident views.
-- Frontend unit, integration, type-check, build, and coverage gates.
+- [x] TanStack Start console served on loopback: account/positions, streaming
+      activity feed (`/events` cursor long-poll), command lifecycle, market
+      window, autopilot and control state — supervised as a launchd agent.
+- [ ] Authentication and authorization for access beyond loopback.
+- [ ] Decision, risk, and incident views beyond the activity feed.
+- [ ] Frontend unit, integration, type-check, build, and coverage gates.
 
 ## Phase 7 — deployment
 

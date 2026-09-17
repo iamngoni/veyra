@@ -34,4 +34,7 @@ pub fn create_app(
         .service(crate::control::audit_log)
         .service(crate::control::request_account_snapshot)
         .service(crate::control::command_status)
+        .service(crate::control::command_list)
+        .service(crate::control::event_feed)
+        .service(crate::control::account_state)
 }

@@ -11,7 +11,7 @@
 //! leaving config, domain, risk, and trading code untouched.
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use actix_web::web::{self, Data};
 use actix_web::{HttpResponse, get, post};
@@ -99,6 +99,132 @@ pub async fn request_account_snapshot(state: Data<AppState>) -> HttpResponse {
         "command_id": command.to_string(),
         "status": "pending"
     }))
+}
+
+/// Query for `GET /commands`.
+#[derive(Debug, Deserialize)]
+pub struct CommandsQuery {
+    /// Newest commands to return (1-100); defaults to 20.
+    pub limit: Option<u32>,
+}
+
+#[get("/commands")]
+/// Lists recent commands with lifecycle status and bounded results.
+///
+/// Read-only: nothing is delivered or executed. Completed payloads are
+/// summarised (counts and verdicts), never raw account balances.
+pub async fn command_list(state: Data<AppState>, query: web::Query<CommandsQuery>) -> HttpResponse {
+    let Some(link) = command_link(&state) else {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "command_channel_unavailable" }));
+    };
+    let limit = query.limit.unwrap_or(20).clamp(1, 100) as usize;
+    let commands: Vec<serde_json::Value> = link
+        .recent_commands(limit)
+        .into_iter()
+        .map(|listed| {
+            json!({
+                "id": listed.id.to_string(),
+                "kind": listed.kind.as_str(),
+                "status": listed.status,
+                "summary": listed.summary,
+                "reason": listed.reason
+            })
+        })
+        .collect();
+    HttpResponse::Ok().json(json!({ "commands": commands }))
+}
+
+/// Query for `GET /events`.
+#[derive(Debug, Deserialize)]
+pub struct EventsQuery {
+    /// Cursor: return events with a sequence number greater than this.
+    pub after: Option<u64>,
+    /// Maximum events per response (1-200); defaults to 50.
+    pub limit: Option<u32>,
+    /// Long-poll window in milliseconds (0-25000); defaults to 15000.
+    /// Ignored when no cursor is supplied, because the tail returns at once.
+    pub wait_ms: Option<u64>,
+}
+
+#[get("/events")]
+/// Live event feed for consoles: recent audit events with sequence cursors.
+///
+/// With no cursor the buffered tail returns immediately; with a cursor the
+/// request long-polls up to the wait window, so a console sees events within
+/// about 250 ms of recording without polling the durable trail.
+pub async fn event_feed(state: Data<AppState>, query: web::Query<EventsQuery>) -> HttpResponse {
+    let Some(runtime) = state.audit() else {
+        return HttpResponse::ServiceUnavailable().json(json!({ "error": "audit_unavailable" }));
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let latest = runtime.feed_latest();
+    let (after, wait) = match query.after {
+        Some(after) => (
+            after,
+            Duration::from_millis(query.wait_ms.unwrap_or(15_000).min(25_000)),
+        ),
+        None => (latest.saturating_sub(limit as u64), Duration::ZERO),
+    };
+    let events = runtime.feed_after(after, limit, wait).await;
+    let next = events.last().map(|event| event.seq).unwrap_or(after);
+    HttpResponse::Ok().json(json!({
+        "events": events
+            .iter()
+            .map(|event| json!({
+                "seq": event.seq,
+                "at_ms": event.at_ms,
+                "kind": event.kind.as_str(),
+                "payload": event.payload
+            }))
+            .collect::<Vec<_>>(),
+        "latest": runtime.feed_latest(),
+        "next": next
+    }))
+}
+
+#[get("/account")]
+/// Owner-facing account state: money, exposure, and both control switches.
+///
+/// Served on the loopback control surface only. Exposing it beyond loopback
+/// (for example through the tunnel) requires authentication first.
+pub async fn account_state(state: Data<AppState>) -> HttpResponse {
+    let Some(broker) = state.broker() else {
+        return HttpResponse::ServiceUnavailable().json(json!({ "error": "broker_unavailable" }));
+    };
+    let Some(link) = broker.ea_link() else {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "command_channel_unavailable" }));
+    };
+    let report = broker.link().report().await;
+    let snapshot = report.snapshot.as_ref();
+    let mut body = json!({
+        "fresh": report.fresh,
+        "connected": snapshot.is_some_and(|snapshot| snapshot.connected()),
+        "tradeAllowed": snapshot.is_some_and(|snapshot| snapshot.trade_allowed()),
+        "liveOrders": snapshot.is_some_and(|snapshot| snapshot.live_orders()),
+    });
+    if let Some(snapshot) = snapshot {
+        body["login"] = json!(snapshot.login().value());
+        body["server"] = json!(snapshot.server().as_str());
+        body["symbol"] = json!(snapshot.symbol().as_str());
+    }
+    body["ageSecs"] = json!(
+        link.last_account_age(SystemTime::now())
+            .map(|age| age.as_secs())
+            .unwrap_or(0)
+    );
+    if let Some(account) = link.last_account() {
+        body["balance"] = json!(account.balance);
+        body["equity"] = json!(account.equity);
+        body["freeMargin"] = json!(account.free_margin);
+        body["orders"] = json!(account.orders);
+        body["lots"] = json!(account.lots);
+        body["positions"] = json!(account.positions);
+        body["positionsTruncated"] = json!(account.positions_truncated);
+        body["serverTime"] = json!(account.server_time);
+    }
+    HttpResponse::Ok().json(body)
 }
 
 /// Query for `GET /market/candles`; every field is optional.
@@ -584,6 +710,7 @@ mod tests {
 
     use super::*;
     use crate::app::create_app;
+    use crate::audit::MemoryTrail;
     use crate::broker::{AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName};
     use crate::config::{ConfigError, ServiceConfig};
     use crate::market::{Candle, CandleSeries, MarketError, MarketFeed, MarketProvider};
@@ -655,7 +782,7 @@ mod tests {
         runtime
     }
 
-    fn state(feed: Option<StubFeed>, broker: bool) -> AppState {
+    fn build_state(feed: Option<StubFeed>, broker: bool) -> AppState {
         let mut state = AppState::new(
             config(),
             if broker {
@@ -676,7 +803,7 @@ mod tests {
 
     #[actix_web::test]
     async fn candles_require_a_configured_feed() {
-        let app = test::init_service(create_app(state(None, true))).await;
+        let app = test::init_service(create_app(build_state(None, true))).await;
         let response = test::call_service(
             &app,
             test::TestRequest::get().uri("/market/candles").to_request(),
@@ -687,7 +814,11 @@ mod tests {
 
     #[actix_web::test]
     async fn candles_validate_the_query_before_touching_the_feed() {
-        let app = test::init_service(create_app(state(Some(StubFeed { fail: false }), true))).await;
+        let app = test::init_service(create_app(build_state(
+            Some(StubFeed { fail: false }),
+            true,
+        )))
+        .await;
 
         let response = test::call_service(
             &app,
@@ -725,7 +856,11 @@ mod tests {
 
     #[actix_web::test]
     async fn candles_use_the_chart_symbol_when_omitted() {
-        let app = test::init_service(create_app(state(Some(StubFeed { fail: false }), true))).await;
+        let app = test::init_service(create_app(build_state(
+            Some(StubFeed { fail: false }),
+            true,
+        )))
+        .await;
         let response = test::call_service(
             &app,
             test::TestRequest::get()
@@ -743,8 +878,11 @@ mod tests {
 
     #[actix_web::test]
     async fn candles_report_a_missing_default_symbol() {
-        let app =
-            test::init_service(create_app(state(Some(StubFeed { fail: false }), false))).await;
+        let app = test::init_service(create_app(build_state(
+            Some(StubFeed { fail: false }),
+            false,
+        )))
+        .await;
         let response = test::call_service(
             &app,
             test::TestRequest::get().uri("/market/candles").to_request(),
@@ -755,9 +893,206 @@ mod tests {
         assert_eq!(body["error"], "symbol_unavailable");
     }
 
+    fn audited_state(feed: Option<StubFeed>) -> (AppState, Arc<MemoryTrail>) {
+        let trail = Arc::new(MemoryTrail::default());
+        let state = build_state(feed, true);
+        let state = state.with_audit(Some(crate::audit::AuditRuntime::new(trail.clone())));
+        (state, trail)
+    }
+
+    #[actix_web::test]
+    async fn event_feed_streams_recorded_events_with_cursors() {
+        let (state, trail) = audited_state(None);
+        let runtime = state.audit().expect("audit").clone();
+        runtime
+            .try_record(crate::audit::AuditEvent::new(
+                crate::audit::AuditKind::CommandQueued,
+                serde_json::json!({"kind": "account_snapshot"}),
+            ))
+            .await;
+        runtime
+            .try_record(crate::audit::AuditEvent::new(
+                crate::audit::AuditKind::ProposalEvaluated,
+                serde_json::json!({"outcome": "no_trade"}),
+            ))
+            .await;
+        assert_eq!(trail.events().len(), 2);
+
+        let app = test::init_service(create_app(state.clone())).await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/events").to_request()).await;
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        let events = body["events"].as_array().expect("events");
+        assert_eq!(events.len(), 2, "no cursor returns the buffered tail");
+        assert_eq!(events[0]["kind"], "command_queued");
+        assert_eq!(events[1]["kind"], "proposal_evaluated");
+        assert_eq!(events[1]["payload"]["outcome"], "no_trade");
+        assert!(events[0]["seq"].as_u64().expect("seq") < events[1]["seq"].as_u64().expect("seq"));
+        let cursor = body["next"].as_u64().expect("next");
+
+        // A cursor at the tip answers immediately (wait_ms=0) with nothing.
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/events?after={cursor}&wait_ms=0"))
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["events"].as_array().expect("events").len(), 0);
+        assert_eq!(body["next"].as_u64().expect("next"), cursor);
+
+        // A stale cursor still receives from the buffer.
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/events?after=0&wait_ms=0&limit=1")
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["events"].as_array().expect("events").len(), 1);
+        assert_eq!(body["events"][0]["kind"], "command_queued");
+    }
+
+    #[actix_web::test]
+    async fn event_feed_requires_an_audit_trail() {
+        let app = test::init_service(create_app(build_state(None, true))).await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/events").to_request()).await;
+        assert_eq!(response.status(), 503);
+    }
+
+    #[actix_web::test]
+    async fn command_list_reports_pending_commands() {
+        let (state, _) = audited_state(None);
+        let link = state.broker().expect("broker").ea_link().expect("ea link");
+        let id = link.enqueue(crate::broker::ea::CommandKind::AccountSnapshot);
+
+        let app = test::init_service(create_app(state.clone())).await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/commands").to_request()).await;
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        let commands = body["commands"].as_array().expect("commands");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["id"], id.to_string());
+        assert_eq!(commands[0]["kind"], "account_snapshot");
+        assert_eq!(commands[0]["status"], "pending");
+
+        let unlinked = test::init_service(create_app(build_state(None, false))).await;
+        let response = test::call_service(
+            &unlinked,
+            test::TestRequest::get().uri("/commands").to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 503);
+    }
+
+    #[actix_web::test]
+    async fn account_state_reports_controls_and_money_after_a_snapshot() {
+        let (state, _) = audited_state(None);
+        let link = state.broker().expect("broker").ea_link().expect("ea link");
+
+        let app = test::init_service(create_app(state.clone())).await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/account").to_request()).await;
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["fresh"], true);
+        assert_eq!(body["connected"], true);
+        assert_eq!(body["tradeAllowed"], true);
+        assert_eq!(
+            body["liveOrders"], false,
+            "the recorded snapshot is disarmed"
+        );
+        assert!(body["balance"].is_null(), "no snapshot payload yet");
+
+        // Deliver one account_snapshot ack through the real poll path.
+        link.enqueue(crate::broker::ea::CommandKind::AccountSnapshot);
+        let ea_app =
+            actix_web::test::init_service(crate::broker::ea::create_ea_app(link.clone())).await;
+        let hello = serde_json::json!({
+            "t": "hb",
+            "token": "test-token-1234567890",
+            "acct": 94168,
+            "server": "IFCMarkets-Real",
+            "symbol": "EURUSD",
+            "connected": true,
+            "tradeAllowed": true,
+            "orders": 0,
+            "lots": 0.0
+        });
+        let mut command = None;
+        for _ in 0..40 {
+            let response = test::call_service(
+                &ea_app,
+                test::TestRequest::post()
+                    .uri("/ea/poll")
+                    .set_payload(hello.to_string())
+                    .to_request(),
+            )
+            .await;
+            let body: Value = test::read_body_json(response).await;
+            if body["t"] == "cmd" {
+                command = Some(body);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let command = command.expect("snapshot command delivered");
+        let ack = serde_json::json!({
+            "t": "ack",
+            "token": "test-token-1234567890",
+            "id": command["id"],
+            "ok": true,
+            "data": {
+                "balance": 20.57,
+                "equity": 21.10,
+                "freeMargin": 20.10,
+                "orders": 1,
+                "lots": 0.01,
+                "positions": [{
+                    "ticket": 123456,
+                    "symbol": "EURUSD",
+                    "kind": "buy",
+                    "lots": 0.01,
+                    "price": 1.09500,
+                    "profit": 0.53,
+                    "magic": 77041
+                }],
+                "positionsTruncated": false,
+                "serverTime": 1_758_000_000
+            }
+        });
+        let response = test::call_service(
+            &ea_app,
+            test::TestRequest::post()
+                .uri("/ea/poll")
+                .set_payload(ack.to_string())
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/account").to_request()).await;
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["balance"], 20.57);
+        assert_eq!(body["equity"], 21.10);
+        assert_eq!(body["orders"], 1);
+        assert_eq!(body["lots"], 0.01);
+        assert_eq!(body["positions"][0]["ticket"], 123456);
+        assert_eq!(body["positions"][0]["magic"], 77041);
+        assert_eq!(body["login"], 94168);
+        assert_eq!(body["server"], "IFCMarkets-Real");
+    }
+
     #[actix_web::test]
     async fn candle_feed_failures_are_gateway_errors() {
-        let app = test::init_service(create_app(state(Some(StubFeed { fail: true }), true))).await;
+        let app =
+            test::init_service(create_app(build_state(Some(StubFeed { fail: true }), true))).await;
         let response = test::call_service(
             &app,
             test::TestRequest::get()

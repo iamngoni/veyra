@@ -2,8 +2,14 @@
 //!
 //! Turns one structured model answer into either "no trade", a risk
 //! rejection, or an approved intent. It never queues, transmits, or executes
-//! anything: the command layer that will do that does not exist yet, and when
-//! it lands it must reuse the same gate.
+//! anything; the autopilot and control surface hand approvals to the staged
+//! execution path. Two narrow transport tolerances exist, both limited to
+//! model phrasing that has no execution meaning: a reference `price` echoed on
+//! a market order (a market order executes at market), and a `comment` the
+//! model embellished past MT4's 31-character limit (the EA order request
+//! carries no comment and the audit never stores it). Every field that affects
+//! execution still fails strict parsing, and the gate re-validates every
+//! draft.
 
 use std::time::SystemTime;
 
@@ -11,7 +17,7 @@ use serde_json::json;
 
 use crate::model::{AnswerFormat, DecisionEngine, DecisionRequest, ModelError, ModelTier};
 use crate::risk::{AccountFacts, RiskDecision, RiskGate, RiskRejection};
-use crate::trading::intent::{TradeIntent, TradeIntentDraft, TradeProposal};
+use crate::trading::intent::{Comment, TradeIntent, TradeIntentDraft, TradeProposal};
 
 /// Name of the forced function/schema the model answers with.
 pub const PROPOSAL_SCHEMA_NAME: &str = "veyra_trade_proposal";
@@ -37,7 +43,11 @@ pub fn proposal_format() -> AnswerFormat {
                     "properties": {
                         "symbol": {"type": "string"},
                         "side": {"type": "string", "enum": ["buy", "sell"]},
-                        "order_type": {"type": "string", "enum": ["market", "limit", "stop"]},
+                        "order_type": {
+                            "type": "string",
+                            "enum": ["market", "limit", "stop"],
+                            "description": "market executes immediately; omit `price` entirely for market orders"
+                        },
                         "price": {"type": ["number", "null"]},
                         "volume": {"type": "number", "exclusiveMinimum": 0},
                         "stop_loss": {"type": ["number", "null"]},
@@ -103,8 +113,8 @@ pub async fn evaluate_proposal(
         })
         .await?;
 
-    let proposal: TradeProposal =
-        serde_json::from_value(answer.value).map_err(|error| PipelineError::InvalidProposal {
+    let proposal: TradeProposal = serde_json::from_value(normalize_proposal(answer.value))
+        .map_err(|error| PipelineError::InvalidProposal {
             reason: error.to_string(),
         })?;
 
@@ -115,6 +125,58 @@ pub async fn evaluate_proposal(
             RiskDecision::Rejected(rejection) => Ok(PipelineOutcome::Rejected { draft, rejection }),
         },
     }
+}
+
+/// Drops a reference `price` echoed on a market-order proposal.
+///
+/// The draft contract keeps `price` absent for market orders so a
+/// contradictory request can never be smuggled through; models occasionally
+/// echo the current price anyway, and a market order ignores it by
+/// definition. Only this exact case is tolerated: everything else still fails
+/// strict parsing, and the gate re-validates every field.
+fn normalize_proposal(value: serde_json::Value) -> serde_json::Value {
+    let mut value = value;
+    // A declined proposal that still carries a draft is a decline: the stray
+    // intent is dropped, which can only ever produce `NoTrade`.
+    if value.get("action").and_then(serde_json::Value::as_str) == Some("none") {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("intent");
+        }
+        return value;
+    }
+    let is_market = value
+        .get("intent")
+        .and_then(|intent| intent.get("order_type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("market");
+    let has_price = value
+        .get("intent")
+        .and_then(|intent| intent.get("price"))
+        .is_some_and(|price| !price.is_null());
+    let stale_comment = value
+        .get("intent")
+        .and_then(|intent| intent.get("comment"))
+        .is_some_and(|comment| !comment.is_null() && !comment_is_usable(comment));
+    if ((is_market && has_price) || stale_comment)
+        && let Some(intent) = value
+            .get_mut("intent")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        if is_market && has_price {
+            intent.remove("price");
+        }
+        if stale_comment {
+            intent.remove("comment");
+        }
+    }
+    value
+}
+
+/// Whether a proposed comment fits the draft contract's MT4 limit.
+fn comment_is_usable(comment: &serde_json::Value) -> bool {
+    comment
+        .as_str()
+        .is_some_and(|text| Comment::parse(text).is_ok())
 }
 
 #[cfg(test)]
@@ -229,6 +291,116 @@ mod tests {
             SystemTime::now(),
         )
         .await
+    }
+
+    #[test]
+    fn market_prices_are_dropped_but_other_violations_survive() {
+        let normalization = |intent: Value| {
+            serde_json::from_value::<TradeProposal>(normalize_proposal(
+                json!({"action": "open", "intent": intent}),
+            ))
+        };
+
+        // A market order with an echoed reference price parses after cleanup.
+        let proposal = normalization(json!({
+            "symbol": "EURUSD",
+            "side": "buy",
+            "order_type": "market",
+            "price": 1.147,
+            "volume": 0.01,
+            "stop_loss": 1.140,
+            "take_profit": 1.160
+        }))
+        .expect("market price is tolerated");
+        match proposal {
+            TradeProposal::Open(draft) => {
+                assert_eq!(draft.order().as_str(), "market");
+                assert!(draft.order().price().is_none());
+            }
+            other => panic!("unexpected proposal: {other:?}"),
+        }
+
+        // A null price was already fine and stays fine.
+        assert!(
+            normalization(json!({
+                "symbol": "EURUSD",
+                "side": "buy",
+                "order_type": "market",
+                "price": null,
+                "volume": 0.01
+            }))
+            .is_ok()
+        );
+
+        // A non-market order with no price must still fail.
+        assert!(
+            normalization(json!({
+                "symbol": "EURUSD",
+                "side": "buy",
+                "order_type": "limit",
+                "volume": 0.01
+            }))
+            .is_err()
+        );
+
+        // Everything else is untouched by the tolerance.
+        assert!(
+            normalization(json!({
+                "symbol": "EURUSD",
+                "side": "buy",
+                "order_type": "market",
+                "price": 1.147,
+                "volume": 0.01,
+                "unknown": true
+            }))
+            .is_err()
+        );
+
+        // A decline that carries a stray intent is still a decline.
+        let proposal = serde_json::from_value::<TradeProposal>(normalize_proposal(json!({
+            "action": "none",
+            "intent": {
+                "symbol": "EURUSD",
+                "side": "buy",
+                "order_type": "market",
+                "volume": 0.01
+            }
+        })))
+        .expect("stray intents on declines are dropped");
+        assert!(matches!(proposal, TradeProposal::None));
+
+        // An over-long or non-ASCII comment is dropped, not fatal.
+        let proposal = normalization(json!({
+            "symbol": "EURUSD",
+            "side": "buy",
+            "order_type": "market",
+            "volume": 0.01,
+            "comment": "a very long commentary that exceeds the MT4 limit by far"
+        }))
+        .expect("embellished comments are dropped");
+        match proposal {
+            TradeProposal::Open(draft) => assert!(draft.comment().is_none()),
+            other => panic!("unexpected proposal: {other:?}"),
+        }
+
+        // A comment that fits the contract is preserved.
+        let proposal = normalization(json!({
+            "symbol": "EURUSD",
+            "side": "buy",
+            "order_type": "market",
+            "volume": 0.01,
+            "comment": "trend follow"
+        }))
+        .expect("short comments survive");
+        match proposal {
+            TradeProposal::Open(draft) => {
+                assert_eq!(
+                    draft.comment().map(|comment| comment.as_str()),
+                    Some("trend follow")
+                );
+            }
+            other => panic!("unexpected proposal: {other:?}"),
+        }
     }
 
     #[actix_web::test]

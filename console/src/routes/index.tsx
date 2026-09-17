@@ -1,0 +1,66 @@
+import { createFileRoute } from '@tanstack/react-router'
+
+import {
+  AccountPanel,
+  ActivityFeed,
+  AutopilotPanel,
+  CommandsPanel,
+  MarketPanel,
+  PositionsPanel,
+  StatusPills,
+} from '../components/veyra'
+import { api } from '../lib/api'
+import { useEventFeed, usePoll } from '../lib/hooks'
+
+export const Route = createFileRoute('/')({ component: Dashboard })
+
+function Dashboard() {
+  const { data: status } = usePoll(api.status, 5000)
+  const { data: account, error: accountError } = usePoll(api.account, 5000)
+  const { data: commands } = usePoll(() => api.commands(25), 10000)
+  const { data: series, error: marketError } = usePoll(() => api.candles(48), 60000)
+  const { events, connected } = useEventFeed(80)
+
+  return (
+    <div className="mx-auto flex min-h-screen w-full max-w-[1500px] flex-col gap-3 p-4">
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-baseline gap-3">
+          <span className="text-lg font-semibold tracking-tight text-slate-100">VEYRA</span>
+          <span className="font-mono text-[11px] text-slate-500">
+            v{status?.version ?? '…'}
+            {status?.model_provider ? ` · ${status.model_provider}` : ''}
+            {status?.jev_provider ? ` + ${status.jev_provider}` : ''}
+          </span>
+        </div>
+        <StatusPills status={status} />
+      </header>
+
+      <div className="grid gap-3 lg:grid-cols-3">
+        <div className="min-w-0">
+          <AccountPanel account={account} error={accountError} />
+        </div>
+        <div className="min-w-0">
+          <MarketPanel series={series} error={marketError} />
+        </div>
+        <div className="min-w-0">
+          <AutopilotPanel status={status?.autopilot} />
+        </div>
+      </div>
+
+      <div className="grid flex-1 items-start gap-3 lg:grid-cols-[3fr_2fr]">
+        <div className="min-w-0">
+          <ActivityFeed events={events} connected={connected} />
+        </div>
+        <div className="flex min-w-0 flex-col gap-3">
+          <PositionsPanel account={account} />
+          <CommandsPanel commands={commands?.commands} />
+        </div>
+      </div>
+
+      <footer className="pb-1 text-center font-mono text-[10px] text-slate-600">
+        loopback console · {status?.broker_provider ?? '—'} broker · {status?.market_provider ?? '—'} market ·{' '}
+        {status?.persistence ?? '—'} audit
+      </footer>
+    </div>
+  )
+}
