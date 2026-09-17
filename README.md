@@ -13,9 +13,10 @@ This repository contains the first tested, safe service slice:
 - Model-provider abstraction (`DecisionEngine`) over `agent-runtime` (pinned git
   revision), configurable to OpenRouter or any OpenAI-compatible endpoint, with
   schema-constrained answers — **proven live** with a real structured response.
-- Loopback-only EA endpoint with token authentication, refined payloads, and
-  heartbeat state (no command execution yet) — **proven live** end-to-end with
-  MT4 under Wine through a Cloudflare Tunnel (heartbeat plus ping/pong).
+- Loopback-only EA endpoint with token authentication, refined payloads,
+  heartbeat state, and an **idempotent command queue** — proven live end-to-end
+  with MT4 under Wine through a Cloudflare Tunnel (heartbeat, ping/pong, and a
+  real `account_snapshot` command round trip).
 - Structured JSON logging, bind-failure propagation, and graceful shutdown.
 - Rust unit, integration, and line-coverage gates.
 - GitHub Actions quality workflow.
@@ -90,8 +91,15 @@ One-time terminal setup:
 2. MT4 → Options → Expert Advisors: enable automated trading, and add the
    **exact endpoint URL** (for example `https://veyra.antonlabs.cc/ea/poll`)
    to the WebRequest allowlist — MT4 matches the full URL, not the host.
-3. Attach `VeyraProbe` to a chart. After recompiling the EA, remove and
-   re-attach it: MT4 does not hot-reload externally rebuilt `.ex4` files.
+3. Attach `VeyraProbe` to a chart. After recompiling the EA, restart the
+   terminal (or remove and re-attach the EA): MT4 does not hot-reload
+   externally rebuilt `.ex4` files.
+
+Commands: the service delivers read-only commands (`ping`, `account_snapshot`)
+on a poll; the EA executes and acknowledges by id. Delivery is at-least-once, a
+command fails after a 15 s timeout, and acknowledgements are validated against
+the command's typed payload before they are recorded. Mutating commands will
+keep the same id/ack discipline and must be idempotent per id.
 
 Platform notes (see docs/decisions/0002):
 

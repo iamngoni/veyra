@@ -10,7 +10,10 @@
 pub mod ea;
 pub mod settings;
 
-pub use ea::{EaErrorBody, EaLink, EaPoll, EaReply, build_server, create_ea_app};
+pub use ea::{
+    AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandRecord, CommandState,
+    EaErrorBody, EaLink, EaPoll, EaReply, build_server, create_ea_app,
+};
 pub use settings::{BrokerSettings, EaToken};
 
 use std::fmt;
@@ -246,6 +249,7 @@ impl BrokerRuntime {
                 let link = Arc::new(EaLink::new(
                     ea_settings.token().clone(),
                     ea_settings.stale_after(),
+                    ea_settings.command_timeout(),
                 ));
                 Ok(Self {
                     provider: BrokerProvider::Ea,

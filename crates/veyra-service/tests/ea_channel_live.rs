@@ -9,7 +9,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use veyra_service::broker::{BrokerLink, BrokerSettings, EaLink, build_server};
+use veyra_service::broker::{
+    BrokerLink, BrokerSettings, CommandKind, CommandPayload, CommandState, EaLink, build_server,
+};
 
 #[actix_web::test]
 #[ignore = "requires the VeyraProbe EA attached to a running MT4 terminal"]
@@ -22,6 +24,7 @@ async fn ea_probe_round_trip() {
     let link = Arc::new(EaLink::new(
         ea_settings.token().clone(),
         Duration::from_secs(30),
+        Duration::from_secs(15),
     ));
     let server = build_server(link.clone(), ea_settings.bind()).expect("EA endpoint must bind");
     let handle = server.handle();
@@ -45,9 +48,6 @@ async fn ea_probe_round_trip() {
         actix_web::rt::time::sleep(Duration::from_millis(250)).await;
     }
 
-    handle.stop(true).await;
-    let _ = task.await;
-
     assert!(
         saw_heartbeat,
         "no EA heartbeat received on {}",
@@ -57,4 +57,32 @@ async fn ea_probe_round_trip() {
         link.pongs_received() > 0,
         "EA did not answer ping with pong"
     );
+
+    // Command round trip: enqueue a read-only snapshot, let the EA pick it up
+    // on a poll, and require a validated acknowledgement before the deadline.
+    let command = link.enqueue(CommandKind::AccountSnapshot);
+    let mut outcome = None;
+    while Instant::now() < deadline {
+        match link.command(command) {
+            Some(record) if !matches!(record.state, CommandState::Pending) => {
+                outcome = Some(record.state);
+                break;
+            }
+            _ => actix_web::rt::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+
+    handle.stop(true).await;
+    let _ = task.await;
+
+    match outcome.expect("command must be acknowledged before the deadline") {
+        CommandState::Completed {
+            payload: CommandPayload::AccountSnapshot(snapshot),
+        } => {
+            assert!(snapshot.balance.is_finite());
+            assert!(snapshot.equity.is_finite());
+            println!("account snapshot: {snapshot:?}");
+        }
+        other => panic!("unexpected command state: {other:?}"),
+    }
 }

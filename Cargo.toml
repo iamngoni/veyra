@@ -15,6 +15,7 @@ agent-runtime = { git = "https://github.com/iamngoni/agent-runtime", rev = "1207
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
 subtle = "2"
 thiserror = "2"
 tracing = "0.1"

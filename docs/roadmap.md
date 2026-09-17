@@ -43,8 +43,11 @@
       the EA control channel as the first implementation.
 - [x] Live probe round trip on the terminal (heartbeat + ping/pong), via the
       Cloudflare tunnel with Wine IPv4 pinning (ADR 0002).
-- [ ] Replace the probe protocol with an idempotent command/ack queue; add
-      command acknowledgements and independent reconciliation.
+- [x] Idempotent command/ack queue with typed payload validation, timeouts,
+      and read-only commands (`ping`, `account_snapshot`) — proven live.
+- [ ] Mutating commands (open/close/modify) with the same id/ack discipline,
+      restricted by the deterministic risk gate.
+- [ ] Independent reconciliation against broker state.
 - [ ] Staged testing: read-only first, then demo, then minimal live exposure
       only after explicit owner approval.
 

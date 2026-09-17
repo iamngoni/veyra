@@ -76,10 +76,14 @@ so the EA polls a loopback-only HTTP endpoint using the terminal's built-in
 `WebRequest` client. The service authenticates a shared token in constant time,
 validates the payload into refined types (`AccountSnapshot`, `ServerName`,
 `Symbol`, `AccountLogin`), records heartbeat state, and answers the probe
-protocol (`ping`/`pong`). Order commands are deliberately absent; they will
-arrive as an idempotent command queue over this same channel. The transport is
-HTTPS through a Cloudflare Tunnel to the loopback listener; MQL4 supports no
-sockets and no explicit ports.
+protocol (`ping`/`pong`) and carries the command queue. Commands are typed
+(`ping`, `account_snapshot` today), delivered on a poll, re-delivered until
+acknowledged, and failed after a timeout; acknowledgements carry a stable id
+and are validated against the command's typed payload before being recorded.
+Order commands are deliberately absent; they will reuse this id/ack discipline
+and must be idempotent per id. The transport is HTTPS through a Cloudflare
+Tunnel to the loopback listener; MQL4 supports no sockets and no explicit
+ports.
 
 **Rejected for now — hosted API bridges.** The evaluated vendors are paid
 services that run their own terminals; the account owner opted for the

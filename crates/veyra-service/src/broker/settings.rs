@@ -74,6 +74,11 @@ impl EaSettings {
     pub fn stale_after(&self) -> Duration {
         Duration::from_secs(10)
     }
+
+    /// An unacknowledged command fails after this window.
+    pub fn command_timeout(&self) -> Duration {
+        Duration::from_secs(15)
+    }
 }
 
 /// Broker configuration selected by `VEYRA_BROKER_PROVIDER`.

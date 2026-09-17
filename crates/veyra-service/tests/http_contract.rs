@@ -120,6 +120,7 @@ async fn status_reports_model_provider() {
     .expect("model must be configured");
     let model =
         veyra_service::model::ModelRuntime::from_settings(settings).expect("model runtime builds");
+    assert_eq!(model.engine().provider().as_str(), "openrouter");
 
     let app = test::init_service(create_app(AppState::new(test_config(), None, Some(model)))).await;
     let request = test::TestRequest::get().uri("/status").to_request();

@@ -309,6 +309,45 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn optional_settings_paths_build_and_debug_stays_redacted() {
+        let settings = ModelSettings::from_source(|name| {
+            Ok(match name {
+                "VEYRA_MODEL_PROVIDER" => "openrouter",
+                "VEYRA_MODEL_API_KEY" => "test-key-12345678",
+                "VEYRA_MODEL_BASE_URL" => "https://example.test/v1",
+                "VEYRA_MODEL_HTTP_REFERER" => "https://github.com/iamngoni/veyra",
+                "VEYRA_MODEL_FAST" | "VEYRA_MODEL_BALANCED" | "VEYRA_MODEL_REASONING" => {
+                    "vendor/model"
+                }
+                _ => return Err(ConfigError::MissingEnvironmentVariable { name }),
+            }
+            .to_owned())
+        })
+        .expect("settings parse")
+        .expect("model configured");
+
+        let engine = AgentRuntimeEngine::build(&settings).expect("engine builds");
+        let debug = format!("{engine:?}");
+        assert!(debug.contains("AgentRuntimeEngine"), "debug: {debug}");
+        assert!(debug.contains("OpenRouter"), "debug: {debug}");
+        assert!(!debug.contains("test-key-12345678"), "debug: {debug}");
+    }
+
+    #[actix_web::test]
+    async fn streaming_stub_refuses_instead_of_faking_a_stream() {
+        let mock = QueueClient::default();
+        // `HttpStreamResponse` is not `Debug`, so match instead of expect_err.
+        let error = match mock
+            .send_streaming(HttpRequest::post("http://unused.test"))
+            .await
+        {
+            Ok(_) => panic!("the structured engine never streams"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("never streams"));
+    }
+
+    #[actix_web::test]
     async fn provider_failures_map_to_request_errors() {
         let mock = Arc::new(QueueClient::default());
         for _ in 0..3 {

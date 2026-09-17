@@ -117,6 +117,7 @@ async fn companion_listener_starts_and_stops_with_main() {
     let link = Arc::new(EaLink::new(
         EaToken::parse("test-token-1234567890").expect("token"),
         Duration::from_secs(10),
+        Duration::from_secs(5),
     ));
     let ea_addr = free_address();
     let ea = build_ea_server(link, ea_addr).expect("EA server build");
