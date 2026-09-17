@@ -463,6 +463,12 @@ async fn record(
         payload["side"] = json!(draft.side().as_str());
         payload["volume"] = json!(draft.volume().value());
         payload["order_type"] = json!(draft.order().as_str());
+        if let Some(stop) = draft.stop_loss() {
+            payload["stop_loss"] = json!(stop.value());
+        }
+        if let Some(target) = draft.take_profit() {
+            payload["take_profit"] = json!(target.value());
+        }
     }
     if let Some(reason) = reason {
         payload["reason"] = json!(reason);
@@ -1305,6 +1311,14 @@ mod tests {
             other => panic!("expected a queued command, got {other:?}"),
         };
         assert!(outcomes(&harness.trail).contains(&"queued".to_owned()));
+        let decision = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.kind() == AuditKind::ProposalEvaluated)
+            .expect("decision recorded");
+        assert_eq!(decision.payload()["stop_loss"], 1.0850);
+        assert_eq!(decision.payload()["take_profit"], 1.1000);
         let kinds: Vec<&'static str> = harness
             .trail
             .events()

@@ -34,6 +34,8 @@ pub enum AuditKind {
     ReconciliationDrift,
     /// The autonomous loop evaluated one proposal.
     ProposalEvaluated,
+    /// A Veyra-managed position disappeared from the book (closed at the venue).
+    PositionClosed,
 }
 
 impl AuditKind {
@@ -47,6 +49,7 @@ impl AuditKind {
             Self::ServiceStarted => "service_started",
             Self::ReconciliationDrift => "reconciliation_drift",
             Self::ProposalEvaluated => "proposal_evaluated",
+            Self::PositionClosed => "position_closed",
         }
     }
 }
@@ -409,6 +412,7 @@ mod tests {
             "reconciliation_drift"
         );
         assert_eq!(AuditKind::ProposalEvaluated.as_str(), "proposal_evaluated");
+        assert_eq!(AuditKind::PositionClosed.as_str(), "position_closed");
         assert_eq!(AuditProvider::Postgres.as_str(), "postgres");
         assert_eq!(AuditProvider::Postgres.to_string(), "postgres");
     }

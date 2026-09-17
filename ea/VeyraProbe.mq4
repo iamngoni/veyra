@@ -6,7 +6,7 @@
 // Requires the endpoint to be listed in
 // Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.19"
+#property version   "1.20"
 #property description "Veyra control channel: heartbeat, account/position snapshots, market rates, order validation, gated live execution, and Veyra-owned closes and stop changes."
 
 input string InUrl         = "__VEYRA_URL__";            // Veyra endpoint (loopback or tunnel)
@@ -401,7 +401,9 @@ string PositionsJson(int maxEntries)
             + ",\"magic\":" + (string)(int)OrderMagicNumber()
             + ",\"lots\":" + DoubleToString(OrderLots(), 2)
             + ",\"price\":" + DoubleToString(OrderOpenPrice(), digits)
-            + ",\"profit\":" + DoubleToString(OrderProfit(), 2) + "}";
+            + ",\"profit\":" + DoubleToString(OrderProfit(), 2)
+            + ",\"sl\":" + DoubleToString(OrderStopLoss(), digits)
+            + ",\"tp\":" + DoubleToString(OrderTakeProfit(), digits) + "}";
       included++;
      }
    return(out + "]");

@@ -142,6 +142,8 @@ export function PositionsPanel({ account }: { account?: Account }) {
               <th className="px-2 py-1.5 font-medium">Side</th>
               <th className="px-2 py-1.5 font-medium">Lots</th>
               <th className="px-2 py-1.5 font-medium">Entry</th>
+              <th className="px-2 py-1.5 font-medium">SL</th>
+              <th className="px-2 py-1.5 font-medium">TP</th>
               <th className="px-2 py-1.5 font-medium">P/L</th>
               <th className="px-3 py-1.5 font-medium">Owner</th>
             </tr>
@@ -155,6 +157,8 @@ export function PositionsPanel({ account }: { account?: Account }) {
                 </td>
                 <td className="px-2 py-1.5 text-slate-300">{position.lots}</td>
                 <td className="px-2 py-1.5 text-slate-300">{position.price}</td>
+                <td className="px-2 py-1.5 text-rose-300/80">{position.sl > 0 ? position.sl : '—'}</td>
+                <td className="px-2 py-1.5 text-emerald-300/80">{position.tp > 0 ? position.tp : '—'}</td>
                 <td className={`px-2 py-1.5 ${position.profit >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                   {position.profit >= 0 ? '+' : ''}
                   {position.profit.toFixed(2)}
@@ -295,6 +299,7 @@ const kindTone: Record<string, string> = {
   command_completed: 'text-emerald-300 bg-emerald-500/10',
   command_failed: 'text-rose-300 bg-rose-500/10',
   broker_snapshot: 'text-slate-400 bg-slate-700/30',
+  position_closed: 'text-cyan-300 bg-cyan-500/10',
   service_started: 'text-amber-300 bg-amber-500/10',
   reconciliation_drift: 'text-rose-300 bg-rose-500/15',
 }
@@ -315,6 +320,10 @@ function payloadSummary(event: FeedEvent): string {
   }
   if (event.kind === 'broker_snapshot') {
     return `orders=${payload.orders} lots=${payload.lots}`
+  }
+  if (event.kind === 'position_closed') {
+    const profit = Number(payload.profit ?? 0)
+    return `ticket ${payload.ticket} ${payload.symbol} ${payload.kind} · P/L ${profit >= 0 ? '+' : ''}${profit.toFixed(2)}`
   }
   return JSON.stringify(payload)
 }

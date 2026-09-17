@@ -37,6 +37,10 @@ export type Position = {
   lots: number
   price: number
   profit: number
+  /** Stop loss as an absolute price, zero when the position carries none. */
+  sl: number
+  /** Take profit as an absolute price, zero when the position carries none. */
+  tp: number
   magic: number
 }
 

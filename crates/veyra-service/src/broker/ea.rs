@@ -146,6 +146,14 @@ pub struct PositionPayload {
     pub price: f64,
     /// Floating profit in account currency.
     pub profit: f64,
+    /// Stop loss as an absolute price, or zero when the position carries
+    /// none. Absent on older terminals that do not report it.
+    #[serde(rename = "sl", default)]
+    pub stop_loss: f64,
+    /// Take profit as an absolute price, or zero when the position carries
+    /// none. Absent on older terminals that do not report it.
+    #[serde(rename = "tp", default)]
+    pub take_profit: f64,
 }
 
 /// Order kinds the terminal can report.
@@ -229,6 +237,13 @@ impl AccountSnapshotPayload {
             }
             if !position.profit.is_finite() {
                 return Err("position profit must be a finite number".to_owned());
+            }
+            for (name, value) in [("sl", position.stop_loss), ("tp", position.take_profit)] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(format!(
+                        "position {name} must be a finite, non-negative price (zero means none)"
+                    ));
+                }
             }
         }
         Ok(())
@@ -816,6 +831,7 @@ pub struct EaLink {
     commands: Mutex<VecDeque<EaCommand>>,
     pongs: AtomicU64,
     last_account: Mutex<Option<StoredAccount>>,
+    previous_account: Mutex<Option<StoredAccount>>,
     audit: Mutex<Option<Arc<AuditRuntime>>>,
 }
 
@@ -832,6 +848,7 @@ impl EaLink {
             commands: Mutex::new(VecDeque::new()),
             pongs: AtomicU64::new(0),
             last_account: Mutex::new(None),
+            previous_account: Mutex::new(None),
             audit: Mutex::new(None),
         }
     }
@@ -1040,12 +1057,17 @@ impl EaLink {
             }
         });
         if let Some(snapshot) = retained {
-            self.with_last_account(|slot| {
+            let replaced = self.with_last_account(|slot| {
+                let previous = slot.take();
                 *slot = Some(StoredAccount {
                     payload: snapshot,
                     at: SystemTime::now(),
                 });
+                previous
             });
+            if let Some(previous) = replaced {
+                self.with_previous_account(|slot| *slot = Some(previous));
+            }
         }
     }
 
@@ -1138,6 +1160,25 @@ impl EaLink {
                     ))
                     .await;
                 if let CommandPayload::AccountSnapshot(snapshot) = payload {
+                    // A managed position that vanished from the book was closed
+                    // at the venue; journal it with its last observed values.
+                    if let Some(previous) = self.take_previous_account() {
+                        for closed in closed_managed_positions(&previous, snapshot) {
+                            audit
+                                .try_record(AuditEvent::new(
+                                    AuditKind::PositionClosed,
+                                    serde_json::json!({
+                                        "ticket": closed.ticket,
+                                        "symbol": closed.symbol,
+                                        "kind": closed.kind,
+                                        "lots": closed.lots,
+                                        "price": closed.price,
+                                        "profit": closed.profit
+                                    }),
+                                ))
+                                .await;
+                        }
+                    }
                     audit
                         .try_record(AuditEvent::new(
                             AuditKind::BrokerSnapshot,
@@ -1193,6 +1234,20 @@ impl EaLink {
             Err(poisoned) => poisoned.into_inner(),
         };
         apply(&mut guard)
+    }
+
+    fn with_previous_account<T>(&self, apply: impl FnOnce(&mut Option<StoredAccount>) -> T) -> T {
+        let mut guard = match self.previous_account.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        apply(&mut guard)
+    }
+
+    /// Consumes the snapshot replaced by the most recent one; used once to
+    /// journal positions that disappeared from the book.
+    fn take_previous_account(&self) -> Option<AccountSnapshotPayload> {
+        self.with_previous_account(|slot| slot.take().map(|stored| stored.payload))
     }
 
     fn with_state<T>(&self, apply: impl FnOnce(&mut Option<EaState>) -> T) -> T {
@@ -1380,6 +1435,32 @@ fn payload_for(kind: CommandKind, data: Option<Value>) -> Result<CommandPayload,
     }
 }
 
+/// Managed positions present in `previous` but missing from `current`.
+///
+/// Only meaningful with two complete book views: any truncated list makes the
+/// comparison untrustworthy, so those snapshots yield no closures rather than
+/// false journal entries.
+fn closed_managed_positions(
+    previous: &AccountSnapshotPayload,
+    current: &AccountSnapshotPayload,
+) -> Vec<PositionPayload> {
+    if previous.positions_truncated || current.positions_truncated {
+        return Vec::new();
+    }
+    previous
+        .positions
+        .iter()
+        .filter(|position| position.magic == ORDER_MAGIC)
+        .filter(|position| {
+            !current
+                .positions
+                .iter()
+                .any(|candidate| candidate.ticket == position.ticket)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Bounded audit summary of a completed command payload.
 fn completed_summary(payload: &CommandPayload) -> Value {
     match payload {
@@ -1457,11 +1538,12 @@ mod tests {
     use super::{
         CandlePayload, CommandRequest, EaAck, EaCloseRequest, EaLink, EaModifyRequest,
         EaOrderRequest, EaRatesRequest, EaReply, EaToken, ORDER_MAGIC, OrderCheckPayload,
-        RatesPayload, hex_preview, payload_for,
+        RatesPayload, closed_managed_positions, hex_preview, payload_for,
     };
     use crate::broker::Symbol as BrokerSymbol;
     use crate::broker::ea::{
         AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandState, PositionKind,
+        PositionPayload,
     };
     use crate::trading::intent::{
         OrderKind, Price, Side, TradeIntent, TradeIntentDraft, Volume, parse_instrument,
@@ -1737,6 +1819,171 @@ mod tests {
         assert_eq!(listed[2].status, "pending");
 
         assert_eq!(link.recent_commands(1).len(), 1, "the cap applies");
+    }
+
+    fn book_position(ticket: i64, magic: u32) -> PositionPayload {
+        PositionPayload {
+            ticket,
+            symbol: "EURUSD".to_owned(),
+            kind: PositionKind::Buy,
+            lots: 0.01,
+            price: 1.095,
+            profit: -0.42,
+            stop_loss: 1.085,
+            take_profit: 1.105,
+            magic,
+        }
+    }
+
+    fn book(positions: Vec<PositionPayload>, truncated: bool) -> AccountSnapshotPayload {
+        AccountSnapshotPayload {
+            balance: 20.0,
+            equity: 20.0,
+            free_margin: 20.0,
+            orders: positions.len() as u32,
+            lots: positions.iter().map(|position| position.lots).sum(),
+            positions,
+            positions_truncated: truncated,
+            server_time: 0,
+        }
+    }
+
+    #[test]
+    fn closures_are_detected_only_with_complete_books() {
+        let closed = closed_managed_positions(
+            &book(
+                vec![book_position(1, ORDER_MAGIC), book_position(2, 0)],
+                false,
+            ),
+            &book(vec![book_position(2, 0)], false),
+        );
+        assert_eq!(closed.len(), 1, "only the vanished managed position counts");
+        assert_eq!(closed[0].ticket, 1);
+        assert_eq!(closed[0].profit, -0.42);
+
+        assert!(
+            closed_managed_positions(
+                &book(vec![book_position(1, ORDER_MAGIC)], false),
+                &book(vec![book_position(1, ORDER_MAGIC)], false)
+            )
+            .is_empty(),
+            "an unchanged book closes nothing"
+        );
+        assert!(
+            closed_managed_positions(
+                &book(vec![book_position(1, 0)], false),
+                &book(Vec::new(), false)
+            )
+            .is_empty(),
+            "foreign positions are never journaled"
+        );
+        assert!(
+            closed_managed_positions(
+                &book(vec![book_position(1, ORDER_MAGIC)], false),
+                &book(Vec::new(), true)
+            )
+            .is_empty(),
+            "a truncated view could hide the ticket"
+        );
+        assert!(
+            closed_managed_positions(
+                &book(vec![book_position(1, ORDER_MAGIC)], true),
+                &book(Vec::new(), false)
+            )
+            .is_empty(),
+            "a truncated previous view is equally untrustworthy"
+        );
+    }
+
+    #[test]
+    fn position_stops_must_be_non_negative() {
+        let snapshot = |stop_loss: f64, take_profit: f64| {
+            let mut snapshot = book(vec![book_position(1, ORDER_MAGIC)], false);
+            snapshot.positions[0].stop_loss = stop_loss;
+            snapshot.positions[0].take_profit = take_profit;
+            snapshot
+        };
+        snapshot(1.085, 1.105).validate().expect("valid stops");
+        snapshot(0.0, 0.0)
+            .validate()
+            .expect("zero means no stop and is valid");
+        assert!(snapshot(-0.5, 1.105).validate().is_err());
+        assert!(snapshot(1.085, f64::NAN).validate().is_err());
+    }
+
+    #[actix_web::test]
+    async fn vanished_managed_positions_are_journaled_once() {
+        use crate::audit::{AuditKind, AuditRuntime, MemoryTrail};
+
+        let trail = Arc::new(MemoryTrail::default());
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(15),
+        );
+        link.set_audit(Arc::new(AuditRuntime::new(trail.clone())));
+
+        let snapshot_data = |positions: Vec<PositionPayload>| {
+            serde_json::json!({
+                "balance": 20.0,
+                "equity": 20.0,
+                "freeMargin": 20.0,
+                "orders": positions.len(),
+                "lots": 0.01,
+                "positions": positions,
+                "positionsTruncated": false,
+                "serverTime": 1_758_000_000
+            })
+        };
+
+        let first = link.enqueue(CommandKind::AccountSnapshot);
+        let ack = EaAck {
+            id: first,
+            ok: true,
+            data: Some(snapshot_data(vec![book_position(777, ORDER_MAGIC)])),
+            error: None,
+        };
+        link.apply_ack(&ack);
+        link.audit_ack(&ack).await;
+
+        let second = link.enqueue(CommandKind::AccountSnapshot);
+        let ack = EaAck {
+            id: second,
+            ok: true,
+            data: Some(snapshot_data(Vec::new())),
+            error: None,
+        };
+        link.apply_ack(&ack);
+        link.audit_ack(&ack).await;
+
+        let closed: Vec<_> = trail
+            .events()
+            .into_iter()
+            .filter(|event| event.kind() == AuditKind::PositionClosed)
+            .collect();
+        assert_eq!(closed.len(), 1, "the vanished position is journaled");
+        assert_eq!(closed[0].payload()["ticket"], 777);
+        assert_eq!(closed[0].payload()["profit"], -0.42);
+        assert_eq!(closed[0].payload()["lots"], 0.01);
+
+        // A further unchanged snapshot must not repeat the journal entry.
+        let third = link.enqueue(CommandKind::AccountSnapshot);
+        let ack = EaAck {
+            id: third,
+            ok: true,
+            data: Some(snapshot_data(Vec::new())),
+            error: None,
+        };
+        link.apply_ack(&ack);
+        link.audit_ack(&ack).await;
+        assert_eq!(
+            trail
+                .events()
+                .iter()
+                .filter(|event| event.kind() == AuditKind::PositionClosed)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2264,12 +2511,16 @@ mod tests {
         link.audit_ack(&foreign_ack).await;
 
         let events = trail.events();
-        assert_eq!(events.len(), 6);
+        assert_eq!(events.len(), 7);
         assert_eq!(events[3].kind(), AuditKind::CommandCompleted);
-        assert_eq!(events[4].kind(), AuditKind::BrokerSnapshot);
-        assert_eq!(events[5].kind(), AuditKind::ReconciliationDrift);
+        // The managed ticket 123 vanished in this snapshot, so the journal
+        // records the closure before the new book state.
+        assert_eq!(events[4].kind(), AuditKind::PositionClosed);
+        assert_eq!(events[4].payload()["ticket"], 123);
+        assert_eq!(events[5].kind(), AuditKind::BrokerSnapshot);
+        assert_eq!(events[6].kind(), AuditKind::ReconciliationDrift);
         assert_eq!(
-            events[5].payload()["unknownTickets"],
+            events[6].payload()["unknownTickets"],
             serde_json::json!([456])
         );
     }

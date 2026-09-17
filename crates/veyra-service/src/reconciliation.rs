@@ -137,6 +137,8 @@ mod tests {
             lots: 0.01,
             price: 1.095,
             profit: -0.25,
+            stop_loss: 1.085,
+            take_profit: 1.105,
             magic,
         }
     }
