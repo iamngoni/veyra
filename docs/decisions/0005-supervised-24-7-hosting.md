@@ -3,7 +3,9 @@
 ## Status
 
 Accepted 2026-09-17; installed and proven (service and tunnel both restarted
-after `SIGKILL`, and the EA link reconnected automatically).
+after `SIGKILL`, and the EA link reconnected automatically). Amended the same
+day: hourly log rotation and a daily verified audit backup joined the agent
+set (see the hosting section of `docs/architecture.md`).
 
 ## Context
 
@@ -16,7 +18,7 @@ after `SIGKILL`, and the EA link reconnected automatically).
 
 ## Decision
 
-- Three LaunchAgents, rendered from portable templates in `scripts/launchd/`
+- Five LaunchAgents, rendered from portable templates in `scripts/launchd/`
   by `scripts/install-launchd.sh` (idempotent, removable with `--uninstall`):
   - `cc.antonlabs.veyra.terminal` starts MT4 at login (`open -a`). No
     KeepAlive: a clean quit should stay quit, and Wine exit codes are not
@@ -25,8 +27,17 @@ after `SIGKILL`, and the EA link reconnected automatically).
     KeepAlive.
   - `cc.antonlabs.veyra.service` runs `scripts/run-service.sh`, which sources
     `.env` and execs the **release** binary, with KeepAlive.
+  - `cc.antonlabs.veyra.logrotate` runs hourly, copy-truncating logs above
+    5 MiB in place (launchd holds the descriptors open) and keeping three
+    generations.
+  - `cc.antonlabs.veyra.backup` runs at load and daily at 03:30, dumping the
+    audit database in custom format, verifying the archive with
+    `pg_restore --list` before it replaces the previous generation, and
+    keeping the newest fourteen dumps under
+    `~/Library/Application Support/veyra/backups`.
 - Secrets stay in `.env` (0600); plists carry only absolute paths.
-- Logs go to `~/Library/Logs/veyra/{service,tunnel,terminal}.{out,err}.log`.
+- Logs go to `~/Library/Logs/veyra/{service,tunnel,terminal,logrotate,backup}.{out,err}.log`,
+  and the logrotate agent keeps them bounded.
 - Exactly one supervised instance owns ports 8080 and 7801; the installer stops
   stray session-bound processes before bootstrapping.
 
@@ -34,7 +45,8 @@ after `SIGKILL`, and the EA link reconnected automatically).
 
 - Code changes require `cargo build --release` and
   `launchctl kickstart -k gui/$(id -u)/cc.antonlabs.veyra.service`.
-- Log rotation, monitoring, and alerting are still manual; a durable
-  host/VPS, managed secrets, and backups remain the deployment phase.
+- Log rotation and local audit backups are supervised; monitoring and
+  alerting, a durable host/VPS, managed secrets, and off-machine backups
+  remain the deployment phase.
 - MT4 crash-restart and checkpointed reconciliation across service restarts are
   deliberate later steps (persistence lands with the storage phase).

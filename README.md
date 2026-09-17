@@ -24,8 +24,9 @@ This repository contains the first tested, safe service slice:
   session, volume/order caps, duplicate suppression) in front of every intent,
   plus broker-side order validation (`order_check`) that never sends an order —
   proven live (retcode 0 for a valid request, 129 for a wrong-side limit).
-- 24/7 supervision: launchd agents for the terminal, tunnel, and service with
-  crash restart, proven by `SIGKILL` (ADR 0005).
+- 24/7 supervision: launchd agents for the terminal, tunnel, service, hourly
+  log rotation, and daily verified audit backups with crash restart on the
+  service and tunnel, proven by `SIGKILL` (ADR 0005).
 - Durable audit trail in PostgreSQL (SQLx migrations, append-only
   `audit_events`, loopback `GET /audit`) — commands, acknowledgements, and
   broker snapshots survive restarts. Configure `VEYRA_DATABASE_URL`; a
@@ -66,7 +67,8 @@ probe EA with `./scripts/compile_ea.sh` (reads `VEYRA_EA_TOKEN` from `.env`).
 
 For unattended operation, install the supervised stack (release build; the
 tunnel and service restart automatically, MT4 starts at login, logs rotate
-hourly under `~/Library/Logs/veyra`):
+hourly under `~/Library/Logs/veyra`, and the audit database is backed up
+daily to `~/Library/Application Support/veyra/backups`):
 
 ```sh
 cargo build --release

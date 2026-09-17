@@ -209,19 +209,22 @@ durable storage.
 
 ## Hosting (24/7)
 
-The stack runs unattended on this Mac through three launchd agents rendered
+The stack runs unattended on this Mac through five launchd agents rendered
 from portable templates (`scripts/launchd/`) by `scripts/install-launchd.sh`:
-the MT4 terminal at login, the named Cloudflare tunnel, and the service (via
-`scripts/run-service.sh`, which sources `.env` and execs the release binary).
-Tunnel and service carry `KeepAlive`, so a crash recovers without a session;
-the terminal deliberately does not, so a clean quit stays quit. A fourth
-agent rotates `~/Library/Logs/veyra` hourly (copy-truncate above 5 MiB,
-three generations), and `/ready` reports broker and audit health, degrading
-instead of hiding an unhealthy dependency. Secrets remain
+the MT4 terminal at login, the named Cloudflare tunnel, the service (via
+`scripts/run-service.sh`, which sources `.env` and execs the release binary),
+hourly log rotation, and a daily verified audit-trail backup. Tunnel and
+service carry `KeepAlive`, so a crash recovers without a session; the terminal
+deliberately does not, so a clean quit stays quit. The rotation agent
+copy-truncates logs under `~/Library/Logs/veyra` above 5 MiB, keeping three
+generations. The backup agent dumps PostgreSQL in custom format, verifies the
+archive with `pg_restore --list` before it replaces the previous generation,
+keeps the newest fourteen dumps under `~/Library/Application Support/veyra/backups`,
+and runs once at load plus daily at 03:30. `/ready` reports broker and audit
+health, degrading instead of hiding an unhealthy dependency. Secrets remain
 in `.env`; plists carry only absolute paths. Exactly one supervised instance
 owns ports 8080 and 7801, and the installer stops stray session-bound
-processes first. Logs land under `~/Library/Logs/veyra` and are not rotated
-yet. See ADR 0005.
+processes first. See ADR 0005.
 
 ## Testing strategy
 
