@@ -9,6 +9,7 @@ fn config(host: &str, port: &str, env: &str) -> Result<ServiceConfig, ConfigErro
             "VEYRA_BIND_HOST" => host,
             "VEYRA_BIND_PORT" => port,
             "VEYRA_ENV" => env,
+            "VEYRA_TRADING_ENABLED" => "false",
             _ => panic!("unexpected setting"),
         }
         .to_owned())
@@ -31,6 +32,30 @@ fn accepts_both_address_families_and_every_environment() {
             assert!(!config.trading_enabled());
         }
     }
+}
+
+#[test]
+fn trading_enablement_is_explicit_and_typed() {
+    let configured = |value: &str| {
+        ServiceConfig::from_source(|name| {
+            Ok(match name {
+                "VEYRA_BIND_HOST" => "127.0.0.1",
+                "VEYRA_BIND_PORT" => "8080",
+                "VEYRA_ENV" => "development",
+                "VEYRA_TRADING_ENABLED" => value,
+                _ => panic!("unexpected setting"),
+            }
+            .to_owned())
+        })
+    };
+
+    assert!(!configured("").unwrap().trading_enabled());
+    assert!(!configured("false").unwrap().trading_enabled());
+    assert!(configured("true").unwrap().trading_enabled());
+    assert_eq!(
+        configured("yes").unwrap_err().to_string(),
+        "invalid environment variable `VEYRA_TRADING_ENABLED`: must be `true` or `false`"
+    );
 }
 
 #[test]

@@ -110,7 +110,8 @@ cargo coverage
 One-time terminal setup:
 
 1. `./scripts/compile_ea.sh` (reads `VEYRA_EA_TOKEN` from `.env`; set
-   `VEYRA_EA_URL` to the tunnel endpoint when using Cloudflare).
+   `VEYRA_EA_URL` to the tunnel endpoint when using Cloudflare). Live order
+   placement additionally requires compiling with `InAllowLiveOrders = true`.
 2. MT4 → Options → Expert Advisors: enable automated trading, and add the
    endpoint URL (for example `https://veyra.antonlabs.cc/ea/poll`) to the
    WebRequest allowlist. Listing the exact URL is the habit that has held on
@@ -129,9 +130,14 @@ will keep the same id/ack discipline and must be idempotent per id.
 
 Loopback control surface (`127.0.0.1:8080`): `POST /intents/evaluate` returns a
 risk decision without queueing anything, `POST /intents/check` queues one
-`order_check` for an approved intent, and `POST /commands/account_snapshot`
-refreshes venue state (orders, open volume, bounded position list); every
-command is pollable through `GET /commands/{id}`.
+`order_check` for an approved intent, `POST /intents/execute` queues
+`open_order` (refused unless `VEYRA_TRADING_ENABLED=true`), and
+`POST /commands/account_snapshot` refreshes venue state (orders, open volume,
+bounded position list); every command is pollable through `GET /commands/{id}`.
+
+Staged execution: with the service switch on, the terminal still validates the
+request and reports a dry run until the EA is recompiled with
+`InAllowLiveOrders = true` — two deliberate acts before real money moves.
 
 Platform notes (see docs/decisions/0002):
 

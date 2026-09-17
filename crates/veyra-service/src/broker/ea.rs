@@ -91,6 +91,9 @@ pub enum CommandKind {
     AccountSnapshot,
     /// Ask the terminal to validate an order request without sending it.
     OrderCheck,
+    /// Ask the terminal to execute an order (subject to the terminal's own
+    /// live-orders control).
+    OpenOrder,
 }
 
 impl CommandKind {
@@ -100,6 +103,7 @@ impl CommandKind {
             Self::Ping => "ping",
             Self::AccountSnapshot => "account_snapshot",
             Self::OrderCheck => "order_check",
+            Self::OpenOrder => "open_order",
         }
     }
 }
@@ -107,6 +111,10 @@ impl CommandKind {
 /// Largest position list the payload accepts; the terminal caps earlier and
 /// flags truncation.
 const MAX_POSITIONS: usize = 64;
+
+/// Magic number stamped on Veyra orders so the terminal and the reconciler can
+/// recognise them.
+pub const ORDER_MAGIC: u32 = 77_041;
 
 /// One open or pending order as the terminal reports it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,14 +251,51 @@ impl OrderCheckPayload {
     }
 }
 
-/// Order request sent to the EA for validation, derived only from an approved
-/// intent. Fields mirror the intent wire contract so the EA can read them
-/// without a nested parser.
+/// Terminal verdict for an `open_order` command.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OrderExecutionPayload {
+    /// Whether an order was actually sent to the broker.
+    pub executed: bool,
+    /// Validation or broker return code; zero means the request was acceptable.
+    pub retcode: i64,
+    /// Terminal commentary, echoed for operators.
+    pub comment: String,
+    /// Ticket of the placed order; zero when nothing was sent.
+    pub ticket: i64,
+    /// Fill or trigger price; zero when nothing was sent.
+    pub price: f64,
+}
+
+impl OrderExecutionPayload {
+    /// Rejects values an operator must never act on.
+    fn validate(&self) -> Result<(), String> {
+        if self.comment.len() > 256 || self.comment.chars().any(char::is_control) {
+            return Err(
+                "comment must be at most 256 characters without control characters".to_owned(),
+            );
+        }
+        if self.ticket < 0 {
+            return Err("ticket must not be negative".to_owned());
+        }
+        if !self.price.is_finite() || self.price < 0.0 {
+            return Err("price must be a finite, non-negative number".to_owned());
+        }
+        if self.executed && (self.ticket <= 0 || self.price <= 0.0) {
+            return Err("an executed order must report a ticket and price".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Order request sent to the EA for validation or execution, derived only from
+/// an approved intent. Fields mirror the intent wire contract so the EA can
+/// read them without a nested parser.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EaOrderRequest {
     symbol: String,
     side: &'static str,
     order_type: &'static str,
+    magic: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     price: Option<f64>,
     volume: f64,
@@ -271,6 +316,7 @@ impl EaOrderRequest {
             symbol: draft.symbol().as_str().to_owned(),
             side: draft.side().as_str(),
             order_type: draft.order().as_str(),
+            magic: ORDER_MAGIC,
             price: draft.order().price().map(|price| price.value()),
             volume: draft.volume().value(),
             stop_loss: draft.stop_loss().map(|price| price.value()),
@@ -288,6 +334,8 @@ pub enum CommandPayload {
     AccountSnapshot(AccountSnapshotPayload),
     /// Result of `order_check`; never an executed order.
     OrderCheck(OrderCheckPayload),
+    /// Result of `open_order`; reports whether anything reached the broker.
+    OpenOrder(OrderExecutionPayload),
 }
 
 /// Lifecycle state of one command.
@@ -519,6 +567,16 @@ impl EaLink {
         self.enqueue_with(CommandKind::OrderCheck, Some(request))
     }
 
+    /// Queues a live order execution.
+    ///
+    /// Like [`Self::enqueue_order_check`], the request can only be derived from
+    /// an approved intent. The terminal still refuses to trade until its own
+    /// live-orders input is enabled, so real money needs two independent
+    /// controls plus a gate approval.
+    pub fn enqueue_order(&self, request: EaOrderRequest) -> CommandId {
+        self.enqueue_with(CommandKind::OpenOrder, Some(request))
+    }
+
     fn enqueue_with(&self, kind: CommandKind, request: Option<EaOrderRequest>) -> CommandId {
         let id = CommandId::new();
         self.with_commands(|queue| {
@@ -596,7 +654,9 @@ impl EaLink {
                 Ok(payload) => {
                     let retained = match &payload {
                         CommandPayload::AccountSnapshot(snapshot) => Some(snapshot.clone()),
-                        CommandPayload::Ping | CommandPayload::OrderCheck(_) => None,
+                        CommandPayload::Ping
+                        | CommandPayload::OrderCheck(_)
+                        | CommandPayload::OpenOrder(_) => None,
                     };
                     command.state = CommandState::Completed { payload };
                     retained
@@ -797,6 +857,13 @@ fn payload_for(kind: CommandKind, data: Option<Value>) -> Result<CommandPayload,
             payload.validate()?;
             Ok(CommandPayload::OrderCheck(payload))
         }
+        CommandKind::OpenOrder => {
+            let value = data.ok_or_else(|| "open_order ack is missing data".to_owned())?;
+            let payload: OrderExecutionPayload = serde_json::from_value(value)
+                .map_err(|error| format!("invalid open_order payload: {error}"))?;
+            payload.validate()?;
+            Ok(CommandPayload::OpenOrder(payload))
+        }
     }
 }
 
@@ -846,7 +913,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        EaAck, EaLink, EaOrderRequest, EaToken, OrderCheckPayload, hex_preview, payload_for,
+        EaAck, EaLink, EaOrderRequest, EaToken, ORDER_MAGIC, OrderCheckPayload, hex_preview,
+        payload_for,
     };
     use crate::broker::ea::{
         AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandState, PositionKind,
@@ -874,6 +942,7 @@ mod tests {
         assert_eq!(CommandKind::Ping.as_str(), "ping");
         assert_eq!(CommandKind::AccountSnapshot.as_str(), "account_snapshot");
         assert_eq!(CommandKind::OrderCheck.as_str(), "order_check");
+        assert_eq!(CommandKind::OpenOrder.as_str(), "open_order");
     }
 
     #[test]
@@ -1080,6 +1149,75 @@ mod tests {
 
         let record = link.command(id).expect("record");
         assert_eq!(record.state, CommandState::Pending);
+    }
+
+    #[test]
+    fn open_order_payloads_require_a_consistent_verdict() {
+        let dry_run = payload_for(
+            CommandKind::OpenOrder,
+            Some(serde_json::json!({
+                "executed": false,
+                "retcode": 0,
+                "comment": "dry run (live orders disabled in EA)",
+                "ticket": 0,
+                "price": 0.0
+            })),
+        )
+        .expect("dry-run payload must validate");
+        assert!(matches!(dry_run, CommandPayload::OpenOrder(_)));
+
+        let executed = payload_for(
+            CommandKind::OpenOrder,
+            Some(serde_json::json!({
+                "executed": true,
+                "retcode": 10009,
+                "comment": "done",
+                "ticket": 123456,
+                "price": 1.095
+            })),
+        )
+        .expect("executed payload must validate");
+        assert!(matches!(executed, CommandPayload::OpenOrder(_)));
+
+        let cases = [
+            serde_json::json!({"executed": true, "retcode": 10009, "comment": "done", "ticket": 0, "price": 1.095}),
+            serde_json::json!({"executed": false, "retcode": 0, "comment": "dry run", "ticket": -1, "price": 0.0}),
+            serde_json::json!({"executed": false, "retcode": 0, "comment": "dry run", "ticket": 0, "price": -1.0}),
+        ];
+        for case in cases {
+            assert!(
+                payload_for(CommandKind::OpenOrder, Some(case)).is_err(),
+                "inconsistent verdict must be rejected"
+            );
+        }
+        assert!(payload_for(CommandKind::OpenOrder, None).is_err());
+    }
+
+    #[test]
+    fn open_orders_carry_the_vevra_magic_to_the_terminal() {
+        let intent = TradeIntent::approve(TradeIntentDraft::new(
+            parse_instrument("EURUSD").expect("symbol"),
+            Side::Buy,
+            OrderKind::Market,
+            Volume::parse(0.01).expect("volume"),
+            None,
+            None,
+            None,
+        ));
+        let request = EaOrderRequest::from_intent(&intent);
+        let wire = serde_json::to_value(&request).expect("serializable");
+        assert_eq!(wire["magic"], ORDER_MAGIC);
+
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        let id = link.enqueue_order(request.clone());
+        let (delivered_id, kind, order) = link.deliverable().expect("pending command");
+        assert_eq!(delivered_id, id);
+        assert_eq!(kind, CommandKind::OpenOrder);
+        assert_eq!(order, Some(request));
     }
 
     #[test]

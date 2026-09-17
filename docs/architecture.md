@@ -156,6 +156,20 @@ the fresh link report plus the open-order count every `BrokerLink`
 implementation reports from locally held state. Audit persistence arrives with
 the storage phase.
 
+### Execution (staged, two switches)
+
+`POST /intents/execute` is the only execution entry point. It refuses with
+`403 trading_disabled` unless the operator sets `VEYRA_TRADING_ENABLED=true`,
+and it refuses outright when no command channel exists. With the service switch
+on, a gate-approved intent becomes a typed `open_order` command carrying the
+Veyra magic number; the terminal validates the request against its market rules
+and margin engine and, unless it was deliberately recompiled with
+`InAllowLiveOrders = true`, acknowledges a dry run (`executed:false`,
+`retcode:0`) without sending anything. Real money therefore needs a gate
+approval plus two independent, deliberate switches. Order ids, acks, and
+timeouts reuse the same at-least-once discipline as read-only commands; `close`
+and `modify` will follow the same pattern.
+
 ## Hosting (24/7)
 
 The stack runs unattended on this Mac through three launchd agents rendered

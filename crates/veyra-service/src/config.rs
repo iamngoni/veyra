@@ -93,6 +93,7 @@ impl Port {
 pub struct ServiceConfig {
     address: SocketAddr,
     environment: Environment,
+    trading_enabled: bool,
 }
 
 impl ServiceConfig {
@@ -115,9 +116,23 @@ impl ServiceConfig {
             })?;
         let port = Port::parse("VEYRA_BIND_PORT", &read("VEYRA_BIND_PORT", &mut source)?)?;
         let environment = read("VEYRA_ENV", &mut source)?.parse()?;
+        let trading_enabled = match source("VEYRA_TRADING_ENABLED") {
+            Err(_) => false,
+            Ok(value) => match value.trim() {
+                "" | "false" => false,
+                "true" => true,
+                _ => {
+                    return Err(ConfigError::InvalidEnvironmentVariable {
+                        name: "VEYRA_TRADING_ENABLED",
+                        reason: "must be `true` or `false`",
+                    });
+                }
+            },
+        };
         Ok(Self {
             address: SocketAddr::new(host, port.value()),
             environment,
+            trading_enabled,
         })
     }
 
@@ -131,9 +146,13 @@ impl ServiceConfig {
         self.environment
     }
 
-    /// Execution is unavailable: no broker adapter is compiled into this service.
+    /// Whether the operator has explicitly enabled execution request paths.
+    ///
+    /// This is the first of two independent controls in front of real money:
+    /// the terminal additionally refuses to trade until its own live-orders
+    /// input is enabled.
     pub fn trading_enabled(&self) -> bool {
-        false
+        self.trading_enabled
     }
 }
 

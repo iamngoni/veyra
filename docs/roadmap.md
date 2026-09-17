@@ -55,8 +55,14 @@
       proven live on the real terminal (retcode 0 for a valid market buy, 129
       for a wrong-side limit) without sending an order; exposed through the
       loopback `POST /intents/check` and `GET /commands/{id}` control surface.
-- [ ] Mutating commands (open/close/modify) with the same id/ack discipline,
-      restricted by the deterministic risk gate.
+- [x] Mutating command plumbing with the same id/ack discipline: an approved
+      intent can queue `open_order`, which the terminal validates and reports
+      as a **dry run** unless a second, operator-set input arms live order
+      placement. Proven live end to end without sending an order.
+- [ ] Live order placement: requires `VEYRA_TRADING_ENABLED=true` **and** an EA
+      recompiled with `InAllowLiveOrders = true` — awaiting explicit owner
+      approval.
+- [ ] Close and modify commands (reuse the same path and controls).
 - [ ] Independent reconciliation against broker state.
 - [ ] Staged testing: read-only first, then demo, then minimal live exposure
       only after explicit owner approval.
@@ -80,7 +86,9 @@
       proven live (`exposure_above_limit` with a 0.005 cap, approved at the
       0.01 default).
 - [ ] Policy persistence and audit trail (needs Phase 1 storage).
-- [ ] Require two independent controls for any live mode transition.
+- [x] Two independent controls in front of real money: the service refuses to
+      queue execution unless `VEYRA_TRADING_ENABLED=true`, and the terminal
+      refuses to trade unless recompiled with `InAllowLiveOrders = true`.
 
 ## Phase 6 — console
 

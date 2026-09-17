@@ -77,6 +77,45 @@ pub async fn request_account_snapshot(state: Data<AppState>) -> HttpResponse {
     }))
 }
 
+#[post("/intents/execute")]
+/// Queues a live order when execution is explicitly enabled.
+///
+/// Refuses with `403 trading_disabled` unless `VEYRA_TRADING_ENABLED=true`, so
+/// an approved intent alone cannot trade. With the service switch on, the
+/// terminal still requires its own live-orders input before anything reaches
+/// the broker; otherwise it validates the request and reports a dry run.
+pub async fn execute_intent(
+    state: Data<AppState>,
+    draft: web::Json<TradeIntentDraft>,
+) -> HttpResponse {
+    let Some(link) = command_link(&state) else {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "command_channel_unavailable" }));
+    };
+    if !state.config().trading_enabled() {
+        return HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }));
+    }
+    let account = crate::routes::account_facts(state.broker()).await;
+    match state
+        .risk()
+        .evaluate(&draft.into_inner(), account, SystemTime::now())
+    {
+        RiskDecision::Rejected(rejection) => {
+            HttpResponse::Ok().json(RiskDecision::Rejected(rejection))
+        }
+        RiskDecision::Approved(intent) => {
+            let command = link.enqueue_order(EaOrderRequest::from_intent(&intent));
+            HttpResponse::Ok().json(json!({
+                "decision": "approved",
+                "intent_id": intent.id().to_string(),
+                "command": "open_order",
+                "command_id": command.to_string(),
+                "status": "pending"
+            }))
+        }
+    }
+}
+
 #[get("/commands/{id}")]
 /// Reports one command's lifecycle state and validated result.
 pub async fn command_status(state: Data<AppState>, id: web::Path<String>) -> HttpResponse {
@@ -134,6 +173,13 @@ fn command_result(payload: CommandPayload) -> serde_json::Value {
             "retcode": check.retcode,
             "comment": check.comment,
             "margin": check.margin
+        }),
+        CommandPayload::OpenOrder(execution) => json!({
+            "executed": execution.executed,
+            "retcode": execution.retcode,
+            "comment": execution.comment,
+            "ticket": execution.ticket,
+            "price": execution.price
         }),
     }
 }

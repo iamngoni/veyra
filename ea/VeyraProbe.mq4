@@ -1,17 +1,19 @@
 // VeyraProbe — MQL4 WebRequest client for the Veyra EA control channel.
 // MQL4 has no socket API; WebRequest is the terminal's native TCP/HTTP client.
-// Places no orders: the order_check command only validates a request through
-// the terminal's OrderCheck(), which never sends anything to the broker.
+// Validates orders with the terminal's own market rules and margin engine
+// (order_check) and, only when explicitly armed with InAllowLiveOrders, places
+// live orders on an approved service command. Disarmed it reports a dry run.
 // Requires the endpoint to be listed in
 // Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.15"
-#property description "Veyra control channel: heartbeat, account and position snapshots, and broker-side order validation. Places no orders."
+#property version   "1.16"
+#property description "Veyra control channel: heartbeat, account/position snapshots, broker-side order validation, and gated live order execution."
 
 input string InUrl         = "__VEYRA_URL__";   // Veyra endpoint (loopback or tunnel)
 input string InToken       = "__VEYRA_TOKEN__"; // shared token
 input int    InHeartbeatMs = 1000;              // heartbeat interval
 input int    InTimeoutMs   = 1500;              // WebRequest timeout
+input bool   InAllowLiveOrders = false;         // arm live order placement (dry run when false)
 
 uint g_last       = 0;
 bool g_said_hello = false;
@@ -115,11 +117,12 @@ void SendAckError(string id, string reason)
    Print("VeyraProbe ack error=", reason, " status=", ack_status);
   }
 
-// Classic-MQL4 validation for one order request. This terminal build exposes
-// no MQL5-style OrderCheck, so the EA applies the terminal's own market rules
-// (volume range and step, stop distance, price side) plus its margin engine
-// through AccountFreeMarginCheck. Nothing is sent to the broker.
-void HandleOrderCheck(string response, string id)
+// Validates one order request against the terminal's market rules and margin
+// engine: volume range and step, price side, stop distance, and free margin.
+// Returns 0 when the request would be accepted, otherwise a classic MT4 trade
+// code, with a human explanation and the required margin. A negative return
+// means the request itself was malformed.
+int ValidateOrderRequest(string response, string &comment, double &margin, double &entryPrice)
   {
    string symbol    = JsonString(response, "symbol");
    string side      = JsonString(response, "side");
@@ -129,15 +132,17 @@ void HandleOrderCheck(string response, string id)
    double sl        = JsonNumber(response, "stop_loss");
    double tp        = JsonNumber(response, "take_profit");
 
+   comment = "ok";
+   margin = 0.0;
+   entryPrice = 0.0;
+
    if(StringLen(symbol) == 0 || volume <= 0.0)
      {
-      SendAckError(id, "malformed order_check request");
-      return;
+      comment = "malformed order request";
+      return(-1);
      }
 
    int code = 0;
-   string comment = "ok";
-
    double minLot    = MarketInfo(symbol, MODE_MINLOT);
    double maxLot    = MarketInfo(symbol, MODE_MAXLOT);
    double lotStep   = MarketInfo(symbol, MODE_LOTSTEP);
@@ -145,7 +150,7 @@ void HandleOrderCheck(string response, string id)
    double point     = MarketInfo(symbol, MODE_POINT);
    double ask       = MarketInfo(symbol, MODE_ASK);
    double bid       = MarketInfo(symbol, MODE_BID);
-   double marginRequired = MarketInfo(symbol, MODE_MARGINREQUIRED) * volume;
+   margin = MarketInfo(symbol, MODE_MARGINREQUIRED) * volume;
 
    if(!IsConnected())
      {
@@ -174,7 +179,7 @@ void HandleOrderCheck(string response, string id)
      }
    else
      {
-      double entry = price;
+      entryPrice = price;
       if(orderType == "market")
         {
          if(ask <= 0.0 || bid <= 0.0)
@@ -182,8 +187,8 @@ void HandleOrderCheck(string response, string id)
             code = 136;
             comment = "no quotes available for this symbol";
            }
-         else if(side == "buy") entry = ask;
-         else                   entry = bid;
+         else if(side == "buy") entryPrice = ask;
+         else                   entryPrice = bid;
         }
       else if(orderType == "limit")
         {
@@ -211,8 +216,8 @@ void HandleOrderCheck(string response, string id)
         {
          if(sl > 0.0)
            {
-            bool wrongSide = (side == "buy" ? sl >= entry : sl <= entry);
-            if(wrongSide || MathAbs(entry - sl) / point < stopLevel)
+            bool wrongSide = (side == "buy" ? sl >= entryPrice : sl <= entryPrice);
+            if(wrongSide || MathAbs(entryPrice - sl) / point < stopLevel)
               {
                code = 130;
                comment = "stop loss violates the minimum stop distance";
@@ -220,8 +225,8 @@ void HandleOrderCheck(string response, string id)
            }
          if(code == 0 && tp > 0.0)
            {
-            bool wrongSide = (side == "buy" ? tp <= entry : tp >= entry);
-            if(wrongSide || MathAbs(tp - entry) / point < stopLevel)
+            bool wrongSide = (side == "buy" ? tp <= entryPrice : tp >= entryPrice);
+            if(wrongSide || MathAbs(tp - entryPrice) / point < stopLevel)
               {
                code = 130;
                comment = "take profit violates the minimum stop distance";
@@ -244,14 +249,105 @@ void HandleOrderCheck(string response, string id)
         }
      }
 
+   return(code);
+  }
+
+// Reports the terminal verdict for an order_check. The request is validated
+// and the outcome echoed; nothing is ever sent to the broker.
+void HandleOrderCheck(string response, string id)
+  {
+   string comment = "";
+   double margin = 0.0;
+   double entry = 0.0;
+   int code = ValidateOrderRequest(response, comment, margin, entry);
+   if(code < 0)
+     {
+      SendAckError(id, comment);
+      return;
+     }
+
    bool passed = (code == 0);
    string data = "{\"passed\":" + (passed ? "true" : "false")
                  + ",\"retcode\":" + (string)code
                  + ",\"comment\":\"" + EscapeJson(comment) + "\""
-                 + ",\"margin\":" + DoubleToString(marginRequired, 2) + "}";
-   Print("VeyraProbe order_check passed=", passed, " retcode=", (string)code,
-         " comment=", comment, " margin=", DoubleToString(marginRequired, 2));
+                 + ",\"margin\":" + DoubleToString(margin, 2) + "}";
+   Print("VeyraProbe order_check passed=", passed, " retcode=", (string)code, " comment=", comment,
+         " margin=", DoubleToString(margin, 2));
    SendAck(id, data);
+  }
+
+// Executes one live order when the terminal is armed; otherwise validates the
+// request and reports a dry run. The OrderSend branch is compiled but only
+// reachable when the operator recompiles with InAllowLiveOrders = true, so
+// real money needs the service switch, a gate approval, and this input.
+void HandleOpenOrder(string response, string id)
+  {
+   string comment = "";
+   double margin = 0.0;
+   double entry = 0.0;
+   int code = ValidateOrderRequest(response, comment, margin, entry);
+   if(code < 0)
+     {
+      SendAckError(id, comment);
+      return;
+     }
+
+   if(code != 0 || !InAllowLiveOrders)
+     {
+      if(code == 0) comment = "dry run (live orders disabled in EA)";
+      string dry = "{\"executed\":false,\"retcode\":" + (string)code
+                   + ",\"comment\":\"" + EscapeJson(comment) + "\""
+                   + ",\"ticket\":0,\"price\":0.0}";
+      Print("VeyraProbe open_order dry run code=", (string)code, " comment=", comment);
+      SendAck(id, dry);
+      return;
+     }
+
+   string symbol    = JsonString(response, "symbol");
+   string side      = JsonString(response, "side");
+   string orderType = JsonString(response, "order_type");
+   double volume    = JsonNumber(response, "volume");
+   double sl        = JsonNumber(response, "stop_loss");
+   double tp        = JsonNumber(response, "take_profit");
+   int magic        = (int)JsonNumber(response, "magic");
+
+   // Classic MQL4 order-type values; this build declares only OP_BUY/OP_SELL.
+   int cmd = 1;
+   if(side == "buy") cmd = 0;
+   if(orderType == "limit")
+     {
+      if(side == "buy") cmd = 2;
+      else              cmd = 3;
+     }
+   else if(orderType == "stop")
+     {
+      if(side == "buy") cmd = 4;
+      else              cmd = 5;
+     }
+
+   ResetLastError();
+   int ticket = OrderSend(symbol, cmd, volume, entry, 10, sl, tp, "Veyra", magic, 0, CLR_NONE);
+   int sendError = GetLastError();
+   if(ticket <= 0)
+     {
+      string failed = "{\"executed\":false,\"retcode\":" + (string)sendError
+                      + ",\"comment\":\"order send failed\",\"ticket\":0,\"price\":0.0}";
+      Print("VeyraProbe open_order failed error=", (string)sendError);
+      SendAck(id, failed);
+      return;
+     }
+
+   double fillPrice = entry;
+   if(OrderSelect(ticket, SELECT_BY_TICKET)) fillPrice = OrderOpenPrice();
+   int digits = (int)MarketInfo(symbol, MODE_DIGITS);
+   if(digits <= 0) digits = 5;
+   string done = "{\"executed\":true,\"retcode\":0"
+                 + ",\"comment\":\"order sent\""
+                 + ",\"ticket\":" + (string)ticket
+                 + ",\"price\":" + DoubleToString(fillPrice, digits) + "}";
+   Print("VeyraProbe open_order sent ticket=", (string)ticket, " price=",
+         DoubleToString(fillPrice, digits));
+   SendAck(id, done);
   }
 
 // Total open volume in lots across every open order.
@@ -318,6 +414,12 @@ void HandleCommand(string response)
    if(kind == "order_check")
      {
       HandleOrderCheck(response, id);
+      return;
+     }
+
+   if(kind == "open_order")
+     {
+      HandleOpenOrder(response, id);
       return;
      }
 

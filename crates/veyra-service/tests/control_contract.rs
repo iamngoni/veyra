@@ -53,6 +53,17 @@ fn gate() -> RiskGate {
     RiskGate::new(policy)
 }
 
+fn config_with_trading(enabled: bool) -> ServiceConfig {
+    ServiceConfig::from_source(|name| match name {
+        "VEYRA_BIND_HOST" => Ok("127.0.0.1".to_owned()),
+        "VEYRA_BIND_PORT" => Ok("8080".to_owned()),
+        "VEYRA_ENV" => Ok("development".to_owned()),
+        "VEYRA_TRADING_ENABLED" => Ok(enabled.to_string()),
+        _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+    })
+    .expect("test configuration must parse")
+}
+
 fn heartbeat() -> Value {
     json!({
         "t": "hb",
@@ -100,6 +111,21 @@ async fn check(state: &AppState, payload: Value) -> (StatusCode, Value) {
     let app = test::init_service(create_app(state.clone())).await;
     let request = test::TestRequest::post()
         .uri("/intents/check")
+        .set_json(&payload)
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    let status = response.status();
+    let bytes = test::read_body(response).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn execute(state: &AppState, payload: Value) -> (StatusCode, Value) {
+    let app = test::init_service(create_app(state.clone())).await;
+    let request = test::TestRequest::post()
+        .uri("/intents/execute")
         .set_json(&payload)
         .to_request();
     let response = test::call_service(&app, request).await;
@@ -290,4 +316,78 @@ async fn control_routes_require_a_command_channel() {
 
     let (status, _) = command_status(&state, "00000000-0000-4000-8000-000000000000").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[actix_web::test]
+async fn execution_is_refused_until_trading_is_enabled() {
+    let (runtime, link) = broker();
+    prime(&link).await;
+
+    let state = AppState::new(test_config(), Some(runtime), None, gate());
+    let (status, body) = execute(
+        &state,
+        json!({"symbol": "EURUSD", "side": "buy", "order_type": "market", "volume": 0.01}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "trading_disabled");
+
+    // Nothing was queued for the terminal.
+    let (_, reply) = poll(link.clone(), heartbeat()).await;
+    assert_eq!(reply["t"], "none");
+}
+
+#[actix_web::test]
+async fn enabled_execution_queues_an_order_and_reports_the_dry_run() {
+    let (runtime, link) = broker();
+    prime(&link).await;
+    let state = AppState::new(config_with_trading(true), Some(runtime), None, gate());
+
+    let (status, body) = execute(
+        &state,
+        json!({"symbol": "EURUSD", "side": "buy", "order_type": "market", "volume": 0.01}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["decision"], "approved");
+    assert_eq!(body["command"], "open_order");
+    let command_id = body["command_id"]
+        .as_str()
+        .expect("execution carries a command id")
+        .to_owned();
+
+    let (status, delivered) = poll(link.clone(), heartbeat()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(delivered["kind"], "open_order");
+    assert_eq!(delivered["order"]["symbol"], "EURUSD");
+    assert_eq!(delivered["order"]["magic"], 77_041);
+
+    // The terminal validates and reports a dry run while its own live-orders
+    // input is disabled; nothing reaches the broker.
+    let (status, _) = poll(
+        link.clone(),
+        json!({
+            "t": "ack",
+            "v": 1,
+            "token": TOKEN,
+            "id": command_id,
+            "ok": true,
+            "data": {
+                "executed": false,
+                "retcode": 0,
+                "comment": "dry run (live orders disabled in EA)",
+                "ticket": 0,
+                "price": 0.0
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = command_status(&state, &command_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["kind"], "open_order");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["result"]["executed"], false);
+    assert_eq!(body["result"]["retcode"], 0);
 }
