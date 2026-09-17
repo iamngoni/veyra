@@ -10,6 +10,7 @@ use veyra_service::broker::{
     AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName, Symbol,
 };
 use veyra_service::config::{ConfigError, ServiceConfig};
+use veyra_service::jev::{JevRuntime, JevSettings};
 use veyra_service::risk::{RiskGate, RiskPolicy};
 
 fn test_config() -> ServiceConfig {
@@ -20,6 +21,16 @@ fn test_config() -> ServiceConfig {
         _ => Err(ConfigError::MissingEnvironmentVariable { name }),
     })
     .expect("test configuration must parse")
+}
+
+fn test_jev() -> JevRuntime {
+    let settings = JevSettings::from_source(|name| match name {
+        "VEYRA_JEV_API_KEY" => Ok("apikey_test_1234567890".to_owned()),
+        _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+    })
+    .expect("jev settings must parse")
+    .expect("jev must be configured");
+    JevRuntime::from_settings(settings).expect("jev runtime must build")
 }
 
 fn test_gate() -> RiskGate {
@@ -143,4 +154,21 @@ async fn status_reports_model_provider() {
     let body: serde_json::Value = test::read_body_json(response).await;
     assert_eq!(body["model_provider"], "openrouter");
     assert_eq!(body["broker_provider"], serde_json::Value::Null);
+}
+
+#[actix_web::test]
+async fn status_reports_the_configured_jev_provider() {
+    let configured =
+        test::init_service(create_app(test_state(None).with_jev(Some(test_jev())))).await;
+    let request = test::TestRequest::get().uri("/status").to_request();
+    let response = test::call_service(&configured, request).await;
+    assert!(response.status().is_success());
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["jev_provider"], "typesafe");
+
+    let unconfigured = test::init_service(create_app(test_state(None))).await;
+    let request = test::TestRequest::get().uri("/status").to_request();
+    let response = test::call_service(&unconfigured, request).await;
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert!(body["jev_provider"].is_null());
 }

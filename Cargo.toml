@@ -13,6 +13,7 @@ repository = "https://github.com/iamngoni/veyra"
 actix-web = "4"
 agent-runtime = { git = "https://github.com/iamngoni/agent-runtime", rev = "1207aa7a1c65f9f88cf8420a1f19cdd2b57a47ab" }
 async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }

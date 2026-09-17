@@ -28,10 +28,16 @@
 
 ## Phase 3 — Jev decision adapter
 
-- Validate early access and pricing.
-- Define typed decision inputs, outputs, and invalid/unknown handling.
-- Adversarial tests for hallucinated instruments and unsupported actions.
-- Benchmark latency and cost under realistic batch questions.
+- [x] API access validated live (key configured, `jev-1.13.0`, ~1.3 s and
+      408 in / 73 out tokens for a three-question request).
+- [x] Typed decision inputs and outputs (`jev::contract`): choice, noul, and
+      score questions over validated state and instructions, with answers
+      validated against the request that produced them.
+- [x] Adversarial parsing tests: mismatched answer ids and types, unoffered or
+      non-maximal choices, malformed probabilities, out-of-range confidence,
+      and legends that disagree with the requested levels.
+- [ ] Confirm current pricing and per-request budget from the console.
+- [ ] Benchmark latency and cost under realistic batch questions.
 
 ## Phase 4 — broker integration
 

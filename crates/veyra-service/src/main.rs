@@ -3,6 +3,7 @@
 //! provider-required loopback listener. This binary has no execution path.
 
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
+use veyra_service::jev::{JevRuntime, JevSettings};
 use veyra_service::model::{ModelRuntime, settings::ModelSettings};
 use veyra_service::risk::{RiskGate, RiskPolicy};
 use veyra_service::{AppState, config::ServiceConfig, observability, server};
@@ -21,6 +22,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    let jev = match JevSettings::from_env()? {
+        Some(settings) => Some(JevRuntime::from_settings(settings)?),
+        None => None,
+    };
+
     let companion = match &broker {
         Some(runtime) => runtime.listener()?,
         None => None,
@@ -31,7 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let risk = RiskGate::new(RiskPolicy::from_env()?);
 
     let listener = server::bind(&config)?;
-    let app = server::build_server(AppState::new(config, broker, model, risk), listener)?;
+    let app = server::build_server(
+        AppState::new(config, broker, model, risk).with_jev(jev),
+        listener,
+    )?;
     server::serve(app, companion).await?;
     Ok(())
 }

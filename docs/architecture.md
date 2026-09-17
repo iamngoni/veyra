@@ -51,9 +51,30 @@ Known gaps for later increments:
 - Rate limiting is delegated to the provider; per-provider budgets belong with
   the risk/ops layer.
 
-### Jev
+### Jev (TypeSafe System One), proven live
 
-Jev is a structured decision interface, not an ordinary text provider. It will be isolated behind its own adapter and response type. Veyra will model its choice, score, and truth/confidence values as fallible, validated domain data. No Jev access exists yet, so none of this slice calls it.
+Jev is a structured judgement interface, not an ordinary text provider, so it
+is a separate boundary rather than a `DecisionEngine` implementation
+(ADR 0004). `jev/mod.rs` owns the `SemanticJudge` contract and the provider
+selector (`VEYRA_JEV_PROVIDER`, default `typesafe`); `jev/contract.rs` owns
+meaning: typed `Choice` (2-32 rubric options), `Noul` (yes/no), and `Score`
+(2-16 ordered levels) questions over validated state and instructions.
+
+Responses are validated against the request that produced them — answer ids
+and types must match, a chosen option must have been offered *and* carry the
+maximum probability, a score legend must equal the requested levels, and
+distributions must sum to one — so a contradictory or hallucinated answer
+fails closed instead of reaching trading code. Transport is one shared
+`reqwest` client with a 5 s connect timeout and a 20 s total timeout; `401/403`
+maps to unauthorized, `422` to a rejected request with the service detail,
+`429/529` to a backoff signal, and anything else to a transport error. The API
+key never appears in `Debug` output.
+
+Live proof on 2026-09-17: `jev-1.13.0` answered a three-question request in
+~1.3 s (408 input / 73 output tokens) with a choice at 0.92 confidence, a noul
+at 0.76, and a score of 1.95 on a 0-2 legend. Judgements are inputs code may
+consult; they grant no execution authority — only the risk gate approves an
+intent.
 
 ### Broker integrations (swappable)
 

@@ -9,6 +9,7 @@ pub mod app;
 pub mod broker;
 pub mod config;
 pub mod control;
+pub mod jev;
 pub mod model;
 pub mod observability;
 pub mod risk;
@@ -18,6 +19,7 @@ pub mod trading;
 
 use broker::BrokerRuntime;
 use config::ServiceConfig;
+use jev::JevRuntime;
 use model::ModelRuntime;
 use risk::RiskGate;
 
@@ -27,6 +29,7 @@ pub struct AppState {
     config: ServiceConfig,
     broker: Option<BrokerRuntime>,
     model: Option<ModelRuntime>,
+    jev: Option<JevRuntime>,
     risk: RiskGate,
 }
 
@@ -42,8 +45,15 @@ impl AppState {
             config,
             broker,
             model,
+            jev: None,
             risk,
         }
+    }
+
+    /// Attaches the configured judgement integration, if any.
+    pub fn with_jev(mut self, jev: Option<JevRuntime>) -> Self {
+        self.jev = jev;
+        self
     }
 
     /// Returns read-only settings without rereading the process environment.
@@ -59,6 +69,11 @@ impl AppState {
     /// Returns the active model integration, if one is configured.
     pub fn model(&self) -> Option<&ModelRuntime> {
         self.model.as_ref()
+    }
+
+    /// Returns the active judgement integration, if one is configured.
+    pub fn jev(&self) -> Option<&JevRuntime> {
+        self.jev.as_ref()
     }
 
     /// Returns the deterministic risk gate every intent must pass.

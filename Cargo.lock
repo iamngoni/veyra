@@ -1954,6 +1954,7 @@ dependencies = [
  "agent-runtime",
  "anyhow",
  "async-trait",
+ "reqwest",
  "serde",
  "serde_json",
  "subtle",
