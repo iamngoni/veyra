@@ -12,8 +12,9 @@ pub mod settings;
 
 pub use ea::{
     AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandRecord, CommandState,
-    EaErrorBody, EaLink, EaOrderRequest, EaPoll, EaReply, ORDER_MAGIC, OrderCheckPayload,
-    OrderExecutionPayload, PositionKind, PositionPayload, build_server, create_ea_app,
+    EaCloseRequest, EaErrorBody, EaLink, EaOrderRequest, EaPoll, EaReply, ORDER_MAGIC,
+    OrderCheckPayload, OrderExecutionPayload, PositionKind, PositionPayload, build_server,
+    create_ea_app,
 };
 pub use settings::{BrokerSettings, EaToken};
 

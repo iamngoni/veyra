@@ -167,8 +167,15 @@ and margin engine and, unless it was deliberately recompiled with
 `InAllowLiveOrders = true`, acknowledges a dry run (`executed:false`,
 `retcode:0`) without sending anything. Real money therefore needs a gate
 approval plus two independent, deliberate switches. Order ids, acks, and
-timeouts reuse the same at-least-once discipline as read-only commands; `close`
-and `modify` will follow the same pattern.
+timeouts reuse the same at-least-once discipline as read-only commands.
+
+`POST /intents/close` closes one Veyra-owned position by ticket. Ownership is
+enforced twice: the service only accepts tickets present in the latest
+completed `account_snapshot` whose magic number is the Veyra magic, and the
+terminal re-checks the magic on the selected order before touching it. Pending
+orders are refused (they need cancellation, not a close), and everything else
+goes through the same switch, dry-run, and ack validation as `open_order`.
+`modify` will follow the same pattern.
 
 ## Hosting (24/7)
 

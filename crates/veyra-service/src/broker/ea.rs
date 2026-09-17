@@ -94,6 +94,8 @@ pub enum CommandKind {
     /// Ask the terminal to execute an order (subject to the terminal's own
     /// live-orders control).
     OpenOrder,
+    /// Ask the terminal to close one Veyra-owned market position.
+    CloseOrder,
 }
 
 impl CommandKind {
@@ -104,6 +106,7 @@ impl CommandKind {
             Self::AccountSnapshot => "account_snapshot",
             Self::OrderCheck => "order_check",
             Self::OpenOrder => "open_order",
+            Self::CloseOrder => "close_order",
         }
     }
 }
@@ -123,6 +126,8 @@ pub struct PositionPayload {
     pub ticket: i64,
     /// Instrument.
     pub symbol: String,
+    /// Magic number stamped on the order; [`ORDER_MAGIC`] marks Veyra orders.
+    pub magic: u32,
     /// Order kind.
     pub kind: PositionKind,
     /// Volume in lots.
@@ -287,6 +292,31 @@ impl OrderExecutionPayload {
     }
 }
 
+/// Close request sent to the EA: one Veyra-owned ticket plus the magic number
+/// the terminal must confirm before touching it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EaCloseRequest {
+    ticket: i64,
+    magic: u32,
+}
+
+impl EaCloseRequest {
+    /// Builds a close request for a validated, Veyra-owned ticket.
+    pub fn new(ticket: i64, magic: u32) -> Self {
+        Self { ticket, magic }
+    }
+
+    /// Ticket to close.
+    pub fn ticket(&self) -> i64 {
+        self.ticket
+    }
+
+    /// Magic number the terminal must find on the selected order.
+    pub fn magic(&self) -> u32 {
+        self.magic
+    }
+}
+
 /// Order request sent to the EA for validation or execution, derived only from
 /// an approved intent. Fields mirror the intent wire contract so the EA can
 /// read them without a nested parser.
@@ -336,6 +366,8 @@ pub enum CommandPayload {
     OrderCheck(OrderCheckPayload),
     /// Result of `open_order`; reports whether anything reached the broker.
     OpenOrder(OrderExecutionPayload),
+    /// Result of `close_order`; reports whether anything reached the broker.
+    CloseOrder(OrderExecutionPayload),
 }
 
 /// Lifecycle state of one command.
@@ -491,9 +523,12 @@ pub enum EaReply {
         id: CommandId,
         /// Command to execute.
         kind: CommandKind,
-        /// Present only for commands that carry a request payload.
+        /// Present for order validation and execution commands.
         #[serde(skip_serializing_if = "Option::is_none")]
         order: Option<EaOrderRequest>,
+        /// Present for close commands.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        close: Option<EaCloseRequest>,
     },
 }
 
@@ -522,7 +557,16 @@ struct EaCommand {
     kind: CommandKind,
     state: CommandState,
     issued_at: Instant,
-    request: Option<EaOrderRequest>,
+    request: Option<CommandRequest>,
+}
+
+/// Payload a queued command carries, when it needs one.
+#[derive(Debug, Clone, PartialEq)]
+enum CommandRequest {
+    /// Validation or execution request for a new order.
+    Order(EaOrderRequest),
+    /// Close request for a validated Veyra position.
+    Close(EaCloseRequest),
 }
 
 /// Shared state of the EA control channel.
@@ -564,7 +608,10 @@ impl EaLink {
     /// Takes an [`EaOrderRequest`], which can only be derived from an approved
     /// intent, so no raw draft can reach the terminal through this path.
     pub fn enqueue_order_check(&self, request: EaOrderRequest) -> CommandId {
-        self.enqueue_with(CommandKind::OrderCheck, Some(request))
+        self.enqueue_with(
+            CommandKind::OrderCheck,
+            Some(CommandRequest::Order(request)),
+        )
     }
 
     /// Queues a live order execution.
@@ -574,10 +621,18 @@ impl EaLink {
     /// live-orders input is enabled, so real money needs two independent
     /// controls plus a gate approval.
     pub fn enqueue_order(&self, request: EaOrderRequest) -> CommandId {
-        self.enqueue_with(CommandKind::OpenOrder, Some(request))
+        self.enqueue_with(CommandKind::OpenOrder, Some(CommandRequest::Order(request)))
     }
 
-    fn enqueue_with(&self, kind: CommandKind, request: Option<EaOrderRequest>) -> CommandId {
+    /// Queues a close for one validated Veyra-owned ticket.
+    pub fn enqueue_close(&self, request: EaCloseRequest) -> CommandId {
+        self.enqueue_with(
+            CommandKind::CloseOrder,
+            Some(CommandRequest::Close(request)),
+        )
+    }
+
+    fn enqueue_with(&self, kind: CommandKind, request: Option<CommandRequest>) -> CommandId {
         let id = CommandId::new();
         self.with_commands(|queue| {
             queue.push_back(EaCommand {
@@ -611,7 +666,7 @@ impl EaLink {
 
     /// Marks timed-out commands as failed and returns the oldest pending
     /// command for delivery, including its request payload when one exists.
-    fn deliverable(&self) -> Option<(CommandId, CommandKind, Option<EaOrderRequest>)> {
+    fn deliverable(&self) -> Option<(CommandId, CommandKind, Option<CommandRequest>)> {
         let timeout = self.command_timeout;
         self.with_commands(|queue| {
             let now = Instant::now();
@@ -656,7 +711,8 @@ impl EaLink {
                         CommandPayload::AccountSnapshot(snapshot) => Some(snapshot.clone()),
                         CommandPayload::Ping
                         | CommandPayload::OrderCheck(_)
-                        | CommandPayload::OpenOrder(_) => None,
+                        | CommandPayload::OpenOrder(_)
+                        | CommandPayload::CloseOrder(_) => None,
                     };
                     command.state = CommandState::Completed { payload };
                     retained
@@ -820,7 +876,19 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
             Ok(snapshot) => {
                 link.record(snapshot);
                 let reply = match link.deliverable() {
-                    Some((id, kind, order)) => EaReply::Command { id, kind, order },
+                    Some((id, kind, request)) => {
+                        let (order, close) = match request {
+                            Some(CommandRequest::Order(order)) => (Some(order), None),
+                            Some(CommandRequest::Close(close)) => (None, Some(close)),
+                            None => (None, None),
+                        };
+                        EaReply::Command {
+                            id,
+                            kind,
+                            order,
+                            close,
+                        }
+                    }
                     // Ask for a pong on hello and until one has been seen for
                     // this process lifetime: it proves the return path before
                     // the channel is trusted with anything else.
@@ -863,6 +931,13 @@ fn payload_for(kind: CommandKind, data: Option<Value>) -> Result<CommandPayload,
                 .map_err(|error| format!("invalid open_order payload: {error}"))?;
             payload.validate()?;
             Ok(CommandPayload::OpenOrder(payload))
+        }
+        CommandKind::CloseOrder => {
+            let value = data.ok_or_else(|| "close_order ack is missing data".to_owned())?;
+            let payload: OrderExecutionPayload = serde_json::from_value(value)
+                .map_err(|error| format!("invalid close_order payload: {error}"))?;
+            payload.validate()?;
+            Ok(CommandPayload::CloseOrder(payload))
         }
     }
 }
@@ -913,8 +988,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        EaAck, EaLink, EaOrderRequest, EaToken, ORDER_MAGIC, OrderCheckPayload, hex_preview,
-        payload_for,
+        CommandRequest, EaAck, EaCloseRequest, EaLink, EaOrderRequest, EaToken, ORDER_MAGIC,
+        OrderCheckPayload, hex_preview, payload_for,
     };
     use crate::broker::ea::{
         AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandState, PositionKind,
@@ -975,6 +1050,7 @@ mod tests {
                     "symbol": "EURUSD",
                     "kind": "buy",
                     "lots": 0.01,
+                    "magic": 77041,
                     "price": 1.095,
                     "profit": -0.25
                 }],
@@ -1020,6 +1096,7 @@ mod tests {
                     "symbol": "EURUSD",
                     "kind": "sell",
                     "lots": 0.01,
+                    "magic": 77041,
                     "price": 1.1,
                     "profit": 0.0
                 })
@@ -1145,7 +1222,10 @@ mod tests {
         let (delivered_id, kind, order) = link.deliverable().expect("pending command");
         assert_eq!(delivered_id, id);
         assert_eq!(kind, CommandKind::OrderCheck);
-        assert_eq!(order, Some(EaOrderRequest::from_intent(&intent)));
+        assert_eq!(
+            order,
+            Some(CommandRequest::Order(EaOrderRequest::from_intent(&intent)))
+        );
 
         let record = link.command(id).expect("record");
         assert_eq!(record.state, CommandState::Pending);
@@ -1217,7 +1297,73 @@ mod tests {
         let (delivered_id, kind, order) = link.deliverable().expect("pending command");
         assert_eq!(delivered_id, id);
         assert_eq!(kind, CommandKind::OpenOrder);
-        assert_eq!(order, Some(request));
+        assert_eq!(order, Some(CommandRequest::Order(request)));
+    }
+
+    #[test]
+    fn close_orders_carry_the_ticket_and_magic() {
+        let request = EaCloseRequest::new(123, ORDER_MAGIC);
+        let wire = serde_json::to_value(&request).expect("serializable");
+        assert_eq!(wire["ticket"], 123);
+        assert_eq!(wire["magic"], ORDER_MAGIC);
+        assert_eq!(request.ticket(), 123);
+        assert_eq!(request.magic(), ORDER_MAGIC);
+
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        let id = link.enqueue_close(request.clone());
+        let (delivered_id, kind, payload) = link.deliverable().expect("pending command");
+        assert_eq!(delivered_id, id);
+        assert_eq!(kind, CommandKind::CloseOrder);
+        assert_eq!(payload, Some(CommandRequest::Close(request)));
+    }
+
+    #[test]
+    fn close_payloads_require_a_consistent_verdict() {
+        let dry_run = payload_for(
+            CommandKind::CloseOrder,
+            Some(serde_json::json!({
+                "executed": false,
+                "retcode": 0,
+                "comment": "dry run (live orders disabled in EA)",
+                "ticket": 0,
+                "price": 0.0
+            })),
+        )
+        .expect("dry-run close payload must validate");
+        assert!(matches!(dry_run, CommandPayload::CloseOrder(_)));
+
+        let closed = payload_for(
+            CommandKind::CloseOrder,
+            Some(serde_json::json!({
+                "executed": true,
+                "retcode": 0,
+                "comment": "closed",
+                "ticket": 123,
+                "price": 1.095
+            })),
+        )
+        .expect("closed payload must validate");
+        assert!(matches!(closed, CommandPayload::CloseOrder(_)));
+
+        assert!(payload_for(CommandKind::CloseOrder, None).is_err());
+        assert!(
+            payload_for(
+                CommandKind::CloseOrder,
+                Some(serde_json::json!({
+                    "executed": true,
+                    "retcode": 0,
+                    "comment": "closed",
+                    "ticket": 0,
+                    "price": 1.095
+                })),
+            )
+            .is_err(),
+            "an executed close must report its ticket"
+        );
     }
 
     #[test]
@@ -1251,6 +1397,7 @@ mod tests {
                     "symbol": "EURUSD",
                     "kind": "buy",
                     "lots": 0.03,
+                    "magic": 77041,
                     "price": 1.095,
                     "profit": -0.25
                 }],

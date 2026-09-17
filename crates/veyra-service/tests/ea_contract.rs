@@ -228,6 +228,7 @@ async fn snapshot_ack_validates_its_typed_payload() {
                 "symbol": "EURUSD",
                 "kind": "buy",
                 "lots": 0.01,
+                "magic": 77041,
                 "price": 1.095,
                 "profit": -0.25
             }],

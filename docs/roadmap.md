@@ -62,7 +62,12 @@
 - [ ] Live order placement: requires `VEYRA_TRADING_ENABLED=true` **and** an EA
       recompiled with `InAllowLiveOrders = true` — awaiting explicit owner
       approval.
-- [ ] Close and modify commands (reuse the same path and controls).
+- [x] `close_order` for Veyra-owned positions: only tickets from the latest
+      completed `account_snapshot` that carry the Veyra magic number are
+      accepted, and the terminal re-validates before a dry run or close —
+      guards proven live (403 disabled, 409 no state, 404 unknown ticket,
+      409 foreign position).
+- [ ] Modify (stop loss / take profit) commands reusing the same path.
 - [ ] Independent reconciliation against broker state.
 - [ ] Staged testing: read-only first, then demo, then minimal live exposure
       only after explicit owner approval.

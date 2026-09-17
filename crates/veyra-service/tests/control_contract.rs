@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 
 use veyra_service::AppState;
 use veyra_service::app::create_app;
-use veyra_service::broker::{BrokerRuntime, BrokerSettings, EaLink, create_ea_app};
+use veyra_service::broker::{
+    BrokerRuntime, BrokerSettings, CommandKind, EaLink, ORDER_MAGIC, create_ea_app,
+};
 use veyra_service::config::{ConfigError, ServiceConfig};
 use veyra_service::risk::{RiskGate, RiskPolicy};
 
@@ -135,6 +137,61 @@ async fn execute(state: &AppState, payload: Value) -> (StatusCode, Value) {
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+async fn close(state: &AppState, ticket: i64) -> (StatusCode, Value) {
+    let app = test::init_service(create_app(state.clone())).await;
+    let request = test::TestRequest::post()
+        .uri("/intents/close")
+        .set_json(json!({ "ticket": ticket }))
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    let status = response.status();
+    let bytes = test::read_body(response).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Retains one completed `account_snapshot` carrying a single position with the
+/// given magic number, so close validation has state to work with.
+async fn retain_position(link: &Arc<EaLink>, magic: u32) {
+    let id = link.enqueue(CommandKind::AccountSnapshot);
+    let (status, delivered) = poll(link.clone(), heartbeat()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(delivered["kind"], "account_snapshot");
+
+    let (status, _) = poll(
+        link.clone(),
+        json!({
+            "t": "ack",
+            "v": 1,
+            "token": TOKEN,
+            "id": id.to_string(),
+            "ok": true,
+            "data": {
+                "balance": 20.57,
+                "equity": 20.57,
+                "freeMargin": 20.57,
+                "orders": 1,
+                "lots": 0.01,
+                "positions": [{
+                    "ticket": 123,
+                    "symbol": "EURUSD",
+                    "kind": "buy",
+                    "lots": 0.01,
+                    "magic": magic,
+                    "price": 1.095,
+                    "profit": -0.25
+                }],
+                "positionsTruncated": false,
+                "serverTime": 1_758_000_000
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 async fn command_status(state: &AppState, id: &str) -> (StatusCode, Value) {
@@ -267,6 +324,7 @@ async fn account_snapshot_requests_report_exposure() {
                     "symbol": "EURUSD",
                     "kind": "buy",
                     "lots": 0.01,
+                    "magic": 77041,
                     "price": 1.095,
                     "profit": -0.25
                 }],
@@ -390,4 +448,92 @@ async fn enabled_execution_queues_an_order_and_reports_the_dry_run() {
     assert_eq!(body["status"], "completed");
     assert_eq!(body["result"]["executed"], false);
     assert_eq!(body["result"]["retcode"], 0);
+}
+
+#[actix_web::test]
+async fn closing_requires_enablement_state_and_ownership() {
+    let (runtime, link) = broker();
+    prime(&link).await;
+
+    // Disabled: refused before any state is consulted.
+    let state = AppState::new(test_config(), Some(runtime.clone()), None, gate());
+    let (status, body) = close(&state, 123).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "trading_disabled");
+
+    // Enabled, but no retained snapshot: fail closed.
+    let enabled = AppState::new(
+        config_with_trading(true),
+        Some(runtime.clone()),
+        None,
+        gate(),
+    );
+    let (status, body) = close(&enabled, 123).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "position_state_unavailable");
+    let (status, body) = close(&enabled, 0).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_ticket");
+
+    // A Veyra-owned position can be closed; foreign tickets cannot.
+    retain_position(&link, ORDER_MAGIC).await;
+    let (status, body) = close(&enabled, 999).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "unknown_position");
+
+    let (status, body) = close(&enabled, 123).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["command"], "close_order");
+    let command_id = body["command_id"]
+        .as_str()
+        .expect("close carries a command id")
+        .to_owned();
+
+    let (status, delivered) = poll(link.clone(), heartbeat()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(delivered["kind"], "close_order");
+    assert_eq!(delivered["close"]["ticket"], 123);
+    assert_eq!(delivered["close"]["magic"], ORDER_MAGIC);
+
+    // The terminal reports a dry run while its live-orders input is disabled.
+    let (status, _) = poll(
+        link.clone(),
+        json!({
+            "t": "ack",
+            "v": 1,
+            "token": TOKEN,
+            "id": command_id,
+            "ok": true,
+            "data": {
+                "executed": false,
+                "retcode": 0,
+                "comment": "dry run (live orders disabled in EA)",
+                "ticket": 0,
+                "price": 0.0
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = command_status(&enabled, &command_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["kind"], "close_order");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["result"]["executed"], false);
+}
+
+#[actix_web::test]
+async fn closing_refuses_positions_veyra_does_not_own() {
+    let (runtime, link) = broker();
+    prime(&link).await;
+    retain_position(&link, 0).await;
+
+    let state = AppState::new(config_with_trading(true), Some(runtime), None, gate());
+    let (status, body) = close(&state, 123).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "not_a_veyra_position");
+
+    // Nothing was queued for the terminal.
+    let (_, reply) = poll(link.clone(), heartbeat()).await;
+    assert_eq!(reply["t"], "none");
 }

@@ -39,6 +39,8 @@ Accepted 2026-09-17; plumbing implemented and proven live as a dry run
   close to a demo account as the current setup allows.
 - Going live is a single reviewed step: `InAllowLiveOrders = true`, with the
   service switch already understood.
-- `close` and `modify` reuse the same pattern; position-tracing reconciliation
-  (magic number to intent) lands with the reconciler before unattended live
-  trading.
+- `close_order` shipped on the same pattern: the service accepts only tickets
+  from the latest completed `account_snapshot` carrying the Veyra magic, and
+  the terminal re-checks the magic before closing. `modify` still follows.
+  Position-tracing reconciliation (magic number to intent) lands with the
+  reconciler before unattended live trading.

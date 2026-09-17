@@ -6,8 +6,8 @@
 // Requires the endpoint to be listed in
 // Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.16"
-#property description "Veyra control channel: heartbeat, account/position snapshots, broker-side order validation, and gated live order execution."
+#property version   "1.17"
+#property description "Veyra control channel: heartbeat, account/position snapshots, broker-side order validation, gated live order execution, and Veyra-owned position closes."
 
 input string InUrl         = "__VEYRA_URL__";   // Veyra endpoint (loopback or tunnel)
 input string InToken       = "__VEYRA_TOKEN__"; // shared token
@@ -115,6 +115,17 @@ void SendAckError(string id, string reason)
    string ack_response;
    int ack_status = PostJson(ack, ack_response);
    Print("VeyraProbe ack error=", reason, " status=", ack_status);
+  }
+
+// Builds the typed execution result the service validates for open_order and
+// close_order acknowledgements.
+string ExecutionResultJson(bool executed, int code, string comment, int ticket, double price, int digits)
+  {
+   return("{\"executed\":" + (executed ? "true" : "false")
+          + ",\"retcode\":" + (string)code
+          + ",\"comment\":\"" + EscapeJson(comment) + "\""
+          + ",\"ticket\":" + (string)ticket
+          + ",\"price\":" + DoubleToString(price, digits) + "}");
   }
 
 // Validates one order request against the terminal's market rules and margin
@@ -295,11 +306,8 @@ void HandleOpenOrder(string response, string id)
    if(code != 0 || !InAllowLiveOrders)
      {
       if(code == 0) comment = "dry run (live orders disabled in EA)";
-      string dry = "{\"executed\":false,\"retcode\":" + (string)code
-                   + ",\"comment\":\"" + EscapeJson(comment) + "\""
-                   + ",\"ticket\":0,\"price\":0.0}";
       Print("VeyraProbe open_order dry run code=", (string)code, " comment=", comment);
-      SendAck(id, dry);
+      SendAck(id, ExecutionResultJson(false, code, comment, 0, 0.0, 2));
       return;
      }
 
@@ -330,10 +338,8 @@ void HandleOpenOrder(string response, string id)
    int sendError = GetLastError();
    if(ticket <= 0)
      {
-      string failed = "{\"executed\":false,\"retcode\":" + (string)sendError
-                      + ",\"comment\":\"order send failed\",\"ticket\":0,\"price\":0.0}";
       Print("VeyraProbe open_order failed error=", (string)sendError);
-      SendAck(id, failed);
+      SendAck(id, ExecutionResultJson(false, sendError, "order send failed", 0, 0.0, 2));
       return;
      }
 
@@ -341,13 +347,9 @@ void HandleOpenOrder(string response, string id)
    if(OrderSelect(ticket, SELECT_BY_TICKET)) fillPrice = OrderOpenPrice();
    int digits = (int)MarketInfo(symbol, MODE_DIGITS);
    if(digits <= 0) digits = 5;
-   string done = "{\"executed\":true,\"retcode\":0"
-                 + ",\"comment\":\"order sent\""
-                 + ",\"ticket\":" + (string)ticket
-                 + ",\"price\":" + DoubleToString(fillPrice, digits) + "}";
    Print("VeyraProbe open_order sent ticket=", (string)ticket, " price=",
          DoubleToString(fillPrice, digits));
-   SendAck(id, done);
+   SendAck(id, ExecutionResultJson(true, 0, "order sent", ticket, fillPrice, digits));
   }
 
 // Total open volume in lots across every open order.
@@ -396,12 +398,75 @@ string PositionsJson(int maxEntries)
       out = out + "{\"ticket\":" + (string)OrderTicket()
             + ",\"symbol\":\"" + EscapeJson(OrderSymbol()) + "\""
             + ",\"kind\":\"" + OrderKindName(OrderType()) + "\""
+            + ",\"magic\":" + (string)(int)OrderMagicNumber()
             + ",\"lots\":" + DoubleToString(OrderLots(), 2)
             + ",\"price\":" + DoubleToString(OrderOpenPrice(), digits)
             + ",\"profit\":" + DoubleToString(OrderProfit(), 2) + "}";
       included++;
      }
    return(out + "]");
+  }
+
+// Closes one Veyra-owned market position when the terminal is armed; otherwise
+// validates the ticket and reports a dry run. Pending orders are not touched.
+void HandleCloseOrder(string response, string id)
+  {
+   int ticket = (int)JsonNumber(response, "ticket");
+   int magic  = (int)JsonNumber(response, "magic");
+
+   if(ticket <= 0)
+     {
+      SendAckError(id, "malformed close request");
+      return;
+     }
+
+   if(!OrderSelect(ticket, SELECT_BY_TICKET))
+     {
+      SendAck(id, ExecutionResultJson(false, 4108, "unknown ticket", 0, 0.0, 2));
+      return;
+     }
+   if((int)OrderMagicNumber() != magic)
+     {
+      SendAck(id, ExecutionResultJson(false, 4108, "ticket is not a Veyra position", 0, 0.0, 2));
+      return;
+     }
+   int type = OrderType();
+   if(type != OP_BUY && type != OP_SELL)
+     {
+      SendAck(id, ExecutionResultJson(false, 4108, "not an open market position", 0, 0.0, 2));
+      return;
+     }
+   string symbol = OrderSymbol();
+   double lots = OrderLots();
+   double price = MarketInfo(symbol, MODE_BID);
+   if(type == OP_SELL) price = MarketInfo(symbol, MODE_ASK);
+   if(lots <= 0.0 || price <= 0.0)
+     {
+      SendAck(id, ExecutionResultJson(false, 4108, "position has no closable volume or quotes", 0, 0.0, 2));
+      return;
+     }
+
+   if(!InAllowLiveOrders)
+     {
+      Print("VeyraProbe close_order dry run ticket=", (string)ticket);
+      SendAck(id, ExecutionResultJson(false, 0, "dry run (live orders disabled in EA)", 0, 0.0, 2));
+      return;
+     }
+
+   ResetLastError();
+   bool closed = OrderClose(ticket, lots, price, 10, CLR_NONE);
+   int closeError = GetLastError();
+   if(!closed)
+     {
+      Print("VeyraProbe close_order failed ticket=", (string)ticket, " error=", (string)closeError);
+      SendAck(id, ExecutionResultJson(false, closeError, "close failed", 0, 0.0, 2));
+      return;
+     }
+
+   int digits = (int)MarketInfo(symbol, MODE_DIGITS);
+   if(digits <= 0) digits = 5;
+   Print("VeyraProbe close_order closed ticket=", (string)ticket, " price=", DoubleToString(price, digits));
+   SendAck(id, ExecutionResultJson(true, 0, "closed", ticket, price, digits));
   }
 
 // Executes one command delivered by the service and acknowledges it by id.
@@ -420,6 +485,12 @@ void HandleCommand(string response)
    if(kind == "open_order")
      {
       HandleOpenOrder(response, id);
+      return;
+     }
+
+   if(kind == "close_order")
+     {
+      HandleCloseOrder(response, id);
       return;
      }
 

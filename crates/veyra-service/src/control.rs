@@ -15,11 +15,13 @@ use std::time::SystemTime;
 
 use actix_web::web::{self, Data};
 use actix_web::{HttpResponse, get, post};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::AppState;
 use crate::broker::ea::{
-    CommandId, CommandKind, CommandPayload, CommandState, EaLink, EaOrderRequest,
+    CommandId, CommandKind, CommandPayload, CommandState, EaCloseRequest, EaLink, EaOrderRequest,
+    ORDER_MAGIC,
 };
 use crate::risk::RiskDecision;
 use crate::trading::TradeIntentDraft;
@@ -116,6 +118,54 @@ pub async fn execute_intent(
     }
 }
 
+/// Body of `POST /intents/close`.
+#[derive(Debug, Deserialize)]
+pub struct CloseRequest {
+    /// Ticket of the Veyra-owned position to close.
+    pub ticket: i64,
+}
+
+#[post("/intents/close")]
+/// Closes one Veyra-owned position by ticket.
+///
+/// Refuses with `403 trading_disabled` unless `VEYRA_TRADING_ENABLED=true`,
+/// and only accepts tickets that appear in the latest completed
+/// `account_snapshot` with the Veyra magic number — a manually placed position
+/// can never be closed through this route. The terminal re-validates the
+/// ticket and reports a dry run while its live-orders input is disabled.
+pub async fn close_position(state: Data<AppState>, body: web::Json<CloseRequest>) -> HttpResponse {
+    let Some(link) = command_link(&state) else {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "command_channel_unavailable" }));
+    };
+    if !state.config().trading_enabled() {
+        return HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }));
+    }
+    if body.ticket <= 0 {
+        return HttpResponse::BadRequest().json(json!({ "error": "invalid_ticket" }));
+    }
+    let Some(snapshot) = link.last_account() else {
+        return HttpResponse::Conflict().json(json!({ "error": "position_state_unavailable" }));
+    };
+    let Some(position) = snapshot
+        .positions
+        .iter()
+        .find(|position| position.ticket == body.ticket)
+    else {
+        return HttpResponse::NotFound().json(json!({ "error": "unknown_position" }));
+    };
+    if position.magic != ORDER_MAGIC {
+        return HttpResponse::Conflict().json(json!({ "error": "not_a_veyra_position" }));
+    }
+    let command = link.enqueue_close(EaCloseRequest::new(position.ticket, position.magic));
+    HttpResponse::Ok().json(json!({
+        "command": "close_order",
+        "command_id": command.to_string(),
+        "ticket": position.ticket,
+        "status": "pending"
+    }))
+}
+
 #[get("/commands/{id}")]
 /// Reports one command's lifecycle state and validated result.
 pub async fn command_status(state: Data<AppState>, id: web::Path<String>) -> HttpResponse {
@@ -174,7 +224,7 @@ fn command_result(payload: CommandPayload) -> serde_json::Value {
             "comment": check.comment,
             "margin": check.margin
         }),
-        CommandPayload::OpenOrder(execution) => json!({
+        CommandPayload::OpenOrder(execution) | CommandPayload::CloseOrder(execution) => json!({
             "executed": execution.executed,
             "retcode": execution.retcode,
             "comment": execution.comment,
