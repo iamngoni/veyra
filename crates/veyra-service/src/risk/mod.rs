@@ -277,6 +277,28 @@ impl RiskPolicy {
         self.session
     }
 
+    /// Bounded, non-sensitive snapshot of the effective policy.
+    ///
+    /// Recorded with the audit trail at startup so a decision can always be
+    /// read against the exact rules that were in force when it was made.
+    pub fn summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "killSwitch": self.kill_switch,
+            "symbols": self
+                .symbols
+                .iter()
+                .map(|symbol| symbol.as_str())
+                .collect::<Vec<_>>(),
+            "maxVolumePerOrder": self.max_volume_per_order.value(),
+            "maxTotalLots": self.max_total_lots.value(),
+            "maxOpenOrders": self.max_open_orders,
+            "duplicateWindowSecs": self.duplicate_window.as_secs(),
+            "sessionUtc": self
+                .session
+                .map(|session| format!("{}-{}", session.start_hour(), session.end_hour()))
+        })
+    }
+
     /// Whether `symbol` is on the allowlist.
     pub fn allows_symbol(&self, symbol: &Symbol) -> bool {
         self.symbols.iter().any(|allowed| allowed == symbol)
@@ -333,6 +355,36 @@ fn parse_symbols(raw: &str) -> Result<Vec<Symbol>, RiskError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trading::intent::Volume;
+
+    #[test]
+    fn policy_summaries_capture_the_effective_rules() {
+        let summary = RiskPolicy::new(
+            false,
+            vec![Symbol::parse("EURUSD").expect("symbol")],
+            Volume::parse(0.01).expect("volume"),
+            Volume::parse(0.05).expect("volume"),
+            1,
+            Duration::from_secs(60),
+            Some(SessionWindow::parse("7-21").expect("session")),
+        )
+        .summary();
+        assert_eq!(summary["killSwitch"], false);
+        assert_eq!(summary["symbols"], serde_json::json!(["EURUSD"]));
+        assert_eq!(summary["maxVolumePerOrder"], 0.01);
+        assert_eq!(summary["maxTotalLots"], 0.05);
+        assert_eq!(summary["maxOpenOrders"], 1);
+        assert_eq!(summary["duplicateWindowSecs"], 60);
+        assert_eq!(summary["sessionUtc"], "7-21");
+
+        let default = RiskPolicy::default().summary();
+        assert_eq!(
+            default["symbols"],
+            serde_json::json!([]),
+            "default denies all"
+        );
+        assert_eq!(default["sessionUtc"], serde_json::Value::Null);
+    }
 
     fn source<'a>(
         pairs: &'a [(&'static str, &'a str)],

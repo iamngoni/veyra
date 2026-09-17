@@ -101,8 +101,9 @@
       truncated list, and reports snapshot age. A periodic refresh
       (`VEYRA_RECONCILE_SECS`, default 30 s) keeps the retained snapshot
       current while the terminal polls — proven live.
-- [ ] Ticket-level tracing (position → approved intent) once commands are
-      recorded durably.
+- [x] Ticket-level tracing: decisions record the approved `intent_id` and the
+      `command_id` they produced, so a position ticket can be followed back
+      through its command and ack to the decision that opened it.
 - [ ] Staged testing: read-only first, then demo, then minimal live exposure
       only after explicit owner approval.
 
@@ -124,7 +125,9 @@
       volume plus the requested volume exceeds `VEYRA_RISK_MAX_TOTAL_LOTS` —
       proven live (`exposure_above_limit` with a 0.005 cap, approved at the
       0.01 default).
-- [ ] Policy persistence and audit trail (needs Phase 1 storage).
+- [x] Policy persistence: the effective risk policy is recorded with the
+      audit trail on every service start, so any decision can be read against
+      the rules that were in force when it was made.
 - [x] Two independent controls in front of real money: the service refuses to
       queue execution unless `VEYRA_TRADING_ENABLED=true`, and the terminal
       refuses to trade unless recompiled with `InAllowLiveOrders = true`.

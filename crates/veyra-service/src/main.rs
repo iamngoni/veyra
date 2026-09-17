@@ -79,7 +79,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime
             .try_record(AuditEvent::new(
                 AuditKind::ServiceStarted,
-                serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+                serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    // The effective risk rules travel with the trail, so any
+                    // decision can be read against the policy in force.
+                    "riskPolicy": state.risk().policy().summary()
+                }),
             ))
             .await;
     }

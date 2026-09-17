@@ -542,24 +542,46 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                 };
             }
             match queue_staged_order(state, &intent).await {
-                StagedExecution::Queued { command, .. } => {
-                    record(state, "queued", Some(&symbol), Some(draft), None).await;
+                StagedExecution::Queued { command, intent_id } => {
+                    record_event(
+                        state,
+                        "queued",
+                        Some(&symbol),
+                        Some(draft),
+                        None,
+                        Some(&intent_id),
+                        Some(&command.to_string()),
+                    )
+                    .await;
                     TickOutcome::Queued {
                         command: command.to_string(),
                     }
                 }
                 StagedExecution::TradingDisabled => {
-                    record(state, "approved_dry_run", Some(&symbol), Some(draft), None).await;
+                    let intent_id = intent.id().to_string();
+                    record_event(
+                        state,
+                        "approved_dry_run",
+                        Some(&symbol),
+                        Some(draft),
+                        None,
+                        Some(&intent_id),
+                        None,
+                    )
+                    .await;
                     TickOutcome::ApprovedDryRun
                 }
                 StagedExecution::ChannelUnavailable => {
                     let reason = "command channel unavailable".to_owned();
-                    record(
+                    let intent_id = intent.id().to_string();
+                    record_event(
                         state,
                         "unavailable",
                         Some(&symbol),
                         Some(draft),
                         Some(&reason),
+                        Some(&intent_id),
+                        None,
                     )
                     .await;
                     TickOutcome::Unavailable { reason }
@@ -992,13 +1014,15 @@ async fn review_positions(
             }
             match queue_staged_close(state, ticket).await {
                 StagedClose::Queued { command, ticket } => {
-                    record_position(
+                    let command_id = command.to_string();
+                    record_position_event(
                         state,
                         "close_queued",
                         "autopilot_review",
                         series,
                         Some(ticket),
                         None,
+                        Some(&command_id),
                     )
                     .await;
                     TickOutcome::CloseQueued {
@@ -1069,13 +1093,15 @@ async fn review_positions(
 async fn move_stop(state: &AppState, series: &CandleSeries, plan: StopMove) -> TickOutcome {
     match queue_staged_modify(state, plan.ticket, Some(plan.stop), None).await {
         StagedModify::Queued { command, ticket } => {
-            record_position(
+            let command_id = command.to_string();
+            record_position_event(
                 state,
                 plan.kind.as_str(),
                 "autopilot",
                 series,
                 Some(ticket),
                 None,
+                Some(&command_id),
             )
             .await;
             TickOutcome::StopMoved {
@@ -1234,6 +1260,20 @@ async fn record_position(
     ticket: Option<i64>,
     reason: Option<&str>,
 ) {
+    record_position_event(state, outcome, origin, series, ticket, reason, None).await;
+}
+
+/// Records one position decision together with the command it produced, so a
+/// stop move or close can be traced from the journal to the terminal ack.
+async fn record_position_event(
+    state: &AppState,
+    outcome: &'static str,
+    origin: &'static str,
+    series: &CandleSeries,
+    ticket: Option<i64>,
+    reason: Option<&str>,
+    command_id: Option<&str>,
+) {
     let Some(audit) = state.audit() else {
         return;
     };
@@ -1248,6 +1288,9 @@ async fn record_position(
     if let Some(reason) = reason {
         payload["reason"] = json!(reason);
     }
+    if let Some(command_id) = command_id {
+        payload["command_id"] = json!(command_id);
+    }
     audit
         .try_record(AuditEvent::new(AuditKind::ProposalEvaluated, payload))
         .await;
@@ -1260,6 +1303,22 @@ async fn record(
     symbol: Option<&Symbol>,
     draft: Option<&TradeIntentDraft>,
     reason: Option<&str>,
+) {
+    record_event(state, outcome, symbol, draft, reason, None, None).await;
+}
+
+/// Records one decision attempt together with the identifiers that connect
+/// it to the rest of the journal: the approved intent and the command it
+/// produced. A position ticket can then be traced back to its decision
+/// through the command.
+async fn record_event(
+    state: &AppState,
+    outcome: &'static str,
+    symbol: Option<&Symbol>,
+    draft: Option<&TradeIntentDraft>,
+    reason: Option<&str>,
+    intent_id: Option<&str>,
+    command_id: Option<&str>,
 ) {
     let Some(audit) = state.audit() else {
         return;
@@ -1281,6 +1340,12 @@ async fn record(
     }
     if let Some(reason) = reason {
         payload["reason"] = json!(reason);
+    }
+    if let Some(intent_id) = intent_id {
+        payload["intent_id"] = json!(intent_id);
+    }
+    if let Some(command_id) = command_id {
+        payload["command_id"] = json!(command_id);
     }
     audit
         .try_record(AuditEvent::new(AuditKind::ProposalEvaluated, payload))
@@ -2144,6 +2209,17 @@ mod tests {
             .expect("decision recorded");
         assert_eq!(decision.payload()["stop_loss"], 1.0850);
         assert_eq!(decision.payload()["take_profit"], 1.1000);
+        assert!(
+            decision.payload()["intent_id"]
+                .as_str()
+                .is_some_and(|id| id.len() == 36),
+            "the decision records its intent"
+        );
+        assert_eq!(
+            decision.payload()["command_id"],
+            command,
+            "the decision links the command it produced"
+        );
         let kinds: Vec<&'static str> = harness
             .trail
             .events()
@@ -2558,6 +2634,21 @@ mod tests {
             other => panic!("expected a queued close, got {other:?}"),
         }
         assert!(outcomes(&harness.trail).contains(&"close_queued".to_owned()));
+        let close = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.kind() == AuditKind::ProposalEvaluated
+                    && event.payload()["outcome"] == "close_queued"
+            })
+            .expect("close recorded");
+        assert!(
+            close.payload()["command_id"]
+                .as_str()
+                .is_some_and(|id| id.len() == 36),
+            "the close links its command"
+        );
         let kinds: Vec<&str> = harness
             .trail
             .events()
@@ -2863,6 +2954,21 @@ mod tests {
             "the deterministic plan acts before the model is consulted"
         );
         assert!(outcomes(&harness.trail).contains(&"break_even".to_owned()));
+        let stop = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.kind() == AuditKind::ProposalEvaluated
+                    && event.payload()["outcome"] == "break_even"
+            })
+            .expect("stop move recorded");
+        assert!(
+            stop.payload()["command_id"]
+                .as_str()
+                .is_some_and(|id| id.len() == 36),
+            "the stop move links its command"
+        );
 
         // Trailing enabled: at 2R the stop trails instead, audited as
         // `trailing_stop`, and the reviewer is not consulted.

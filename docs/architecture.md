@@ -249,7 +249,10 @@ through the same `queue_staged_order` path as the control surface, so both
 operator controls and the audit trail still apply. Every tick records a
 `proposal_evaluated` audit event with its outcome — `no_trade`, `rejected`,
 `approved_dry_run`, `queued`, or `unavailable` — plus the command events when
-one is queued. Every autonomous entry must carry both a stop loss and a take
+one is queued. Decisions carry the `intent_id` and `command_id` they produced,
+so a venue ticket can be traced back through its command and ack to the
+decision that opened it, and the service start event records the effective
+risk policy so every decision can be read against the rules in force. Every autonomous entry must carry both a stop loss and a take
 profit; unbracketed proposals are rejected before the command layer sees them.
 
 While a managed position is open the tick first applies the deterministic
