@@ -540,10 +540,10 @@ pub async fn modify_position(
     state: Data<AppState>,
     body: web::Json<ModifyRequest>,
 ) -> HttpResponse {
-    let Some(link) = command_link(&state) else {
+    if command_link(&state).is_none() {
         return HttpResponse::ServiceUnavailable()
             .json(json!({ "error": "command_channel_unavailable" }));
-    };
+    }
     if !state.config().trading_enabled() {
         return HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }));
     }
@@ -557,27 +557,91 @@ pub async fn modify_position(
     if !provided || !stops_valid {
         return HttpResponse::BadRequest().json(json!({ "error": "invalid_stops" }));
     }
+    match queue_staged_modify(&state, body.ticket, body.stop_loss, body.take_profit).await {
+        StagedModify::Queued { command, ticket } => HttpResponse::Ok().json(json!({
+            "command": "modify_order",
+            "command_id": command.to_string(),
+            "ticket": ticket,
+            "status": "pending"
+        })),
+        StagedModify::TradingDisabled => {
+            HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }))
+        }
+        StagedModify::ChannelUnavailable => HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "command_channel_unavailable" })),
+        StagedModify::NoPositions => {
+            HttpResponse::Conflict().json(json!({ "error": "position_state_unavailable" }))
+        }
+        StagedModify::UnknownTicket => {
+            HttpResponse::NotFound().json(json!({ "error": "unknown_position" }))
+        }
+        StagedModify::NotVeyra => {
+            HttpResponse::Conflict().json(json!({ "error": "not_a_veyra_position" }))
+        }
+    }
+}
+
+/// Outcome of handing a stop change to the modify path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StagedModify {
+    /// The modify command was queued and audited; poll it by id.
+    Queued {
+        /// Identifier of the queued command.
+        command: EaCommandId,
+        /// Ticket whose stops change.
+        ticket: i64,
+    },
+    /// The operator switch is off; nothing was queued.
+    TradingDisabled,
+    /// The active broker exposes no command channel.
+    ChannelUnavailable,
+    /// No completed account snapshot is retained yet.
+    NoPositions,
+    /// The ticket is not in the latest completed snapshot.
+    UnknownTicket,
+    /// The ticket exists but is not Veyra-owned.
+    NotVeyra,
+}
+
+/// Queues one stop change for a ticket from the latest completed snapshot.
+///
+/// The single modify path shared by the control surface and the autonomous
+/// loop: same ownership guards as closing, and the terminal re-validates
+/// every stop distance before acting. Callers validate that at least one
+/// finite positive stop is provided.
+pub async fn queue_staged_modify(
+    state: &AppState,
+    ticket: i64,
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+) -> StagedModify {
+    let Some(link) = command_link(state) else {
+        return StagedModify::ChannelUnavailable;
+    };
+    if !state.config().trading_enabled() {
+        return StagedModify::TradingDisabled;
+    }
     let Some(snapshot) = link.last_account() else {
-        return HttpResponse::Conflict().json(json!({ "error": "position_state_unavailable" }));
+        return StagedModify::NoPositions;
     };
     let Some(position) = snapshot
         .positions
         .iter()
-        .find(|position| position.ticket == body.ticket)
+        .find(|position| position.ticket == ticket)
     else {
-        return HttpResponse::NotFound().json(json!({ "error": "unknown_position" }));
+        return StagedModify::UnknownTicket;
     };
     if position.magic != ORDER_MAGIC {
-        return HttpResponse::Conflict().json(json!({ "error": "not_a_veyra_position" }));
+        return StagedModify::NotVeyra;
     }
     let command = link.enqueue_modify(EaModifyRequest::new(
         position.ticket,
         position.magic,
-        body.stop_loss,
-        body.take_profit,
+        stop_loss,
+        take_profit,
     ));
     audit(
-        &state,
+        state,
         AuditKind::CommandQueued,
         json!({
             "command_id": command.to_string(),
@@ -586,12 +650,10 @@ pub async fn modify_position(
         }),
     )
     .await;
-    HttpResponse::Ok().json(json!({
-        "command": "modify_order",
-        "command_id": command.to_string(),
-        "ticket": position.ticket,
-        "status": "pending"
-    }))
+    StagedModify::Queued {
+        command,
+        ticket: position.ticket,
+    }
 }
 
 #[get("/reconciliation")]

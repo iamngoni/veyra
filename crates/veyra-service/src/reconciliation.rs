@@ -140,6 +140,7 @@ mod tests {
             stop_loss: 1.085,
             take_profit: 1.105,
             opened_at: 1_758_000_000,
+            current: 1.096,
             magic,
         }
     }

@@ -159,6 +159,10 @@ pub struct PositionPayload {
     /// it cannot verify.
     #[serde(rename = "openedAt", default)]
     pub opened_at: i64,
+    /// Current close price for the position, or zero when the terminal does
+    /// not report it. The break-even policy is skipped without it.
+    #[serde(default)]
+    pub current: f64,
 }
 
 /// Order kinds the terminal can report.
@@ -252,6 +256,9 @@ impl AccountSnapshotPayload {
             }
             if position.opened_at < 0 {
                 return Err("position openedAt must be non-negative".to_owned());
+            }
+            if !position.current.is_finite() || position.current < 0.0 {
+                return Err("position current must be a finite, non-negative price".to_owned());
             }
         }
         Ok(())
@@ -1854,6 +1861,7 @@ mod tests {
             stop_loss: 1.085,
             take_profit: 1.105,
             opened_at: 1_758_000_000,
+            current: 1.096,
             magic,
         }
     }

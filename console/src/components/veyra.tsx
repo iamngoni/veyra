@@ -309,6 +309,8 @@ const outcomeTone: Record<string, string> = {
   approved_dry_run: 'text-cyan-300',
   no_trade: 'text-slate-400',
   held: 'text-sky-300',
+  break_even: 'text-emerald-300',
+  break_even_rejected: 'text-rose-300',
   close_queued: 'text-amber-300',
   close_rejected: 'text-rose-300',
   rejected: 'text-amber-300',

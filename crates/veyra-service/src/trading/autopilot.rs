@@ -31,7 +31,10 @@ use crate::audit::{AuditEvent, AuditKind};
 use crate::broker::Symbol;
 use crate::broker::ea::{ORDER_MAGIC, PositionPayload};
 use crate::config::ConfigError;
-use crate::control::{StagedClose, StagedExecution, queue_staged_close, queue_staged_order};
+use crate::control::{
+    StagedClose, StagedExecution, StagedModify, queue_staged_close, queue_staged_modify,
+    queue_staged_order,
+};
 use crate::jev::{
     Answer, ChoiceOptions, Instructions, JevRequest, JevRuntime, NoulCriteria, Question,
     ScoreLevels, State as JevState,
@@ -98,6 +101,7 @@ pub struct AutopilotSettings {
     interval: Duration,
     jev: JevPreference,
     min_hold: Duration,
+    breakeven_r: f64,
 }
 
 impl AutopilotSettings {
@@ -127,6 +131,7 @@ impl AutopilotSettings {
         let interval_raw = optional(&mut source, "VEYRA_AUTOPILOT_INTERVAL_SECS");
         let jev_raw = optional(&mut source, "VEYRA_AUTOPILOT_JEV");
         let min_hold_raw = optional(&mut source, "VEYRA_AUTOPILOT_MIN_HOLD_SECS");
+        let breakeven_raw = optional(&mut source, "VEYRA_AUTOPILOT_BREAKEVEN_R");
 
         if enabled_raw.is_empty()
             && symbol_raw.is_empty()
@@ -136,6 +141,7 @@ impl AutopilotSettings {
             && interval_raw.is_empty()
             && jev_raw.is_empty()
             && min_hold_raw.is_empty()
+            && breakeven_raw.is_empty()
         {
             return Ok(None);
         }
@@ -225,6 +231,21 @@ impl AutopilotSettings {
             }
         };
 
+        let breakeven_r = match breakeven_raw.as_str() {
+            "" => 0.0,
+            other => {
+                let invalid = || ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_AUTOPILOT_BREAKEVEN_R",
+                    reason: "must be a number from 0 through 10 (0 disables the policy)",
+                };
+                let value = other.parse::<f64>().map_err(|_| invalid())?;
+                if !value.is_finite() || !(0.0..=10.0).contains(&value) {
+                    return Err(invalid());
+                }
+                value
+            }
+        };
+
         Ok(Some(Self {
             enabled,
             symbol,
@@ -234,6 +255,7 @@ impl AutopilotSettings {
             interval,
             jev,
             min_hold,
+            breakeven_r,
         }))
     }
 
@@ -277,6 +299,12 @@ impl AutopilotSettings {
     pub fn min_hold(&self) -> Duration {
         self.min_hold
     }
+
+    /// Multiple of the entry risk at which the stop moves to break-even;
+    /// zero disables the policy.
+    pub fn breakeven_r(&self) -> f64 {
+        self.breakeven_r
+    }
 }
 
 fn optional(
@@ -309,6 +337,11 @@ pub enum TickOutcome {
     /// The reviewer asked to close; the close command was queued.
     CloseQueued {
         /// Identifier of the queued close command.
+        command: String,
+    },
+    /// The stop moved to break-even; the modify command was queued.
+    StopMoved {
+        /// Identifier of the queued modify command.
         command: String,
     },
     /// The gate or the stop policy rejected the proposal.
@@ -415,6 +448,13 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     // position needs a lifecycle decision.
     let positions = managed_positions(state);
     if !positions.is_empty() {
+        // Capital preservation first: one action per tick, and moving the
+        // stop is cheaper and safer than any entry or exit decision.
+        if state.config().trading_enabled()
+            && let Some((ticket, stop)) = break_even_plan(&positions, settings.breakeven_r())
+        {
+            return move_to_break_even(state, &series, ticket, stop).await;
+        }
         return review_positions(
             state,
             settings,
@@ -504,17 +544,36 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     }
 }
 
+/// Direction of a managed position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedSide {
+    /// Long.
+    Buy,
+    /// Short.
+    Sell,
+}
+
+impl ManagedSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Buy => "buy",
+            Self::Sell => "sell",
+        }
+    }
+}
+
 /// One Veyra-managed position as the review needs it.
 #[derive(Debug, Clone, PartialEq)]
 struct ManagedPosition {
     ticket: i64,
-    side: &'static str,
+    side: ManagedSide,
     lots: f64,
     entry: f64,
     profit: f64,
     stop_loss: f64,
     take_profit: f64,
     opened_at: i64,
+    current: f64,
 }
 
 /// Managed positions from the latest completed snapshot.
@@ -545,11 +604,11 @@ fn managed_from_payload(position: &PositionPayload) -> ManagedPosition {
             PositionKind::Buy
             | PositionKind::BuyLimit
             | PositionKind::BuyStop
-            | PositionKind::BuyStopLimit => "buy",
+            | PositionKind::BuyStopLimit => ManagedSide::Buy,
             PositionKind::Sell
             | PositionKind::SellLimit
             | PositionKind::SellStop
-            | PositionKind::SellStopLimit => "sell",
+            | PositionKind::SellStopLimit => ManagedSide::Sell,
         },
         lots: position.lots,
         entry: position.price,
@@ -557,7 +616,45 @@ fn managed_from_payload(position: &PositionPayload) -> ManagedPosition {
         stop_loss: position.stop_loss,
         take_profit: position.take_profit,
         opened_at: position.opened_at,
+        current: position.current,
     }
+}
+
+/// Break-even plan for the first position that has travelled at least `r`
+/// times its entry risk in favour while its stop still sits behind the entry.
+///
+/// Deterministic capital preservation: when it fires, the stop moves to the
+/// entry price, so a trade that reached the target distance can no longer
+/// turn into a loss. Positions without a stop, without a reported current
+/// price, or already protected at break-even are skipped.
+fn break_even_plan(positions: &[ManagedPosition], r: f64) -> Option<(i64, f64)> {
+    if !r.is_finite() || r <= 0.0 {
+        return None;
+    }
+    for position in positions {
+        if position.stop_loss <= 0.0 || position.current <= 0.0 || position.entry <= 0.0 {
+            continue;
+        }
+        let risk = (position.entry - position.stop_loss).abs();
+        if risk <= 0.0 {
+            continue;
+        }
+        let (favourable, already_protected) = match position.side {
+            ManagedSide::Buy => (
+                position.current - position.entry,
+                position.stop_loss >= position.entry,
+            ),
+            ManagedSide::Sell => (
+                position.entry - position.current,
+                position.stop_loss <= position.entry,
+            ),
+        };
+        if already_protected || favourable < r * risk {
+            continue;
+        }
+        return Some((position.ticket, position.entry));
+    }
+    None
 }
 
 /// Position age in seconds when both broker timestamps allow it.
@@ -661,7 +758,15 @@ async fn review_positions(
     let decision = match parse_review(&answer.value) {
         Ok(decision) => decision,
         Err(reason) => {
-            record_position(state, "close_rejected", series, None, Some(&reason)).await;
+            record_position(
+                state,
+                "close_rejected",
+                "autopilot_review",
+                series,
+                None,
+                Some(&reason),
+            )
+            .await;
             return TickOutcome::Rejected {
                 code: "invalid_review",
             };
@@ -670,7 +775,15 @@ async fn review_positions(
 
     match decision {
         ReviewDecision::Hold => {
-            record_position(state, "held", series, Some(positions[0].ticket), None).await;
+            record_position(
+                state,
+                "held",
+                "autopilot_review",
+                series,
+                Some(positions[0].ticket),
+                None,
+            )
+            .await;
             TickOutcome::Held
         }
         ReviewDecision::Close(ticket) => {
@@ -678,6 +791,7 @@ async fn review_positions(
                 record_position(
                     state,
                     "close_rejected",
+                    "autopilot_review",
                     series,
                     Some(ticket),
                     Some("unknown_ticket"),
@@ -699,6 +813,7 @@ async fn review_positions(
                     record_position(
                         state,
                         "close_rejected",
+                        "autopilot_review",
                         series,
                         Some(ticket),
                         Some("position_too_young"),
@@ -712,6 +827,7 @@ async fn review_positions(
                     record_position(
                         state,
                         "close_rejected",
+                        "autopilot_review",
                         series,
                         Some(ticket),
                         Some("position_age_unknown"),
@@ -724,7 +840,15 @@ async fn review_positions(
             }
             match queue_staged_close(state, ticket).await {
                 StagedClose::Queued { command, ticket } => {
-                    record_position(state, "close_queued", series, Some(ticket), None).await;
+                    record_position(
+                        state,
+                        "close_queued",
+                        "autopilot_review",
+                        series,
+                        Some(ticket),
+                        None,
+                    )
+                    .await;
                     TickOutcome::CloseQueued {
                         command: command.to_string(),
                     }
@@ -733,6 +857,7 @@ async fn review_positions(
                     record_position(
                         state,
                         "close_rejected",
+                        "autopilot_review",
                         series,
                         Some(ticket),
                         Some("trading_disabled"),
@@ -744,14 +869,22 @@ async fn review_positions(
                 }
                 StagedClose::ChannelUnavailable => {
                     let reason = "command channel unavailable".to_owned();
-                    record_position(state, "unavailable", series, Some(ticket), Some(&reason))
-                        .await;
+                    record_position(
+                        state,
+                        "unavailable",
+                        "autopilot_review",
+                        series,
+                        Some(ticket),
+                        Some(&reason),
+                    )
+                    .await;
                     TickOutcome::Unavailable { reason }
                 }
                 StagedClose::NoPositions | StagedClose::UnknownTicket => {
                     record_position(
                         state,
                         "close_rejected",
+                        "autopilot_review",
                         series,
                         Some(ticket),
                         Some("stale_position"),
@@ -765,6 +898,7 @@ async fn review_positions(
                     record_position(
                         state,
                         "close_rejected",
+                        "autopilot_review",
                         series,
                         Some(ticket),
                         Some("not_a_veyra_position"),
@@ -774,6 +908,78 @@ async fn review_positions(
                         code: "not_a_veyra_position",
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Moves one reviewed position's stop to its entry price.
+async fn move_to_break_even(
+    state: &AppState,
+    series: &CandleSeries,
+    ticket: i64,
+    stop: f64,
+) -> TickOutcome {
+    match queue_staged_modify(state, ticket, Some(stop), None).await {
+        StagedModify::Queued { command, ticket } => {
+            record_position(state, "break_even", "autopilot", series, Some(ticket), None).await;
+            TickOutcome::StopMoved {
+                command: command.to_string(),
+            }
+        }
+        StagedModify::TradingDisabled => {
+            record_position(
+                state,
+                "break_even_rejected",
+                "autopilot",
+                series,
+                Some(ticket),
+                Some("trading_disabled"),
+            )
+            .await;
+            TickOutcome::Rejected {
+                code: "trading_disabled",
+            }
+        }
+        StagedModify::ChannelUnavailable => {
+            let reason = "command channel unavailable".to_owned();
+            record_position(
+                state,
+                "break_even_rejected",
+                "autopilot",
+                series,
+                Some(ticket),
+                Some(&reason),
+            )
+            .await;
+            TickOutcome::Unavailable { reason }
+        }
+        StagedModify::NoPositions | StagedModify::UnknownTicket => {
+            record_position(
+                state,
+                "break_even_rejected",
+                "autopilot",
+                series,
+                Some(ticket),
+                Some("stale_position"),
+            )
+            .await;
+            TickOutcome::Rejected {
+                code: "stale_position",
+            }
+        }
+        StagedModify::NotVeyra => {
+            record_position(
+                state,
+                "break_even_rejected",
+                "autopilot",
+                series,
+                Some(ticket),
+                Some("not_a_veyra_position"),
+            )
+            .await;
+            TickOutcome::Rejected {
+                code: "not_a_veyra_position",
             }
         }
     }
@@ -834,7 +1040,7 @@ fn review_input(
         .map(|position| {
             json!({
                 "ticket": position.ticket,
-                "side": position.side,
+                "side": position.side.as_str(),
                 "lots": position.lots,
                 "entry": position.entry,
                 "profit": position.profit,
@@ -868,6 +1074,7 @@ fn review_input(
 async fn record_position(
     state: &AppState,
     outcome: &'static str,
+    origin: &'static str,
     series: &CandleSeries,
     ticket: Option<i64>,
     reason: Option<&str>,
@@ -877,7 +1084,7 @@ async fn record_position(
     };
     let mut payload = json!({
         "outcome": outcome,
-        "origin": "autopilot_review",
+        "origin": origin,
         "symbol": series.symbol().as_str()
     });
     if let Some(ticket) = ticket {
@@ -1462,6 +1669,7 @@ mod tests {
         assert_eq!(defaults.interval(), Duration::from_secs(300));
         assert_eq!(defaults.jev(), JevPreference::Auto);
         assert_eq!(defaults.min_hold(), Duration::from_secs(300));
+        assert_eq!(defaults.breakeven_r(), 0.0, "break-even is opt-in");
         assert!(defaults.symbol().is_none());
 
         let custom = settings_from(|name| match name {
@@ -1473,10 +1681,12 @@ mod tests {
             "VEYRA_AUTOPILOT_INTERVAL_SECS" => Ok("60".to_owned()),
             "VEYRA_AUTOPILOT_JEV" => Ok("off".to_owned()),
             "VEYRA_AUTOPILOT_MIN_HOLD_SECS" => Ok("0".to_owned()),
+            "VEYRA_AUTOPILOT_BREAKEVEN_R" => Ok("1.5".to_owned()),
             _ => Err(ConfigError::MissingEnvironmentVariable { name }),
         });
         assert!(custom.enabled());
         assert_eq!(custom.min_hold(), Duration::ZERO);
+        assert_eq!(custom.breakeven_r(), 1.5);
         assert_eq!(custom.symbol().expect("symbol").as_str(), "gbpusd");
         assert_eq!(custom.timeframe(), Timeframe::H4);
         assert_eq!(custom.bars(), 96);
@@ -1500,6 +1710,9 @@ mod tests {
             ("VEYRA_AUTOPILOT_JEV", "always"),
             ("VEYRA_AUTOPILOT_MIN_HOLD_SECS", "86401"),
             ("VEYRA_AUTOPILOT_MIN_HOLD_SECS", "-5"),
+            ("VEYRA_AUTOPILOT_BREAKEVEN_R", "-1"),
+            ("VEYRA_AUTOPILOT_BREAKEVEN_R", "10.5"),
+            ("VEYRA_AUTOPILOT_BREAKEVEN_R", "soon"),
         ] {
             let error = AutopilotSettings::from_source(|requested| match requested {
                 _ if requested == name => Ok(value.to_owned()),
@@ -1981,6 +2194,16 @@ mod tests {
     }
 
     fn managed_snapshot(ticket: i64, opened_at: i64, server_time: i64) -> AccountSnapshotPayload {
+        managed_snapshot_at(ticket, opened_at, server_time, 1.1477)
+    }
+
+    /// Snapshot with an explicit current price for the managed position.
+    fn managed_snapshot_at(
+        ticket: i64,
+        opened_at: i64,
+        server_time: i64,
+        current: f64,
+    ) -> AccountSnapshotPayload {
         AccountSnapshotPayload {
             balance: 20.57,
             equity: 20.57,
@@ -1997,6 +2220,7 @@ mod tests {
                 stop_loss: 1.1497,
                 take_profit: 1.14554,
                 opened_at,
+                current,
                 magic: crate::broker::ea::ORDER_MAGIC,
             }],
             positions_truncated: false,
@@ -2279,6 +2503,264 @@ mod tests {
         assert!(
             request.instructions.contains("Decide whether to open"),
             "the entry prompt ran, not the review prompt"
+        );
+    }
+
+    fn managed_position(side: ManagedSide, entry: f64, stop: f64, current: f64) -> ManagedPosition {
+        ManagedPosition {
+            ticket: 1,
+            side,
+            lots: 0.01,
+            entry,
+            profit: 0.0,
+            stop_loss: stop,
+            take_profit: 0.0,
+            opened_at: 1_758_000_000,
+            current,
+        }
+    }
+
+    #[test]
+    fn break_even_fires_only_at_r_with_a_stop_behind_the_entry() {
+        // Sell: risk 1.14757-1.1497 = 20 pips; at exactly 1R the plan fires.
+        let at_r = managed_position(ManagedSide::Sell, 1.14757, 1.1497, 1.14544);
+        assert_eq!(
+            break_even_plan(std::slice::from_ref(&at_r), 1.0),
+            Some((1, 1.14757))
+        );
+        assert_eq!(
+            break_even_plan(std::slice::from_ref(&at_r), 0.5),
+            Some((1, 1.14757)),
+            "a lower multiple fires sooner"
+        );
+        assert_eq!(
+            break_even_plan(
+                &[managed_position(ManagedSide::Sell, 1.14757, 1.1497, 1.1470)],
+                1.0
+            ),
+            None,
+            "below R nothing moves"
+        );
+        assert_eq!(
+            break_even_plan(
+                &[managed_position(
+                    ManagedSide::Sell,
+                    1.14757,
+                    1.14757,
+                    1.14544
+                )],
+                1.0
+            ),
+            None,
+            "already at break-even"
+        );
+        assert_eq!(
+            break_even_plan(
+                &[managed_position(ManagedSide::Sell, 1.14757, 0.0, 1.14544)],
+                1.0
+            ),
+            None,
+            "without a stop there is no risk to reference"
+        );
+        assert_eq!(
+            break_even_plan(
+                &[managed_position(ManagedSide::Sell, 1.14757, 1.1497, 0.0)],
+                1.0
+            ),
+            None,
+            "without a current price nothing moves"
+        );
+        assert_eq!(
+            break_even_plan(std::slice::from_ref(&at_r), 0.0),
+            None,
+            "zero disables the policy"
+        );
+        // Buy: symmetric.
+        assert_eq!(
+            break_even_plan(
+                &[managed_position(
+                    ManagedSide::Buy,
+                    1.14757,
+                    1.14544,
+                    1.14971
+                )],
+                1.0
+            ),
+            Some((1, 1.14757))
+        );
+    }
+
+    #[actix_web::test]
+    async fn tick_moves_the_stop_to_break_even_before_any_review() {
+        let settings = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_BREAKEVEN_R" => Ok("1.0".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        let engine = StubEngine::answering(json!({"action": "hold"}));
+        let harness = build_harness(
+            settings,
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot_at(
+                10650805,
+                1_758_000_000,
+                1_758_003_600,
+                1.14544,
+            ));
+
+        match tick(&harness.state).await {
+            TickOutcome::StopMoved { command } => assert!(!command.is_empty()),
+            other => panic!("expected a stop move, got {other:?}"),
+        }
+        assert!(
+            engine.requests().is_empty(),
+            "the deterministic plan acts before the model is consulted"
+        );
+        assert!(outcomes(&harness.trail).contains(&"break_even".to_owned()));
+        let link = harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link");
+        assert!(link.has_pending(CommandKind::ModifyOrder));
+    }
+
+    #[actix_web::test]
+    async fn tick_holds_at_r_when_break_even_is_disabled() {
+        let engine = StubEngine::answering(json!({"action": "hold"}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot_at(
+                10650805,
+                1_758_000_000,
+                1_758_003_600,
+                1.14544,
+            ));
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::Held);
+        assert_eq!(engine.requests().len(), 1, "the review still runs");
+        let link = harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link");
+        assert!(!link.has_pending(CommandKind::ModifyOrder));
+    }
+
+    #[actix_web::test]
+    async fn break_even_reports_every_guard() {
+        let series = CandleSeries::from_validated(
+            Symbol::parse("EURUSD").expect("symbol"),
+            Timeframe::H4,
+            vec![Candle::from_validated(
+                1_700_000_000,
+                1.1,
+                1.2,
+                1.0,
+                1.15,
+                1,
+            )],
+        );
+        let feed = || {
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+            })
+        };
+
+        // The service switch is off.
+        let harness = build_harness(enabled_settings(), None, feed(), None, false, true);
+        assert_eq!(
+            move_to_break_even(&harness.state, &series, 10650805, 1.14757).await,
+            TickOutcome::Rejected {
+                code: "trading_disabled"
+            }
+        );
+
+        // No command channel exists.
+        let no_broker = AppState::new(config(true), None, None, gate())
+            .with_autopilot(Some(enabled_settings()));
+        assert!(matches!(
+            move_to_break_even(&no_broker, &series, 1, 1.0).await,
+            TickOutcome::Unavailable { .. }
+        ));
+
+        // No completed snapshot has been retained.
+        let harness = build_harness(enabled_settings(), None, feed(), None, true, false);
+        assert_eq!(
+            move_to_break_even(&harness.state, &series, 1, 1.0).await,
+            TickOutcome::Rejected {
+                code: "stale_position"
+            }
+        );
+
+        // The ticket is not in the latest snapshot.
+        let harness = build_harness(enabled_settings(), None, feed(), None, true, false);
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot(7, 1_758_000_000, 1_758_003_600));
+        assert_eq!(
+            move_to_break_even(&harness.state, &series, 999, 1.0).await,
+            TickOutcome::Rejected {
+                code: "stale_position"
+            }
+        );
+
+        // The ticket is a manual position.
+        let harness = build_harness(enabled_settings(), None, feed(), None, true, false);
+        let mut manual = managed_snapshot(7, 1_758_000_000, 1_758_003_600);
+        manual.positions[0].magic = 0;
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(manual);
+        assert_eq!(
+            move_to_break_even(&harness.state, &series, 7, 1.0).await,
+            TickOutcome::Rejected {
+                code: "not_a_veyra_position"
+            }
+        );
+        assert!(
+            outcomes(&harness.trail).contains(&"break_even_rejected".to_owned()),
+            "refusals are audited"
         );
     }
 
