@@ -158,6 +158,11 @@
       opens, and closed positions, pushing JSON webhook alerts (any provider
       that accepts `text`) — proven live with a database bounce (degraded and
       recovery alerts delivered) and a silent steady state.
+- [x] Deployment readiness: `docs/deployment.md` documents the move to an
+      always-on Mac step by step and `scripts/preflight.sh` checks every
+      prerequisite on the target (verified on this machine: 16 pass, 0 fail);
+      `scripts/check.sh` is the single local gate for the Rust workspace and
+      the console.
 - [ ] Durable 24/7 host or VPS, managed secrets, off-machine backups, and
       remote monitoring.
 - [ ] Versioned deployment pipeline.
