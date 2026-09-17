@@ -27,6 +27,7 @@ use serde_json::Value;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+use crate::audit::{AuditEvent, AuditKind, AuditRuntime};
 use crate::broker::settings::EaToken;
 use crate::broker::{
     AccountLogin, AccountSnapshot, BrokerError, BrokerLink, BrokerProvider, LinkReport, ServerName,
@@ -640,6 +641,7 @@ pub struct EaLink {
     commands: Mutex<VecDeque<EaCommand>>,
     pongs: AtomicU64,
     last_account: Mutex<Option<StoredAccount>>,
+    audit: Mutex<Option<Arc<AuditRuntime>>>,
 }
 
 impl EaLink {
@@ -655,6 +657,7 @@ impl EaLink {
             commands: Mutex::new(VecDeque::new()),
             pongs: AtomicU64::new(0),
             last_account: Mutex::new(None),
+            audit: Mutex::new(None),
         }
     }
 
@@ -838,6 +841,76 @@ impl EaLink {
         self.pongs.load(Ordering::Relaxed)
     }
 
+    /// Attaches the audit trail; command acknowledgements are recorded
+    /// best-effort from then on.
+    pub fn set_audit(&self, audit: Arc<AuditRuntime>) {
+        let mut guard = match self.audit.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(audit);
+    }
+
+    fn attached_audit(&self) -> Option<Arc<AuditRuntime>> {
+        let guard = match self.audit.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    }
+
+    /// Records the terminal state of an acknowledged command, when auditing is
+    /// attached. Best-effort: storage failures are logged, never propagated.
+    async fn audit_ack(&self, ack: &EaAck) {
+        let Some(audit) = self.attached_audit() else {
+            return;
+        };
+        let Some(record) = self.command(ack.id) else {
+            return;
+        };
+        let kind = record.kind.as_str();
+        match &record.state {
+            CommandState::Pending => {}
+            CommandState::Failed { reason } => {
+                audit
+                    .try_record(AuditEvent::new(
+                        AuditKind::CommandFailed,
+                        serde_json::json!({
+                            "command_id": record.id.to_string(),
+                            "kind": kind,
+                            "error": reason
+                        }),
+                    ))
+                    .await;
+            }
+            CommandState::Completed { payload } => {
+                audit
+                    .try_record(AuditEvent::new(
+                        AuditKind::CommandCompleted,
+                        serde_json::json!({
+                            "command_id": record.id.to_string(),
+                            "kind": kind,
+                            "result": completed_summary(payload)
+                        }),
+                    ))
+                    .await;
+                if let CommandPayload::AccountSnapshot(snapshot) = payload {
+                    audit
+                        .try_record(AuditEvent::new(
+                            AuditKind::BrokerSnapshot,
+                            serde_json::json!({
+                                "orders": snapshot.orders,
+                                "lots": snapshot.lots,
+                                "positions": snapshot.positions.len(),
+                                "positionsTruncated": snapshot.positions_truncated
+                            }),
+                        ))
+                        .await;
+                }
+            }
+        }
+    }
+
     /// Latest validated `account_snapshot` acknowledgement, if any.
     ///
     /// `None` until the first snapshot command completes. Read-only callers
@@ -953,6 +1026,7 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
     // Acks may ride along with any message kind.
     if let Some(ack) = poll.ack() {
         link.apply_ack(&ack);
+        link.audit_ack(&ack).await;
     }
 
     match poll.kind() {
@@ -1046,6 +1120,29 @@ fn payload_for(kind: CommandKind, data: Option<Value>) -> Result<CommandPayload,
     }
 }
 
+/// Bounded audit summary of a completed command payload.
+fn completed_summary(payload: &CommandPayload) -> Value {
+    match payload {
+        CommandPayload::Ping => serde_json::json!({}),
+        CommandPayload::AccountSnapshot(snapshot) => serde_json::json!({
+            "orders": snapshot.orders,
+            "lots": snapshot.lots
+        }),
+        CommandPayload::OrderCheck(check) => serde_json::json!({
+            "passed": check.passed,
+            "retcode": check.retcode,
+            "margin": check.margin
+        }),
+        CommandPayload::OpenOrder(execution)
+        | CommandPayload::CloseOrder(execution)
+        | CommandPayload::ModifyOrder(execution) => serde_json::json!({
+            "executed": execution.executed,
+            "retcode": execution.retcode,
+            "ticket": execution.ticket
+        }),
+    }
+}
+
 /// Hex preview used in malformed-payload diagnostics; never includes secrets by
 /// itself, but payloads are operator-supplied control messages.
 fn hex_preview(bytes: &[u8]) -> String {
@@ -1089,6 +1186,7 @@ pub fn build_server(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{
@@ -1529,6 +1627,68 @@ mod tests {
             .is_err(),
             "an executed modify must report its ticket"
         );
+    }
+
+    #[actix_web::test]
+    async fn acknowledged_commands_are_audited_when_a_trail_is_attached() {
+        use crate::audit::{AuditKind, AuditRuntime, MemoryTrail};
+
+        let trail = Arc::new(MemoryTrail::default());
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        link.set_audit(Arc::new(AuditRuntime::new(trail.clone())));
+
+        let id = link.enqueue(CommandKind::AccountSnapshot);
+        let ack = EaAck {
+            id,
+            ok: true,
+            data: Some(serde_json::json!({
+                "balance": 20.57,
+                "equity": 20.57,
+                "freeMargin": 20.57,
+                "orders": 1,
+                "lots": 0.01,
+                "positions": [{
+                    "ticket": 123,
+                    "symbol": "EURUSD",
+                    "kind": "buy",
+                    "lots": 0.01,
+                    "magic": ORDER_MAGIC,
+                    "price": 1.095,
+                    "profit": -0.25
+                }],
+                "positionsTruncated": false,
+                "serverTime": 1_758_000_000
+            })),
+            error: None,
+        };
+        link.apply_ack(&ack);
+        link.audit_ack(&ack).await;
+
+        let events = trail.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind(), AuditKind::CommandCompleted);
+        assert_eq!(events[0].payload()["kind"], "account_snapshot");
+        assert_eq!(events[1].kind(), AuditKind::BrokerSnapshot);
+        assert_eq!(events[1].payload()["orders"], 1);
+
+        let failing = link.enqueue(CommandKind::Ping);
+        let failure = EaAck {
+            id: failing,
+            ok: false,
+            data: None,
+            error: Some("nope".to_owned()),
+        };
+        link.apply_ack(&failure);
+        link.audit_ack(&failure).await;
+
+        let events = trail.events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].kind(), AuditKind::CommandFailed);
+        assert_eq!(events[2].payload()["error"], "nope");
     }
 
     #[test]

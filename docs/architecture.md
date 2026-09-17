@@ -19,6 +19,7 @@ Config -> Runtime state -> HTTP control plane
              +-- BrokerLink (selected by VEYRA_BROKER_PROVIDER)
              |      +-- Ea  (loopback HTTP control channel)
              |      +-- ... (hosted bridge / direct API, added later)
+             +-- Audit trail (PostgreSQL via SQLx)
              +-- Persistence/reconciliation
 ```
 
@@ -180,6 +181,16 @@ positive stop is required, `0`/absent stops keep their current values, and the
 terminal re-validates distance rules before acting. All three mutating commands
 (open, close, modify) share one contract, one switch pair, and one validated
 ack shape.
+
+### Persistence (audit trail)
+
+Durable history lives in one append-only `audit_events` table (id, timestamp,
+kind, JSONB payload) managed by embedded SQLx migrations. Command queueing,
+acknowledgements, validated broker snapshots, and process starts are recorded;
+a configured-but-unreachable database fails startup, while individual writes
+are best-effort so a storage hiccup never blocks a command. `GET /audit`
+returns the newest rows. PostgreSQL runs as a Homebrew service on this machine
+(auto-start at login); retention, rotation, and backups are still open.
 
 ### Reconciliation
 

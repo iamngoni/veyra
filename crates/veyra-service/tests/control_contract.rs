@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use veyra_service::AppState;
 use veyra_service::app::create_app;
+use veyra_service::audit::{AuditKind, AuditRuntime, MemoryTrail};
 use veyra_service::broker::{
     BrokerRuntime, BrokerSettings, CommandKind, EaLink, ORDER_MAGIC, create_ea_app,
 };
@@ -699,4 +700,53 @@ async fn reconciliation_walks_from_unavailable_to_drift() {
     assert_eq!(body["status"], "drift");
     assert_eq!(body["unknownTickets"], json!([123]));
     assert_eq!(body["positions"][0]["managed"], false);
+}
+
+#[actix_web::test]
+async fn queued_commands_and_the_audit_route_share_one_trail() {
+    let trail = Arc::new(MemoryTrail::default());
+    let (runtime, link) = broker();
+    prime(&link).await;
+    let state = AppState::new(test_config(), Some(runtime), None, gate())
+        .with_audit(Some(AuditRuntime::new(trail.clone())));
+
+    let (status, body) = check(
+        &state,
+        json!({"symbol": "EURUSD", "side": "buy", "order_type": "market", "volume": 0.01}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let command_id = body["command_id"].as_str().expect("command id").to_owned();
+
+    let events = trail.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind(), AuditKind::CommandQueued);
+    assert_eq!(events[0].payload()["command_id"], command_id.as_str());
+    assert_eq!(events[0].payload()["kind"], "order_check");
+
+    let app = test::init_service(create_app(state.clone())).await;
+    let request = test::TestRequest::get().uri("/audit?limit=5").to_request();
+    let response = test::call_service(&app, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = test::read_body_json(response).await;
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["provider"], "postgres");
+    assert_eq!(body["events"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["events"][0]["kind"], "command_queued");
+    assert_eq!(
+        body["events"][0]["payload"]["command_id"],
+        command_id.as_str()
+    );
+}
+
+#[actix_web::test]
+async fn the_audit_route_reports_disabled_without_a_trail() {
+    let state = AppState::new(test_config(), None, None, gate());
+    let app = test::init_service(create_app(state)).await;
+    let request = test::TestRequest::get().uri("/audit").to_request();
+    let response = test::call_service(&app, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = test::read_body_json(response).await;
+    assert_eq!(body["status"], "disabled");
+    assert_eq!(body["events"].as_array().map(Vec::len), Some(0));
 }

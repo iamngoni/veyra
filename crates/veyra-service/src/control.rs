@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::AppState;
+use crate::audit::{AuditEvent, AuditKind};
 use crate::broker::ea::{
     CommandId, CommandKind, CommandPayload, CommandState, EaCloseRequest, EaLink, EaModifyRequest,
     EaOrderRequest, ORDER_MAGIC,
@@ -50,6 +51,16 @@ pub async fn check_intent(
         }
         RiskDecision::Approved(intent) => {
             let command = link.enqueue_order_check(EaOrderRequest::from_intent(&intent));
+            audit(
+                &state,
+                AuditKind::CommandQueued,
+                json!({
+                    "command_id": command.to_string(),
+                    "kind": "order_check",
+                    "intent_id": intent.id().to_string()
+                }),
+            )
+            .await;
             HttpResponse::Ok().json(json!({
                 "decision": "approved",
                 "intent_id": intent.id().to_string(),
@@ -72,6 +83,15 @@ pub async fn request_account_snapshot(state: Data<AppState>) -> HttpResponse {
             .json(json!({ "error": "command_channel_unavailable" }));
     };
     let command = link.enqueue(CommandKind::AccountSnapshot);
+    audit(
+        &state,
+        AuditKind::CommandQueued,
+        json!({
+            "command_id": command.to_string(),
+            "kind": "account_snapshot"
+        }),
+    )
+    .await;
     HttpResponse::Ok().json(json!({
         "command": "account_snapshot",
         "command_id": command.to_string(),
@@ -107,6 +127,16 @@ pub async fn execute_intent(
         }
         RiskDecision::Approved(intent) => {
             let command = link.enqueue_order(EaOrderRequest::from_intent(&intent));
+            audit(
+                &state,
+                AuditKind::CommandQueued,
+                json!({
+                    "command_id": command.to_string(),
+                    "kind": "open_order",
+                    "intent_id": intent.id().to_string()
+                }),
+            )
+            .await;
             HttpResponse::Ok().json(json!({
                 "decision": "approved",
                 "intent_id": intent.id().to_string(),
@@ -158,6 +188,16 @@ pub async fn close_position(state: Data<AppState>, body: web::Json<CloseRequest>
         return HttpResponse::Conflict().json(json!({ "error": "not_a_veyra_position" }));
     }
     let command = link.enqueue_close(EaCloseRequest::new(position.ticket, position.magic));
+    audit(
+        &state,
+        AuditKind::CommandQueued,
+        json!({
+            "command_id": command.to_string(),
+            "kind": "close_order",
+            "ticket": position.ticket
+        }),
+    )
+    .await;
     HttpResponse::Ok().json(json!({
         "command": "close_order",
         "command_id": command.to_string(),
@@ -227,6 +267,16 @@ pub async fn modify_position(
         body.stop_loss,
         body.take_profit,
     ));
+    audit(
+        &state,
+        AuditKind::CommandQueued,
+        json!({
+            "command_id": command.to_string(),
+            "kind": "modify_order",
+            "ticket": position.ticket
+        }),
+    )
+    .await;
     HttpResponse::Ok().json(json!({
         "command": "modify_order",
         "command_id": command.to_string(),
@@ -283,6 +333,39 @@ pub async fn reconciliation(state: Data<AppState>) -> HttpResponse {
     }))
 }
 
+/// Query for `GET /audit`.
+#[derive(Debug, Deserialize)]
+pub struct AuditQuery {
+    /// Maximum rows to return (1-200, default 50).
+    pub limit: Option<u32>,
+}
+
+#[get("/audit")]
+/// Returns the newest audit events, newest first.
+pub async fn audit_log(state: Data<AppState>, query: web::Query<AuditQuery>) -> HttpResponse {
+    let Some(runtime) = state.audit() else {
+        return HttpResponse::Ok().json(json!({ "status": "disabled", "events": [] }));
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    match runtime.trail().recent(limit).await {
+        Ok(rows) => HttpResponse::Ok().json(json!({
+            "status": "ok",
+            "provider": runtime.provider().as_str(),
+            "events": rows
+                .iter()
+                .map(|row| json!({
+                    "id": row.id,
+                    "at": row.at,
+                    "kind": row.kind,
+                    "payload": row.payload
+                }))
+                .collect::<Vec<_>>()
+        })),
+        Err(error) => HttpResponse::ServiceUnavailable()
+            .json(json!({ "status": "unavailable", "error": error.to_string() })),
+    }
+}
+
 #[get("/commands/{id}")]
 /// Reports one command's lifecycle state and validated result.
 pub async fn command_status(state: Data<AppState>, id: web::Path<String>) -> HttpResponse {
@@ -322,6 +405,13 @@ pub async fn command_status(state: Data<AppState>, id: web::Path<String>) -> Htt
 /// Returns the EA command channel of the active provider, when it exposes one.
 fn command_link(state: &AppState) -> Option<Arc<EaLink>> {
     state.broker()?.ea_link()
+}
+
+/// Records an audit event best-effort, when a trail is configured.
+async fn audit(state: &AppState, kind: AuditKind, payload: serde_json::Value) {
+    if let Some(runtime) = state.audit() {
+        runtime.try_record(AuditEvent::new(kind, payload)).await;
+    }
 }
 
 /// Flattens a validated payload for operators; account balances stay out of

@@ -10,10 +10,15 @@
 
 ## Phase 1 — durable service core
 
-- PostgreSQL via SQLx for decisions, audit events, risk changes, and broker state.
-- Migration and reconciliation workflow.
-- Structured tracing spans and metrics.
-- Operational readiness checks tied to real dependencies.
+- [x] PostgreSQL via SQLx for audit events and broker state: append-only
+      `audit_events` (commands, acknowledgements, snapshots, restarts),
+      embedded migrations, and a loopback `GET /audit` view — proven live
+      against PostgreSQL 17 (rows survive restarts).
+- [x] Migration and reconciliation workflow: embedded migrations run before
+      listening; the reconciliation view and its periodic refresh are audited.
+- [ ] Structured tracing spans and metrics.
+- [ ] Operational readiness checks tied to real dependencies (`/status`
+      reports the persistence provider today; `/ready` is still process-only).
 
 ## Phase 2 — model integration
 

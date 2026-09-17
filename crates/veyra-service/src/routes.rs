@@ -37,6 +37,7 @@ struct StatusResponse {
     broker_provider: Option<&'static str>,
     model_provider: Option<&'static str>,
     jev_provider: Option<&'static str>,
+    persistence: Option<&'static str>,
     broker_connected: bool,
     trading_enabled: bool,
 }
@@ -78,6 +79,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
 
     let model_provider = state.model().map(|runtime| runtime.provider().as_str());
     let jev_provider = state.jev().map(|runtime| runtime.provider().as_str());
+    let persistence = state.audit().map(|runtime| runtime.provider().as_str());
 
     HttpResponse::Ok().json(StatusResponse {
         service: "veyra",
@@ -86,6 +88,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         broker_provider,
         model_provider,
         jev_provider,
+        persistence,
         broker_connected,
         trading_enabled: state.config().trading_enabled(),
     })

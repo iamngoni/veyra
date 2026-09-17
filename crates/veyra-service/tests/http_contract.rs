@@ -3,9 +3,12 @@
 //! They build the same Actix app used by the production binary and assert the
 //! safe current state so future execution work cannot silently change it.
 
+use std::sync::Arc;
+
 use actix_web::test;
 use veyra_service::AppState;
 use veyra_service::app::create_app;
+use veyra_service::audit::{AuditRuntime, MemoryTrail};
 use veyra_service::broker::{
     AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName, Symbol,
 };
@@ -172,4 +175,20 @@ async fn status_reports_the_configured_jev_provider() {
     let response = test::call_service(&unconfigured, request).await;
     let body: serde_json::Value = test::read_body_json(response).await;
     assert!(body["jev_provider"].is_null());
+}
+
+#[actix_web::test]
+async fn status_reports_the_configured_persistence_provider() {
+    let audit = AuditRuntime::new(Arc::new(MemoryTrail::default()));
+    let configured = test::init_service(create_app(test_state(None).with_audit(Some(audit)))).await;
+    let request = test::TestRequest::get().uri("/status").to_request();
+    let response = test::call_service(&configured, request).await;
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["persistence"], "postgres");
+
+    let unconfigured = test::init_service(create_app(test_state(None))).await;
+    let request = test::TestRequest::get().uri("/status").to_request();
+    let response = test::call_service(&unconfigured, request).await;
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert!(body["persistence"].is_null());
 }

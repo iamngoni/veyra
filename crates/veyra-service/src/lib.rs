@@ -6,6 +6,7 @@
 #![deny(missing_docs)]
 
 pub mod app;
+pub mod audit;
 pub mod broker;
 pub mod config;
 pub mod control;
@@ -16,8 +17,10 @@ pub mod reconciliation;
 pub mod risk;
 pub mod routes;
 pub mod server;
+pub mod store;
 pub mod trading;
 
+use audit::AuditRuntime;
 use broker::BrokerRuntime;
 use config::ServiceConfig;
 use jev::JevRuntime;
@@ -31,6 +34,7 @@ pub struct AppState {
     broker: Option<BrokerRuntime>,
     model: Option<ModelRuntime>,
     jev: Option<JevRuntime>,
+    audit: Option<AuditRuntime>,
     risk: RiskGate,
 }
 
@@ -47,8 +51,15 @@ impl AppState {
             broker,
             model,
             jev: None,
+            audit: None,
             risk,
         }
+    }
+
+    /// Attaches the configured audit trail, if any.
+    pub fn with_audit(mut self, audit: Option<AuditRuntime>) -> Self {
+        self.audit = audit;
+        self
     }
 
     /// Attaches the configured judgement integration, if any.
@@ -75,6 +86,11 @@ impl AppState {
     /// Returns the active judgement integration, if one is configured.
     pub fn jev(&self) -> Option<&JevRuntime> {
         self.jev.as_ref()
+    }
+
+    /// Returns the active audit trail, if one is configured.
+    pub fn audit(&self) -> Option<&AuditRuntime> {
+        self.audit.as_ref()
     }
 
     /// Returns the deterministic risk gate every intent must pass.

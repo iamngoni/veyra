@@ -2,13 +2,16 @@
 //! broker settings are invalid, then serve the diagnostic surface plus any
 //! provider-required loopback listener. This binary has no execution path.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use veyra_service::audit::{AuditEvent, AuditKind, AuditRuntime};
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
 use veyra_service::jev::{JevRuntime, JevSettings};
 use veyra_service::model::{ModelRuntime, settings::ModelSettings};
 use veyra_service::reconciliation;
 use veyra_service::risk::{RiskGate, RiskPolicy};
+use veyra_service::store::Store;
 use veyra_service::{AppState, config::ServiceConfig, observability, server};
 
 #[actix_web::main]
@@ -39,8 +42,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // allowlist approves nothing, so a missing setting cannot widen behavior.
     let risk = RiskGate::new(RiskPolicy::from_env()?);
 
+    // A configured database must be reachable before the service listens: a
+    // missing audit trail is never mistaken for an empty one. Writes are
+    // best-effort once running.
+    let audit = match config.database_url() {
+        Some(url) => {
+            let store = Store::connect(url).await?;
+            store.migrate().await?;
+            Some(Arc::new(AuditRuntime::new(Arc::new(store))))
+        }
+        None => None,
+    };
+
     let listener = server::bind(&config)?;
-    let state = AppState::new(config, broker, model, risk).with_jev(jev);
+    let state = AppState::new(config, broker, model, risk)
+        .with_jev(jev)
+        .with_audit(audit.as_ref().map(|runtime| (**runtime).clone()));
+
+    if let Some(runtime) = &audit {
+        if let Some(link) = state.broker().and_then(|broker| broker.ea_link()) {
+            link.set_audit(runtime.clone());
+        }
+        runtime
+            .try_record(AuditEvent::new(
+                AuditKind::ServiceStarted,
+                serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+            ))
+            .await;
+    }
 
     // Keep broker state fresh for the close/modify guards and the
     // reconciliation view while the terminal is polling.

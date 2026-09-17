@@ -11,6 +11,7 @@ fn config(host: &str, port: &str, env: &str) -> Result<ServiceConfig, ConfigErro
             "VEYRA_ENV" => env,
             "VEYRA_TRADING_ENABLED" => "false",
             "VEYRA_RECONCILE_SECS" => "30",
+            "VEYRA_DATABASE_URL" => "",
             _ => panic!("unexpected setting"),
         }
         .to_owned())
@@ -45,6 +46,7 @@ fn trading_enablement_is_explicit_and_typed() {
                 "VEYRA_ENV" => "development",
                 "VEYRA_TRADING_ENABLED" => value,
                 "VEYRA_RECONCILE_SECS" => "30",
+                "VEYRA_DATABASE_URL" => "",
                 _ => panic!("unexpected setting"),
             }
             .to_owned())
@@ -70,6 +72,7 @@ fn reconciliation_interval_is_bounded_and_typed() {
                 "VEYRA_ENV" => "development",
                 "VEYRA_TRADING_ENABLED" => "false",
                 "VEYRA_RECONCILE_SECS" => value,
+                "VEYRA_DATABASE_URL" => "",
                 _ => panic!("unexpected setting"),
             }
             .to_owned())

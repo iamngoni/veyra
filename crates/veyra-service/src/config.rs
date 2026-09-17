@@ -100,6 +100,7 @@ pub struct ServiceConfig {
     environment: Environment,
     trading_enabled: bool,
     reconcile_secs: u64,
+    database_url: Option<String>,
 }
 
 impl ServiceConfig {
@@ -152,11 +153,19 @@ impl ServiceConfig {
                 }
             },
         };
+        let database_url = match source("VEYRA_DATABASE_URL") {
+            Err(_) => None,
+            Ok(value) => match value.trim() {
+                "" => None,
+                url => Some(url.to_owned()),
+            },
+        };
         Ok(Self {
             address: SocketAddr::new(host, port.value()),
             environment,
             trading_enabled,
             reconcile_secs,
+            database_url,
         })
     }
 
@@ -168,6 +177,11 @@ impl ServiceConfig {
     /// Returns the deployment label, not a trading permission.
     pub fn environment(&self) -> Environment {
         self.environment
+    }
+
+    /// PostgreSQL connection string for the audit trail, when configured.
+    pub fn database_url(&self) -> Option<&str> {
+        self.database_url.as_deref()
     }
 
     /// Interval between periodic broker-state refreshes; zero disables them.

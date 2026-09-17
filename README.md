@@ -26,6 +26,10 @@ This repository contains the first tested, safe service slice:
   proven live (retcode 0 for a valid request, 129 for a wrong-side limit).
 - 24/7 supervision: launchd agents for the terminal, tunnel, and service with
   crash restart, proven by `SIGKILL` (ADR 0005).
+- Durable audit trail in PostgreSQL (SQLx migrations, append-only
+  `audit_events`, loopback `GET /audit`) — commands, acknowledgements, and
+  broker snapshots survive restarts. Configure `VEYRA_DATABASE_URL`; a
+  configured but unreachable database fails startup.
 - Structured JSON logging, bind-failure propagation, and graceful shutdown.
 - Rust unit, integration, and line-coverage gates.
 - GitHub Actions quality workflow.

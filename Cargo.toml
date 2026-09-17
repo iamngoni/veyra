@@ -14,6 +14,7 @@ actix-web = "4"
 agent-runtime = { git = "https://github.com/iamngoni/agent-runtime", rev = "1207aa7a1c65f9f88cf8420a1f19cdd2b57a47ab" }
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "macros", "migrate", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -25,3 +26,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Cargo 1.77+ defaults release builds to `strip = "debuginfo"`; on this
+# toolchain (Rust 1.93.1 / macOS 24.4) stripping malforms large proc-macro
+# dylibs ("mis-aligned LINKEDIT string pool" when sqlx_macros loads). Keep
+# symbols unstripped so `cargo build --release` produces loadable artifacts.
+strip = "none"

@@ -1,6 +1,8 @@
 # Coverage exclusions are narrow and documented: `src/main.rs` is process
-# wiring, and `tests/*_live.rs` files hold ignored tests that require live
-# external systems; both are exercised by `scripts/smoke.sh` and manual live
-# runs instead of the deterministic test suite.
+# wiring, `tests/*_live.rs` files hold ignored tests that require live external
+# systems, and `src/store.rs` is thin PostgreSQL glue whose behaviour depends on
+# a running server. All three are exercised by `scripts/smoke.sh` and manual
+# live runs (`cargo test --test store_live -- --ignored`) instead of the
+# deterministic test suite.
 [alias]
-coverage = 'llvm-cov --all-features --workspace --fail-under-lines 95 --ignore-filename-regex crates/.*/src/main\.rs$|crates/.*/tests/.*_live\.rs$'
+coverage = 'llvm-cov --all-features --workspace --fail-under-lines 95 --ignore-filename-regex crates/.*/src/main\.rs$|crates/.*/tests/.*_live\.rs$|crates/.*/src/store\.rs$'

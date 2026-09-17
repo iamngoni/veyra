@@ -8,6 +8,7 @@
 //! down cannot accumulate stale commands.
 
 use crate::AppState;
+use crate::audit::{AuditEvent, AuditKind};
 use crate::broker::ea::{AccountSnapshotPayload, CommandKind, ORDER_MAGIC, PositionPayload};
 
 /// One open order classified by ownership.
@@ -93,7 +94,19 @@ pub async fn refresh_once(state: &AppState) -> bool {
     if !should_refresh(fresh, link.has_pending(CommandKind::AccountSnapshot)) {
         return false;
     }
-    link.enqueue(CommandKind::AccountSnapshot);
+    let command = link.enqueue(CommandKind::AccountSnapshot);
+    if let Some(audit) = state.audit() {
+        audit
+            .try_record(AuditEvent::new(
+                AuditKind::CommandQueued,
+                serde_json::json!({
+                    "command_id": command.to_string(),
+                    "kind": "account_snapshot",
+                    "origin": "periodic_refresh"
+                }),
+            ))
+            .await;
+    }
     true
 }
 
@@ -224,5 +237,39 @@ mod tests {
             !refresh_once(&state).await,
             "a pending snapshot is not duplicated"
         );
+
+        // With a trail attached, the periodic refresh records its own queueing.
+        use std::sync::Arc;
+
+        use crate::audit::{AuditKind, AuditRuntime, MemoryTrail};
+
+        let trail = Arc::new(MemoryTrail::default());
+        let settings = BrokerSettings::from_source(|name| match name {
+            "VEYRA_BROKER_PROVIDER" => Ok("ea".to_owned()),
+            "VEYRA_EA_TOKEN" => Ok("test-token-1234567890".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        })
+        .expect("settings must parse")
+        .expect("broker must be configured");
+        let runtime = BrokerRuntime::from_settings(settings).expect("runtime builds");
+        runtime
+            .ea_link()
+            .expect("ea link")
+            .record(AccountSnapshot::new(
+                AccountLogin::parse(94168).expect("login"),
+                ServerName::parse("IFCMarkets-Real").expect("server"),
+                Symbol::parse("EURUSD").expect("symbol"),
+                true,
+                true,
+                0,
+                0.0,
+            ));
+        let audited = AppState::new(config(), Some(runtime), None, gate())
+            .with_audit(Some(AuditRuntime::new(trail.clone())));
+        assert!(refresh_once(&audited).await);
+        let events = trail.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind(), AuditKind::CommandQueued);
+        assert_eq!(events[0].payload()["origin"], "periodic_refresh");
     }
 }
