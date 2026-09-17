@@ -46,6 +46,7 @@ struct StatusResponse {
     trading_enabled: bool,
     ea_live_orders: bool,
     autopilot: Option<serde_json::Value>,
+    model_budget: Option<serde_json::Value>,
 }
 
 #[get("/health")]
@@ -147,6 +148,15 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         })
     });
     let model_provider = state.model().map(|runtime| runtime.provider().as_str());
+    let model_budget = state.model().map(|runtime| {
+        let budget = runtime.budget();
+        json!({
+            "hourLimit": budget.hour_limit,
+            "hourCalls": budget.hour_calls,
+            "dayLimit": budget.day_limit,
+            "dayCalls": budget.day_calls
+        })
+    });
     let jev_provider = state.jev().map(|runtime| runtime.provider().as_str());
     let persistence = state.audit().map(|runtime| runtime.provider().as_str());
 
@@ -163,6 +173,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         trading_enabled: state.config().trading_enabled(),
         ea_live_orders,
         autopilot,
+        model_budget,
     })
 }
 

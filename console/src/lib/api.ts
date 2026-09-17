@@ -32,6 +32,8 @@ export type Status = {
   trading_enabled: boolean
   ea_live_orders: boolean
   autopilot: AutopilotStatus | null
+  /** Model call usage against the configured caps; null without a model. */
+  model_budget: { hourLimit: number; hourCalls: number; dayLimit: number; dayCalls: number } | null
 }
 
 export type Position = {

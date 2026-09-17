@@ -46,7 +46,7 @@ function Dashboard() {
           <MarketPanel series={series} error={marketError} />
         </div>
         <div className="min-w-0">
-          <AutopilotPanel status={status?.autopilot} />
+          <AutopilotPanel status={status?.autopilot} budget={status?.model_budget} />
         </div>
       </div>
 

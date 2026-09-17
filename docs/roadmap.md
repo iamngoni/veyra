@@ -29,7 +29,10 @@
 - [x] Dynamic-schema support contributed upstream (`run_structured_with_format`).
 - [x] Retry policy for transient provider failures; deterministic adapter tests
       with an injected transport; live OpenRouter proof.
-- [ ] Per-tier budget/rate-limit policy in the operations layer.
+- [x] Call budget in the operations layer: a `BudgetedEngine` decorator
+      enforces `VEYRA_MODEL_MAX_CALLS_PER_HOUR` / `_PER_DAY` (0 = unlimited)
+      over any engine implementation, and `GET /status` reports the current
+      usage against the limits.
 - [x] Model decisions never reach execution directly (no execution exists).
 
 ## Phase 3 — Jev decision adapter

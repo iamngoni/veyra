@@ -182,6 +182,15 @@ terminal re-validates distance rules before acting. All three mutating commands
 (open, close, modify) share one contract, one switch pair, and one validated
 ack shape.
 
+### Model call budget
+
+`ModelRuntime` wraps whatever engine an implementation provides in a
+`BudgetedEngine`: fixed hourly and daily windows admit or refuse calls before
+the provider is reached, so a runaway loop records `unavailable: ... budget
+...` instead of spending. Zero limits (the default) mean unlimited — the
+guard bounds accidents, not normal operation; `GET /status` reports current
+usage against the configured caps.
+
 ### Persistence (audit trail)
 
 Durable history lives in one append-only `audit_events` table (id, timestamp,

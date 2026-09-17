@@ -8,9 +8,11 @@
 //! plus a selector; callers do not change.
 
 pub mod agent_runtime_engine;
+pub mod budget;
 pub mod settings;
 
 pub use agent_runtime_engine::AgentRuntimeEngine;
+pub use budget::{BudgetPolicy, BudgetSnapshot, BudgetTracker, BudgetedEngine};
 pub use settings::{ApiKey, ModelSettings, TierModels};
 
 use std::fmt;
@@ -152,10 +154,12 @@ pub trait DecisionEngine: Send + Sync + fmt::Debug + 'static {
 pub struct ModelRuntime {
     provider: ModelProvider,
     engine: Arc<dyn DecisionEngine>,
+    budget: Arc<BudgetTracker>,
 }
 
 impl ModelRuntime {
-    /// Builds the implementation selected by settings.
+    /// Builds the implementation selected by settings, wrapped in the call
+    /// budget so a runaway loop cannot silently multiply provider cost.
     ///
     /// # Errors
     /// Returns [`ModelError::Construction`] when the provider rejects its
@@ -164,9 +168,12 @@ impl ModelRuntime {
         match settings.provider() {
             ModelProvider::OpenRouter => {
                 let engine = AgentRuntimeEngine::build(&settings)?;
+                let budget = Arc::new(BudgetTracker::new(*settings.budget()));
+                let engine = Arc::new(BudgetedEngine::new(Arc::new(engine), budget.clone()));
                 Ok(Self {
                     provider: settings.provider(),
-                    engine: Arc::new(engine),
+                    engine,
+                    budget,
                 })
             }
         }
@@ -182,10 +189,19 @@ impl ModelRuntime {
         self.engine.clone()
     }
 
+    /// Current call usage against the configured budget.
+    pub fn budget(&self) -> BudgetSnapshot {
+        self.budget.snapshot()
+    }
+
     /// Builds a runtime around an injected engine; used by tests.
     #[cfg(test)]
     pub(crate) fn with_engine(provider: ModelProvider, engine: Arc<dyn DecisionEngine>) -> Self {
-        Self { provider, engine }
+        Self {
+            provider,
+            engine,
+            budget: Arc::new(BudgetTracker::new(BudgetPolicy::default())),
+        }
     }
 }
 

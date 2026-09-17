@@ -233,7 +233,13 @@ export function MarketPanel({ series, error }: { series?: CandleSeries; error?: 
 
 /* ---------- autopilot ---------- */
 
-export function AutopilotPanel({ status }: { status?: Status['autopilot'] }) {
+export function AutopilotPanel({
+  status,
+  budget,
+}: {
+  status?: Status['autopilot']
+  budget?: Status['model_budget']
+}) {
   const on = status?.enabled === true
   return (
     <Panel title="Autopilot" detail={on ? 'deciding on cadence' : 'disabled'}>
@@ -252,6 +258,14 @@ export function AutopilotPanel({ status }: { status?: Status['autopilot'] }) {
                   .filter(Boolean)
                   .join(' · ')
               : 'bracket only'
+          }
+        />
+        <Field
+          label="Model calls"
+          value={
+            budget
+              ? `${budget.hourCalls}/${budget.hourLimit || '∞'} h · ${budget.dayCalls}/${budget.dayLimit || '∞'} d`
+              : '—'
           }
         />
       </div>

@@ -84,6 +84,7 @@ pub struct ModelSettings {
     base_url: Option<String>,
     tiers: TierModels,
     http_referer: Option<String>,
+    budget: crate::model::BudgetPolicy,
 }
 
 impl ModelSettings {
@@ -115,6 +116,8 @@ impl ModelSettings {
         let balanced_raw = optional(&mut source, "VEYRA_MODEL_BALANCED");
         let reasoning_raw = optional(&mut source, "VEYRA_MODEL_REASONING");
         let referer_raw = optional(&mut source, "VEYRA_MODEL_HTTP_REFERER");
+        let hourly_cap_raw = optional(&mut source, "VEYRA_MODEL_MAX_CALLS_PER_HOUR");
+        let daily_cap_raw = optional(&mut source, "VEYRA_MODEL_MAX_CALLS_PER_DAY");
 
         if key_raw.is_empty() {
             let any_other = !provider_raw.is_empty()
@@ -122,7 +125,9 @@ impl ModelSettings {
                 || !fast_raw.is_empty()
                 || !balanced_raw.is_empty()
                 || !reasoning_raw.is_empty()
-                || !referer_raw.is_empty();
+                || !referer_raw.is_empty()
+                || !hourly_cap_raw.is_empty()
+                || !daily_cap_raw.is_empty();
             if any_other {
                 return Err(ConfigError::MissingEnvironmentVariable {
                     name: "VEYRA_MODEL_API_KEY",
@@ -167,6 +172,26 @@ impl ModelSettings {
             tier("VEYRA_MODEL_REASONING", reasoning_raw)?,
         );
 
+        // Zero means unlimited; the cap bounds accidents, not normal use.
+        let cap = |name: &'static str, raw: &str| -> Result<u32, ConfigError> {
+            if raw.is_empty() {
+                return Ok(0);
+            }
+            let invalid = || ConfigError::InvalidEnvironmentVariable {
+                name,
+                reason: "must be an integer from 0 through 100000 (0 = unlimited)",
+            };
+            let value = raw.parse::<u32>().map_err(|_| invalid())?;
+            if value > 100_000 {
+                return Err(invalid());
+            }
+            Ok(value)
+        };
+        let budget = crate::model::BudgetPolicy::new(
+            cap("VEYRA_MODEL_MAX_CALLS_PER_HOUR", &hourly_cap_raw)?,
+            cap("VEYRA_MODEL_MAX_CALLS_PER_DAY", &daily_cap_raw)?,
+        );
+
         let http_referer = if referer_raw.is_empty() {
             None
         } else {
@@ -179,6 +204,7 @@ impl ModelSettings {
             base_url,
             tiers,
             http_referer,
+            budget,
         }))
     }
 
@@ -205,6 +231,11 @@ impl ModelSettings {
     /// Optional OpenRouter attribution header.
     pub fn http_referer(&self) -> Option<&str> {
         self.http_referer.as_deref()
+    }
+
+    /// Call budget applied to the active engine.
+    pub fn budget(&self) -> &crate::model::BudgetPolicy {
+        &self.budget
     }
 }
 
@@ -253,6 +284,51 @@ mod tests {
             }
         }
         pairs
+    }
+
+    #[test]
+    fn budget_caps_parse_and_fail_closed() {
+        // Defaults are unlimited.
+        let settings = ModelSettings::from_source(source(&full(&[])))
+            .expect("settings parse")
+            .expect("configured");
+        assert_eq!(settings.budget().hourly(), 0);
+        assert_eq!(settings.budget().daily(), 0);
+
+        let settings = ModelSettings::from_source(source(&full(&[
+            ("VEYRA_MODEL_MAX_CALLS_PER_HOUR", "120"),
+            ("VEYRA_MODEL_MAX_CALLS_PER_DAY", "2000"),
+        ])))
+        .expect("settings parse")
+        .expect("configured");
+        assert_eq!(settings.budget().hourly(), 120);
+        assert_eq!(settings.budget().daily(), 2000);
+
+        for (name, value) in [
+            ("VEYRA_MODEL_MAX_CALLS_PER_HOUR", "many"),
+            ("VEYRA_MODEL_MAX_CALLS_PER_HOUR", "100001"),
+            ("VEYRA_MODEL_MAX_CALLS_PER_DAY", "-1"),
+        ] {
+            let error = ModelSettings::from_source(source(&full(&[(name, value)])))
+                .expect_err("malformed caps are rejected");
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::InvalidEnvironmentVariable { name: rejected, .. } if rejected == name
+                ),
+                "unexpected error for {name}={value}: {error:?}"
+            );
+        }
+
+        // A cap without a key is partial configuration and fails closed.
+        let error = ModelSettings::from_source(source(&[("VEYRA_MODEL_MAX_CALLS_PER_HOUR", "10")]))
+            .expect_err("caps without a key are partial");
+        assert_eq!(
+            error,
+            ConfigError::MissingEnvironmentVariable {
+                name: "VEYRA_MODEL_API_KEY"
+            }
+        );
     }
 
     #[test]

@@ -109,6 +109,7 @@ async fn status_reports_no_broker_connection() {
     assert_eq!(body["broker_provider"], serde_json::Value::Null);
     assert_eq!(body["market_provider"], serde_json::Value::Null);
     assert_eq!(body["model_provider"], serde_json::Value::Null);
+    assert_eq!(body["model_budget"], serde_json::Value::Null);
     assert_eq!(body["autopilot"], serde_json::Value::Null);
     assert_eq!(body["broker_connected"], false);
     assert_eq!(body["trading_enabled"], false);
@@ -194,6 +195,9 @@ async fn status_reports_model_provider() {
     assert!(response.status().is_success());
     let body: serde_json::Value = test::read_body_json(response).await;
     assert_eq!(body["model_provider"], "openrouter");
+    assert_eq!(body["model_budget"]["hourLimit"], 0, "unlimited by default");
+    assert_eq!(body["model_budget"]["hourCalls"], 0);
+    assert_eq!(body["model_budget"]["dayCalls"], 0);
     assert_eq!(body["broker_provider"], serde_json::Value::Null);
 }
 
