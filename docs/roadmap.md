@@ -87,6 +87,10 @@
 
 ## Phase 7 — deployment
 
-- Durable 24/7 host or VPS, managed secrets, backups, and monitoring.
-- Versioned deployment pipeline.
-- Staged rollout: local → paper account → minimal live exposure only after explicit owner approval.
+- [x] Local 24/7 supervision: launchd agents for the terminal, tunnel, and
+      service (release build, crash restart for the service and tunnel,
+      portable templates plus installer, logs under `~/Library/Logs/veyra`) —
+      restart proven live with `SIGKILL` (ADR 0005).
+- [ ] Durable 24/7 host or VPS, managed secrets, backups, and monitoring.
+- [ ] Versioned deployment pipeline.
+- [ ] Staged rollout: local → paper account → minimal live exposure only after explicit owner approval.

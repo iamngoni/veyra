@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>cc.antonlabs.veyra.service</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__ROOT__/scripts/run-service.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__ROOT__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/veyra/service.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/veyra/service.err.log</string>
+</dict>
+</plist>

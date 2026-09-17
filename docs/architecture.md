@@ -151,6 +151,19 @@ the fresh link report plus the open-order count every `BrokerLink`
 implementation reports from locally held state. Audit persistence arrives with
 the storage phase.
 
+## Hosting (24/7)
+
+The stack runs unattended on this Mac through three launchd agents rendered
+from portable templates (`scripts/launchd/`) by `scripts/install-launchd.sh`:
+the MT4 terminal at login, the named Cloudflare tunnel, and the service (via
+`scripts/run-service.sh`, which sources `.env` and execs the release binary).
+Tunnel and service carry `KeepAlive`, so a crash recovers without a session;
+the terminal deliberately does not, so a clean quit stays quit. Secrets remain
+in `.env`; plists carry only absolute paths. Exactly one supervised instance
+owns ports 8080 and 7801, and the installer stops stray session-bound
+processes first. Logs land under `~/Library/Logs/veyra` and are not rotated
+yet. See ADR 0005.
+
 ## Testing strategy
 
 - Unit tests for refined types and policy rules.
