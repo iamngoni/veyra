@@ -1,3 +1,5 @@
+import { useState } from 'react'
+
 import { createFileRoute } from '@tanstack/react-router'
 
 import {
@@ -20,6 +22,7 @@ function Dashboard() {
   const { data: commands } = usePoll(() => api.commands(25), 10000)
   const { data: series, error: marketError } = usePoll(() => api.candles(48), 60000)
   const { events, connected } = useEventFeed(80)
+  const [focus, setFocus] = useState(true)
 
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-[1500px] flex-col gap-3 p-4">
@@ -49,7 +52,7 @@ function Dashboard() {
 
       <div className="grid flex-1 items-start gap-3 lg:grid-cols-[3fr_2fr]">
         <div className="min-w-0">
-          <ActivityFeed events={events} connected={connected} />
+          <ActivityFeed events={events} connected={connected} focus={focus} onFocusChange={setFocus} />
         </div>
         <div className="flex min-w-0 flex-col gap-3">
           <PositionsPanel account={account} />

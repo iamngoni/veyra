@@ -337,23 +337,62 @@ function payloadSummary(event: FeedEvent): string {
   return JSON.stringify(payload)
 }
 
-export function ActivityFeed({ events, connected }: { events: FeedEvent[]; connected: boolean }) {
+/// High-frequency plumbing the focus mode hides: snapshots and the read-only
+/// commands the loop issues every cycle. Decisions, orders, and lifecycle
+/// events always show.
+function isRoutine(event: FeedEvent): boolean {
+  if (event.kind === 'broker_snapshot') return true
+  if (event.kind === 'command_queued' || event.kind === 'command_completed') {
+    const kind = String(event.payload?.kind ?? '')
+    return kind === 'account_snapshot' || kind === 'rates' || kind === 'ping'
+  }
+  return false
+}
+
+export function ActivityFeed({
+  events,
+  connected,
+  focus,
+  onFocusChange,
+}: {
+  events: FeedEvent[]
+  connected: boolean
+  focus: boolean
+  onFocusChange: (focus: boolean) => void
+}) {
+  const visible = focus ? events.filter((event) => !isRoutine(event)) : events
   return (
     <Panel
       title="Activity"
       className="min-h-[320px]"
       detail={
-        <span className="flex items-center gap-1.5">
-          <span className={`size-1.5 rounded-full ${connected ? 'animate-pulse bg-emerald-400' : 'bg-rose-400'}`} />
-          {connected ? 'streaming' : 'reconnecting…'}
+        <span className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => onFocusChange(!focus)}
+            className={`rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wider transition-colors ${
+              focus
+                ? 'border-slate-700 text-slate-300 hover:border-slate-500'
+                : 'border-amber-500/40 text-amber-300'
+            }`}
+            title={focus ? 'Show routine snapshots and reads' : 'Hide routine snapshots and reads'}
+          >
+            {focus ? 'focus' : 'all'}
+          </button>
+          <span className="flex items-center gap-1.5">
+            <span className={`size-1.5 rounded-full ${connected ? 'animate-pulse bg-emerald-400' : 'bg-rose-400'}`} />
+            {connected ? 'streaming' : 'reconnecting…'}
+          </span>
         </span>
       }
     >
-      {events.length === 0 ? (
-        <div className="p-3 text-xs text-slate-500">Waiting for events…</div>
+      {visible.length === 0 ? (
+        <div className="p-3 text-xs text-slate-500">
+          {events.length === 0 ? 'Waiting for events…' : 'No decisions yet — routine activity hidden.'}
+        </div>
       ) : (
         <ul className="divide-y divide-slate-800/40">
-          {events.map((event) => {
+          {visible.map((event) => {
             const outcome = typeof event.payload?.outcome === 'string' ? event.payload.outcome : undefined
             return (
               <li key={event.seq} className="flex items-start gap-2 px-3 py-1.5 text-xs">
