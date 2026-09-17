@@ -71,7 +71,13 @@
       closing, at least one finite positive stop required, absent stops keep
       their current values, and the terminal re-validates distances before a
       dry run or `OrderModify` — guards proven live (403/400/409/404).
-- [ ] Independent reconciliation against broker state.
+- [x] Reconciliation view over broker state: `GET /reconciliation` classifies
+      every open order as Veyra-managed or unknown by magic number, flags a
+      truncated list, and reports snapshot age. A periodic refresh
+      (`VEYRA_RECONCILE_SECS`, default 30 s) keeps the retained snapshot
+      current while the terminal polls — proven live.
+- [ ] Ticket-level tracing (position → approved intent) once commands are
+      recorded durably.
 - [ ] Staged testing: read-only first, then demo, then minimal live exposure
       only after explicit owner approval.
 

@@ -623,6 +623,13 @@ enum CommandRequest {
     Modify(EaModifyRequest),
 }
 
+/// Retained account snapshot plus the instant it was validated.
+#[derive(Debug)]
+struct StoredAccount {
+    payload: AccountSnapshotPayload,
+    at: SystemTime,
+}
+
 /// Shared state of the EA control channel.
 #[derive(Debug)]
 pub struct EaLink {
@@ -632,7 +639,7 @@ pub struct EaLink {
     state: Mutex<Option<EaState>>,
     commands: Mutex<VecDeque<EaCommand>>,
     pongs: AtomicU64,
-    last_account: Mutex<Option<AccountSnapshotPayload>>,
+    last_account: Mutex<Option<StoredAccount>>,
 }
 
 impl EaLink {
@@ -787,7 +794,12 @@ impl EaLink {
             }
         });
         if let Some(snapshot) = retained {
-            self.with_last_account(|slot| *slot = Some(snapshot));
+            self.with_last_account(|slot| {
+                *slot = Some(StoredAccount {
+                    payload: snapshot,
+                    at: SystemTime::now(),
+                });
+            });
         }
     }
 
@@ -831,13 +843,27 @@ impl EaLink {
     /// `None` until the first snapshot command completes. Read-only callers
     /// (risk facts, reconciliation) use it instead of querying the terminal.
     pub fn last_account(&self) -> Option<AccountSnapshotPayload> {
-        self.with_last_account(|slot| slot.clone())
+        self.with_last_account(|slot| slot.as_ref().map(|stored| stored.payload.clone()))
     }
 
-    fn with_last_account<T>(
-        &self,
-        apply: impl FnOnce(&mut Option<AccountSnapshotPayload>) -> T,
-    ) -> T {
+    /// Age of the retained account snapshot, when one exists.
+    pub fn last_account_age(&self, now: SystemTime) -> Option<Duration> {
+        self.with_last_account(|slot| {
+            slot.as_ref()
+                .map(|stored| now.duration_since(stored.at).unwrap_or_default())
+        })
+    }
+
+    /// Whether a command of this kind is still awaiting delivery or ack.
+    pub fn has_pending(&self, kind: CommandKind) -> bool {
+        self.with_commands(|queue| {
+            queue.iter().any(|command| {
+                command.kind == kind && matches!(command.state, CommandState::Pending)
+            })
+        })
+    }
+
+    fn with_last_account<T>(&self, apply: impl FnOnce(&mut Option<StoredAccount>) -> T) -> T {
         // Same poisoning stance as the other guards: the slot holds one whole
         // value, so recovering the guard cannot observe a partial write.
         let mut guard = match self.last_account.lock() {

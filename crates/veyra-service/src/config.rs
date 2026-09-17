@@ -26,6 +26,11 @@ pub enum ConfigError {
     },
 }
 
+/// Default interval for periodic broker-state refresh.
+const DEFAULT_RECONCILE_SECS: u64 = 30;
+/// Largest refresh interval the parser accepts.
+const MAX_RECONCILE_SECS: u64 = 3_600;
+
 /// Deployment label; it does not grant execution authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Environment {
@@ -94,6 +99,7 @@ pub struct ServiceConfig {
     address: SocketAddr,
     environment: Environment,
     trading_enabled: bool,
+    reconcile_secs: u64,
 }
 
 impl ServiceConfig {
@@ -129,10 +135,28 @@ impl ServiceConfig {
                 }
             },
         };
+        let reconcile_secs = match source("VEYRA_RECONCILE_SECS") {
+            Err(_) => DEFAULT_RECONCILE_SECS,
+            Ok(value) => match value.trim() {
+                "" => DEFAULT_RECONCILE_SECS,
+                other => {
+                    let invalid = || ConfigError::InvalidEnvironmentVariable {
+                        name: "VEYRA_RECONCILE_SECS",
+                        reason: "must be an integer number of seconds from 0 through 3600",
+                    };
+                    let secs = other.parse::<u64>().map_err(|_| invalid())?;
+                    if secs > MAX_RECONCILE_SECS {
+                        return Err(invalid());
+                    }
+                    secs
+                }
+            },
+        };
         Ok(Self {
             address: SocketAddr::new(host, port.value()),
             environment,
             trading_enabled,
+            reconcile_secs,
         })
     }
 
@@ -144,6 +168,11 @@ impl ServiceConfig {
     /// Returns the deployment label, not a trading permission.
     pub fn environment(&self) -> Environment {
         self.environment
+    }
+
+    /// Interval between periodic broker-state refreshes; zero disables them.
+    pub fn reconcile_secs(&self) -> u64 {
+        self.reconcile_secs
     }
 
     /// Whether the operator has explicitly enabled execution request paths.

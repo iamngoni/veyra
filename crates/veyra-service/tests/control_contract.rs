@@ -139,6 +139,18 @@ async fn execute(state: &AppState, payload: Value) -> (StatusCode, Value) {
     )
 }
 
+async fn reconciliation(state: &AppState) -> (StatusCode, Value) {
+    let app = test::init_service(create_app(state.clone())).await;
+    let request = test::TestRequest::get().uri("/reconciliation").to_request();
+    let response = test::call_service(&app, request).await;
+    let status = response.status();
+    let bytes = test::read_body(response).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 async fn modify(state: &AppState, payload: Value) -> (StatusCode, Value) {
     let app = test::init_service(create_app(state.clone())).await;
     let request = test::TestRequest::post()
@@ -648,4 +660,43 @@ async fn modifying_targets_only_veyra_positions() {
     assert_eq!(body["kind"], "modify_order");
     assert_eq!(body["status"], "completed");
     assert_eq!(body["result"]["executed"], false);
+}
+
+#[actix_web::test]
+async fn reconciliation_walks_from_unavailable_to_drift() {
+    // No command channel at all.
+    let bare = AppState::new(test_config(), None, None, gate());
+    let (status, body) = reconciliation(&bare).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "unavailable");
+
+    // A channel that has never heard from the terminal is stale.
+    let (runtime, link) = broker();
+    let state = AppState::new(test_config(), Some(runtime.clone()), None, gate());
+    let (status, body) = reconciliation(&state).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "stale");
+
+    // A fresh heartbeat without a completed snapshot has nothing to assess.
+    let (status, _) = poll(link.clone(), heartbeat()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = reconciliation(&state).await;
+    assert_eq!(body["status"], "no_snapshot");
+
+    // One Veyra-managed position reconciles cleanly.
+    retain_position(&link, ORDER_MAGIC).await;
+    let (_, body) = reconciliation(&state).await;
+    assert_eq!(body["status"], "reconciled");
+    assert_eq!(body["orders"], 1);
+    assert_eq!(body["positions"][0]["managed"], true);
+    assert_eq!(body["positions"][0]["ticket"], 123);
+    assert_eq!(body["unknownTickets"], json!([]));
+    assert!(body["accountAgeSecs"].as_u64().is_some());
+
+    // A foreign position is drift, named by ticket.
+    retain_position(&link, 0).await;
+    let (_, body) = reconciliation(&state).await;
+    assert_eq!(body["status"], "drift");
+    assert_eq!(body["unknownTickets"], json!([123]));
+    assert_eq!(body["positions"][0]["managed"], false);
 }

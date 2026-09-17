@@ -134,8 +134,11 @@ risk decision without queueing anything and `POST /intents/check` queues one
 /intents/execute` (queues `open_order`), `POST /intents/close`, and `POST
 /intents/modify` (stops on a Veyra-owned ticket) — all refuse unless
 `VEYRA_TRADING_ENABLED=true`. `POST /commands/account_snapshot` refreshes venue
-state (orders, open volume, bounded position list with magic numbers), and
-every command is pollable through `GET /commands/{id}`.
+state (orders, open volume, bounded position list with magic numbers) — the
+service also refreshes it automatically every `VEYRA_RECONCILE_SECS` (default
+30 s). `GET /reconciliation` classifies every open order as Veyra-managed or
+unknown and reports drift, and every command is pollable through
+`GET /commands/{id}`.
 
 Staged execution: with the service switch on, the terminal still validates the
 request and reports a dry run until the EA is recompiled with

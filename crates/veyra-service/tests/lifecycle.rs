@@ -23,6 +23,7 @@ fn config(host: &str, port: &str) -> ServiceConfig {
             "VEYRA_BIND_PORT" => port,
             "VEYRA_ENV" => "development",
             "VEYRA_TRADING_ENABLED" => "false",
+            "VEYRA_RECONCILE_SECS" => "30",
             _ => unreachable!("unexpected setting"),
         }
         .to_owned())

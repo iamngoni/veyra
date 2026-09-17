@@ -235,6 +235,54 @@ pub async fn modify_position(
     }))
 }
 
+#[get("/reconciliation")]
+/// Reports how the terminal's open orders relate to Veyra's ownership.
+///
+/// `status` is `unavailable` (no command channel), `stale` (the terminal is
+/// not polling), `no_snapshot` (nothing retained yet), `reconciled` (every
+/// order is Veyra-managed), or `drift` (unknown orders or a truncated list).
+pub async fn reconciliation(state: Data<AppState>) -> HttpResponse {
+    let Some(runtime) = state.broker() else {
+        return HttpResponse::Ok().json(json!({ "status": "unavailable" }));
+    };
+    let Some(link) = runtime.ea_link() else {
+        return HttpResponse::Ok().json(json!({ "status": "unavailable" }));
+    };
+    if !runtime.link().report().await.fresh {
+        return HttpResponse::Ok().json(json!({ "status": "stale" }));
+    }
+    let Some(snapshot) = link.last_account() else {
+        return HttpResponse::Ok().json(json!({ "status": "no_snapshot" }));
+    };
+    let report = crate::reconciliation::assess(&snapshot);
+    let account_age_secs = link
+        .last_account_age(SystemTime::now())
+        .map(|age| age.as_secs())
+        .unwrap_or(0);
+    let positions = report
+        .positions
+        .iter()
+        .map(|position| {
+            json!({
+                "ticket": position.ticket,
+                "symbol": position.symbol,
+                "magic": position.magic,
+                "managed": position.managed,
+                "lots": position.lots
+            })
+        })
+        .collect::<Vec<_>>();
+    HttpResponse::Ok().json(json!({
+        "status": if report.is_reconciled() { "reconciled" } else { "drift" },
+        "orders": snapshot.orders,
+        "lots": report.lots,
+        "positions": positions,
+        "unknownTickets": report.unknown_tickets,
+        "positionsTruncated": report.positions_truncated,
+        "accountAgeSecs": account_age_secs
+    }))
+}
+
 #[get("/commands/{id}")]
 /// Reports one command's lifecycle state and validated result.
 pub async fn command_status(state: Data<AppState>, id: web::Path<String>) -> HttpResponse {

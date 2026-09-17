@@ -181,6 +181,19 @@ terminal re-validates distance rules before acting. All three mutating commands
 (open, close, modify) share one contract, one switch pair, and one validated
 ack shape.
 
+### Reconciliation
+
+`reconciliation.rs` classifies every order in the retained `account_snapshot`
+as Veyra-managed (its magic number is `ORDER_MAGIC`) or unknown, and treats a
+truncated list as drift even when every visible order is ours. `GET
+/reconciliation` exposes the assessment with its snapshot age and one of
+`unavailable`, `stale`, `no_snapshot`, `reconciled`, or `drift`. A background
+refresh (`VEYRA_RECONCILE_SECS`, default 30 s, zero disables) queues one
+`account_snapshot` per interval but only while the channel is fresh and no
+snapshot is already pending, so a terminal that is down cannot accumulate
+stale commands. Ticket-level tracing to specific approved intents lands with
+durable storage.
+
 ## Hosting (24/7)
 
 The stack runs unattended on this Mac through three launchd agents rendered

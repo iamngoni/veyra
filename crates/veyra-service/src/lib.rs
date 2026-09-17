@@ -12,6 +12,7 @@ pub mod control;
 pub mod jev;
 pub mod model;
 pub mod observability;
+pub mod reconciliation;
 pub mod risk;
 pub mod routes;
 pub mod server;
