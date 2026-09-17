@@ -28,6 +28,7 @@ use jev::JevRuntime;
 use market::MarketRuntime;
 use model::ModelRuntime;
 use risk::RiskGate;
+use trading::autopilot::AutopilotSettings;
 
 /// Immutable runtime state shared by HTTP handlers.
 #[derive(Debug, Clone)]
@@ -35,6 +36,7 @@ pub struct AppState {
     config: ServiceConfig,
     broker: Option<BrokerRuntime>,
     market: Option<MarketRuntime>,
+    autopilot: Option<AutopilotSettings>,
     model: Option<ModelRuntime>,
     jev: Option<JevRuntime>,
     audit: Option<AuditRuntime>,
@@ -53,6 +55,7 @@ impl AppState {
             config,
             broker,
             market: None,
+            autopilot: None,
             model,
             jev: None,
             audit: None,
@@ -63,6 +66,12 @@ impl AppState {
     /// Attaches the configured market-data integration, if any.
     pub fn with_market(mut self, market: Option<MarketRuntime>) -> Self {
         self.market = market;
+        self
+    }
+
+    /// Attaches the configured autonomous loop settings, if any.
+    pub fn with_autopilot(mut self, autopilot: Option<AutopilotSettings>) -> Self {
+        self.autopilot = autopilot;
         self
     }
 
@@ -91,6 +100,11 @@ impl AppState {
     /// Returns the active market-data integration, if one is configured.
     pub fn market(&self) -> Option<&MarketRuntime> {
         self.market.as_ref()
+    }
+
+    /// Returns the autonomous loop settings, if any were configured.
+    pub fn autopilot(&self) -> Option<&AutopilotSettings> {
+        self.autopilot.as_ref()
     }
 
     /// Returns the active model integration, if one is configured.

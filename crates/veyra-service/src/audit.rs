@@ -29,6 +29,8 @@ pub enum AuditKind {
     ServiceStarted,
     /// Reconciliation found orders Veyra does not own.
     ReconciliationDrift,
+    /// The autonomous loop evaluated one proposal.
+    ProposalEvaluated,
 }
 
 impl AuditKind {
@@ -41,6 +43,7 @@ impl AuditKind {
             Self::BrokerSnapshot => "broker_snapshot",
             Self::ServiceStarted => "service_started",
             Self::ReconciliationDrift => "reconciliation_drift",
+            Self::ProposalEvaluated => "proposal_evaluated",
         }
     }
 }
@@ -297,6 +300,7 @@ mod tests {
             AuditKind::ReconciliationDrift.as_str(),
             "reconciliation_drift"
         );
+        assert_eq!(AuditKind::ProposalEvaluated.as_str(), "proposal_evaluated");
         assert_eq!(AuditProvider::Postgres.as_str(), "postgres");
         assert_eq!(AuditProvider::Postgres.to_string(), "postgres");
     }

@@ -109,6 +109,7 @@ async fn status_reports_no_broker_connection() {
     assert_eq!(body["broker_provider"], serde_json::Value::Null);
     assert_eq!(body["market_provider"], serde_json::Value::Null);
     assert_eq!(body["model_provider"], serde_json::Value::Null);
+    assert_eq!(body["autopilot"], serde_json::Value::Null);
     assert_eq!(body["broker_connected"], false);
     assert_eq!(body["trading_enabled"], false);
     assert_eq!(body["environment"], "development");
@@ -135,6 +136,32 @@ async fn status_reports_broker_link_state() {
         body["ea_live_orders"], true,
         "the armed EA state is reported even while the service switch is off"
     );
+}
+
+#[actix_web::test]
+async fn status_reports_autopilot_configuration() {
+    let settings = veyra_service::trading::AutopilotSettings::from_source(|name| match name {
+        "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+        "VEYRA_AUTOPILOT_SYMBOL" => Ok("EURUSD".to_owned()),
+        "VEYRA_AUTOPILOT_TIER" => Ok("reasoning".to_owned()),
+        _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+    })
+    .expect("settings parse")
+    .expect("configured");
+    let state = test_state(None).with_autopilot(Some(settings));
+    let app = test::init_service(create_app(state)).await;
+    let request = test::TestRequest::get().uri("/status").to_request();
+    let response = test::call_service(&app, request).await;
+
+    assert!(response.status().is_success());
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["autopilot"]["enabled"], true);
+    assert_eq!(body["autopilot"]["symbol"], "EURUSD");
+    assert_eq!(body["autopilot"]["tier"], "reasoning");
+    assert_eq!(body["autopilot"]["timeframe"], "H4");
+    assert_eq!(body["autopilot"]["bars"], 48);
+    assert_eq!(body["autopilot"]["interval_secs"], 300);
+    assert_eq!(body["autopilot"]["jev"], "auto");
 }
 
 #[actix_web::test]

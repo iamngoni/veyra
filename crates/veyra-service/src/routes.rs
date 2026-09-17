@@ -10,6 +10,7 @@ use std::time::SystemTime;
 use actix_web::web::{self, Data};
 use actix_web::{HttpResponse, get, post};
 use serde::Serialize;
+use serde_json::json;
 
 use crate::AppState;
 use crate::broker::BrokerRuntime;
@@ -44,6 +45,7 @@ struct StatusResponse {
     broker_connected: bool,
     trading_enabled: bool,
     ea_live_orders: bool,
+    autopilot: Option<serde_json::Value>,
 }
 
 #[get("/health")]
@@ -112,6 +114,17 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
     };
 
     let market_provider = state.market().map(|runtime| runtime.provider().as_str());
+    let autopilot = state.autopilot().map(|settings| {
+        json!({
+            "enabled": settings.enabled(),
+            "interval_secs": settings.interval().as_secs(),
+            "timeframe": settings.timeframe().as_str(),
+            "tier": settings.tier().as_str(),
+            "bars": settings.bars(),
+            "symbol": settings.symbol().map(|symbol| symbol.as_str()),
+            "jev": settings.jev().as_str()
+        })
+    });
     let model_provider = state.model().map(|runtime| runtime.provider().as_str());
     let jev_provider = state.jev().map(|runtime| runtime.provider().as_str());
     let persistence = state.audit().map(|runtime| runtime.provider().as_str());
@@ -128,6 +141,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         broker_connected,
         trading_enabled: state.config().trading_enabled(),
         ea_live_orders,
+        autopilot,
     })
 }
 

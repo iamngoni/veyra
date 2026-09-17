@@ -30,6 +30,33 @@ pub enum ModelTier {
     Reasoning,
 }
 
+impl ModelTier {
+    /// Stable name used in configuration and status output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Reasoning => "reasoning",
+        }
+    }
+
+    /// Parses a configuration value; unknown tiers are rejected.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fast" => Some(Self::Fast),
+            "balanced" => Some(Self::Balanced),
+            "reasoning" => Some(Self::Reasoning),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ModelTier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Supported model provider implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelProvider {
@@ -153,5 +180,31 @@ impl ModelRuntime {
     /// Domain-level engine contract used by the decision layer.
     pub fn engine(&self) -> Arc<dyn DecisionEngine> {
         self.engine.clone()
+    }
+
+    /// Builds a runtime around an injected engine; used by tests.
+    #[cfg(test)]
+    pub(crate) fn with_engine(provider: ModelProvider, engine: Arc<dyn DecisionEngine>) -> Self {
+        Self { provider, engine }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tier_names_round_trip() {
+        for (tier, name) in [
+            (ModelTier::Fast, "fast"),
+            (ModelTier::Balanced, "balanced"),
+            (ModelTier::Reasoning, "reasoning"),
+        ] {
+            assert_eq!(tier.as_str(), name);
+            assert_eq!(ModelTier::parse(name), Some(tier));
+            assert_eq!(ModelTier::parse(&name.to_ascii_uppercase()), Some(tier));
+            assert_eq!(tier.to_string(), name);
+        }
+        assert_eq!(ModelTier::parse("genius"), None);
     }
 }

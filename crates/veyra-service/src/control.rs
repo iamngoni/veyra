@@ -27,7 +27,7 @@ use crate::broker::ea::{
 };
 use crate::market::{CandleRequest, Timeframe};
 use crate::risk::RiskDecision;
-use crate::trading::TradeIntentDraft;
+use crate::trading::{TradeIntent, TradeIntentDraft};
 
 #[post("/intents/check")]
 /// Evaluates a draft and, when approved, queues one terminal `order_check`.
@@ -194,10 +194,10 @@ pub async fn execute_intent(
     state: Data<AppState>,
     draft: web::Json<TradeIntentDraft>,
 ) -> HttpResponse {
-    let Some(link) = command_link(&state) else {
+    if command_link(&state).is_none() {
         return HttpResponse::ServiceUnavailable()
             .json(json!({ "error": "command_channel_unavailable" }));
-    };
+    }
     if !state.config().trading_enabled() {
         return HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }));
     }
@@ -209,26 +209,68 @@ pub async fn execute_intent(
         RiskDecision::Rejected(rejection) => {
             HttpResponse::Ok().json(RiskDecision::Rejected(rejection))
         }
-        RiskDecision::Approved(intent) => {
-            let command = link.enqueue_order(EaOrderRequest::from_intent(&intent));
-            audit(
-                &state,
-                AuditKind::CommandQueued,
-                json!({
-                    "command_id": command.to_string(),
-                    "kind": "open_order",
-                    "intent_id": intent.id().to_string()
-                }),
-            )
-            .await;
-            HttpResponse::Ok().json(json!({
+        RiskDecision::Approved(intent) => match queue_staged_order(&state, &intent).await {
+            StagedExecution::Queued { command, intent_id } => HttpResponse::Ok().json(json!({
                 "decision": "approved",
-                "intent_id": intent.id().to_string(),
+                "intent_id": intent_id,
                 "command": "open_order",
                 "command_id": command.to_string(),
                 "status": "pending"
-            }))
-        }
+            })),
+            // Both refusals were checked above; a change mid-request is a
+            // conflict, not a silent no-op.
+            StagedExecution::TradingDisabled => {
+                HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }))
+            }
+            StagedExecution::ChannelUnavailable => HttpResponse::ServiceUnavailable()
+                .json(json!({ "error": "command_channel_unavailable" })),
+        },
+    }
+}
+
+/// Outcome of handing one gate-approved intent to the command channel.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StagedExecution {
+    /// The order command was queued and audited; poll it by id.
+    Queued {
+        /// Identifier of the queued command.
+        command: CommandId,
+        /// Identifier of the approved intent the command carries.
+        intent_id: String,
+    },
+    /// The operator switch is off; nothing was queued.
+    TradingDisabled,
+    /// The active broker exposes no command channel.
+    ChannelUnavailable,
+}
+
+/// Queues one approved intent as a live order command.
+///
+/// This is the single execution path shared by the control surface and the
+/// autonomous loop: it re-checks both operator controls, stamps the Veyra
+/// magic through [`EaOrderRequest::from_intent`], and audits the queueing.
+/// Approval alone can never trade.
+pub async fn queue_staged_order(state: &AppState, intent: &TradeIntent) -> StagedExecution {
+    let Some(link) = command_link(state) else {
+        return StagedExecution::ChannelUnavailable;
+    };
+    if !state.config().trading_enabled() {
+        return StagedExecution::TradingDisabled;
+    }
+    let command = link.enqueue_order(EaOrderRequest::from_intent(intent));
+    audit(
+        state,
+        AuditKind::CommandQueued,
+        json!({
+            "command_id": command.to_string(),
+            "kind": "open_order",
+            "intent_id": intent.id().to_string()
+        }),
+    )
+    .await;
+    StagedExecution::Queued {
+        command,
+        intent_id: intent.id().to_string(),
     }
 }
 

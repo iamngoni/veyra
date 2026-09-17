@@ -144,6 +144,12 @@ impl JevRuntime {
     pub fn judge(&self) -> &Arc<dyn SemanticJudge> {
         &self.judge
     }
+
+    /// Builds a runtime around an injected judge; used by tests.
+    #[cfg(test)]
+    pub(crate) fn with_judge(provider: JevProvider, judge: Arc<dyn SemanticJudge>) -> Self {
+        Self { provider, judge }
+    }
 }
 
 #[cfg(test)]
