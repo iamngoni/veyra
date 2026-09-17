@@ -30,11 +30,16 @@ This repository contains the first tested, safe service slice:
   first autonomous order (EURUSD 0.01 sell, ticket 10650805, executed with
   retcode 0 after explicit owner approval of both switches).
 - An **operations console** (TanStack Start) on `http://127.0.0.1:3000`:
-  account and positions, a streaming activity feed, recent commands, and the
-  current market window.
+  account and positions with their stops, a streaming activity feed, recent
+  commands, and the current market window.
+- **Alerting** without a vendor: a supervised probe watches readiness, the
+  two execution controls, repeated autopilot failures, reconciliation drift,
+  executed opens, and closed positions (with last P/L), and pushes one JSON
+  POST per finding to `VEYRA_ALERT_WEBHOOK` — Slack, Discord, or ntfy all
+  accept the payload. Without a webhook it logs to `~/Library/Logs/veyra`.
 - 24/7 supervision: launchd agents for the terminal, tunnel, service, console,
-  hourly log rotation, and daily verified audit backups with crash restart on
-  the service, tunnel, and console (ADR 0005).
+  alert probe, hourly log rotation, and daily verified audit backups with
+  crash restart on the service, tunnel, and console (ADR 0005).
 - Durable audit trail in PostgreSQL (SQLx migrations, append-only
   `audit_events`, loopback `GET /audit`) — commands, acknowledgements, and
   broker snapshots survive restarts. Configure `VEYRA_DATABASE_URL`; a

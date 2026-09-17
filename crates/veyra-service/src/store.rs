@@ -30,7 +30,7 @@ impl Store {
     pub async fn connect(url: &str) -> Result<Self, AuditError> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
-            .acquire_timeout(Duration::from_secs(5))
+            .acquire_timeout(Duration::from_secs(3))
             .connect(url)
             .await
             .map_err(|error| storage_error("connect", &error))?;

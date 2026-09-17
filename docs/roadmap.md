@@ -143,7 +143,12 @@
       custom format, verifies each archive with `pg_restore --list`, keeps the
       newest fourteen under `~/Library/Application Support/veyra/backups`,
       and prunes older generations.
+- [x] Local alerting: a two-minute probe watches readiness, both execution
+      controls, repeated autopilot failures, reconciliation drift, executed
+      opens, and closed positions, pushing JSON webhook alerts (any provider
+      that accepts `text`) — proven live with a database bounce (degraded and
+      recovery alerts delivered) and a silent steady state.
 - [ ] Durable 24/7 host or VPS, managed secrets, off-machine backups, and
-      monitoring.
+      remote monitoring.
 - [ ] Versioned deployment pipeline.
 - [ ] Staged rollout: local → paper account → minimal live exposure only after explicit owner approval.

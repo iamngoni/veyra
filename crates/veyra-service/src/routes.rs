@@ -5,7 +5,7 @@
 //! response exposes credentials, account balances, or model prompts. Adding an
 //! executable route requires an explicit design change plus the risk gate.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use actix_web::web::{self, Data};
 use actix_web::{HttpResponse, get, post};
@@ -72,13 +72,7 @@ pub async fn readiness(state: Data<AppState>) -> HttpResponse {
     };
     let audit = match state.audit() {
         None => "disabled",
-        Some(runtime) => match runtime.trail().recent(1).await {
-            Ok(_) => "ok",
-            Err(error) => {
-                tracing::warn!(%error, "readiness audit probe failed");
-                "unavailable"
-            }
-        },
+        Some(runtime) => audit_health(runtime, READINESS_PROBE_TIMEOUT).await,
     };
     let overall = if broker == "stale" || audit == "unavailable" {
         "degraded"
@@ -91,6 +85,31 @@ pub async fn readiness(state: Data<AppState>) -> HttpResponse {
         broker,
         audit,
     })
+}
+
+/// How long the readiness probe waits for the audit store before reporting
+/// it unavailable. A database that is down must make `/ready` answer quickly
+/// with `degraded`, never hang the caller; the sqlx pool's own acquire
+/// timeout is the backstop for every other path.
+const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Probes the audit store with a bounded wait, returning `ok`, `unavailable`,
+/// or `timeout`.
+pub(crate) async fn audit_health(
+    runtime: &crate::audit::AuditRuntime,
+    timeout: Duration,
+) -> &'static str {
+    match actix_web::rt::time::timeout(timeout, runtime.trail().recent(1)).await {
+        Ok(Ok(_)) => "ok",
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "readiness audit probe failed");
+            "unavailable"
+        }
+        Err(_) => {
+            tracing::warn!("readiness audit probe timed out");
+            "unavailable"
+        }
+    }
 }
 
 #[get("/status")]
@@ -180,4 +199,61 @@ pub(crate) async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<Acco
         open_orders: snapshot.open_orders(),
         open_lots: snapshot.open_lots(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use async_trait::async_trait;
+
+    use super::audit_health;
+    use crate::audit::{
+        AuditError, AuditEvent, AuditProvider, AuditRow, AuditRuntime, AuditTrail, MemoryTrail,
+    };
+
+    /// Trail whose reads never finish, as a wedged database would behave.
+    #[derive(Debug)]
+    struct HangingTrail;
+
+    #[async_trait]
+    impl AuditTrail for HangingTrail {
+        fn provider(&self) -> AuditProvider {
+            AuditProvider::Postgres
+        }
+
+        async fn record(&self, _event: AuditEvent) -> Result<(), AuditError> {
+            Ok(())
+        }
+
+        async fn recent(&self, _limit: u32) -> Result<Vec<AuditRow>, AuditError> {
+            actix_web::rt::time::sleep(Duration::from_secs(30)).await;
+            Ok(Vec::new())
+        }
+
+        async fn prune(&self, _keep_days: u32) -> Result<u64, AuditError> {
+            Ok(0)
+        }
+    }
+
+    #[actix_web::test]
+    async fn audit_health_is_bounded() {
+        let healthy = AuditRuntime::new(Arc::new(MemoryTrail::default()));
+        assert_eq!(
+            audit_health(&healthy, Duration::from_millis(500)).await,
+            "ok"
+        );
+
+        let hanging = AuditRuntime::new(Arc::new(HangingTrail));
+        let started = Instant::now();
+        assert_eq!(
+            audit_health(&hanging, Duration::from_millis(50)).await,
+            "unavailable"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a wedged store must not hold the probe"
+        );
+    }
 }

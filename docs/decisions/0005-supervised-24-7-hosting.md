@@ -4,8 +4,9 @@
 
 Accepted 2026-09-17; installed and proven (service and tunnel both restarted
 after `SIGKILL`, and the EA link reconnected automatically). Amended the same
-day: hourly log rotation and a daily verified audit backup joined the agent
-set (see the hosting section of `docs/architecture.md`).
+day: hourly log rotation, a daily verified audit backup, the operations
+console, and a two-minute alert probe joined the agent set (see the hosting
+section of `docs/architecture.md`).
 
 ## Context
 
@@ -18,7 +19,7 @@ set (see the hosting section of `docs/architecture.md`).
 
 ## Decision
 
-- Five LaunchAgents, rendered from portable templates in `scripts/launchd/`
+- Seven LaunchAgents, rendered from portable templates in `scripts/launchd/`
   by `scripts/install-launchd.sh` (idempotent, removable with `--uninstall`):
   - `cc.antonlabs.veyra.terminal` starts MT4 at login (`open -a`). No
     KeepAlive: a clean quit should stay quit, and Wine exit codes are not
@@ -35,6 +36,11 @@ set (see the hosting section of `docs/architecture.md`).
     `pg_restore --list` before it replaces the previous generation, and
     keeping the newest fourteen dumps under
     `~/Library/Application Support/veyra/backups`.
+  - `cc.antonlabs.veyra.console` serves the built operations console on
+    loopback, proxying `/api` to the service.
+  - `cc.antonlabs.veyra.alerts` runs every two minutes, comparing the stack
+    against the previous run and pushing findings to `VEYRA_ALERT_WEBHOOK`
+    (logged under `~/Library/Logs/veyra` when unset).
 - Secrets stay in `.env` (0600); plists carry only absolute paths.
 - Logs go to `~/Library/Logs/veyra/{service,tunnel,terminal,logrotate,backup}.{out,err}.log`,
   and the logrotate agent keeps them bounded.
