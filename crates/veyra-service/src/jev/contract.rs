@@ -5,7 +5,9 @@
 //! question ids, instructions, options, and levels on the way in;
 //! probabilities, confidences, legends, and answer/option alignment on the way
 //! out. Wire shapes mirror `POST /v1/systemone` (docs.typesafe.ai); the
-//! transport owns HTTP, this module owns meaning.
+//! transport owns HTTP, this module owns meaning. Distribution sums allow the
+//! provider's two-decimal rounding (see `PROBABILITY_TOLERANCE`); anything
+//! less usable still fails closed.
 
 use std::collections::BTreeMap;
 
@@ -24,8 +26,15 @@ const MAX_OPTIONS: usize = 32;
 const MAX_LEVELS: usize = 16;
 const MIN_CHOICES: usize = 2;
 const MIN_LEVELS: usize = 2;
-/// Float slack allowed when checking that a distribution sums to one.
-const PROBABILITY_TOLERANCE: f64 = 1e-3;
+/// Slack allowed when checking that a distribution sums to one.
+///
+/// Jev reports probabilities rounded to two decimals, so a three-option
+/// answer can legitimately total 0.99 or 1.01 (each option loses up to half a
+/// cent to rounding). 0.02 covers four options with margin while still
+/// rejecting a genuinely malformed distribution — 0.97 or 1.3 does not pass.
+/// Live sampling on 2026-09-17 observed 0.99 sums in roughly one in ten
+/// answers; failing those skipped whole autopilot ticks for pure formatting.
+const PROBABILITY_TOLERANCE: f64 = 2e-2;
 
 fn contract(reason: &str) -> JevError {
     JevError::Contract {
@@ -926,6 +935,76 @@ mod tests {
         request()
             .validate_answers(&response)
             .expect("answers are aligned with the questions");
+    }
+
+    #[test]
+    fn rounding_slack_is_accepted_but_real_drift_is_not() {
+        let response = |answer: serde_json::Value| {
+            let body = serde_json::json!({
+                "model": "jev-1.13.0",
+                "answers": {"q": answer},
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })
+            .to_string();
+            parse_response_body(body.as_bytes())
+        };
+
+        // Observed live: two-decimal rounding loses a cent.
+        assert!(
+            response(serde_json::json!({
+                "type": "score",
+                "score": 1.27,
+                "legend": {"0": "Weak", "1": "Neutral", "2": "Strong"},
+                "probabilities": {"0": 0.28, "1": 0.16, "2": 0.55},
+                "confidence": 0.8
+            }))
+            .is_ok(),
+            "a 0.99 score distribution is usable"
+        );
+        assert!(
+            response(serde_json::json!({
+                "type": "choice",
+                "choice": "short",
+                "probabilities": {"long": 0.02, "short": 0.93, "flat": 0.04},
+                "confidence": 0.9
+            }))
+            .is_ok(),
+            "a 0.99 choice distribution is usable"
+        );
+        // The same shape rounded to 1.01 is equally fine.
+        assert!(
+            response(serde_json::json!({
+                "type": "score",
+                "score": 1.7,
+                "legend": {"0": "Weak", "1": "Neutral", "2": "Strong"},
+                "probabilities": {"0": 0.29, "1": 0.17, "2": 0.55},
+                "confidence": 0.8
+            }))
+            .is_ok(),
+            "a 1.01 score distribution is usable"
+        );
+        // Real drift still fails.
+        assert!(
+            response(serde_json::json!({
+                "type": "score",
+                "score": 1.2,
+                "legend": {"0": "Weak", "1": "Neutral", "2": "Strong"},
+                "probabilities": {"0": 0.28, "1": 0.16, "2": 0.53},
+                "confidence": 0.8
+            }))
+            .is_err(),
+            "a 0.97 distribution is malformed"
+        );
+        assert!(
+            response(serde_json::json!({
+                "type": "choice",
+                "choice": "long",
+                "probabilities": {"long": 0.9, "short": 0.05},
+                "confidence": 0.8
+            }))
+            .is_err(),
+            "a 0.95 distribution is malformed"
+        );
     }
 
     #[test]

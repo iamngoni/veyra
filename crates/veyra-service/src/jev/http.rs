@@ -110,9 +110,37 @@ impl SemanticJudge for HttpJev {
             }
         }
 
-        let parsed = parse_response_body(&bytes)?;
-        request.validate_answers(&parsed)?;
+        // A rejected response is logged with a bounded preview: provider drift
+        // in probability formatting must be diagnosable without reconstructing
+        // the request, and the response carries only judgements.
+        let parsed = match parse_response_body(&bytes) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                logging::warn_rejected(&error, &bytes);
+                return Err(error);
+            }
+        };
+        if let Err(error) = request.validate_answers(&parsed) {
+            logging::warn_rejected(&error, &bytes);
+            return Err(error);
+        }
         Ok(parsed)
+    }
+}
+
+mod logging {
+    use crate::jev::JevError;
+
+    /// Bounded response preview attached to contract rejections.
+    const PREVIEW_CHARS: usize = 700;
+
+    pub(super) fn warn_rejected(error: &JevError, bytes: &[u8]) {
+        let preview: String = String::from_utf8_lossy(bytes)
+            .chars()
+            .filter(|character| !character.is_control() || *character == ' ')
+            .take(PREVIEW_CHARS)
+            .collect();
+        tracing::warn!(%error, preview, "jev response rejected");
     }
 }
 
