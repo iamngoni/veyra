@@ -5,8 +5,8 @@
 // Requires the endpoint to be listed in
 // Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.14"
-#property description "Veyra control channel: heartbeat, account snapshot, and broker-side order validation. Places no orders."
+#property version   "1.15"
+#property description "Veyra control channel: heartbeat, account and position snapshots, and broker-side order validation. Places no orders."
 
 input string InUrl         = "__VEYRA_URL__";   // Veyra endpoint (loopback or tunnel)
 input string InToken       = "__VEYRA_TOKEN__"; // shared token
@@ -254,6 +254,60 @@ void HandleOrderCheck(string response, string id)
    SendAck(id, data);
   }
 
+// Total open volume in lots across every open order.
+double OpenLots()
+  {
+   double total = 0.0;
+   for(int i = 0; i < OrdersTotal(); i++)
+     {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) total += OrderLots();
+     }
+   return(total);
+  }
+
+// Stable wire names for terminal order kinds. This MQL4 build declares only
+// OP_BUY and OP_SELL, so the remaining documented order-type values are
+// matched explicitly.
+string OrderKindName(int type)
+  {
+   switch(type)
+     {
+      case 0: return("buy");
+      case 1: return("sell");
+      case 2: return("buy_limit");
+      case 3: return("sell_limit");
+      case 4: return("buy_stop");
+      case 5: return("sell_stop");
+      case 6: return("buy_stop_limit");
+      case 7: return("sell_stop_limit");
+     }
+   return("unknown");
+  }
+
+// Bounded JSON array of open orders for the account snapshot. OrderSelect()
+// moves the terminal's selection cursor, so callers must not depend on it.
+string PositionsJson(int maxEntries)
+  {
+   string out = "[";
+   int included = 0;
+   int total = OrdersTotal();
+   for(int i = 0; i < total && included < maxEntries; i++)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      int digits = (int)MarketInfo(OrderSymbol(), MODE_DIGITS);
+      if(digits <= 0) digits = 5;
+      if(included > 0) out = out + ",";
+      out = out + "{\"ticket\":" + (string)OrderTicket()
+            + ",\"symbol\":\"" + EscapeJson(OrderSymbol()) + "\""
+            + ",\"kind\":\"" + OrderKindName(OrderType()) + "\""
+            + ",\"lots\":" + DoubleToString(OrderLots(), 2)
+            + ",\"price\":" + DoubleToString(OrderOpenPrice(), digits)
+            + ",\"profit\":" + DoubleToString(OrderProfit(), 2) + "}";
+      included++;
+     }
+   return(out + "]");
+  }
+
 // Executes one command delivered by the service and acknowledges it by id.
 void HandleCommand(string response)
   {
@@ -278,6 +332,9 @@ void HandleCommand(string response)
              + ",\"equity\":" + DoubleToString(AccountEquity(), 2)
              + ",\"freeMargin\":" + DoubleToString(AccountFreeMargin(), 2)
              + ",\"orders\":" + (string)OrdersTotal()
+             + ",\"lots\":" + DoubleToString(OpenLots(), 2)
+             + ",\"positions\":" + PositionsJson(32)
+             + ",\"positionsTruncated\":" + (OrdersTotal() > 32 ? "true" : "false")
              + ",\"serverTime\":" + (string)(long)TimeLocal() + "}";
      }
    else
@@ -318,6 +375,7 @@ void OnTimer()
                  + ",\"connected\":" + (IsConnected() ? "true" : "false")
                  + ",\"tradeAllowed\":" + (IsTradeAllowed() ? "true" : "false")
                  + ",\"orders\":" + (string)OrdersTotal()
+                 + ",\"lots\":" + DoubleToString(OpenLots(), 2)
                  + ",\"balance\":" + DoubleToString(AccountBalance(), 2)
                  + ",\"ts\":" + (string)(long)TimeLocal() + "}";
 

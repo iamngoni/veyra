@@ -64,6 +64,7 @@ fn snapshot() -> AccountSnapshot {
         true,
         true,
         0,
+        0.0,
     )
 }
 

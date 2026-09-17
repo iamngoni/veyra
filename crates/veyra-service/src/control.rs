@@ -18,7 +18,9 @@ use actix_web::{HttpResponse, get, post};
 use serde_json::json;
 
 use crate::AppState;
-use crate::broker::ea::{CommandId, CommandPayload, CommandState, EaLink, EaOrderRequest};
+use crate::broker::ea::{
+    CommandId, CommandKind, CommandPayload, CommandState, EaLink, EaOrderRequest,
+};
 use crate::risk::RiskDecision;
 use crate::trading::TradeIntentDraft;
 
@@ -55,6 +57,24 @@ pub async fn check_intent(
             }))
         }
     }
+}
+
+#[post("/commands/account_snapshot")]
+/// Queues the read-only `account_snapshot` command and returns its id.
+///
+/// Operators use this to refresh venue state (orders, open volume, positions)
+/// on demand; it never sends an order.
+pub async fn request_account_snapshot(state: Data<AppState>) -> HttpResponse {
+    let Some(link) = command_link(&state) else {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "command_channel_unavailable" }));
+    };
+    let command = link.enqueue(CommandKind::AccountSnapshot);
+    HttpResponse::Ok().json(json!({
+        "command": "account_snapshot",
+        "command_id": command.to_string(),
+        "status": "pending"
+    }))
 }
 
 #[get("/commands/{id}")]
@@ -103,7 +123,12 @@ fn command_link(state: &AppState) -> Option<Arc<EaLink>> {
 fn command_result(payload: CommandPayload) -> serde_json::Value {
     match payload {
         CommandPayload::Ping => json!({}),
-        CommandPayload::AccountSnapshot(snapshot) => json!({ "orders": snapshot.orders }),
+        CommandPayload::AccountSnapshot(snapshot) => json!({
+            "orders": snapshot.orders,
+            "lots": snapshot.lots,
+            "positions": snapshot.positions,
+            "positionsTruncated": snapshot.positions_truncated
+        }),
         CommandPayload::OrderCheck(check) => json!({
             "passed": check.passed,
             "retcode": check.retcode,

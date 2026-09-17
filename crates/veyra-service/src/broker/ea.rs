@@ -104,6 +104,49 @@ impl CommandKind {
     }
 }
 
+/// Largest position list the payload accepts; the terminal caps earlier and
+/// flags truncation.
+const MAX_POSITIONS: usize = 64;
+
+/// One open or pending order as the terminal reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PositionPayload {
+    /// Venue ticket.
+    pub ticket: i64,
+    /// Instrument.
+    pub symbol: String,
+    /// Order kind.
+    pub kind: PositionKind,
+    /// Volume in lots.
+    pub lots: f64,
+    /// Entry or trigger price.
+    pub price: f64,
+    /// Floating profit in account currency.
+    pub profit: f64,
+}
+
+/// Order kinds the terminal can report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionKind {
+    /// Market buy position.
+    Buy,
+    /// Market sell position.
+    Sell,
+    /// Buy limit order.
+    BuyLimit,
+    /// Sell limit order.
+    SellLimit,
+    /// Buy stop order.
+    BuyStop,
+    /// Sell stop order.
+    SellStop,
+    /// Buy stop-limit order.
+    BuyStopLimit,
+    /// Sell stop-limit order.
+    SellStopLimit,
+}
+
 /// Account state reported by an `account_snapshot` command.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct AccountSnapshotPayload {
@@ -116,13 +159,21 @@ pub struct AccountSnapshotPayload {
     pub free_margin: f64,
     /// Open orders; MT4 counts positions and pending orders here.
     pub orders: u32,
+    /// Total open volume across every open order, in lots.
+    pub lots: f64,
+    /// Bounded snapshot of the open orders.
+    pub positions: Vec<PositionPayload>,
+    /// Whether the terminal omitted orders beyond its own cap.
+    #[serde(rename = "positionsTruncated")]
+    pub positions_truncated: bool,
     /// Terminal server time.
     #[serde(rename = "serverTime")]
     pub server_time: i64,
 }
 
 impl AccountSnapshotPayload {
-    /// Rejects non-finite money values before they reach callers.
+    /// Rejects non-finite money values and unusable exposure data before they
+    /// reach callers.
     fn validate(&self) -> Result<(), String> {
         for (name, value) in [
             ("balance", self.balance),
@@ -131,6 +182,30 @@ impl AccountSnapshotPayload {
         ] {
             if !value.is_finite() {
                 return Err(format!("{name} must be a finite number"));
+            }
+        }
+        if !self.lots.is_finite() || self.lots < 0.0 {
+            return Err("lots must be a finite, non-negative number".to_owned());
+        }
+        if self.positions.len() > MAX_POSITIONS {
+            return Err(format!(
+                "positions must contain at most {MAX_POSITIONS} entries"
+            ));
+        }
+        for position in &self.positions {
+            if position.ticket <= 0 {
+                return Err("position ticket must be positive".to_owned());
+            }
+            Symbol::parse(&position.symbol)
+                .map_err(|error| format!("position symbol is invalid: {error}"))?;
+            if !position.lots.is_finite() || position.lots <= 0.0 {
+                return Err("position lots must be a finite, positive number".to_owned());
+            }
+            if !position.price.is_finite() || position.price <= 0.0 {
+                return Err("position price must be a finite, positive number".to_owned());
+            }
+            if !position.profit.is_finite() {
+                return Err("position profit must be a finite number".to_owned());
             }
         }
         Ok(())
@@ -275,6 +350,8 @@ pub struct EaPoll {
     trade_allowed: Option<bool>,
     #[serde(default)]
     orders: Option<u32>,
+    #[serde(default)]
+    lots: Option<f64>,
     #[serde(rename = "id", default)]
     command_id: Option<CommandId>,
     #[serde(default)]
@@ -327,6 +404,15 @@ impl EaPoll {
             field: "orders",
             reason: "missing",
         })?;
+        let open_lots = match self.lots {
+            Some(value) if value.is_finite() && value >= 0.0 => value,
+            _ => {
+                return Err(BrokerError::InvalidPayload {
+                    field: "lots",
+                    reason: "must be a finite, non-negative number",
+                });
+            }
+        };
         Ok(AccountSnapshot::new(
             login,
             server,
@@ -334,6 +420,7 @@ impl EaPoll {
             self.connected.unwrap_or(false),
             self.trade_allowed.unwrap_or(false),
             open_orders,
+            open_lots,
         ))
     }
 }
@@ -762,7 +849,7 @@ mod tests {
         EaAck, EaLink, EaOrderRequest, EaToken, OrderCheckPayload, hex_preview, payload_for,
     };
     use crate::broker::ea::{
-        AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandState,
+        AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandState, PositionKind,
     };
     use crate::trading::intent::{
         OrderKind, Price, Side, TradeIntent, TradeIntentDraft, Volume, parse_instrument,
@@ -796,10 +883,92 @@ mod tests {
             equity: 0.0,
             free_margin: 0.0,
             orders: 0,
+            lots: 0.0,
+            positions: Vec::new(),
+            positions_truncated: false,
             server_time: 0,
         };
         let error = payload.validate().expect_err("NaN must be rejected");
         assert!(error.contains("balance"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn snapshot_payloads_reject_unusable_exposure() {
+        let base = || {
+            serde_json::json!({
+                "balance": 20.57,
+                "equity": 20.57,
+                "freeMargin": 20.57,
+                "orders": 1,
+                "lots": 0.01,
+                "positions": [{
+                    "ticket": 123,
+                    "symbol": "EURUSD",
+                    "kind": "buy",
+                    "lots": 0.01,
+                    "price": 1.095,
+                    "profit": -0.25
+                }],
+                "positionsTruncated": false,
+                "serverTime": 1_758_000_000
+            })
+        };
+
+        let valid = payload_for(CommandKind::AccountSnapshot, Some(base()))
+            .expect("complete payload must validate");
+        assert!(matches!(valid, CommandPayload::AccountSnapshot(_)));
+
+        let mut cases = Vec::new();
+        let mut negative_lots = base();
+        negative_lots["lots"] = serde_json::json!(-1.0);
+        cases.push(negative_lots);
+
+        let mut bad_ticket = base();
+        bad_ticket["positions"][0]["ticket"] = serde_json::json!(0);
+        cases.push(bad_ticket);
+
+        let mut bad_symbol = base();
+        bad_symbol["positions"][0]["symbol"] = serde_json::json!("not a symbol!");
+        cases.push(bad_symbol);
+
+        let mut bad_lots = base();
+        bad_lots["positions"][0]["lots"] = serde_json::json!(0.0);
+        cases.push(bad_lots);
+
+        let mut bad_price = base();
+        bad_price["positions"][0]["price"] = serde_json::json!(-1.0);
+        cases.push(bad_price);
+
+        let mut bad_profit = base();
+        bad_profit["positions"][0]["profit"] = serde_json::json!("lots");
+        cases.push(bad_profit);
+
+        let mut too_many = base();
+        let entries = (0..65)
+            .map(|ticket| {
+                serde_json::json!({
+                    "ticket": ticket + 1,
+                    "symbol": "EURUSD",
+                    "kind": "sell",
+                    "lots": 0.01,
+                    "price": 1.1,
+                    "profit": 0.0
+                })
+            })
+            .collect::<Vec<_>>();
+        too_many["positions"] = serde_json::json!(entries);
+        cases.push(too_many);
+
+        for case in cases {
+            assert!(
+                payload_for(CommandKind::AccountSnapshot, Some(case)).is_err(),
+                "payload must be rejected"
+            );
+        }
+
+        let mut unknown_kind = base();
+        unknown_kind["positions"][0]["kind"] = serde_json::json!("sideways");
+        assert!(payload_for(CommandKind::AccountSnapshot, Some(unknown_kind)).is_err());
     }
 
     #[test]
@@ -938,6 +1107,16 @@ mod tests {
                 "equity": 20.57,
                 "freeMargin": 20.57,
                 "orders": 3,
+                "lots": 0.03,
+                "positions": [{
+                    "ticket": 123,
+                    "symbol": "EURUSD",
+                    "kind": "buy",
+                    "lots": 0.03,
+                    "price": 1.095,
+                    "profit": -0.25
+                }],
+                "positionsTruncated": false,
                 "serverTime": 1_758_000_000
             })),
             error: None,
@@ -945,6 +1124,8 @@ mod tests {
 
         let retained = link.last_account().expect("snapshot retained");
         assert_eq!(retained.orders, 3);
+        assert_eq!(retained.lots, 0.03);
+        assert_eq!(retained.positions[0].kind, PositionKind::Buy);
         assert_eq!(
             link.command(id).expect("recorded").state,
             CommandState::Completed {

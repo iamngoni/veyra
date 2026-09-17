@@ -62,7 +62,8 @@ fn heartbeat() -> Value {
         "symbol": "EURUSD",
         "connected": true,
         "tradeAllowed": true,
-        "orders": 0
+        "orders": 0,
+        "lots": 0.0
     })
 }
 
@@ -128,6 +129,9 @@ async fn prime_snapshot(link: &Arc<EaLink>) {
                 "equity": 20.57,
                 "freeMargin": 20.57,
                 "orders": 0,
+                "lots": 0.0,
+                "positions": [],
+                "positionsTruncated": false,
                 "serverTime": 1_758_000_000
             }
         }),

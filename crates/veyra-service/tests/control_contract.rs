@@ -63,7 +63,8 @@ fn heartbeat() -> Value {
         "symbol": "EURUSD",
         "connected": true,
         "tradeAllowed": true,
-        "orders": 0
+        "orders": 0,
+        "lots": 0.0
     })
 }
 
@@ -197,6 +198,69 @@ async fn rejected_drafts_never_reach_the_terminal() {
 
     let (_, reply) = poll(link.clone(), heartbeat()).await;
     assert_eq!(reply["t"], "none", "no command may be queued");
+}
+
+#[actix_web::test]
+async fn account_snapshot_requests_report_exposure() {
+    let (runtime, link) = broker();
+    prime(&link).await;
+
+    let state = AppState::new(test_config(), Some(runtime), None, gate());
+    let app = test::init_service(create_app(state.clone())).await;
+    let request = test::TestRequest::post()
+        .uri("/commands/account_snapshot")
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = test::read_body_json(response).await;
+    let command_id = body["command_id"]
+        .as_str()
+        .expect("snapshot requests carry a command id")
+        .to_owned();
+
+    let (status, delivered) = poll(link.clone(), heartbeat()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(delivered["kind"], "account_snapshot");
+
+    let (status, _) = poll(
+        link.clone(),
+        json!({
+            "t": "ack",
+            "v": 1,
+            "token": TOKEN,
+            "id": command_id,
+            "ok": true,
+            "data": {
+                "balance": 20.57,
+                "equity": 20.57,
+                "freeMargin": 20.57,
+                "orders": 1,
+                "lots": 0.01,
+                "positions": [{
+                    "ticket": 123,
+                    "symbol": "EURUSD",
+                    "kind": "buy",
+                    "lots": 0.01,
+                    "price": 1.095,
+                    "profit": -0.25
+                }],
+                "positionsTruncated": false,
+                "serverTime": 1_758_000_000
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = command_status(&state, &command_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["kind"], "account_snapshot");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["result"]["orders"], 1);
+    assert_eq!(body["result"]["lots"], 0.01);
+    assert_eq!(body["result"]["positions"][0]["kind"], "buy");
+    assert_eq!(body["result"]["positions"][0]["ticket"], 123);
+    assert_eq!(body["result"]["positionsTruncated"], false);
 }
 
 #[actix_web::test]

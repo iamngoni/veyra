@@ -128,8 +128,10 @@ market rules and margin engine — it never sends an order, and mutating command
 will keep the same id/ack discipline and must be idempotent per id.
 
 Loopback control surface (`127.0.0.1:8080`): `POST /intents/evaluate` returns a
-risk decision without queueing anything, and `POST /intents/check` queues one
-`order_check` for an approved intent, pollable through `GET /commands/{id}`.
+risk decision without queueing anything, `POST /intents/check` queues one
+`order_check` for an approved intent, and `POST /commands/account_snapshot`
+refreshes venue state (orders, open volume, bounded position list); every
+command is pollable through `GET /commands/{id}`.
 
 Platform notes (see docs/decisions/0002):
 

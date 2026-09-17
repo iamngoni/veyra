@@ -187,6 +187,7 @@ mod tests {
             false,
             vec![parse_instrument("eurusd").expect("symbol")],
             Volume::parse(0.5).expect("volume"),
+            Volume::parse(0.5).expect("volume"),
             2,
             Duration::from_secs(60),
             None,
@@ -197,6 +198,7 @@ mod tests {
         Some(AccountFacts {
             trade_allowed: true,
             open_orders: 0,
+            open_lots: 0.0,
         })
     }
 

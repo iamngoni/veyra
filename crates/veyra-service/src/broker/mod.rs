@@ -12,8 +12,8 @@ pub mod settings;
 
 pub use ea::{
     AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandRecord, CommandState,
-    EaErrorBody, EaLink, EaOrderRequest, EaPoll, EaReply, OrderCheckPayload, build_server,
-    create_ea_app,
+    EaErrorBody, EaLink, EaOrderRequest, EaPoll, EaReply, OrderCheckPayload, PositionKind,
+    PositionPayload, build_server, create_ea_app,
 };
 pub use settings::{BrokerSettings, EaToken};
 
@@ -154,7 +154,7 @@ impl Symbol {
 }
 
 /// Account and terminal state observed from the venue.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AccountSnapshot {
     login: AccountLogin,
     server: ServerName,
@@ -162,6 +162,7 @@ pub struct AccountSnapshot {
     connected: bool,
     trade_allowed: bool,
     open_orders: u32,
+    open_lots: f64,
 }
 
 impl AccountSnapshot {
@@ -173,6 +174,7 @@ impl AccountSnapshot {
         connected: bool,
         trade_allowed: bool,
         open_orders: u32,
+        open_lots: f64,
     ) -> Self {
         Self {
             login,
@@ -181,6 +183,7 @@ impl AccountSnapshot {
             connected,
             trade_allowed,
             open_orders,
+            open_lots,
         }
     }
 
@@ -212,6 +215,11 @@ impl AccountSnapshot {
     /// Number of open venue orders (MT4 counts positions and pending orders).
     pub fn open_orders(&self) -> u32 {
         self.open_orders
+    }
+
+    /// Total open volume in lots across every open order.
+    pub fn open_lots(&self) -> f64 {
+        self.open_lots
     }
 }
 

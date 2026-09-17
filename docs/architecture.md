@@ -102,7 +102,10 @@ protocol (`ping`/`pong`) and carries the command queue. Commands are typed
 (`ping`, `account_snapshot`, `order_check` today), delivered on a poll,
 re-delivered until acknowledged, and failed after a timeout; acknowledgements
 carry a stable id and are validated against the command's typed payload before
-being recorded. `order_check` carries a gate-approved intent to the terminal,
+being recorded. The heartbeat also carries open volume in lots, and `account_snapshot`
+returns a bounded, validated order list (ticket, symbol, kind, lots, price,
+profit, plus a truncation flag) that feeds the gate's exposure cap and the
+future reconciler. `order_check` carries a gate-approved intent to the terminal,
 which applies its own market rules and margin engine (`MarketInfo`,
 `AccountFreeMarginCheck`) and returns a classic MT4 trade code (for example 129
 wrong-side price, 131 volume, 134 margin) without ever sending an order; the
@@ -138,9 +141,11 @@ answer through the gate and returns no-trade, a rejection, or an approved
 The gate is deterministic code, not a model prompt. `risk/mod.rs` parses the
 `VEYRA_RISK_*` policy; `risk/gate.rs` evaluates one draft in a fixed order —
 kill switch, instrument allowlist, UTC session window, per-order volume cap,
-account availability, trading permission, open-order cap, duplicate
-suppression — and mints a `TradeIntent` only on approval. Rejections carry
-stable codes and non-sensitive details.
+account availability, trading permission, open-order cap, total-exposure cap,
+duplicate suppression — and mints a `TradeIntent` only on approval. The
+exposure cap compares open volume (reported by the link) plus the requested
+volume against `VEYRA_RISK_MAX_TOTAL_LOTS`. Rejections carry stable codes and
+non-sensitive details.
 
 The gate fails closed: missing or stale account facts reject, and defaults
 allow no instrument until one is configured. `POST /intents/evaluate` on the

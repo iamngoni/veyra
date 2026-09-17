@@ -74,7 +74,11 @@
       listener, backed by live link state.
 - [x] `VEYRA_RISK_*` configuration with restrictive defaults; malformed values
       fail startup.
-- [ ] Exposure limits in lots (needs the EA to report open volume).
+- [x] Exposure limits in lots: the EA reports open volume (heartbeat) and a
+      bounded order list (`account_snapshot`), and the gate rejects when open
+      volume plus the requested volume exceeds `VEYRA_RISK_MAX_TOTAL_LOTS` —
+      proven live (`exposure_above_limit` with a 0.005 cap, approved at the
+      0.01 default).
 - [ ] Policy persistence and audit trail (needs Phase 1 storage).
 - [ ] Require two independent controls for any live mode transition.
 

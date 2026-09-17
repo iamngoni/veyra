@@ -124,5 +124,6 @@ pub(crate) async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<Acco
     Some(AccountFacts {
         trade_allowed: snapshot.trade_allowed(),
         open_orders: snapshot.open_orders(),
+        open_lots: snapshot.open_lots(),
     })
 }

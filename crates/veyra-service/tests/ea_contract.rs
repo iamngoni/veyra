@@ -34,7 +34,8 @@ fn body(kind: &str) -> Value {
         "symbol": "EURUSD",
         "connected": true,
         "tradeAllowed": true,
-        "orders": 0
+        "orders": 0,
+        "lots": 0.0
     })
 }
 
@@ -220,7 +221,17 @@ async fn snapshot_ack_validates_its_typed_payload() {
             "balance": 20.57,
             "equity": 20.57,
             "freeMargin": 20.57,
-            "orders": 0,
+            "orders": 1,
+            "lots": 0.01,
+            "positions": [{
+                "ticket": 123,
+                "symbol": "EURUSD",
+                "kind": "buy",
+                "lots": 0.01,
+                "price": 1.095,
+                "profit": -0.25
+            }],
+            "positionsTruncated": false,
             "serverTime": 1_758_000_000
         }
     });
@@ -232,9 +243,42 @@ async fn snapshot_ack_validates_its_typed_payload() {
             payload: CommandPayload::AccountSnapshot(snapshot),
         } => {
             assert_eq!(snapshot.balance, 20.57);
-            assert_eq!(snapshot.orders, 0);
+            assert_eq!(snapshot.orders, 1);
+            assert_eq!(snapshot.lots, 0.01);
+            assert_eq!(snapshot.positions.len(), 1);
+            assert!(!snapshot.positions_truncated);
             assert_eq!(snapshot.server_time, 1_758_000_000);
         }
+        other => panic!("unexpected state: {other:?}"),
+    }
+}
+
+#[actix_web::test]
+async fn snapshot_ack_rejects_unusable_exposure_fields() {
+    let link = link(Duration::from_secs(10));
+    let id = link.enqueue(CommandKind::AccountSnapshot);
+    post(link.clone(), body("hb")).await;
+
+    let ack = json!({
+        "t": "ack",
+        "token": TOKEN,
+        "id": id.to_string(),
+        "ok": true,
+        "data": {
+            "balance": 20.57,
+            "equity": 20.57,
+            "freeMargin": 20.57,
+            "orders": 1,
+            "lots": -1.0,
+            "positions": [],
+            "positionsTruncated": false,
+            "serverTime": 1_758_000_000
+        }
+    });
+    let (status, _) = post(link.clone(), ack).await;
+    assert_eq!(status, StatusCode::OK);
+    match link.command(id).expect("recorded").state {
+        CommandState::Failed { reason } => assert!(reason.contains("lots")),
         other => panic!("unexpected state: {other:?}"),
     }
 }

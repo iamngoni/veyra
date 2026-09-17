@@ -104,6 +104,7 @@ pub struct RiskPolicy {
     kill_switch: bool,
     symbols: Vec<Symbol>,
     max_volume_per_order: Volume,
+    max_total_lots: Volume,
     max_open_orders: u32,
     duplicate_window: Duration,
     session: Option<SessionWindow>,
@@ -115,6 +116,7 @@ impl RiskPolicy {
         kill_switch: bool,
         symbols: Vec<Symbol>,
         max_volume_per_order: Volume,
+        max_total_lots: Volume,
         max_open_orders: u32,
         duplicate_window: Duration,
         session: Option<SessionWindow>,
@@ -123,6 +125,7 @@ impl RiskPolicy {
             kill_switch,
             symbols,
             max_volume_per_order,
+            max_total_lots,
             max_open_orders,
             duplicate_window,
             session,
@@ -175,6 +178,20 @@ impl RiskPolicy {
             }
         };
 
+        let max_total_lots = match trimmed(&mut source, "VEYRA_RISK_MAX_TOTAL_LOTS") {
+            None => Volume::MINIMUM,
+            Some(raw) => {
+                let value = raw.parse::<f64>().map_err(|_| RiskError {
+                    name: "VEYRA_RISK_MAX_TOTAL_LOTS",
+                    reason: VOLUME_RULE,
+                })?;
+                Volume::parse(value).map_err(|error| RiskError {
+                    name: "VEYRA_RISK_MAX_TOTAL_LOTS",
+                    reason: error.reason,
+                })?
+            }
+        };
+
         let max_open_orders = match trimmed(&mut source, "VEYRA_RISK_MAX_OPEN_ORDERS") {
             None => DEFAULT_MAX_OPEN_ORDERS,
             Some(raw) => {
@@ -218,6 +235,7 @@ impl RiskPolicy {
             kill_switch,
             symbols,
             max_volume_per_order,
+            max_total_lots,
             max_open_orders,
             duplicate_window,
             session,
@@ -237,6 +255,11 @@ impl RiskPolicy {
     /// Largest lot volume a single intent may request.
     pub fn max_volume_per_order(&self) -> Volume {
         self.max_volume_per_order
+    }
+
+    /// Largest total open volume, across existing orders plus a new intent.
+    pub fn max_total_lots(&self) -> Volume {
+        self.max_total_lots
     }
 
     /// Largest number of open venue orders the gate tolerates.
@@ -267,6 +290,7 @@ impl Default for RiskPolicy {
         Self::new(
             false,
             Vec::new(),
+            Volume::MINIMUM,
             Volume::MINIMUM,
             DEFAULT_MAX_OPEN_ORDERS,
             Duration::from_secs(DEFAULT_DUPLICATE_WINDOW_SECS),
@@ -327,6 +351,7 @@ mod tests {
         assert!(!policy.kill_switch());
         assert!(policy.symbols().is_empty());
         assert_eq!(policy.max_volume_per_order().value(), 0.01);
+        assert_eq!(policy.max_total_lots().value(), 0.01);
         assert_eq!(policy.max_open_orders(), 1);
         assert_eq!(policy.duplicate_window(), Duration::from_secs(60));
         assert_eq!(policy.session(), None);
@@ -340,6 +365,7 @@ mod tests {
             ("VEYRA_RISK_KILL_SWITCH", "true"),
             ("VEYRA_RISK_SYMBOLS", " eurusd , EURUSD,gbpusd ,, "),
             ("VEYRA_RISK_MAX_VOLUME_PER_ORDER", "0.25"),
+            ("VEYRA_RISK_MAX_TOTAL_LOTS", "0.05"),
             ("VEYRA_RISK_MAX_OPEN_ORDERS", "7"),
             ("VEYRA_RISK_DUPLICATE_WINDOW_SECS", "5"),
             ("VEYRA_RISK_SESSION_HOURS_UTC", "8-17"),
@@ -350,6 +376,7 @@ mod tests {
         assert_eq!(policy.symbols().len(), 2);
         assert!(policy.allows_symbol(&parse_instrument("gbpusd").expect("symbol")));
         assert_eq!(policy.max_volume_per_order().value(), 0.25);
+        assert_eq!(policy.max_total_lots().value(), 0.05);
         assert_eq!(policy.max_open_orders(), 7);
         assert_eq!(policy.duplicate_window(), Duration::from_secs(5));
         assert_eq!(
@@ -360,12 +387,14 @@ mod tests {
 
     #[test]
     fn malformed_settings_are_rejected_by_name() {
-        let cases: [(&'static str, &'static str); 8] = [
+        let cases: [(&'static str, &'static str); 10] = [
             ("VEYRA_RISK_KILL_SWITCH", "yes"),
             ("VEYRA_RISK_SYMBOLS", "not a symbol!,EURUSD"),
             ("VEYRA_RISK_MAX_VOLUME_PER_ORDER", "0"),
             ("VEYRA_RISK_MAX_VOLUME_PER_ORDER", "101"),
             ("VEYRA_RISK_MAX_VOLUME_PER_ORDER", "lots"),
+            ("VEYRA_RISK_MAX_TOTAL_LOTS", "0"),
+            ("VEYRA_RISK_MAX_TOTAL_LOTS", "lots"),
             ("VEYRA_RISK_MAX_OPEN_ORDERS", "1001"),
             ("VEYRA_RISK_DUPLICATE_WINDOW_SECS", "86401"),
             ("VEYRA_RISK_SESSION_HOURS_UTC", "24-3"),

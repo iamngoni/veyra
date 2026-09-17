@@ -20,16 +20,20 @@ use crate::trading::intent::{TradeIntent, TradeIntentDraft};
 
 /// How many approvals are remembered for duplicate suppression.
 const APPROVAL_HISTORY: usize = 128;
+/// Slack allowed when comparing summed lot volumes.
+const EXPOSURE_EPSILON: f64 = 1e-9;
 
 /// Facts the gate needs from the venue, assembled by the caller from a fresh
 /// link report. Nothing here is inferred: when the caller cannot supply fresh
 /// facts, it passes `None` and the gate rejects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AccountFacts {
     /// The terminal currently allows trading operations.
     pub trade_allowed: bool,
     /// Open venue orders (MT4 counts positions and pending orders here).
     pub open_orders: u32,
+    /// Total open volume across every open order, in lots.
+    pub open_lots: f64,
 }
 
 /// Stable rejection codes; additions are backwards-compatible for consumers
@@ -51,6 +55,8 @@ pub enum RiskCode {
     TradingNotAllowed,
     /// The venue already holds the maximum tolerated number of orders.
     OrderLimitReached,
+    /// Open volume plus the requested volume exceeds the total exposure cap.
+    ExposureAboveLimit,
     /// An identical draft was approved inside the duplicate window.
     DuplicateIntent,
 }
@@ -66,6 +72,7 @@ impl RiskCode {
             Self::AccountStateUnavailable => "account_state_unavailable",
             Self::TradingNotAllowed => "trading_not_allowed",
             Self::OrderLimitReached => "order_limit_reached",
+            Self::ExposureAboveLimit => "exposure_above_limit",
             Self::DuplicateIntent => "duplicate_intent",
         }
     }
@@ -80,6 +87,9 @@ impl RiskCode {
             Self::AccountStateUnavailable => "no fresh account state is available",
             Self::TradingNotAllowed => "the terminal reports trading is not allowed",
             Self::OrderLimitReached => "the venue already holds the maximum tolerated orders",
+            Self::ExposureAboveLimit => {
+                "open exposure plus the requested volume exceeds the total cap"
+            }
             Self::DuplicateIntent => "an identical intent was approved inside the duplicate window",
         }
     }
@@ -190,6 +200,11 @@ impl RiskGate {
         if account.open_orders >= self.policy.max_open_orders() {
             return Self::reject(RiskCode::OrderLimitReached);
         }
+        if account.open_lots + draft.volume().value()
+            > self.policy.max_total_lots().value() + EXPOSURE_EPSILON
+        {
+            return Self::reject(RiskCode::ExposureAboveLimit);
+        }
         if self.suppress_duplicate(draft, now) {
             return Self::reject(RiskCode::DuplicateIntent);
         }
@@ -272,6 +287,7 @@ mod tests {
             false,
             vec![symbol()],
             Volume::parse(0.5).expect("volume"),
+            Volume::parse(0.5).expect("volume"),
             2,
             Duration::from_secs(60),
             None,
@@ -279,9 +295,14 @@ mod tests {
     }
 
     fn facts(open_orders: u32) -> Option<AccountFacts> {
+        facts_with(open_orders, 0.0)
+    }
+
+    fn facts_with(open_orders: u32, open_lots: f64) -> Option<AccountFacts> {
         Some(AccountFacts {
             trade_allowed: true,
             open_orders,
+            open_lots,
         })
     }
 
@@ -327,6 +348,7 @@ mod tests {
             false,
             vec![symbol()],
             Volume::parse(0.5).expect("volume"),
+            Volume::parse(0.5).expect("volume"),
             2,
             Duration::ZERO,
             None,
@@ -347,6 +369,7 @@ mod tests {
         let gate = RiskGate::new(RiskPolicy::new(
             true,
             Vec::new(),
+            Volume::MINIMUM,
             Volume::MINIMUM,
             0,
             Duration::ZERO,
@@ -387,6 +410,7 @@ mod tests {
             false,
             vec![symbol()],
             Volume::parse(0.5).expect("volume"),
+            Volume::parse(0.5).expect("volume"),
             2,
             Duration::ZERO,
             Some(SessionWindow::parse("7-21").expect("window")),
@@ -403,6 +427,7 @@ mod tests {
         let wrapping = RiskGate::new(RiskPolicy::new(
             false,
             vec![symbol()],
+            Volume::parse(0.5).expect("volume"),
             Volume::parse(0.5).expect("volume"),
             2,
             Duration::ZERO,
@@ -433,6 +458,7 @@ mod tests {
         let closed_account = Some(AccountFacts {
             trade_allowed: false,
             open_orders: 0,
+            open_lots: 0.0,
         });
         assert_eq!(
             expect_rejection(gate.evaluate(&draft(0.1), closed_account, now)).code(),
@@ -449,10 +475,34 @@ mod tests {
     }
 
     #[test]
+    fn total_exposure_is_capped() {
+        let gate = RiskGate::new(RiskPolicy::new(
+            false,
+            vec![symbol()],
+            Volume::parse(0.5).expect("volume"),
+            Volume::parse(0.05).expect("volume"),
+            2,
+            Duration::ZERO,
+            None,
+        ));
+        let now = at(10);
+
+        // Open volume plus the request may equal the cap, but never exceed it.
+        assert!(matches!(
+            gate.evaluate(&draft(0.02), facts_with(0, 0.03), now),
+            RiskDecision::Approved(_)
+        ));
+        let rejection = expect_rejection(gate.evaluate(&draft(0.02), facts_with(0, 0.04), now));
+        assert_eq!(rejection.code(), RiskCode::ExposureAboveLimit);
+        assert_eq!(rejection.detail(), RiskCode::ExposureAboveLimit.detail());
+    }
+
+    #[test]
     fn approval_history_is_bounded() {
         let gate = RiskGate::new(RiskPolicy::new(
             false,
             vec![symbol()],
+            Volume::parse(1.0).expect("volume"),
             Volume::parse(1.0).expect("volume"),
             2,
             Duration::from_secs(3_600),
@@ -504,6 +554,7 @@ mod tests {
             RiskCode::AccountStateUnavailable,
             RiskCode::TradingNotAllowed,
             RiskCode::OrderLimitReached,
+            RiskCode::ExposureAboveLimit,
             RiskCode::DuplicateIntent,
         ];
         for code in codes {
