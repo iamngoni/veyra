@@ -19,7 +19,10 @@
 - [x] Operational readiness checks tied to real dependencies: `/ready`
       reports broker and audit status and degrades without gating the surface
       (proven live: database stopped → `degraded`, restored → `ready`).
-- [ ] Structured tracing spans and metrics.
+- [x] Structured tracing spans and metrics: `autopilot.tick` and `ea.poll`
+      run inside spans, and `GET /metrics` reports process-lifetime counters
+      derived from the audit stream (`event.*`, `proposal.<outcome>`,
+      `command.<event>.<kind>`).
 
 ## Phase 2 — model integration
 

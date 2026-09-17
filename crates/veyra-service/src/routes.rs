@@ -177,6 +177,24 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
     })
 }
 
+#[get("/metrics")]
+/// In-process counters since startup, derived from the audit stream: event
+/// totals, proposal outcomes, and command lifecycle by kind.
+///
+/// Process-lifetime only — the durable trail stays the source of truth — but
+/// cheap enough for dashboards, alerts, and a quick operator glance.
+pub async fn metrics(state: Data<AppState>) -> HttpResponse {
+    let Some(runtime) = state.audit() else {
+        return HttpResponse::ServiceUnavailable().json(json!({ "error": "audit_unavailable" }));
+    };
+    HttpResponse::Ok().json(json!({
+        "service": "veyra",
+        "version": env!("CARGO_PKG_VERSION"),
+        "counters": runtime.counters(),
+        "feedLatest": runtime.feed_latest()
+    }))
+}
+
 #[post("/intents/evaluate")]
 /// Evaluates one proposed intent against the deterministic risk gate.
 ///
@@ -248,6 +266,67 @@ mod tests {
         async fn prune(&self, _keep_days: u32) -> Result<u64, AuditError> {
             Ok(0)
         }
+    }
+
+    #[actix_web::test]
+    async fn metrics_report_audit_counters() {
+        use crate::AppState;
+        use crate::app::create_app;
+        use crate::audit::{AuditEvent, AuditKind, AuditRuntime, MemoryTrail};
+        use crate::broker::BrokerRuntime;
+        use crate::config::{ConfigError, ServiceConfig};
+        use crate::risk::{RiskGate, RiskPolicy};
+
+        let config = ServiceConfig::from_source(|name| match name {
+            "VEYRA_BIND_HOST" => Ok("127.0.0.1".to_owned()),
+            "VEYRA_BIND_PORT" => Ok("8080".to_owned()),
+            "VEYRA_ENV" => Ok("development".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        })
+        .expect("config parses");
+        let runtime = AuditRuntime::new(Arc::new(MemoryTrail::default()));
+        runtime
+            .try_record(AuditEvent::new(
+                AuditKind::ProposalEvaluated,
+                serde_json::json!({"outcome": "held"}),
+            ))
+            .await;
+        let state = AppState::new(
+            config.clone(),
+            None::<BrokerRuntime>,
+            None,
+            RiskGate::new(RiskPolicy::default()),
+        )
+        .with_audit(Some(runtime));
+
+        let app = actix_web::test::init_service(create_app(state.clone())).await;
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/metrics")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+        assert_eq!(body["counters"]["event.proposal_evaluated"], 1);
+        assert_eq!(body["counters"]["proposal.held"], 1);
+
+        let unaudited = actix_web::test::init_service(create_app(AppState::new(
+            config,
+            None::<BrokerRuntime>,
+            None,
+            RiskGate::new(RiskPolicy::default()),
+        )))
+        .await;
+        let response = actix_web::test::call_service(
+            &unaudited,
+            actix_web::test::TestRequest::get()
+                .uri("/metrics")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 503);
     }
 
     #[actix_web::test]

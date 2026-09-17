@@ -294,6 +294,15 @@ command lifecycle, `/reconciliation`, and `/market/candles` for the chart.
 is loopback-only by design; exposing it beyond loopback requires
 authentication first.
 
+### Observability
+
+The service spans its two hot paths (`autopilot.tick`, `ea.poll`) with
+`tracing`, so nested events carry symbol and command context even when
+nothing is sampled. `GET /metrics` exposes process-lifetime counters derived
+from the audit stream — `event.*` totals, `proposal.<outcome>`, and
+`command.<event>.<kind>` — cheap enough for dashboards and alerts; the
+durable trail remains the source of truth.
+
 ## Testing strategy
 
 - Unit tests for refined types and policy rules.

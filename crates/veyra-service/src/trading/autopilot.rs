@@ -380,6 +380,7 @@ pub enum TickOutcome {
 
 /// Runs one decision cycle. Never panics on provider failure: every external
 /// call degrades to an audited outcome or a skip.
+#[tracing::instrument(skip_all, name = "autopilot.tick", fields(symbol = tracing::field::Empty))]
 pub async fn tick(state: &AppState) -> TickOutcome {
     let Some(settings) = state.autopilot() else {
         return TickOutcome::Skipped {
@@ -420,6 +421,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             reason: "symbol_unavailable",
         };
     };
+    tracing::Span::current().record("symbol", symbol.as_str());
     let Some(account) = crate::routes::account_facts(Some(broker)).await else {
         return TickOutcome::Skipped {
             reason: "account_unavailable",

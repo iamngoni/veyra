@@ -24,6 +24,7 @@ pub fn create_app(
         .service(crate::routes::health)
         .service(crate::routes::readiness)
         .service(crate::routes::status)
+        .service(crate::routes::metrics)
         .service(crate::routes::evaluate_intent)
         .service(crate::control::check_intent)
         .service(crate::control::execute_intent)

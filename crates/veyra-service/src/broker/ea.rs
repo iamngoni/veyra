@@ -1326,6 +1326,7 @@ impl BrokerLink for EaLink {
 /// The body is read as raw bytes and parsed here because the MQL4 WebRequest
 /// client cannot set a JSON content type; requiring one would reject every
 /// real EA poll.
+#[tracing::instrument(skip_all, name = "ea.poll")]
 pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse {
     // Some WebRequest clients append terminating NUL bytes; strip them so a
     // well-formed body is never rejected for padding alone.

@@ -226,11 +226,57 @@ impl EventFeed {
     }
 }
 
+/// Process-lifetime counters derived from the audit stream.
+///
+/// Cheap tallies for the operations surface: every recorded event bumps one
+/// total, proposals also bump their outcome, and command events bump their
+/// command kind. Counters reset with the process; the durable trail remains
+/// the source of truth.
+#[derive(Debug, Default)]
+struct EventCounters {
+    counts: Mutex<std::collections::BTreeMap<String, u64>>,
+}
+
+impl EventCounters {
+    fn increment(&self, key: &str) {
+        let mut counts = match self.counts.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *counts.entry(key.to_owned()).or_insert(0) += 1;
+    }
+
+    fn snapshot(&self) -> std::collections::BTreeMap<String, u64> {
+        let counts = match self.counts.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        counts.clone()
+    }
+
+    fn tally(&self, kind: AuditKind, payload: &Value) {
+        self.increment(&format!("event.{}", kind.as_str()));
+        if kind == AuditKind::ProposalEvaluated
+            && let Some(outcome) = payload.get("outcome").and_then(Value::as_str)
+        {
+            self.increment(&format!("proposal.{outcome}"));
+        }
+        if matches!(
+            kind,
+            AuditKind::CommandQueued | AuditKind::CommandCompleted | AuditKind::CommandFailed
+        ) && let Some(command) = payload.get("kind").and_then(Value::as_str)
+        {
+            self.increment(&format!("command.{}.{}", kind.as_str(), command));
+        }
+    }
+}
+
 /// Active audit integration.
 #[derive(Debug, Clone)]
 pub struct AuditRuntime {
     trail: Arc<dyn AuditTrail>,
     feed: Arc<EventFeed>,
+    counters: Arc<EventCounters>,
 }
 
 impl AuditRuntime {
@@ -239,7 +285,14 @@ impl AuditRuntime {
         Self {
             trail,
             feed: Arc::new(EventFeed::new()),
+            counters: Arc::new(EventCounters::default()),
         }
+    }
+
+    /// Counters since process start, keyed by `event.*`, `proposal.*`, and
+    /// `command.*`.
+    pub fn counters(&self) -> std::collections::BTreeMap<String, u64> {
+        self.counters.snapshot()
     }
 
     /// Sequence number of the most recent recorded event (zero before any).
@@ -280,6 +333,7 @@ impl AuditRuntime {
     /// the in-memory feed for live readers, whether or not storage accepts it.
     pub async fn try_record(&self, event: AuditEvent) {
         self.feed.publish(event.kind(), event.payload());
+        self.counters.tally(event.kind(), event.payload());
         if let Err(error) = self.trail.record(event).await {
             tracing::warn!(%error, "audit write failed");
         }
@@ -398,6 +452,57 @@ mod tests {
                 reason: "down".to_owned(),
             })
         }
+    }
+
+    #[actix_web::test]
+    async fn counters_tally_events_outcomes_and_commands() {
+        use serde_json::json;
+
+        let runtime = AuditRuntime::new(Arc::new(MemoryTrail::default()));
+        assert!(runtime.counters().is_empty(), "nothing recorded yet");
+
+        runtime
+            .try_record(AuditEvent::new(
+                AuditKind::ProposalEvaluated,
+                json!({"outcome": "held"}),
+            ))
+            .await;
+        runtime
+            .try_record(AuditEvent::new(
+                AuditKind::ProposalEvaluated,
+                json!({"outcome": "held"}),
+            ))
+            .await;
+        runtime
+            .try_record(AuditEvent::new(
+                AuditKind::ProposalEvaluated,
+                json!({"outcome": "queued"}),
+            ))
+            .await;
+        runtime
+            .try_record(AuditEvent::new(
+                AuditKind::CommandQueued,
+                json!({"kind": "open_order"}),
+            ))
+            .await;
+        runtime
+            .try_record(AuditEvent::new(
+                AuditKind::CommandCompleted,
+                json!({"kind": "open_order"}),
+            ))
+            .await;
+        runtime
+            .try_record(AuditEvent::new(AuditKind::BrokerSnapshot, json!({})))
+            .await;
+
+        let counters = runtime.counters();
+        assert_eq!(counters["event.proposal_evaluated"], 3);
+        assert_eq!(counters["proposal.held"], 2);
+        assert_eq!(counters["proposal.queued"], 1);
+        assert_eq!(counters["event.command_queued"], 1);
+        assert_eq!(counters["command.command_queued.open_order"], 1);
+        assert_eq!(counters["command.command_completed.open_order"], 1);
+        assert_eq!(counters["event.broker_snapshot"], 1);
     }
 
     #[test]
