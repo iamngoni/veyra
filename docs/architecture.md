@@ -175,7 +175,11 @@ completed `account_snapshot` whose magic number is the Veyra magic, and the
 terminal re-checks the magic on the selected order before touching it. Pending
 orders are refused (they need cancellation, not a close), and everything else
 goes through the same switch, dry-run, and ack validation as `open_order`.
-`modify` will follow the same pattern.
+`POST /intents/modify` changes stops on the same terms: at least one finite,
+positive stop is required, `0`/absent stops keep their current values, and the
+terminal re-validates distance rules before acting. All three mutating commands
+(open, close, modify) share one contract, one switch pair, and one validated
+ack shape.
 
 ## Hosting (24/7)
 

@@ -129,13 +129,13 @@ market rules and margin engine — it never sends an order, and mutating command
 will keep the same id/ack discipline and must be idempotent per id.
 
 Loopback control surface (`127.0.0.1:8080`): `POST /intents/evaluate` returns a
-risk decision without queueing anything, `POST /intents/check` queues one
-`order_check` for an approved intent, `POST /intents/execute` queues
-`open_order` and `POST /intents/close` closes one Veyra-owned ticket (both
-refused unless `VEYRA_TRADING_ENABLED=true`), and
-`POST /commands/account_snapshot` refreshes venue state (orders, open volume,
-bounded position list with magic numbers); every command is pollable through
-`GET /commands/{id}`.
+risk decision without queueing anything and `POST /intents/check` queues one
+`order_check` for an approved intent. The mutating routes — `POST
+/intents/execute` (queues `open_order`), `POST /intents/close`, and `POST
+/intents/modify` (stops on a Veyra-owned ticket) — all refuse unless
+`VEYRA_TRADING_ENABLED=true`. `POST /commands/account_snapshot` refreshes venue
+state (orders, open volume, bounded position list with magic numbers), and
+every command is pollable through `GET /commands/{id}`.
 
 Staged execution: with the service switch on, the terminal still validates the
 request and reports a dry run until the EA is recompiled with

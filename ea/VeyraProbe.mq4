@@ -6,8 +6,8 @@
 // Requires the endpoint to be listed in
 // Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.17"
-#property description "Veyra control channel: heartbeat, account/position snapshots, broker-side order validation, gated live order execution, and Veyra-owned position closes."
+#property version   "1.18"
+#property description "Veyra control channel: heartbeat, account/position snapshots, order validation, gated live execution, and Veyra-owned closes and stop changes."
 
 input string InUrl         = "__VEYRA_URL__";   // Veyra endpoint (loopback or tunnel)
 input string InToken       = "__VEYRA_TOKEN__"; // shared token
@@ -469,6 +469,106 @@ void HandleCloseOrder(string response, string id)
    SendAck(id, ExecutionResultJson(true, 0, "closed", ticket, price, digits));
   }
 
+// Changes the stops on one Veyra-owned market position when the terminal is
+// armed; otherwise validates the request and reports a dry run. Stops that are
+// absent from the request keep their current values.
+void HandleModifyOrder(string response, string id)
+  {
+   int ticket = (int)JsonNumber(response, "ticket");
+   int magic  = (int)JsonNumber(response, "magic");
+   double sl  = JsonNumber(response, "stop_loss");
+   double tp  = JsonNumber(response, "take_profit");
+
+   if(ticket <= 0 || (sl <= 0.0 && tp <= 0.0))
+     {
+      SendAckError(id, "malformed modify request");
+      return;
+     }
+
+   if(!OrderSelect(ticket, SELECT_BY_TICKET))
+     {
+      SendAck(id, ExecutionResultJson(false, 4108, "unknown ticket", 0, 0.0, 2));
+      return;
+     }
+   if((int)OrderMagicNumber() != magic)
+     {
+      SendAck(id, ExecutionResultJson(false, 4108, "ticket is not a Veyra position", 0, 0.0, 2));
+      return;
+     }
+   int type = OrderType();
+   if(type != OP_BUY && type != OP_SELL)
+     {
+      SendAck(id, ExecutionResultJson(false, 4108, "not an open market position", 0, 0.0, 2));
+      return;
+     }
+
+   string symbol    = OrderSymbol();
+   double point     = MarketInfo(symbol, MODE_POINT);
+   double stopLevel = MarketInfo(symbol, MODE_STOPLEVEL);
+   double bid       = MarketInfo(symbol, MODE_BID);
+   double ask       = MarketInfo(symbol, MODE_ASK);
+   double openPrice = OrderOpenPrice();
+   double currentSl = OrderStopLoss();
+   double currentTp = OrderTakeProfit();
+   double newSl = (sl > 0.0 ? sl : currentSl);
+   double newTp = (tp > 0.0 ? tp : currentTp);
+
+   int code = 0;
+   string comment = "ok";
+   if(point > 0.0)
+     {
+      if(newSl > 0.0)
+        {
+         bool wrongSide = (type == OP_BUY ? newSl >= bid : newSl <= ask);
+         bool tooClose = (stopLevel > 0.0 && MathAbs((type == OP_BUY ? bid : ask) - newSl) / point < stopLevel);
+         if(wrongSide || tooClose)
+           {
+            code = 130;
+            comment = "stop loss violates the minimum stop distance";
+           }
+        }
+      if(code == 0 && newTp > 0.0)
+        {
+         bool wrongSide = (type == OP_BUY ? newTp <= bid : newTp >= ask);
+         bool tooClose = (stopLevel > 0.0 && MathAbs(newTp - (type == OP_BUY ? bid : ask)) / point < stopLevel);
+         if(wrongSide || tooClose)
+           {
+            code = 130;
+            comment = "take profit violates the minimum stop distance";
+           }
+        }
+     }
+   if(code == 0 && newSl == currentSl && newTp == currentTp)
+     {
+      code = 1;
+      comment = "no changes";
+     }
+
+   if(code != 0 || !InAllowLiveOrders)
+     {
+      if(code == 0) comment = "dry run (live orders disabled in EA)";
+      Print("VeyraProbe modify_order dry run code=", (string)code, " comment=", comment);
+      SendAck(id, ExecutionResultJson(false, code, comment, 0, 0.0, 2));
+      return;
+     }
+
+   ResetLastError();
+   bool modified = OrderModify(ticket, openPrice, newSl, newTp, 0, CLR_NONE);
+   int modifyError = GetLastError();
+   if(!modified)
+     {
+      Print("VeyraProbe modify_order failed ticket=", (string)ticket, " error=", (string)modifyError);
+      SendAck(id, ExecutionResultJson(false, modifyError, "modify failed", 0, 0.0, 2));
+      return;
+     }
+
+   int digits = (int)MarketInfo(symbol, MODE_DIGITS);
+   if(digits <= 0) digits = 5;
+   Print("VeyraProbe modify_order ok ticket=", (string)ticket, " sl=", DoubleToString(newSl, digits),
+         " tp=", DoubleToString(newTp, digits));
+   SendAck(id, ExecutionResultJson(true, 0, "stops changed", ticket, openPrice, digits));
+  }
+
 // Executes one command delivered by the service and acknowledges it by id.
 void HandleCommand(string response)
   {
@@ -491,6 +591,12 @@ void HandleCommand(string response)
    if(kind == "close_order")
      {
       HandleCloseOrder(response, id);
+      return;
+     }
+
+   if(kind == "modify_order")
+     {
+      HandleModifyOrder(response, id);
       return;
      }
 

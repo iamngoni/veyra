@@ -67,7 +67,10 @@
       accepted, and the terminal re-validates before a dry run or close —
       guards proven live (403 disabled, 409 no state, 404 unknown ticket,
       409 foreign position).
-- [ ] Modify (stop loss / take profit) commands reusing the same path.
+- [x] `modify_order` for Veyra-owned positions: same ownership guards as
+      closing, at least one finite positive stop required, absent stops keep
+      their current values, and the terminal re-validates distances before a
+      dry run or `OrderModify` — guards proven live (403/400/409/404).
 - [ ] Independent reconciliation against broker state.
 - [ ] Staged testing: read-only first, then demo, then minimal live exposure
       only after explicit owner approval.

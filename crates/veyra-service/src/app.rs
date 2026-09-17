@@ -26,6 +26,7 @@ pub fn create_app(
         .service(crate::control::check_intent)
         .service(crate::control::execute_intent)
         .service(crate::control::close_position)
+        .service(crate::control::modify_position)
         .service(crate::control::request_account_snapshot)
         .service(crate::control::command_status)
 }

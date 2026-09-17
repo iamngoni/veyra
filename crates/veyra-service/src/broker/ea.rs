@@ -96,6 +96,8 @@ pub enum CommandKind {
     OpenOrder,
     /// Ask the terminal to close one Veyra-owned market position.
     CloseOrder,
+    /// Ask the terminal to change the stops on a Veyra-owned position.
+    ModifyOrder,
 }
 
 impl CommandKind {
@@ -107,6 +109,7 @@ impl CommandKind {
             Self::OrderCheck => "order_check",
             Self::OpenOrder => "open_order",
             Self::CloseOrder => "close_order",
+            Self::ModifyOrder => "modify_order",
         }
     }
 }
@@ -317,6 +320,50 @@ impl EaCloseRequest {
     }
 }
 
+/// Stop-change request sent to the EA for one Veyra-owned ticket. At least one
+/// of the two stops must be present; the terminal re-validates distances.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EaModifyRequest {
+    ticket: i64,
+    magic: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_loss: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    take_profit: Option<f64>,
+}
+
+impl EaModifyRequest {
+    /// Builds a stop change for a validated, Veyra-owned ticket.
+    pub fn new(ticket: i64, magic: u32, stop_loss: Option<f64>, take_profit: Option<f64>) -> Self {
+        Self {
+            ticket,
+            magic,
+            stop_loss,
+            take_profit,
+        }
+    }
+
+    /// Ticket whose stops change.
+    pub fn ticket(&self) -> i64 {
+        self.ticket
+    }
+
+    /// Magic number the terminal must find on the selected order.
+    pub fn magic(&self) -> u32 {
+        self.magic
+    }
+
+    /// New stop loss, when provided.
+    pub fn stop_loss(&self) -> Option<f64> {
+        self.stop_loss
+    }
+
+    /// New take profit, when provided.
+    pub fn take_profit(&self) -> Option<f64> {
+        self.take_profit
+    }
+}
+
 /// Order request sent to the EA for validation or execution, derived only from
 /// an approved intent. Fields mirror the intent wire contract so the EA can
 /// read them without a nested parser.
@@ -368,6 +415,8 @@ pub enum CommandPayload {
     OpenOrder(OrderExecutionPayload),
     /// Result of `close_order`; reports whether anything reached the broker.
     CloseOrder(OrderExecutionPayload),
+    /// Result of `modify_order`; reports whether the stops were changed.
+    ModifyOrder(OrderExecutionPayload),
 }
 
 /// Lifecycle state of one command.
@@ -525,10 +574,13 @@ pub enum EaReply {
         kind: CommandKind,
         /// Present for order validation and execution commands.
         #[serde(skip_serializing_if = "Option::is_none")]
-        order: Option<EaOrderRequest>,
+        order: Option<Box<EaOrderRequest>>,
         /// Present for close commands.
         #[serde(skip_serializing_if = "Option::is_none")]
-        close: Option<EaCloseRequest>,
+        close: Option<Box<EaCloseRequest>>,
+        /// Present for stop-change commands.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        modify: Option<Box<EaModifyRequest>>,
     },
 }
 
@@ -567,6 +619,8 @@ enum CommandRequest {
     Order(EaOrderRequest),
     /// Close request for a validated Veyra position.
     Close(EaCloseRequest),
+    /// Stop change for a validated Veyra position.
+    Modify(EaModifyRequest),
 }
 
 /// Shared state of the EA control channel.
@@ -629,6 +683,14 @@ impl EaLink {
         self.enqueue_with(
             CommandKind::CloseOrder,
             Some(CommandRequest::Close(request)),
+        )
+    }
+
+    /// Queues a stop change for one validated Veyra-owned ticket.
+    pub fn enqueue_modify(&self, request: EaModifyRequest) -> CommandId {
+        self.enqueue_with(
+            CommandKind::ModifyOrder,
+            Some(CommandRequest::Modify(request)),
         )
     }
 
@@ -712,7 +774,8 @@ impl EaLink {
                         CommandPayload::Ping
                         | CommandPayload::OrderCheck(_)
                         | CommandPayload::OpenOrder(_)
-                        | CommandPayload::CloseOrder(_) => None,
+                        | CommandPayload::CloseOrder(_)
+                        | CommandPayload::ModifyOrder(_) => None,
                     };
                     command.state = CommandState::Completed { payload };
                     retained
@@ -877,16 +940,24 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
                 link.record(snapshot);
                 let reply = match link.deliverable() {
                     Some((id, kind, request)) => {
-                        let (order, close) = match request {
-                            Some(CommandRequest::Order(order)) => (Some(order), None),
-                            Some(CommandRequest::Close(close)) => (None, Some(close)),
-                            None => (None, None),
+                        let (order, close, modify) = match request {
+                            Some(CommandRequest::Order(order)) => {
+                                (Some(Box::new(order)), None, None)
+                            }
+                            Some(CommandRequest::Close(close)) => {
+                                (None, Some(Box::new(close)), None)
+                            }
+                            Some(CommandRequest::Modify(modify)) => {
+                                (None, None, Some(Box::new(modify)))
+                            }
+                            None => (None, None, None),
                         };
                         EaReply::Command {
                             id,
                             kind,
                             order,
                             close,
+                            modify,
                         }
                     }
                     // Ask for a pong on hello and until one has been seen for
@@ -939,6 +1010,13 @@ fn payload_for(kind: CommandKind, data: Option<Value>) -> Result<CommandPayload,
             payload.validate()?;
             Ok(CommandPayload::CloseOrder(payload))
         }
+        CommandKind::ModifyOrder => {
+            let value = data.ok_or_else(|| "modify_order ack is missing data".to_owned())?;
+            let payload: OrderExecutionPayload = serde_json::from_value(value)
+                .map_err(|error| format!("invalid modify_order payload: {error}"))?;
+            payload.validate()?;
+            Ok(CommandPayload::ModifyOrder(payload))
+        }
     }
 }
 
@@ -988,8 +1066,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CommandRequest, EaAck, EaCloseRequest, EaLink, EaOrderRequest, EaToken, ORDER_MAGIC,
-        OrderCheckPayload, hex_preview, payload_for,
+        CommandRequest, EaAck, EaCloseRequest, EaLink, EaModifyRequest, EaOrderRequest, EaToken,
+        ORDER_MAGIC, OrderCheckPayload, hex_preview, payload_for,
     };
     use crate::broker::ea::{
         AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandState, PositionKind,
@@ -1018,6 +1096,8 @@ mod tests {
         assert_eq!(CommandKind::AccountSnapshot.as_str(), "account_snapshot");
         assert_eq!(CommandKind::OrderCheck.as_str(), "order_check");
         assert_eq!(CommandKind::OpenOrder.as_str(), "open_order");
+        assert_eq!(CommandKind::CloseOrder.as_str(), "close_order");
+        assert_eq!(CommandKind::ModifyOrder.as_str(), "modify_order");
     }
 
     #[test]
@@ -1363,6 +1443,65 @@ mod tests {
             )
             .is_err(),
             "an executed close must report its ticket"
+        );
+    }
+
+    #[test]
+    fn modify_orders_carry_their_stops_and_magic() {
+        let request = EaModifyRequest::new(123, ORDER_MAGIC, Some(1.05), None);
+        let wire = serde_json::to_value(&request).expect("serializable");
+        assert_eq!(wire["ticket"], 123);
+        assert_eq!(wire["magic"], ORDER_MAGIC);
+        assert_eq!(wire["stop_loss"], 1.05);
+        assert!(
+            wire.get("take_profit").is_none(),
+            "absent stops are omitted"
+        );
+        assert_eq!(request.ticket(), 123);
+        assert_eq!(request.magic(), ORDER_MAGIC);
+        assert_eq!(request.stop_loss(), Some(1.05));
+        assert_eq!(request.take_profit(), None);
+
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        let id = link.enqueue_modify(request.clone());
+        let (delivered_id, kind, payload) = link.deliverable().expect("pending command");
+        assert_eq!(delivered_id, id);
+        assert_eq!(kind, CommandKind::ModifyOrder);
+        assert_eq!(payload, Some(CommandRequest::Modify(request)));
+    }
+
+    #[test]
+    fn modify_payloads_require_a_consistent_verdict() {
+        let dry_run = payload_for(
+            CommandKind::ModifyOrder,
+            Some(serde_json::json!({
+                "executed": false,
+                "retcode": 0,
+                "comment": "dry run (live orders disabled in EA)",
+                "ticket": 0,
+                "price": 0.0
+            })),
+        )
+        .expect("dry-run modify payload must validate");
+        assert!(matches!(dry_run, CommandPayload::ModifyOrder(_)));
+        assert!(payload_for(CommandKind::ModifyOrder, None).is_err());
+        assert!(
+            payload_for(
+                CommandKind::ModifyOrder,
+                Some(serde_json::json!({
+                    "executed": true,
+                    "retcode": 0,
+                    "comment": "stops changed",
+                    "ticket": 0,
+                    "price": 1.1
+                })),
+            )
+            .is_err(),
+            "an executed modify must report its ticket"
         );
     }
 

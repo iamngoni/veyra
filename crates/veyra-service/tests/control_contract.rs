@@ -139,6 +139,21 @@ async fn execute(state: &AppState, payload: Value) -> (StatusCode, Value) {
     )
 }
 
+async fn modify(state: &AppState, payload: Value) -> (StatusCode, Value) {
+    let app = test::init_service(create_app(state.clone())).await;
+    let request = test::TestRequest::post()
+        .uri("/intents/modify")
+        .set_json(&payload)
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    let status = response.status();
+    let bytes = test::read_body(response).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 async fn close(state: &AppState, ticket: i64) -> (StatusCode, Value) {
     let app = test::init_service(create_app(state.clone())).await;
     let request = test::TestRequest::post()
@@ -536,4 +551,101 @@ async fn closing_refuses_positions_veyra_does_not_own() {
     // Nothing was queued for the terminal.
     let (_, reply) = poll(link.clone(), heartbeat()).await;
     assert_eq!(reply["t"], "none");
+}
+
+#[actix_web::test]
+async fn modifying_requires_enablement_and_valid_stops() {
+    let (runtime, link) = broker();
+    prime(&link).await;
+
+    // Disabled: refused before any state is consulted.
+    let state = AppState::new(test_config(), Some(runtime.clone()), None, gate());
+    let (status, body) = modify(&state, json!({"ticket": 123, "stop_loss": 1.05})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "trading_disabled");
+
+    let enabled = AppState::new(
+        config_with_trading(true),
+        Some(runtime.clone()),
+        None,
+        gate(),
+    );
+    let (status, body) = modify(&enabled, json!({"ticket": 0, "stop_loss": 1.05})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_ticket");
+
+    // No stops, or unusable stops, are rejected before any state is read.
+    let (status, body) = modify(&enabled, json!({"ticket": 123})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_stops");
+    let (status, body) = modify(&enabled, json!({"ticket": 123, "take_profit": 0.0})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_stops");
+
+    // Enabled and well-formed, but no retained snapshot: fail closed.
+    let (status, body) = modify(&enabled, json!({"ticket": 123, "stop_loss": 1.05})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "position_state_unavailable");
+}
+
+#[actix_web::test]
+async fn modifying_targets_only_veyra_positions() {
+    let (runtime, link) = broker();
+    prime(&link).await;
+    retain_position(&link, 0).await;
+
+    let state = AppState::new(
+        config_with_trading(true),
+        Some(runtime.clone()),
+        None,
+        gate(),
+    );
+    let (status, body) = modify(&state, json!({"ticket": 123, "stop_loss": 1.05})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "not_a_veyra_position");
+    let (_, reply) = poll(link.clone(), heartbeat()).await;
+    assert_eq!(reply["t"], "none");
+
+    // A Veyra-owned position can have its stops changed.
+    retain_position(&link, ORDER_MAGIC).await;
+    let (status, body) = modify(&state, json!({"ticket": 123, "stop_loss": 1.05})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["command"], "modify_order");
+    let command_id = body["command_id"]
+        .as_str()
+        .expect("modify carries a command id")
+        .to_owned();
+
+    let (status, delivered) = poll(link.clone(), heartbeat()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(delivered["kind"], "modify_order");
+    assert_eq!(delivered["modify"]["ticket"], 123);
+    assert_eq!(delivered["modify"]["magic"], ORDER_MAGIC);
+    assert_eq!(delivered["modify"]["stop_loss"], 1.05);
+    assert!(delivered["modify"].get("take_profit").is_none());
+
+    let (status, _) = poll(
+        link.clone(),
+        json!({
+            "t": "ack",
+            "v": 1,
+            "token": TOKEN,
+            "id": command_id,
+            "ok": true,
+            "data": {
+                "executed": false,
+                "retcode": 0,
+                "comment": "dry run (live orders disabled in EA)",
+                "ticket": 0,
+                "price": 0.0
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = command_status(&state, &command_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["kind"], "modify_order");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["result"]["executed"], false);
 }

@@ -20,8 +20,8 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::broker::ea::{
-    CommandId, CommandKind, CommandPayload, CommandState, EaCloseRequest, EaLink, EaOrderRequest,
-    ORDER_MAGIC,
+    CommandId, CommandKind, CommandPayload, CommandState, EaCloseRequest, EaLink, EaModifyRequest,
+    EaOrderRequest, ORDER_MAGIC,
 };
 use crate::risk::RiskDecision;
 use crate::trading::TradeIntentDraft;
@@ -166,6 +166,75 @@ pub async fn close_position(state: Data<AppState>, body: web::Json<CloseRequest>
     }))
 }
 
+/// Body of `POST /intents/modify`.
+#[derive(Debug, Deserialize)]
+pub struct ModifyRequest {
+    /// Ticket of the Veyra-owned position whose stops change.
+    pub ticket: i64,
+    /// New stop loss, when provided.
+    #[serde(default)]
+    pub stop_loss: Option<f64>,
+    /// New take profit, when provided.
+    #[serde(default)]
+    pub take_profit: Option<f64>,
+}
+
+#[post("/intents/modify")]
+/// Changes the stops on one Veyra-owned position.
+///
+/// Same guards as closing: `403 trading_disabled` unless enabled, and only
+/// tickets from the latest completed `account_snapshot` carrying the Veyra
+/// magic number are accepted. At least one finite, positive stop is required;
+/// the terminal re-validates distances and reports a dry run while its
+/// live-orders input is disabled.
+pub async fn modify_position(
+    state: Data<AppState>,
+    body: web::Json<ModifyRequest>,
+) -> HttpResponse {
+    let Some(link) = command_link(&state) else {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "command_channel_unavailable" }));
+    };
+    if !state.config().trading_enabled() {
+        return HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }));
+    }
+    if body.ticket <= 0 {
+        return HttpResponse::BadRequest().json(json!({ "error": "invalid_ticket" }));
+    }
+    let valid_stop = |stop: f64| stop.is_finite() && stop > 0.0;
+    let provided = body.stop_loss.is_some() || body.take_profit.is_some();
+    let stops_valid =
+        body.stop_loss.is_none_or(valid_stop) && body.take_profit.is_none_or(valid_stop);
+    if !provided || !stops_valid {
+        return HttpResponse::BadRequest().json(json!({ "error": "invalid_stops" }));
+    }
+    let Some(snapshot) = link.last_account() else {
+        return HttpResponse::Conflict().json(json!({ "error": "position_state_unavailable" }));
+    };
+    let Some(position) = snapshot
+        .positions
+        .iter()
+        .find(|position| position.ticket == body.ticket)
+    else {
+        return HttpResponse::NotFound().json(json!({ "error": "unknown_position" }));
+    };
+    if position.magic != ORDER_MAGIC {
+        return HttpResponse::Conflict().json(json!({ "error": "not_a_veyra_position" }));
+    }
+    let command = link.enqueue_modify(EaModifyRequest::new(
+        position.ticket,
+        position.magic,
+        body.stop_loss,
+        body.take_profit,
+    ));
+    HttpResponse::Ok().json(json!({
+        "command": "modify_order",
+        "command_id": command.to_string(),
+        "ticket": position.ticket,
+        "status": "pending"
+    }))
+}
+
 #[get("/commands/{id}")]
 /// Reports one command's lifecycle state and validated result.
 pub async fn command_status(state: Data<AppState>, id: web::Path<String>) -> HttpResponse {
@@ -224,7 +293,9 @@ fn command_result(payload: CommandPayload) -> serde_json::Value {
             "comment": check.comment,
             "margin": check.margin
         }),
-        CommandPayload::OpenOrder(execution) | CommandPayload::CloseOrder(execution) => json!({
+        CommandPayload::OpenOrder(execution)
+        | CommandPayload::CloseOrder(execution)
+        | CommandPayload::ModifyOrder(execution) => json!({
             "executed": execution.executed,
             "retcode": execution.retcode,
             "comment": execution.comment,
