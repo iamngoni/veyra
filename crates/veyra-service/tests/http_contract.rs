@@ -22,7 +22,7 @@ fn test_config() -> ServiceConfig {
 }
 
 fn test_state(broker: Option<BrokerRuntime>) -> AppState {
-    AppState::new(test_config(), broker)
+    AppState::new(test_config(), broker, None)
 }
 
 fn ea_broker() -> BrokerRuntime {
@@ -82,6 +82,7 @@ async fn status_reports_no_broker_connection() {
     assert!(response.status().is_success());
     let body: serde_json::Value = test::read_body_json(response).await;
     assert_eq!(body["broker_provider"], serde_json::Value::Null);
+    assert_eq!(body["model_provider"], serde_json::Value::Null);
     assert_eq!(body["broker_connected"], false);
     assert_eq!(body["trading_enabled"], false);
     assert_eq!(body["environment"], "development");
@@ -104,4 +105,28 @@ async fn status_reports_broker_link_state() {
     assert_eq!(body["broker_provider"], "ea");
     assert_eq!(body["broker_connected"], true);
     assert_eq!(body["trading_enabled"], false);
+}
+
+#[actix_web::test]
+async fn status_reports_model_provider() {
+    let settings = veyra_service::model::ModelSettings::from_source(|name| match name {
+        "VEYRA_MODEL_API_KEY" => Ok("test-key-12345678".to_owned()),
+        "VEYRA_MODEL_FAST" => Ok("vendor/fast".to_owned()),
+        "VEYRA_MODEL_BALANCED" => Ok("vendor/balanced".to_owned()),
+        "VEYRA_MODEL_REASONING" => Ok("vendor/reasoning".to_owned()),
+        _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+    })
+    .expect("model settings must parse")
+    .expect("model must be configured");
+    let model =
+        veyra_service::model::ModelRuntime::from_settings(settings).expect("model runtime builds");
+
+    let app = test::init_service(create_app(AppState::new(test_config(), None, Some(model)))).await;
+    let request = test::TestRequest::get().uri("/status").to_request();
+    let response = test::call_service(&app, request).await;
+
+    assert!(response.status().is_success());
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["model_provider"], "openrouter");
+    assert_eq!(body["broker_provider"], serde_json::Value::Null);
 }

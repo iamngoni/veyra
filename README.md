@@ -10,6 +10,9 @@ This repository contains the first tested, safe service slice:
 - Read-only `/health`, `/ready`, and `/status` HTTP endpoints.
 - Broker integration abstraction (`BrokerLink`) with a configuration-selected
   provider; the MetaTrader 4 EA control channel is the first implementation.
+- Model-provider abstraction (`DecisionEngine`) over `agent-runtime` (pinned git
+  revision), configurable to OpenRouter or any OpenAI-compatible endpoint, with
+  schema-constrained answers — **proven live** with a real structured response.
 - Loopback-only EA endpoint with token authentication, refined payloads, and
   heartbeat state (no command execution yet) — **proven live** end-to-end with
   MT4 under Wine through a Cloudflare Tunnel (heartbeat plus ping/pong).
@@ -52,6 +55,21 @@ Then inspect:
 - `http://127.0.0.1:8080/health`
 - `http://127.0.0.1:8080/ready`
 - `http://127.0.0.1:8080/status`
+
+## Model configuration
+
+`VEYRA_MODEL_PROVIDER=openrouter` plus `VEYRA_MODEL_API_KEY` and three explicit
+tier models (`VEYRA_MODEL_FAST`, `VEYRA_MODEL_BALANCED`, `VEYRA_MODEL_REASONING`)
+enable structured decisions. Partial configuration fails closed at startup.
+
+Tier models must accept forced tool calls — the structured path enforces the
+schema through `tool_choice`, so reasoning modes that reject it cannot be used.
+Live check:
+
+```sh
+set -a; source .env; set +a
+cargo test --test model_live -- --ignored --nocapture
+```
 
 ## Quality
 

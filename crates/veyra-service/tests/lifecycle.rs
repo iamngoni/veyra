@@ -62,7 +62,7 @@ fn bind_fails_when_the_address_is_occupied() {
 #[actix_web::test]
 async fn serves_health_then_stops_gracefully() {
     let (listener, address) = bind_ephemeral();
-    let state = AppState::new(config("127.0.0.1", &address.port().to_string()), None);
+    let state = AppState::new(config("127.0.0.1", &address.port().to_string()), None, None);
     let app = server::build_server(state, listener).expect("server build");
     let handle = app.handle();
     let task = actix_web::rt::spawn(server::serve(app, None));
@@ -105,7 +105,11 @@ fn free_address() -> SocketAddr {
 async fn companion_listener_starts_and_stops_with_main() {
     let (main_listener, main_addr) = bind_ephemeral();
     let main = server::build_server(
-        AppState::new(config("127.0.0.1", &main_addr.port().to_string()), None),
+        AppState::new(
+            config("127.0.0.1", &main_addr.port().to_string()),
+            None,
+            None,
+        ),
         main_listener,
     )
     .expect("main server build");

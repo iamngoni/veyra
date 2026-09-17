@@ -3,6 +3,7 @@
 //! provider-required loopback listener. This binary has no execution path.
 
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
+use veyra_service::model::{ModelRuntime, settings::ModelSettings};
 use veyra_service::{AppState, config::ServiceConfig, observability, server};
 
 #[actix_web::main]
@@ -14,13 +15,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(settings) => Some(BrokerRuntime::from_settings(settings)?),
         None => None,
     };
+    let model = match ModelSettings::from_env()? {
+        Some(settings) => Some(ModelRuntime::from_settings(settings)?),
+        None => None,
+    };
+
     let companion = match &broker {
         Some(runtime) => runtime.listener()?,
         None => None,
     };
 
     let listener = server::bind(&config)?;
-    let app = server::build_server(AppState::new(config, broker), listener)?;
+    let app = server::build_server(AppState::new(config, broker, model), listener)?;
     server::serve(app, companion).await?;
     Ok(())
 }

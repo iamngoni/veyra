@@ -21,16 +21,34 @@ Config -> Runtime state -> HTTP control plane
              +-- Persistence/reconciliation
 ```
 
-### agent-runtime
+### Model providers (swappable)
 
-`agent-runtime` is an existing Rust crate. Its current public types include `Llm`, `LlmBuilder`, provider kinds, model tiers, and injectable transport. Veyra will consume it as a dependency pinned to a specific Git revision rather than forking the implementation.
+Model access mirrors the broker pattern. `DecisionEngine` in `model/mod.rs` is
+the contract: `provider()` plus a structured `answer(request)` returning a
+parsed JSON value. The implementation is selected by `VEYRA_MODEL_PROVIDER`
+and constructed once at startup by `ModelRuntime`.
 
-Current integration gaps to account for before production use:
+**Implementation 1 — `agent-runtime` adapter (`model/agent_runtime_engine.rs`).**
+It owns every `agent-runtime` type, so the rest of the service never imports the
+dependency. The crate is pinned to a Git revision; Veyra contributed the
+dynamic-schema entry point (`run_structured_with_format`) upstream so callers
+can constrain responses to schemas only known at runtime. Models come from
+explicitly configured tiers — never from library defaults — and are sent
+through the OpenAI-compatible path (OpenRouter preset), with a bounded retry
+policy for transient failures.
 
-- Native Gemini, Cohere, and Bedrock providers do not all expose the structured-output path used by `run_structured`.
-- Bedrock support is bearer-token based and lacks SigV4/IAM support.
-- Explicit model identifiers are required; defaults must not be relied on.
-- Provider defaults and rate limits need Veyra-level configuration and tests.
+Operational constraint: tier models must accept forced tool calls, because the
+schema is enforced through `tool_choice`. Reasoning modes that reject it (for
+example DeepSeek thinking) return provider errors; verified working models are
+listed in `model/settings.rs`.
+
+Known gaps for later increments:
+
+- Native Gemini/Cohere/Bedrock providers do not all implement the structured
+  path; the OpenAI-compatible surface is what Veyra relies on today.
+- Bedrock support remains bearer-token based (no SigV4/IAM).
+- Rate limiting is delegated to the provider; per-provider budgets belong with
+  the risk/ops layer.
 
 ### Jev
 

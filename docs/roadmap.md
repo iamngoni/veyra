@@ -15,13 +15,16 @@
 - Structured tracing spans and metrics.
 - Operational readiness checks tied to real dependencies.
 
-## Phase 2 — agent-runtime integration
+## Phase 2 — model integration
 
-- Pin `agent-runtime` to a known revision.
-- Provider/model configuration through typed, secret-aware settings.
-- Schema-constrained request/response contracts.
-- Timeout, retry, transport, and provider-failure tests.
-- Do not place model decisions directly into execution.
+- [x] Pin `agent-runtime` to a known revision.
+- [x] Provider/model configuration through typed, secret-aware settings.
+- [x] Schema-constrained request/response contracts (`DecisionEngine`).
+- [x] Dynamic-schema support contributed upstream (`run_structured_with_format`).
+- [x] Retry policy for transient provider failures; deterministic adapter tests
+      with an injected transport; live OpenRouter proof.
+- [ ] Per-tier budget/rate-limit policy in the operations layer.
+- [x] Model decisions never reach execution directly (no execution exists).
 
 ## Phase 3 — Jev decision adapter
 
