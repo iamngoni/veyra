@@ -71,6 +71,7 @@ fn snapshot() -> AccountSnapshot {
         0,
         0.0,
     )
+    .with_live_orders(true)
 }
 
 #[actix_web::test]
@@ -129,6 +130,10 @@ async fn status_reports_broker_link_state() {
     assert_eq!(body["broker_provider"], "ea");
     assert_eq!(body["broker_connected"], true);
     assert_eq!(body["trading_enabled"], false);
+    assert_eq!(
+        body["ea_live_orders"], true,
+        "the armed EA state is reported even while the service switch is off"
+    );
 }
 
 #[actix_web::test]

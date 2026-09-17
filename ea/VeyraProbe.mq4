@@ -6,14 +6,14 @@
 // Requires the endpoint to be listed in
 // Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.18"
-#property description "Veyra control channel: heartbeat, account/position snapshots, order validation, gated live execution, and Veyra-owned closes and stop changes."
+#property version   "1.19"
+#property description "Veyra control channel: heartbeat, account/position snapshots, market rates, order validation, gated live execution, and Veyra-owned closes and stop changes."
 
-input string InUrl         = "__VEYRA_URL__";   // Veyra endpoint (loopback or tunnel)
-input string InToken       = "__VEYRA_TOKEN__"; // shared token
-input int    InHeartbeatMs = 1000;              // heartbeat interval
-input int    InTimeoutMs   = 1500;              // WebRequest timeout
-input bool   InAllowLiveOrders = false;         // arm live order placement (dry run when false)
+input string InUrl         = "__VEYRA_URL__";            // Veyra endpoint (loopback or tunnel)
+input string InToken       = "__VEYRA_TOKEN__";          // shared token
+input int    InHeartbeatMs = 1000;                       // heartbeat interval
+input int    InTimeoutMs   = 1500;                       // WebRequest timeout
+input bool   InAllowLiveOrders = __VEYRA_ALLOW_LIVE__;   // arm live order placement (dry run when false)
 
 uint g_last       = 0;
 bool g_said_hello = false;
@@ -569,6 +569,54 @@ void HandleModifyOrder(string response, string id)
    SendAck(id, ExecutionResultJson(true, 0, "stops changed", ticket, openPrice, digits));
   }
 
+// Reports the last `bars` closed candles for a symbol/timeframe. Oldest
+// candle first, so the array order matches time order. Only closed candles
+// are returned (shift 1..bars), never the forming bar.
+void HandleRates(string response, string id)
+  {
+   string symbol = JsonString(response, "symbol");
+   int tf = (int)JsonNumber(response, "timeframeMinutes");
+   int bars = (int)JsonNumber(response, "bars");
+   if(StringLen(symbol) == 0) symbol = Symbol();
+   if(tf <= 0 || bars <= 0 || bars > 240)
+     {
+      SendAckError(id, "malformed rates request");
+      return;
+     }
+   if(iTime(symbol, tf, bars) == 0 || iClose(symbol, tf, 1) <= 0.0)
+     {
+      SendAckError(id, "rates unavailable");
+      return;
+     }
+
+   int digits = (int)MarketInfo(symbol, MODE_DIGITS);
+   if(digits <= 0) digits = 5;
+
+   string json = "{\"symbol\":\"" + EscapeJson(symbol) + "\",\"timeframeMinutes\":" + (string)tf
+                 + ",\"candles\":[";
+   for(int shift = bars; shift >= 1; shift--)
+     {
+      double open  = iOpen(symbol, tf, shift);
+      double high  = iHigh(symbol, tf, shift);
+      double low   = iLow(symbol, tf, shift);
+      double close = iClose(symbol, tf, shift);
+      if(open <= 0.0 || high <= 0.0 || low <= 0.0 || close <= 0.0)
+        {
+         SendAckError(id, "rates unavailable");
+         return;
+        }
+      if(shift < bars) json = json + ",";
+      json = json + "{\"time\":" + (string)(long)iTime(symbol, tf, shift)
+             + ",\"open\":" + DoubleToString(open, digits)
+             + ",\"high\":" + DoubleToString(high, digits)
+             + ",\"low\":" + DoubleToString(low, digits)
+             + ",\"close\":" + DoubleToString(close, digits)
+             + ",\"volume\":" + (string)(long)iVolume(symbol, tf, shift) + "}";
+     }
+   json = json + "]}";
+   SendAck(id, json);
+  }
+
 // Executes one command delivered by the service and acknowledges it by id.
 void HandleCommand(string response)
   {
@@ -597,6 +645,12 @@ void HandleCommand(string response)
    if(kind == "modify_order")
      {
       HandleModifyOrder(response, id);
+      return;
+     }
+
+   if(kind == "rates")
+     {
+      HandleRates(response, id);
       return;
      }
 
@@ -656,6 +710,7 @@ void OnTimer()
                  + ",\"orders\":" + (string)OrdersTotal()
                  + ",\"lots\":" + DoubleToString(OpenLots(), 2)
                  + ",\"balance\":" + DoubleToString(AccountBalance(), 2)
+                 + ",\"liveOrders\":" + (InAllowLiveOrders ? "true" : "false")
                  + ",\"ts\":" + (string)(long)TimeLocal() + "}";
 
    string response;

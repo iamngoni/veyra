@@ -478,6 +478,8 @@ pub struct EaPoll {
     connected: Option<bool>,
     #[serde(rename = "tradeAllowed", default)]
     trade_allowed: Option<bool>,
+    #[serde(rename = "liveOrders", default)]
+    live_orders: Option<bool>,
     #[serde(default)]
     orders: Option<u32>,
     #[serde(default)]
@@ -551,7 +553,8 @@ impl EaPoll {
             self.trade_allowed.unwrap_or(false),
             open_orders,
             open_lots,
-        ))
+        )
+        .with_live_orders(self.live_orders.unwrap_or(false)))
     }
 }
 
@@ -1228,6 +1231,36 @@ mod tests {
         assert_eq!(CommandKind::OpenOrder.as_str(), "open_order");
         assert_eq!(CommandKind::CloseOrder.as_str(), "close_order");
         assert_eq!(CommandKind::ModifyOrder.as_str(), "modify_order");
+    }
+
+    #[test]
+    fn heartbeat_live_orders_flag_reports_armed_state() {
+        let parse = |live_orders: Option<bool>| {
+            let mut body = serde_json::json!({
+                "t": "hb",
+                "token": "test-token-1234567890",
+                "acct": 94168,
+                "server": "IFCMarkets-Real",
+                "symbol": "EURUSD",
+                "connected": true,
+                "tradeAllowed": true,
+                "orders": 0,
+                "lots": 0.0
+            });
+            if let Some(armed) = live_orders {
+                body["liveOrders"] = serde_json::json!(armed);
+            }
+            serde_json::from_value::<super::EaPoll>(body)
+                .expect("poll parses")
+                .snapshot()
+                .expect("snapshot validates")
+        };
+        assert!(parse(Some(true)).live_orders(), "armed EA reports armed");
+        assert!(!parse(Some(false)).live_orders());
+        assert!(
+            !parse(None).live_orders(),
+            "an older EA without the field is treated as disarmed"
+        );
     }
 
     #[test]

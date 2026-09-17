@@ -162,12 +162,15 @@ pub struct AccountSnapshot {
     symbol: Symbol,
     connected: bool,
     trade_allowed: bool,
+    live_orders: bool,
     open_orders: u32,
     open_lots: f64,
 }
 
 impl AccountSnapshot {
-    /// Builds a snapshot from already validated components.
+    /// Builds a snapshot from already validated components; the terminal
+    /// starts assumed disarmed until [`AccountSnapshot::with_live_orders`]
+    /// reports otherwise.
     pub fn new(
         login: AccountLogin,
         server: ServerName,
@@ -183,9 +186,16 @@ impl AccountSnapshot {
             symbol,
             connected,
             trade_allowed,
+            live_orders: false,
             open_orders,
             open_lots,
         }
+    }
+
+    /// Records whether the terminal's EA is armed for live orders.
+    pub fn with_live_orders(mut self, live_orders: bool) -> Self {
+        self.live_orders = live_orders;
+        self
     }
 
     /// Account number.
@@ -211,6 +221,12 @@ impl AccountSnapshot {
     /// Whether the terminal currently allows trading operations.
     pub fn trade_allowed(&self) -> bool {
         self.trade_allowed
+    }
+
+    /// Whether the terminal's EA is compiled and attached armed for live
+    /// orders (`InAllowLiveOrders`). The second of the two execution controls.
+    pub fn live_orders(&self) -> bool {
+        self.live_orders
     }
 
     /// Number of open venue orders (MT4 counts positions and pending orders).

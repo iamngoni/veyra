@@ -42,6 +42,7 @@ struct StatusResponse {
     persistence: Option<&'static str>,
     broker_connected: bool,
     trading_enabled: bool,
+    ea_live_orders: bool,
 }
 
 #[get("/health")]
@@ -92,7 +93,7 @@ pub async fn readiness(state: Data<AppState>) -> HttpResponse {
 #[get("/status")]
 /// Returns non-sensitive build and integration status.
 pub async fn status(state: Data<AppState>) -> HttpResponse {
-    let (broker_provider, broker_connected) = match state.broker() {
+    let (broker_provider, broker_connected, ea_live_orders) = match state.broker() {
         Some(runtime) => {
             let report = runtime.link().report().await;
             let connected = report.fresh
@@ -100,9 +101,13 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
                     .snapshot
                     .as_ref()
                     .is_some_and(|snapshot| snapshot.connected());
-            (Some(runtime.provider().as_str()), connected)
+            let armed = report
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.live_orders());
+            (Some(runtime.provider().as_str()), connected, armed)
         }
-        None => (None, false),
+        None => (None, false, false),
     };
 
     let model_provider = state.model().map(|runtime| runtime.provider().as_str());
@@ -119,6 +124,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         persistence,
         broker_connected,
         trading_enabled: state.config().trading_enabled(),
+        ea_live_orders,
     })
 }
 
