@@ -11,6 +11,7 @@ fn config(host: &str, port: &str, env: &str) -> Result<ServiceConfig, ConfigErro
             "VEYRA_ENV" => env,
             "VEYRA_TRADING_ENABLED" => "false",
             "VEYRA_RECONCILE_SECS" => "30",
+            "VEYRA_AUDIT_RETENTION_DAYS" => "30",
             "VEYRA_DATABASE_URL" => "",
             _ => panic!("unexpected setting"),
         }
@@ -46,6 +47,7 @@ fn trading_enablement_is_explicit_and_typed() {
                 "VEYRA_ENV" => "development",
                 "VEYRA_TRADING_ENABLED" => value,
                 "VEYRA_RECONCILE_SECS" => "30",
+                "VEYRA_AUDIT_RETENTION_DAYS" => "30",
                 "VEYRA_DATABASE_URL" => "",
                 _ => panic!("unexpected setting"),
             }
@@ -72,6 +74,7 @@ fn reconciliation_interval_is_bounded_and_typed() {
                 "VEYRA_ENV" => "development",
                 "VEYRA_TRADING_ENABLED" => "false",
                 "VEYRA_RECONCILE_SECS" => value,
+                "VEYRA_AUDIT_RETENTION_DAYS" => "30",
                 "VEYRA_DATABASE_URL" => "",
                 _ => panic!("unexpected setting"),
             }
@@ -87,6 +90,34 @@ fn reconciliation_interval_is_bounded_and_typed() {
         "invalid environment variable `VEYRA_RECONCILE_SECS`: must be an integer number of seconds from 0 through 3600"
     );
     assert!(configured("soon").is_err());
+}
+
+#[test]
+fn audit_retention_is_bounded_and_typed() {
+    let configured = |value: &str| {
+        ServiceConfig::from_source(|name| {
+            Ok(match name {
+                "VEYRA_BIND_HOST" => "127.0.0.1",
+                "VEYRA_BIND_PORT" => "8080",
+                "VEYRA_ENV" => "development",
+                "VEYRA_TRADING_ENABLED" => "false",
+                "VEYRA_RECONCILE_SECS" => "30",
+                "VEYRA_AUDIT_RETENTION_DAYS" => value,
+                "VEYRA_DATABASE_URL" => "",
+                _ => panic!("unexpected setting"),
+            }
+            .to_owned())
+        })
+    };
+
+    assert_eq!(configured("").unwrap().audit_retention_days(), 30);
+    assert_eq!(configured("0").unwrap().audit_retention_days(), 0);
+    assert_eq!(configured("365").unwrap().audit_retention_days(), 365);
+    assert_eq!(
+        configured("3651").unwrap_err().to_string(),
+        "invalid environment variable `VEYRA_AUDIT_RETENTION_DAYS`: must be an integer from 0 through 3650"
+    );
+    assert!(configured("forever").is_err());
 }
 
 #[test]

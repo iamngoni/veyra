@@ -30,6 +30,10 @@ pub enum ConfigError {
 const DEFAULT_RECONCILE_SECS: u64 = 30;
 /// Largest refresh interval the parser accepts.
 const MAX_RECONCILE_SECS: u64 = 3_600;
+/// Default audit retention in days.
+const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 30;
+/// Largest audit retention the parser accepts.
+const MAX_AUDIT_RETENTION_DAYS: u32 = 3_650;
 
 /// Deployment label; it does not grant execution authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +104,7 @@ pub struct ServiceConfig {
     environment: Environment,
     trading_enabled: bool,
     reconcile_secs: u64,
+    audit_retention_days: u32,
     database_url: Option<String>,
 }
 
@@ -153,6 +158,23 @@ impl ServiceConfig {
                 }
             },
         };
+        let audit_retention_days = match source("VEYRA_AUDIT_RETENTION_DAYS") {
+            Err(_) => DEFAULT_AUDIT_RETENTION_DAYS,
+            Ok(value) => match value.trim() {
+                "" => DEFAULT_AUDIT_RETENTION_DAYS,
+                other => {
+                    let invalid = || ConfigError::InvalidEnvironmentVariable {
+                        name: "VEYRA_AUDIT_RETENTION_DAYS",
+                        reason: "must be an integer from 0 through 3650",
+                    };
+                    let days = other.parse::<u32>().map_err(|_| invalid())?;
+                    if days > MAX_AUDIT_RETENTION_DAYS {
+                        return Err(invalid());
+                    }
+                    days
+                }
+            },
+        };
         let database_url = match source("VEYRA_DATABASE_URL") {
             Err(_) => None,
             Ok(value) => match value.trim() {
@@ -165,6 +187,7 @@ impl ServiceConfig {
             environment,
             trading_enabled,
             reconcile_secs,
+            audit_retention_days,
             database_url,
         })
     }
@@ -177,6 +200,11 @@ impl ServiceConfig {
     /// Returns the deployment label, not a trading permission.
     pub fn environment(&self) -> Environment {
         self.environment
+    }
+
+    /// Days of audit history to keep; zero keeps everything.
+    pub fn audit_retention_days(&self) -> u32 {
+        self.audit_retention_days
     }
 
     /// PostgreSQL connection string for the audit trail, when configured.

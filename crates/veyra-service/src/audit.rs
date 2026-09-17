@@ -27,6 +27,8 @@ pub enum AuditKind {
     BrokerSnapshot,
     /// The service process started with auditing enabled.
     ServiceStarted,
+    /// Reconciliation found orders Veyra does not own.
+    ReconciliationDrift,
 }
 
 impl AuditKind {
@@ -38,6 +40,7 @@ impl AuditKind {
             Self::CommandFailed => "command_failed",
             Self::BrokerSnapshot => "broker_snapshot",
             Self::ServiceStarted => "service_started",
+            Self::ReconciliationDrift => "reconciliation_drift",
         }
     }
 }
@@ -129,6 +132,13 @@ pub trait AuditTrail: Send + Sync + fmt::Debug + 'static {
     /// # Errors
     /// Returns [`AuditError`] when the store is unavailable.
     async fn recent(&self, limit: u32) -> Result<Vec<AuditRow>, AuditError>;
+
+    /// Deletes events older than `keep_days`, returning how many rows went.
+    /// Zero keeps everything.
+    ///
+    /// # Errors
+    /// Returns [`AuditError`] when the store is unavailable.
+    async fn prune(&self, keep_days: u32) -> Result<u64, AuditError>;
 }
 
 /// Active audit integration.
@@ -158,6 +168,18 @@ impl AuditRuntime {
     pub async fn try_record(&self, event: AuditEvent) {
         if let Err(error) = self.trail.record(event).await {
             tracing::warn!(%error, "audit write failed");
+        }
+    }
+
+    /// Prunes the trail best-effort: failures are logged and reported as zero
+    /// rows removed, so a storage hiccup never fails the maintenance loop.
+    pub async fn try_prune(&self, keep_days: u32) -> u64 {
+        match self.trail.prune(keep_days).await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                tracing::warn!(%error, "audit prune failed");
+                0
+            }
         }
     }
 }
@@ -206,6 +228,11 @@ impl AuditTrail for MemoryTrail {
         Ok(())
     }
 
+    async fn prune(&self, _keep_days: u32) -> Result<u64, AuditError> {
+        // The in-memory trail never prunes: tests assert on what was written.
+        Ok(0)
+    }
+
     async fn recent(&self, limit: u32) -> Result<Vec<AuditRow>, AuditError> {
         let events = match self.events.lock() {
             Ok(events) => events,
@@ -251,6 +278,12 @@ mod tests {
                 reason: "down".to_owned(),
             })
         }
+
+        async fn prune(&self, _keep_days: u32) -> Result<u64, AuditError> {
+            Err(AuditError::Storage {
+                reason: "down".to_owned(),
+            })
+        }
     }
 
     #[test]
@@ -260,6 +293,10 @@ mod tests {
         assert_eq!(AuditKind::CommandFailed.as_str(), "command_failed");
         assert_eq!(AuditKind::BrokerSnapshot.as_str(), "broker_snapshot");
         assert_eq!(AuditKind::ServiceStarted.as_str(), "service_started");
+        assert_eq!(
+            AuditKind::ReconciliationDrift.as_str(),
+            "reconciliation_drift"
+        );
         assert_eq!(AuditProvider::Postgres.as_str(), "postgres");
         assert_eq!(AuditProvider::Postgres.to_string(), "postgres");
     }
@@ -300,5 +337,17 @@ mod tests {
             .try_record(AuditEvent::new(AuditKind::CommandFailed, json!({})))
             .await;
         assert!(runtime.trail().recent(1).await.is_err());
+        assert_eq!(runtime.try_prune(30).await, 0, "failures report zero rows");
+    }
+
+    #[actix_web::test]
+    async fn pruning_is_best_effort_and_keeps_memory_trails_intact() {
+        let trail = Arc::new(MemoryTrail::default());
+        let runtime = AuditRuntime::new(trail.clone());
+        runtime
+            .try_record(AuditEvent::new(AuditKind::ServiceStarted, json!({})))
+            .await;
+        assert_eq!(runtime.try_prune(30).await, 0);
+        assert_eq!(trail.len(), 1);
     }
 }

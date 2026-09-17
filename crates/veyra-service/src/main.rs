@@ -87,6 +87,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Retention: prune audit history once an hour, best-effort. Zero days
+    // keeps everything.
+    let retention_days = state.config().audit_retention_days();
+    if let (Some(runtime), true) = (state.audit(), retention_days > 0) {
+        let retention = runtime.clone();
+        actix_web::rt::spawn(async move {
+            loop {
+                actix_web::rt::time::sleep(Duration::from_secs(3_600)).await;
+                let deleted = retention.try_prune(retention_days).await;
+                if deleted > 0 {
+                    tracing::info!(deleted, "pruned audit rows");
+                }
+            }
+        });
+    }
+
     let app = server::build_server(state, listener)?;
     server::serve(app, companion).await?;
     Ok(())

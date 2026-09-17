@@ -16,9 +16,10 @@
       against PostgreSQL 17 (rows survive restarts).
 - [x] Migration and reconciliation workflow: embedded migrations run before
       listening; the reconciliation view and its periodic refresh are audited.
+- [x] Operational readiness checks tied to real dependencies: `/ready`
+      reports broker and audit status and degrades without gating the surface
+      (proven live: database stopped → `degraded`, restored → `ready`).
 - [ ] Structured tracing spans and metrics.
-- [ ] Operational readiness checks tied to real dependencies (`/status`
-      reports the persistence provider today; `/ready` is still process-only).
 
 ## Phase 2 — model integration
 
@@ -118,10 +119,14 @@
 
 ## Phase 7 — deployment
 
-- [x] Local 24/7 supervision: launchd agents for the terminal, tunnel, and
-      service (release build, crash restart for the service and tunnel,
-      portable templates plus installer, logs under `~/Library/Logs/veyra`) —
-      restart proven live with `SIGKILL` (ADR 0005).
+- [x] Local 24/7 supervision: launchd agents for the terminal, tunnel,
+      service, and hourly log rotation (release build, crash restart for the
+      service and tunnel, copy-truncate logs above 5 MiB keeping three
+      generations, portable templates plus installer) — restart proven live
+      with `SIGKILL` (ADR 0005) and rotation proven with a low threshold.
+- [x] Audit retention: rows older than `VEYRA_AUDIT_RETENTION_DAYS` (default
+      30) are pruned hourly — proven live (an aged row was removed while
+      recent rows survived).
 - [ ] Durable 24/7 host or VPS, managed secrets, backups, and monitoring.
 - [ ] Versioned deployment pipeline.
 - [ ] Staged rollout: local → paper account → minimal live exposure only after explicit owner approval.

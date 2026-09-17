@@ -24,6 +24,7 @@ fn config(host: &str, port: &str) -> ServiceConfig {
             "VEYRA_ENV" => "development",
             "VEYRA_TRADING_ENABLED" => "false",
             "VEYRA_RECONCILE_SECS" => "30",
+            "VEYRA_AUDIT_RETENTION_DAYS" => "30",
             "VEYRA_DATABASE_URL" => "",
             _ => unreachable!("unexpected setting"),
         }

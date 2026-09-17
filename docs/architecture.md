@@ -190,7 +190,9 @@ acknowledgements, validated broker snapshots, and process starts are recorded;
 a configured-but-unreachable database fails startup, while individual writes
 are best-effort so a storage hiccup never blocks a command. `GET /audit`
 returns the newest rows. PostgreSQL runs as a Homebrew service on this machine
-(auto-start at login); retention, rotation, and backups are still open.
+(auto-start at login). Rows older than `VEYRA_AUDIT_RETENTION_DAYS` (default
+30, zero keeps everything) are pruned hourly, best-effort. Backups and
+monitoring are still open.
 
 ### Reconciliation
 
@@ -212,7 +214,10 @@ from portable templates (`scripts/launchd/`) by `scripts/install-launchd.sh`:
 the MT4 terminal at login, the named Cloudflare tunnel, and the service (via
 `scripts/run-service.sh`, which sources `.env` and execs the release binary).
 Tunnel and service carry `KeepAlive`, so a crash recovers without a session;
-the terminal deliberately does not, so a clean quit stays quit. Secrets remain
+the terminal deliberately does not, so a clean quit stays quit. A fourth
+agent rotates `~/Library/Logs/veyra` hourly (copy-truncate above 5 MiB,
+three generations), and `/ready` reports broker and audit health, degrading
+instead of hiding an unhealthy dependency. Secrets remain
 in `.env`; plists carry only absolute paths. Exactly one supervised instance
 owns ports 8080 and 7801, and the installer stops stray session-bound
 processes first. Logs land under `~/Library/Logs/veyra` and are not rotated

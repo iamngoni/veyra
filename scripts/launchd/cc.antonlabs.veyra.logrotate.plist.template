@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Hourly log rotation for the supervised stack: copy-truncate files above the
+  threshold (default 5 MiB) keeping three generations.
+-->
+<dict>
+    <key>Label</key>
+    <string>cc.antonlabs.veyra.logrotate</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__ROOT__/scripts/rotate-logs.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/veyra/logrotate.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/veyra/logrotate.err.log</string>
+</dict>
+</plist>

@@ -15,7 +15,12 @@ AGENTS="$HOME/Library/LaunchAgents"
 LOGS="$HOME/Library/Logs/veyra"
 TEMPLATES="$ROOT/scripts/launchd"
 DOMAIN="gui/$(id -u)"
-LABELS=(cc.antonlabs.veyra.terminal cc.antonlabs.veyra.tunnel cc.antonlabs.veyra.service)
+LABELS=(
+  cc.antonlabs.veyra.terminal
+  cc.antonlabs.veyra.tunnel
+  cc.antonlabs.veyra.service
+  cc.antonlabs.veyra.logrotate
+)
 
 uninstall() {
   for label in "${LABELS[@]}"; do
@@ -52,8 +57,14 @@ sleep 1
 for label in "${LABELS[@]}"; do
   launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
 done
+# launchd occasionally returns a transient "Input/output error" while a
+# previous instance is still tearing down; one short retry makes the installer
+# idempotent in practice.
 for label in "${LABELS[@]}"; do
-  launchctl bootstrap "$DOMAIN" "$AGENTS/$label.plist"
+  if ! launchctl bootstrap "$DOMAIN" "$AGENTS/$label.plist" 2>/dev/null; then
+    sleep 2
+    launchctl bootstrap "$DOMAIN" "$AGENTS/$label.plist"
+  fi
 done
 
 sleep 3

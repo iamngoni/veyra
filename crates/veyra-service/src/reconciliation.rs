@@ -65,6 +65,20 @@ pub fn assess(snapshot: &AccountSnapshotPayload) -> ReconciliationReport {
     }
 }
 
+/// Drift summary for auditing, when a snapshot shows orders Veyra does not
+/// own or a truncated list. `None` means the book reconciles cleanly.
+pub fn drift_summary(snapshot: &AccountSnapshotPayload) -> Option<serde_json::Value> {
+    let report = assess(snapshot);
+    if report.is_reconciled() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "orders": snapshot.orders,
+        "unknownTickets": report.unknown_tickets,
+        "positionsTruncated": report.positions_truncated
+    }))
+}
+
 fn classify(position: &PositionPayload, managed: bool) -> PositionAssessment {
     PositionAssessment {
         ticket: position.ticket,
@@ -175,6 +189,19 @@ mod tests {
         assert!(report.unknown_tickets.is_empty());
         assert!(!report.is_reconciled());
         assert!(report.positions_truncated);
+    }
+
+    #[test]
+    fn drift_summaries_are_audited_only_when_the_book_disagrees() {
+        assert!(drift_summary(&snapshot(Vec::new(), false)).is_none());
+        assert!(drift_summary(&snapshot(vec![position(1, ORDER_MAGIC)], false)).is_none());
+
+        let foreign = drift_summary(&snapshot(vec![position(456, 0)], false)).expect("drift");
+        assert_eq!(foreign["unknownTickets"], serde_json::json!([456]));
+
+        let truncated =
+            drift_summary(&snapshot(vec![position(1, ORDER_MAGIC)], true)).expect("drift");
+        assert_eq!(truncated["positionsTruncated"], true);
     }
 
     #[test]

@@ -27,6 +27,8 @@ struct HealthResponse {
 struct ReadinessResponse {
     status: &'static str,
     trading_enabled: bool,
+    broker: &'static str,
+    audit: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,11 +55,37 @@ pub async fn health() -> HttpResponse {
 }
 
 #[get("/ready")]
-/// Reports diagnostic-control-plane readiness only, not trading readiness.
+/// Reports dependency-aware readiness without gating the diagnostic surface:
+/// the service always answers, and `status` degrades when a configured
+/// dependency is unhealthy.
 pub async fn readiness(state: Data<AppState>) -> HttpResponse {
+    let broker = match state.broker() {
+        None => "unconfigured",
+        Some(runtime) => {
+            let report = runtime.link().report().await;
+            if report.fresh { "connected" } else { "stale" }
+        }
+    };
+    let audit = match state.audit() {
+        None => "disabled",
+        Some(runtime) => match runtime.trail().recent(1).await {
+            Ok(_) => "ok",
+            Err(error) => {
+                tracing::warn!(%error, "readiness audit probe failed");
+                "unavailable"
+            }
+        },
+    };
+    let overall = if broker == "stale" || audit == "unavailable" {
+        "degraded"
+    } else {
+        "ready"
+    };
     HttpResponse::Ok().json(ReadinessResponse {
-        status: "ready",
+        status: overall,
         trading_enabled: state.config().trading_enabled(),
+        broker,
+        audit,
     })
 }
 

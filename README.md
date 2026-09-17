@@ -65,8 +65,8 @@ on loopback (`VEYRA_EA_BIND_HOST:VEYRA_EA_BIND_PORT`). Build and install the
 probe EA with `./scripts/compile_ea.sh` (reads `VEYRA_EA_TOKEN` from `.env`).
 
 For unattended operation, install the supervised stack (release build; the
-tunnel and service restart automatically, MT4 starts at login; logs under
-`~/Library/Logs/veyra`):
+tunnel and service restart automatically, MT4 starts at login, logs rotate
+hourly under `~/Library/Logs/veyra`):
 
 ```sh
 cargo build --release
@@ -81,7 +81,8 @@ After changing code, rebuild and restart the supervised service:
 Then inspect:
 
 - `http://127.0.0.1:8080/health`
-- `http://127.0.0.1:8080/ready`
+- `http://127.0.0.1:8080/ready` (dependency-aware: reports broker and audit
+  status, degrading when either is unhealthy)
 - `http://127.0.0.1:8080/status`
 
 ## Model configuration

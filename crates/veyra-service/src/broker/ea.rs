@@ -906,6 +906,12 @@ impl EaLink {
                             }),
                         ))
                         .await;
+                    if let Some(summary) = crate::reconciliation::drift_summary(snapshot) {
+                        tracing::warn!(%summary, "reconciliation drift detected");
+                        audit
+                            .try_record(AuditEvent::new(AuditKind::ReconciliationDrift, summary))
+                            .await;
+                    }
                 }
             }
         }
@@ -1689,6 +1695,44 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert_eq!(events[2].kind(), AuditKind::CommandFailed);
         assert_eq!(events[2].payload()["error"], "nope");
+
+        // A foreign position turns the next snapshot into audited drift.
+        let drifting = link.enqueue(CommandKind::AccountSnapshot);
+        let foreign_ack = EaAck {
+            id: drifting,
+            ok: true,
+            data: Some(serde_json::json!({
+                "balance": 20.57,
+                "equity": 20.57,
+                "freeMargin": 20.57,
+                "orders": 1,
+                "lots": 0.01,
+                "positions": [{
+                    "ticket": 456,
+                    "symbol": "EURUSD",
+                    "kind": "buy",
+                    "lots": 0.01,
+                    "magic": 0,
+                    "price": 1.095,
+                    "profit": -0.25
+                }],
+                "positionsTruncated": false,
+                "serverTime": 1_758_000_000
+            })),
+            error: None,
+        };
+        link.apply_ack(&foreign_ack);
+        link.audit_ack(&foreign_ack).await;
+
+        let events = trail.events();
+        assert_eq!(events.len(), 6);
+        assert_eq!(events[3].kind(), AuditKind::CommandCompleted);
+        assert_eq!(events[4].kind(), AuditKind::BrokerSnapshot);
+        assert_eq!(events[5].kind(), AuditKind::ReconciliationDrift);
+        assert_eq!(
+            events[5].payload()["unknownTickets"],
+            serde_json::json!([456])
+        );
     }
 
     #[test]

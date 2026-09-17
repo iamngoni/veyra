@@ -8,7 +8,9 @@ use std::sync::Arc;
 use actix_web::test;
 use veyra_service::AppState;
 use veyra_service::app::create_app;
-use veyra_service::audit::{AuditRuntime, MemoryTrail};
+use veyra_service::audit::{
+    AuditError, AuditEvent, AuditProvider, AuditRow, AuditRuntime, AuditTrail, MemoryTrail,
+};
 use veyra_service::broker::{
     AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName, Symbol,
 };
@@ -191,4 +193,78 @@ async fn status_reports_the_configured_persistence_provider() {
     let response = test::call_service(&unconfigured, request).await;
     let body: serde_json::Value = test::read_body_json(response).await;
     assert!(body["persistence"].is_null());
+}
+
+/// Audit store that is always down, to prove readiness degrades.
+#[derive(Debug)]
+struct BrokenTrail;
+
+#[async_trait::async_trait]
+impl AuditTrail for BrokenTrail {
+    fn provider(&self) -> AuditProvider {
+        AuditProvider::Postgres
+    }
+
+    async fn record(&self, _event: AuditEvent) -> Result<(), AuditError> {
+        Err(AuditError::Storage {
+            reason: "down".to_owned(),
+        })
+    }
+
+    async fn recent(&self, _limit: u32) -> Result<Vec<AuditRow>, AuditError> {
+        Err(AuditError::Storage {
+            reason: "down".to_owned(),
+        })
+    }
+
+    async fn prune(&self, _keep_days: u32) -> Result<u64, AuditError> {
+        Err(AuditError::Storage {
+            reason: "down".to_owned(),
+        })
+    }
+}
+
+#[actix_web::test]
+async fn readiness_is_dependency_aware() {
+    // Nothing configured: the process is ready with both dependencies disabled.
+    let bare = test::init_service(create_app(test_state(None))).await;
+    let request = test::TestRequest::get().uri("/ready").to_request();
+    let response = test::call_service(&bare, request).await;
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["broker"], "unconfigured");
+    assert_eq!(body["audit"], "disabled");
+
+    // A configured broker without heartbeats degrades readiness.
+    let stale = test::init_service(create_app(test_state(Some(ea_broker())))).await;
+    let request = test::TestRequest::get().uri("/ready").to_request();
+    let response = test::call_service(&stale, request).await;
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["broker"], "stale");
+
+    // An unreachable audit store degrades readiness as well.
+    let broken = AuditRuntime::new(Arc::new(BrokenTrail));
+    let state = test_state(None).with_audit(Some(broken));
+    let app = test::init_service(create_app(state)).await;
+    let request = test::TestRequest::get().uri("/ready").to_request();
+    let response = test::call_service(&app, request).await;
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["audit"], "unavailable");
+
+    // A fresh terminal heartbeat plus a healthy trail: ready.
+    let broker = ea_broker();
+    if let Some(link) = broker.ea_link() {
+        link.record(snapshot());
+    }
+    let healthy = AuditRuntime::new(Arc::new(MemoryTrail::default()));
+    let state = test_state(Some(broker)).with_audit(Some(healthy));
+    let app = test::init_service(create_app(state)).await;
+    let request = test::TestRequest::get().uri("/ready").to_request();
+    let response = test::call_service(&app, request).await;
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["broker"], "connected");
+    assert_eq!(body["audit"], "ok");
 }

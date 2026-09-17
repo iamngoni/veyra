@@ -64,6 +64,24 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes rows older than `keep_days`, returning how many were removed.
+    ///
+    /// # Errors
+    /// Returns [`AuditError::Storage`] when the delete fails.
+    pub async fn delete_older_than(&self, keep_days: u32) -> Result<u64, AuditError> {
+        if keep_days == 0 {
+            return Ok(0);
+        }
+        let days = i32::try_from(keep_days).unwrap_or(i32::MAX);
+        let result =
+            sqlx::query("delete from audit_events where at < now() - make_interval(days => $1)")
+                .bind(days)
+                .execute(&self.pool)
+                .await
+                .map_err(|error| storage_error("prune", &error))?;
+        Ok(result.rows_affected())
+    }
+
     /// Returns the newest rows, newest first.
     ///
     /// # Errors
@@ -101,6 +119,10 @@ impl AuditTrail for Store {
 
     async fn recent(&self, limit: u32) -> Result<Vec<AuditRow>, AuditError> {
         self.list(limit).await
+    }
+
+    async fn prune(&self, keep_days: u32) -> Result<u64, AuditError> {
+        self.delete_older_than(keep_days).await
     }
 }
 
