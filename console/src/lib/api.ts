@@ -34,6 +34,25 @@ export type Status = {
   autopilot: AutopilotStatus | null
   /** Model call usage against the configured caps; null without a model. */
   model_budget: { hourLimit: number; hourCalls: number; dayLimit: number; dayCalls: number } | null
+  /** Effective risk gate policy; always present. */
+  risk_policy: RiskPolicy
+}
+
+export type RiskPolicy = {
+  killSwitch: boolean
+  symbols: string[]
+  maxVolumePerOrder: number
+  maxTotalLots: number
+  maxOpenOrders: number
+  duplicateWindowSecs: number
+  sessionUtc: string | null
+}
+
+export type Metrics = {
+  service: string
+  version: string
+  counters: Record<string, number>
+  feedLatest: number
 }
 
 export type Position = {
@@ -124,6 +143,7 @@ export const api = {
   status: () => get<Status>('/status'),
   account: () => get<Account>('/account'),
   reconciliation: () => get<Reconciliation>('/reconciliation'),
+  metrics: () => get<Metrics>('/metrics'),
   commands: (limit = 25) => get<{ commands: CommandRecord[] }>(`/commands?limit=${limit}`),
   candles: (bars = 48) => get<CandleSeries>(`/market/candles?timeframe=H4&bars=${bars}`),
   events: (after: number | undefined, waitMs = 15000) =>

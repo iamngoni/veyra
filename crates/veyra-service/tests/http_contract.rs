@@ -112,6 +112,10 @@ async fn status_reports_no_broker_connection() {
     assert_eq!(body["model_budget"], serde_json::Value::Null);
     assert_eq!(body["autopilot"], serde_json::Value::Null);
     assert_eq!(body["broker_connected"], false);
+    // The effective policy is always reported, even with no integrations.
+    assert_eq!(body["risk_policy"]["symbols"], serde_json::json!([]));
+    assert_eq!(body["risk_policy"]["maxOpenOrders"], 1);
+    assert_eq!(body["risk_policy"]["killSwitch"], false);
     assert_eq!(body["trading_enabled"], false);
     assert_eq!(body["environment"], "development");
 }

@@ -47,6 +47,8 @@ struct StatusResponse {
     ea_live_orders: bool,
     autopilot: Option<serde_json::Value>,
     model_budget: Option<serde_json::Value>,
+    /// Effective risk gate policy; always present (the gate never sleeps).
+    risk_policy: serde_json::Value,
 }
 
 #[get("/health")]
@@ -174,6 +176,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         ea_live_orders,
         autopilot,
         model_budget,
+        risk_policy: state.risk().policy().summary(),
     })
 }
 

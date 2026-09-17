@@ -8,7 +8,9 @@ import {
   AutopilotPanel,
   CommandsPanel,
   MarketPanel,
+  MetricsPanel,
   PositionsPanel,
+  RiskPanel,
   StatusPills,
 } from '../components/veyra'
 import { api } from '../lib/api'
@@ -21,6 +23,7 @@ function Dashboard() {
   const { data: account, error: accountError } = usePoll(api.account, 5000)
   const { data: commands } = usePoll(() => api.commands(25), 10000)
   const { data: series, error: marketError } = usePoll(() => api.candles(48), 60000)
+  const { data: metrics, error: metricsError } = usePoll(api.metrics, 10000)
   const { events, connected } = useEventFeed(80)
   const [focus, setFocus] = useState(true)
 
@@ -58,6 +61,11 @@ function Dashboard() {
           <PositionsPanel account={account} />
           <CommandsPanel commands={commands?.commands} />
         </div>
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-2">
+        <RiskPanel policy={status?.risk_policy} status={status} />
+        <MetricsPanel metrics={metrics} error={metricsError} />
       </div>
 
       <footer className="pb-1 text-center font-mono text-[10px] text-slate-600">

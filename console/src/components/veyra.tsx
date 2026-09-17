@@ -1,6 +1,16 @@
 import type { ReactNode } from 'react'
 
-import type { Account, Candle, CandleSeries, CommandRecord, FeedEvent, Position, Status } from '../lib/api'
+import type {
+  Account,
+  Candle,
+  CandleSeries,
+  CommandRecord,
+  FeedEvent,
+  Metrics,
+  Position,
+  RiskPolicy,
+  Status,
+} from '../lib/api'
 import { VEYRA_MAGIC } from '../lib/api'
 import { clockTime, money, relativeTime } from '../lib/hooks'
 
@@ -273,6 +283,74 @@ export function AutopilotPanel({
         Every entry carries both stops, passes the deterministic risk gate, and still needs both armed switches
         before the terminal can place it.
       </div>
+    </Panel>
+  )
+}
+
+/* ---------- risk ---------- */
+
+export function RiskPanel({ policy, status }: { policy?: RiskPolicy; status?: Status }) {
+  return (
+    <Panel
+      title="Risk"
+      detail={policy?.killSwitch ? <span className="text-rose-400">kill switch on</span> : 'gate active'}
+    >
+      <div className="grid grid-cols-2 gap-x-4 gap-y-3 p-3 sm:grid-cols-4">
+        <Field
+          label="Symbols"
+          value={policy ? (policy.symbols.length > 0 ? policy.symbols.join(' · ') : 'none allowed') : '—'}
+        />
+        <Field label="Max / order" value={policy ? `${policy.maxVolumePerOrder} lots` : '—'} />
+        <Field label="Max total" value={policy ? `${policy.maxTotalLots} lots` : '—'} />
+        <Field label="Max open" value={policy?.maxOpenOrders ?? '—'} />
+        <Field label="Duplicates" value={policy ? `${policy.duplicateWindowSecs}s window` : '—'} />
+        <Field label="Session UTC" value={policy?.sessionUtc ?? 'always open'} />
+        <Field
+          label="Execution"
+          value={status?.trading_enabled ? 'switch on' : 'switch off'}
+          tone={status?.trading_enabled ? 'text-amber-300' : undefined}
+        />
+        <Field
+          label="Terminal"
+          value={status?.ea_live_orders ? 'armed' : 'disarmed'}
+          tone={status?.ea_live_orders ? 'text-emerald-300' : undefined}
+        />
+      </div>
+      <div className="border-t border-slate-800/80 px-3 py-2 text-[11px] leading-relaxed text-slate-500">
+        Every intent passes the gate in order: kill switch, allowlist, session, per-order cap, account
+        facts, order cap, exposure, duplicates. Both armed switches are still required for real money.
+      </div>
+    </Panel>
+  )
+}
+
+/* ---------- metrics ---------- */
+
+export function MetricsPanel({ metrics, error }: { metrics?: Metrics; error?: string }) {
+  const counters = metrics
+    ? Object.entries(metrics.counters)
+        .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+        .slice(0, 12)
+    : []
+  return (
+    <Panel
+      title="Metrics"
+      detail={metrics ? `feed #${metrics.feedLatest}` : error ? <span className="text-rose-400">{error}</span> : '…'}
+    >
+      {counters.length === 0 ? (
+        <div className="p-3 text-xs text-slate-500">No counters yet.</div>
+      ) : (
+        <ul className="divide-y divide-slate-800/40">
+          {counters.map(([key, value]) => (
+            <li key={key} className="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
+              <span className="truncate font-mono text-[10px] text-slate-400" title={key}>
+                {key}
+              </span>
+              <span className="shrink-0 font-mono tabular-nums text-slate-200">{value}</span>
+            </li>
+          ))}
+        </ul>
+      )}
     </Panel>
   )
 }
