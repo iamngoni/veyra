@@ -29,6 +29,7 @@ struct StatusResponse {
     service: &'static str,
     version: &'static str,
     environment: String,
+    broker_provider: Option<&'static str>,
     broker_connected: bool,
     trading_enabled: bool,
 }
@@ -55,11 +56,25 @@ pub async fn readiness(state: Data<AppState>) -> HttpResponse {
 #[get("/status")]
 /// Returns non-sensitive build and integration status.
 pub async fn status(state: Data<AppState>) -> HttpResponse {
+    let (broker_provider, broker_connected) = match state.broker() {
+        Some(runtime) => {
+            let report = runtime.link().report().await;
+            let connected = report.fresh
+                && report
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.connected());
+            (Some(runtime.provider().as_str()), connected)
+        }
+        None => (None, false),
+    };
+
     HttpResponse::Ok().json(StatusResponse {
         service: "veyra",
         version: env!("CARGO_PKG_VERSION"),
         environment: state.config().environment().to_string(),
-        broker_connected: false,
+        broker_provider,
+        broker_connected,
         trading_enabled: state.config().trading_enabled(),
     })
 }

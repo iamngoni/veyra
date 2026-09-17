@@ -53,11 +53,17 @@ fn rejects_invalid_addresses_without_echoing_input() {
 #[test]
 fn enforces_port_boundaries() {
     for port in ["1024", "65535"] {
-        assert_eq!(Port::parse(port).unwrap().value().to_string(), port);
+        assert_eq!(
+            Port::parse("VEYRA_BIND_PORT", port)
+                .unwrap()
+                .value()
+                .to_string(),
+            port
+        );
     }
     for port in ["0", "80", "1023", "65536", "-1", "", "abc", " 8080"] {
         assert!(matches!(
-            Port::parse(port),
+            Port::parse("VEYRA_BIND_PORT", port),
             Err(ConfigError::InvalidEnvironmentVariable {
                 name: "VEYRA_BIND_PORT",
                 ..

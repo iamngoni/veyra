@@ -1,14 +1,26 @@
-//! Minimal process wiring: fail before listening if configuration or logging is
-//! invalid, then await the diagnostic server. This binary has no execution path.
+//! Minimal process wiring: fail before listening if configuration, logging, or
+//! broker settings are invalid, then serve the diagnostic surface plus any
+//! provider-required loopback listener. This binary has no execution path.
 
+use veyra_service::broker::{BrokerRuntime, BrokerSettings};
 use veyra_service::{AppState, config::ServiceConfig, observability, server};
 
 #[actix_web::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServiceConfig::from_env()?;
     observability::init()?;
+
+    let broker = match BrokerSettings::from_env()? {
+        Some(settings) => Some(BrokerRuntime::from_settings(settings)?),
+        None => None,
+    };
+    let companion = match &broker {
+        Some(runtime) => runtime.listener()?,
+        None => None,
+    };
+
     let listener = server::bind(&config)?;
-    let app = server::build_server(AppState::new(config), listener)?;
-    server::serve(app).await?;
+    let app = server::build_server(AppState::new(config, broker), listener)?;
+    server::serve(app, companion).await?;
     Ok(())
 }

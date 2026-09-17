@@ -38,3 +38,8 @@ Report local, CI, live, and deployment proof separately. Do not call an untested
 ## Scope boundaries
 
 Do not add fake trading, demo fills, or mock broker data as if it were production functionality. Integrations must declare their boundary and tests must verify it.
+
+External integrations are implementations of narrow traits selected by
+configuration (see `broker/mod.rs`). Construct them once at startup, keep
+vendor specifics inside the implementation, and never call a vendor SDK or
+transport directly from domain, risk, or reporting code.

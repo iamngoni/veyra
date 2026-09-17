@@ -6,23 +6,52 @@
 use actix_web::test;
 use veyra_service::AppState;
 use veyra_service::app::create_app;
-use veyra_service::config::ConfigError;
+use veyra_service::broker::{
+    AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName, Symbol,
+};
+use veyra_service::config::{ConfigError, ServiceConfig};
 
-fn test_state() -> AppState {
-    let config = veyra_service::config::ServiceConfig::from_source(|name| match name {
+fn test_config() -> ServiceConfig {
+    ServiceConfig::from_source(|name| match name {
         "VEYRA_BIND_HOST" => Ok("127.0.0.1".to_owned()),
         "VEYRA_BIND_PORT" => Ok("8080".to_owned()),
         "VEYRA_ENV" => Ok("development".to_owned()),
         _ => Err(ConfigError::MissingEnvironmentVariable { name }),
     })
-    .unwrap();
+    .expect("test configuration must parse")
+}
 
-    AppState::new(config)
+fn test_state(broker: Option<BrokerRuntime>) -> AppState {
+    AppState::new(test_config(), broker)
+}
+
+fn ea_broker() -> BrokerRuntime {
+    let settings = BrokerSettings::from_source(|name| match name {
+        "VEYRA_BROKER_PROVIDER" => Ok("ea".to_owned()),
+        "VEYRA_EA_TOKEN" => Ok("test-token-1234567890".to_owned()),
+        "VEYRA_EA_BIND_HOST" => Ok("127.0.0.1".to_owned()),
+        "VEYRA_EA_BIND_PORT" => Ok("7801".to_owned()),
+        _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+    })
+    .expect("broker settings must parse")
+    .expect("broker must be configured");
+
+    BrokerRuntime::from_settings(settings).expect("runtime must build")
+}
+
+fn snapshot() -> AccountSnapshot {
+    AccountSnapshot::new(
+        AccountLogin::parse(94168).expect("login must validate"),
+        ServerName::parse("IFCMarkets-Real").expect("server must validate"),
+        Symbol::parse("EURUSD").expect("symbol must validate"),
+        true,
+        true,
+    )
 }
 
 #[actix_web::test]
 async fn health_reports_process_liveness() {
-    let app = test::init_service(create_app(test_state())).await;
+    let app = test::init_service(create_app(test_state(None))).await;
     let request = test::TestRequest::get().uri("/health").to_request();
     let response = test::call_service(&app, request).await;
 
@@ -34,7 +63,7 @@ async fn health_reports_process_liveness() {
 
 #[actix_web::test]
 async fn readiness_reports_trading_disabled() {
-    let app = test::init_service(create_app(test_state())).await;
+    let app = test::init_service(create_app(test_state(None))).await;
     let request = test::TestRequest::get().uri("/ready").to_request();
     let response = test::call_service(&app, request).await;
 
@@ -46,13 +75,33 @@ async fn readiness_reports_trading_disabled() {
 
 #[actix_web::test]
 async fn status_reports_no_broker_connection() {
-    let app = test::init_service(create_app(test_state())).await;
+    let app = test::init_service(create_app(test_state(None))).await;
     let request = test::TestRequest::get().uri("/status").to_request();
     let response = test::call_service(&app, request).await;
 
     assert!(response.status().is_success());
     let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["broker_provider"], serde_json::Value::Null);
     assert_eq!(body["broker_connected"], false);
     assert_eq!(body["trading_enabled"], false);
     assert_eq!(body["environment"], "development");
+}
+
+#[actix_web::test]
+async fn status_reports_broker_link_state() {
+    let runtime = ea_broker();
+    runtime
+        .ea_link()
+        .expect("EA link must exist")
+        .record(snapshot());
+
+    let app = test::init_service(create_app(test_state(Some(runtime)))).await;
+    let request = test::TestRequest::get().uri("/status").to_request();
+    let response = test::call_service(&app, request).await;
+
+    assert!(response.status().is_success());
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["broker_provider"], "ea");
+    assert_eq!(body["broker_connected"], true);
+    assert_eq!(body["trading_enabled"], false);
 }

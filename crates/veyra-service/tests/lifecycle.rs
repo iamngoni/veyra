@@ -3,10 +3,12 @@
 //! Process environment is never mutated here.
 
 use std::net::{SocketAddr, TcpListener};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use veyra_service::broker::{EaLink, EaToken, build_server as build_ea_server};
 use veyra_service::{AppState, config::ServiceConfig, server};
 
 fn config(host: &str, port: &str) -> ServiceConfig {
@@ -60,10 +62,10 @@ fn bind_fails_when_the_address_is_occupied() {
 #[actix_web::test]
 async fn serves_health_then_stops_gracefully() {
     let (listener, address) = bind_ephemeral();
-    let state = AppState::new(config("127.0.0.1", &address.port().to_string()));
+    let state = AppState::new(config("127.0.0.1", &address.port().to_string()), None);
     let app = server::build_server(state, listener).expect("server build");
     let handle = app.handle();
-    let task = actix_web::rt::spawn(server::serve(app));
+    let task = actix_web::rt::spawn(server::serve(app, None));
 
     let mut response = None;
     for _ in 0..100 {
@@ -89,4 +91,59 @@ async fn serves_health_then_stops_gracefully() {
     task.await
         .expect("server task must not panic")
         .expect("graceful shutdown must succeed");
+}
+
+/// Address that was bound and immediately released; used to pre-select the
+/// companion listener's port. The tiny reuse race is retried by the caller's
+/// readiness loop instead of being flaky.
+fn free_address() -> SocketAddr {
+    let probe = TcpListener::bind("127.0.0.1:0").expect("probe listener");
+    probe.local_addr().expect("probe address")
+}
+
+#[actix_web::test]
+async fn companion_listener_starts_and_stops_with_main() {
+    let (main_listener, main_addr) = bind_ephemeral();
+    let main = server::build_server(
+        AppState::new(config("127.0.0.1", &main_addr.port().to_string()), None),
+        main_listener,
+    )
+    .expect("main server build");
+
+    let link = Arc::new(EaLink::new(
+        EaToken::parse("test-token-1234567890").expect("token"),
+        Duration::from_secs(10),
+    ));
+    let ea_addr = free_address();
+    let ea = build_ea_server(link, ea_addr).expect("EA server build");
+
+    let main_handle = main.handle();
+    let task = actix_web::rt::spawn(server::serve(main, Some(ea)));
+
+    let mut ready = false;
+    for _ in 0..100 {
+        let http_ok = get(main_addr, "/health").await.is_some();
+        let ea_ok = tokio::net::TcpStream::connect(ea_addr).await.is_ok();
+        if http_ok && ea_ok {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready, "both listeners must accept connections");
+
+    main_handle.stop(true).await;
+    task.await
+        .expect("serve task must not panic")
+        .expect("clean shutdown");
+
+    let mut refused = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(ea_addr).await.is_err() {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refused, "companion listener must stop with the main server");
 }

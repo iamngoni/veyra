@@ -69,9 +69,10 @@ pub struct Port(u16);
 
 impl Port {
     /// Parses an integer in 1024..=65535; rejects whitespace and port zero.
-    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+    /// `name` is the setting name used in error messages.
+    pub fn parse(name: &'static str, value: &str) -> Result<Self, ConfigError> {
         let invalid = || ConfigError::InvalidEnvironmentVariable {
-            name: "VEYRA_BIND_PORT",
+            name,
             reason: "must be an integer from 1024 through 65535",
         };
         let port = value.parse::<u16>().map_err(|_| invalid())?;
@@ -112,7 +113,7 @@ impl ServiceConfig {
                 name: "VEYRA_BIND_HOST",
                 reason: "must be an IPv4 or IPv6 literal",
             })?;
-        let port = Port::parse(&read("VEYRA_BIND_PORT", &mut source)?)?;
+        let port = Port::parse("VEYRA_BIND_PORT", &read("VEYRA_BIND_PORT", &mut source)?)?;
         let environment = read("VEYRA_ENV", &mut source)?.parse()?;
         Ok(Self {
             address: SocketAddr::new(host, port.value()),

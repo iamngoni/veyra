@@ -30,12 +30,19 @@
 - Adversarial tests for hallucinated instruments and unsupported actions.
 - Benchmark latency and cost under realistic batch questions.
 
-## Phase 4 — broker adapter selection
+## Phase 4 — broker integration
 
-- Verify IFC Markets-supported access methods and account restrictions.
-- Compare direct/vetted hosted bridge and MQL4 EA paths.
-- Test with read-only credentials first, then paper/testing accounts.
-- Implement idempotency keys, command acknowledgements, and reconciliation.
+- [x] Verify IFC Markets-supported access methods and account restrictions
+      (no public retail REST/FIX API; MT4 has no MQL4 socket API).
+- [x] Compare hosted bridge and MQL4 EA paths (bridges are paid; EA chosen as
+      the zero-recurring-cost first implementation).
+- [x] Broker integration boundary (`BrokerLink`) with provider selection and
+      the EA control channel as the first implementation.
+- [ ] Live probe round trip on the terminal (heartbeat + ping/pong).
+- [ ] Replace the probe protocol with an idempotent command/ack queue; add
+      command acknowledgements and independent reconciliation.
+- [ ] Staged testing: read-only first, then demo, then minimal live exposure
+      only after explicit owner approval.
 
 ## Phase 5 — deterministic risk and control
 

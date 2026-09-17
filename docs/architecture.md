@@ -2,7 +2,11 @@
 
 ## Current implementation
 
-The first crate is `veyra-service`, a Rust 2024 Actix Web control plane. It exposes read-only health, readiness, and status endpoints. Runtime settings are parsed into refined types before they reach handlers. The public status contract reports `broker_connected: false` and `trading_enabled: false`.
+The first crate is `veyra-service`, a Rust 2024 Actix Web control plane. It
+exposes read-only health, readiness, and status endpoints. Runtime settings are
+parsed into refined types before they reach handlers. Status reports the active
+`broker_provider`, whether the broker link is fresh and connected, and
+`trading_enabled` (still false: no execution path exists).
 
 ## Boundaries
 
@@ -11,7 +15,9 @@ Config -> Runtime state -> HTTP control plane
              |
              +-- Decision adapter (future)
              +-- Deterministic risk gate
-             +-- Broker adapter
+             +-- BrokerLink (selected by VEYRA_BROKER_PROVIDER)
+             |      +-- Ea  (loopback HTTP control channel)
+             |      +-- ... (hosted bridge / direct API, added later)
              +-- Persistence/reconciliation
 ```
 
@@ -30,14 +36,39 @@ Current integration gaps to account for before production use:
 
 Jev is a structured decision interface, not an ordinary text provider. It will be isolated behind its own adapter and response type. Veyra will model its choice, score, and truth/confidence values as fallible, validated domain data. No Jev access exists yet, so none of this slice calls it.
 
-### Broker and IFC Markets
+### Broker integrations (swappable)
 
-IFC Markets documents MT4/MQL4 program trading; no public retail broker REST/FIX API has been verified. The candidate adapters are:
+Every venue integration implements the `BrokerLink` contract in
+`broker/mod.rs`:
 
-1. A vetted hosted API bridge, if it is independently evaluated, supports the required operations, and the account owner explicitly approves credentials and costs.
-2. A narrowly scoped MQL4 EA fallback using a private control protocol, idempotent command IDs, local execution safety, and independent reconciliation.
+- `provider() -> BrokerProvider` identifies the implementation.
+- `report() -> LinkReport` returns the latest locally held state.
 
-No bridge is selected. No credentials are stored. The Veyra core will not depend on either choice.
+`BrokerRuntime::from_settings` is the single construction point; the provider
+is selected by `VEYRA_BROKER_PROVIDER`. Decision, risk, and reporting code
+depend only on `Arc<dyn BrokerLink>`, so swapping venues means adding an
+implementation plus a provider variant — no caller changes. Each
+implementation owns its transport and its own loopback listener when it needs
+one; nothing vendor-specific leaks into domain code.
+
+**Implementation 1 — MQL4 EA control channel (`broker/ea.rs`).** MT4's MQL4
+has no socket API (verified against build 1476 and the MetaQuotes reference),
+so the EA polls a loopback-only HTTP endpoint using the terminal's built-in
+`WebRequest` client. The service authenticates a shared token in constant time,
+validates the payload into refined types (`AccountSnapshot`, `ServerName`,
+`Symbol`, `AccountLogin`), records heartbeat state, and answers the probe
+protocol (`ping`/`pong`). Order commands are deliberately absent; they will
+arrive as an idempotent command queue over this same channel.
+
+**Rejected for now — hosted API bridges.** The evaluated vendors are paid
+services that run their own terminals; the account owner opted for the
+zero-recurring-cost EA path. A bridge can still be added later as a second
+`BrokerLink` implementation without disturbing anything else, and a direct
+broker API likewise if IFC ever exposes one.
+
+No account credentials are stored in Veyra or in the repository: the MT4
+terminal holds the session, and the EA token only authorizes the loopback
+control channel.
 
 ### Risk gate
 

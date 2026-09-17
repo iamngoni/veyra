@@ -38,12 +38,26 @@ pub fn build_server(state: AppState, listener: TcpListener) -> io::Result<Server
     Ok(server)
 }
 
-/// Awaits server completion after a graceful or forced stop.
+/// Awaits server completion after a graceful or forced stop, stopping the
+/// optional companion listener (for example the EA control channel) with it.
 ///
 /// Worker failure propagates as an error instead of being reported as a clean
 /// shutdown.
-pub async fn serve(server: Server) -> io::Result<()> {
-    server.await?;
+pub async fn serve(main: Server, companion: Option<Server>) -> io::Result<()> {
+    let companion_task = companion.map(|server| {
+        let handle = server.handle();
+        (actix_web::rt::spawn(server), handle)
+    });
+
+    let result = main.await;
+
+    if let Some((task, handle)) = companion_task {
+        handle.stop(true).await;
+        let _ = task.await;
+        tracing::info!("companion listener stopped");
+    }
+
+    result?;
     tracing::info!("Veyra diagnostic server stopped");
     Ok(())
 }

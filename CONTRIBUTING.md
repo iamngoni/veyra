@@ -10,6 +10,6 @@ cargo test --all-targets
 cargo coverage
 ```
 
-`main.rs` is the only documented coverage exclusion: it is process wiring exercised by `scripts/smoke.sh` rather than unit-testable domain logic.
+The documented coverage exclusions are `src/main.rs` (process wiring exercised by `scripts/smoke.sh`) and `tests/*_live.rs` (ignored tests that require live external systems).
 
 Keep changes focused, document public contracts, and preserve safety boundaries. Account credentials, broker passwords, and provider keys are never accepted in source, examples, screenshots, or logs.

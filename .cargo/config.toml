@@ -1,5 +1,6 @@
-# The only coverage exclusion is `src/main.rs`: process wiring whose bind,
-# serve, and shutdown paths are exercised by `tests/lifecycle.rs` and
-# `scripts/smoke.sh` instead of unit tests.
+# Coverage exclusions are narrow and documented: `src/main.rs` is process
+# wiring, and `tests/*_live.rs` files hold ignored tests that require live
+# external systems; both are exercised by `scripts/smoke.sh` and manual live
+# runs instead of the deterministic test suite.
 [alias]
-coverage = "llvm-cov --all-features --workspace --fail-under-lines 95 --ignore-filename-regex crates/.*/src/main.rs$"
+coverage = 'llvm-cov --all-features --workspace --fail-under-lines 95 --ignore-filename-regex crates/.*/src/main\.rs$|crates/.*/tests/.*_live\.rs$'
