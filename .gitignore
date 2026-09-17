@@ -17,3 +17,6 @@
 .DS_Store
 .idea/
 .vscode/
+# Python artifacts (alert probe bytecode)
+__pycache__/
+*.pyc
