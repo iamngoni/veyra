@@ -37,6 +37,7 @@ struct StatusResponse {
     version: &'static str,
     environment: String,
     broker_provider: Option<&'static str>,
+    market_provider: Option<&'static str>,
     model_provider: Option<&'static str>,
     jev_provider: Option<&'static str>,
     persistence: Option<&'static str>,
@@ -110,6 +111,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         None => (None, false, false),
     };
 
+    let market_provider = state.market().map(|runtime| runtime.provider().as_str());
     let model_provider = state.model().map(|runtime| runtime.provider().as_str());
     let jev_provider = state.jev().map(|runtime| runtime.provider().as_str());
     let persistence = state.audit().map(|runtime| runtime.provider().as_str());
@@ -119,6 +121,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         version: env!("CARGO_PKG_VERSION"),
         environment: state.config().environment().to_string(),
         broker_provider,
+        market_provider,
         model_provider,
         jev_provider,
         persistence,

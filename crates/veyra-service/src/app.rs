@@ -1,5 +1,7 @@
 //! HTTP assembly shared by the process and integration tests.
-//! Diagnostic and non-executing evaluation routes only; no execution API exists.
+//! Diagnostic routes, deterministic evaluation, the read-only market view, and
+//! the loopback control surface; execution routes refuse unless both operator
+//! controls are enabled.
 
 use crate::AppState;
 use actix_web::{App, Error, body::BoxBody, dev, web};
@@ -28,6 +30,7 @@ pub fn create_app(
         .service(crate::control::close_position)
         .service(crate::control::modify_position)
         .service(crate::control::reconciliation)
+        .service(crate::control::market_candles)
         .service(crate::control::audit_log)
         .service(crate::control::request_account_snapshot)
         .service(crate::control::command_status)

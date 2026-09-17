@@ -8,6 +8,7 @@ use std::time::Duration;
 use veyra_service::audit::{AuditEvent, AuditKind, AuditRuntime};
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
 use veyra_service::jev::{JevRuntime, JevSettings};
+use veyra_service::market::{MarketRuntime, MarketSettings};
 use veyra_service::model::{ModelRuntime, settings::ModelSettings};
 use veyra_service::reconciliation;
 use veyra_service::risk::{RiskGate, RiskPolicy};
@@ -30,6 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let jev = match JevSettings::from_env()? {
         Some(settings) => Some(JevRuntime::from_settings(settings)?),
+        None => None,
+    };
+
+    // Market data follows the broker: the EA provider reads candles through
+    // the same command channel, so it refuses to build without it.
+    let market = match MarketSettings::from_env()? {
+        Some(settings) => Some(MarketRuntime::from_settings(settings, broker.as_ref())?),
         None => None,
     };
 
@@ -56,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = server::bind(&config)?;
     let state = AppState::new(config, broker, model, risk)
+        .with_market(market)
         .with_jev(jev)
         .with_audit(audit.as_ref().map(|runtime| (**runtime).clone()));
 

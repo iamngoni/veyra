@@ -99,6 +99,8 @@ pub enum CommandKind {
     CloseOrder,
     /// Ask the terminal to change the stops on a Veyra-owned position.
     ModifyOrder,
+    /// Report recent closed candles for one symbol and timeframe.
+    Rates,
 }
 
 impl CommandKind {
@@ -111,6 +113,7 @@ impl CommandKind {
             Self::OpenOrder => "open_order",
             Self::CloseOrder => "close_order",
             Self::ModifyOrder => "modify_order",
+            Self::Rates => "rates",
         }
     }
 }
@@ -122,6 +125,9 @@ const MAX_POSITIONS: usize = 64;
 /// Magic number stamped on Veyra orders so the terminal and the reconciler can
 /// recognise them.
 pub const ORDER_MAGIC: u32 = 77_041;
+
+/// Standard MT4 periods in minutes; the `rates` contract accepts only these.
+pub const SUPPORTED_TIMEFRAME_MINUTES: [u32; 9] = [1, 5, 15, 30, 60, 240, 1_440, 10_080, 43_200];
 
 /// One open or pending order as the terminal reports it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -365,6 +371,149 @@ impl EaModifyRequest {
     }
 }
 
+/// Market-rates request sent to the EA: `bars` closed candles for a symbol
+/// and timeframe, oldest first. The symbol is an already validated [`Symbol`]
+/// and the timeframe must be one of [`SUPPORTED_TIMEFRAME_MINUTES`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EaRatesRequest {
+    symbol: String,
+    #[serde(rename = "timeframeMinutes")]
+    timeframe_minutes: u32,
+    bars: u16,
+}
+
+impl EaRatesRequest {
+    /// Largest candle count one request may ask for.
+    pub const MAX_BARS: u16 = 240;
+
+    /// Builds a validated request.
+    ///
+    /// # Errors
+    /// Returns [`BrokerError::InvalidPayload`] when the timeframe is not a
+    /// standard MT4 period or the bar count is outside 1-240.
+    pub fn new(symbol: &Symbol, timeframe_minutes: u32, bars: u16) -> Result<Self, BrokerError> {
+        if !SUPPORTED_TIMEFRAME_MINUTES.contains(&timeframe_minutes) {
+            return Err(BrokerError::InvalidPayload {
+                field: "timeframeMinutes",
+                reason: "must be a standard MT4 period in minutes (1, 5, 15, 30, 60, 240, 1440, 10080, 43200)",
+            });
+        }
+        if bars == 0 || bars > Self::MAX_BARS {
+            return Err(BrokerError::InvalidPayload {
+                field: "bars",
+                reason: "must be from 1 through 240",
+            });
+        }
+        Ok(Self {
+            symbol: symbol.as_str().to_owned(),
+            timeframe_minutes,
+            bars,
+        })
+    }
+
+    /// Instrument the candles are requested for.
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    /// Requested timeframe in minutes.
+    pub fn timeframe_minutes(&self) -> u32 {
+        self.timeframe_minutes
+    }
+
+    /// Requested number of closed candles.
+    pub fn bars(&self) -> u16 {
+        self.bars
+    }
+}
+
+/// One closed OHLC candle as the terminal reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandlePayload {
+    /// Bar open time (Unix seconds, broker server time).
+    pub time: i64,
+    /// Open price.
+    pub open: f64,
+    /// High price.
+    pub high: f64,
+    /// Low price.
+    pub low: f64,
+    /// Close price.
+    pub close: f64,
+    /// Tick volume reported by MT4.
+    pub volume: i64,
+}
+
+impl CandlePayload {
+    fn validate(&self) -> Result<(), String> {
+        if self.time <= 0 {
+            return Err("candle time must be positive".to_owned());
+        }
+        for (name, value) in [
+            ("open", self.open),
+            ("high", self.high),
+            ("low", self.low),
+            ("close", self.close),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!("candle {name} must be a finite, positive price"));
+            }
+        }
+        if self.high < self.low {
+            return Err("candle high must not be below its low".to_owned());
+        }
+        if self.high < self.open.max(self.close) {
+            return Err("candle high must not be below its body prices".to_owned());
+        }
+        if self.low > self.open.min(self.close) {
+            return Err("candle low must not be above its body prices".to_owned());
+        }
+        if self.volume < 0 {
+            return Err("candle volume must be non-negative".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Result of a `rates` command: the requested window of closed candles.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RatesPayload {
+    /// Instrument the candles belong to.
+    pub symbol: String,
+    /// Timeframe in minutes.
+    #[serde(rename = "timeframeMinutes")]
+    pub timeframe_minutes: u32,
+    /// Closed candles, oldest first.
+    pub candles: Vec<CandlePayload>,
+}
+
+impl RatesPayload {
+    /// Rejects unusable series before they reach callers: unknown
+    /// symbol/timeframe, an empty or oversized series, non-monotonic times,
+    /// or any candle that fails OHLC sanity. Market-feed implementations call
+    /// this again when converting to domain types, so a hand-built payload
+    /// cannot bypass the checks.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        Symbol::parse(&self.symbol).map_err(|error| format!("rates symbol is invalid: {error}"))?;
+        if !SUPPORTED_TIMEFRAME_MINUTES.contains(&self.timeframe_minutes) {
+            return Err("rates timeframeMinutes is not a standard MT4 period".to_owned());
+        }
+        let max = usize::from(EaRatesRequest::MAX_BARS);
+        if self.candles.is_empty() || self.candles.len() > max {
+            return Err(format!("rates candles must be 1-{max} entries"));
+        }
+        let mut previous = None;
+        for candle in &self.candles {
+            candle.validate()?;
+            if previous.is_some_and(|previous| candle.time <= previous) {
+                return Err("candle times must be strictly increasing".to_owned());
+            }
+            previous = Some(candle.time);
+        }
+        Ok(())
+    }
+}
+
 /// Order request sent to the EA for validation or execution, derived only from
 /// an approved intent. Fields mirror the intent wire contract so the EA can
 /// read them without a nested parser.
@@ -418,6 +567,8 @@ pub enum CommandPayload {
     CloseOrder(OrderExecutionPayload),
     /// Result of `modify_order`; reports whether the stops were changed.
     ModifyOrder(OrderExecutionPayload),
+    /// Result of `rates`; the requested window of closed candles.
+    Rates(RatesPayload),
 }
 
 /// Lifecycle state of one command.
@@ -585,6 +736,9 @@ pub enum EaReply {
         /// Present for stop-change commands.
         #[serde(skip_serializing_if = "Option::is_none")]
         modify: Option<Box<EaModifyRequest>>,
+        /// Present for market-rates commands.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rates: Option<Box<EaRatesRequest>>,
     },
 }
 
@@ -625,6 +779,8 @@ enum CommandRequest {
     Close(EaCloseRequest),
     /// Stop change for a validated Veyra position.
     Modify(EaModifyRequest),
+    /// Market-rates request for one symbol and timeframe.
+    Rates(EaRatesRequest),
 }
 
 /// Retained account snapshot plus the instant it was validated.
@@ -707,6 +863,11 @@ impl EaLink {
         )
     }
 
+    /// Queues a read-only market-rates request.
+    pub fn enqueue_rates(&self, request: EaRatesRequest) -> CommandId {
+        self.enqueue_with(CommandKind::Rates, Some(CommandRequest::Rates(request)))
+    }
+
     fn enqueue_with(&self, kind: CommandKind, request: Option<CommandRequest>) -> CommandId {
         let id = CommandId::new();
         self.with_commands(|queue| {
@@ -737,6 +898,34 @@ impl EaLink {
                     state: command.state.clone(),
                 })
         })
+    }
+
+    /// Waits until a command reaches a terminal state, polling the retained
+    /// queue. Delivery, acknowledgement, and timeout classification stay with
+    /// the queue; this only observes. Commands that leave the bounded history
+    /// or outlive `timeout` report a failure.
+    pub async fn await_command(&self, id: CommandId, timeout: Duration) -> CommandState {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.command(id) {
+                Some(record) => {
+                    if !matches!(record.state, CommandState::Pending) {
+                        return record.state;
+                    }
+                }
+                None => {
+                    return CommandState::Failed {
+                        reason: "command left the retained history".to_owned(),
+                    };
+                }
+            }
+            if Instant::now() >= deadline {
+                return CommandState::Failed {
+                    reason: "await timeout".to_owned(),
+                };
+            }
+            actix_web::rt::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Marks timed-out commands as failed and returns the oldest pending
@@ -788,7 +977,8 @@ impl EaLink {
                         | CommandPayload::OrderCheck(_)
                         | CommandPayload::OpenOrder(_)
                         | CommandPayload::CloseOrder(_)
-                        | CommandPayload::ModifyOrder(_) => None,
+                        | CommandPayload::ModifyOrder(_)
+                        | CommandPayload::Rates(_) => None,
                     };
                     command.state = CommandState::Completed { payload };
                     retained
@@ -1049,17 +1239,20 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
                 link.record(snapshot);
                 let reply = match link.deliverable() {
                     Some((id, kind, request)) => {
-                        let (order, close, modify) = match request {
+                        let (order, close, modify, rates) = match request {
                             Some(CommandRequest::Order(order)) => {
-                                (Some(Box::new(order)), None, None)
+                                (Some(Box::new(order)), None, None, None)
                             }
                             Some(CommandRequest::Close(close)) => {
-                                (None, Some(Box::new(close)), None)
+                                (None, Some(Box::new(close)), None, None)
                             }
                             Some(CommandRequest::Modify(modify)) => {
-                                (None, None, Some(Box::new(modify)))
+                                (None, None, Some(Box::new(modify)), None)
                             }
-                            None => (None, None, None),
+                            Some(CommandRequest::Rates(rates)) => {
+                                (None, None, None, Some(Box::new(rates)))
+                            }
+                            None => (None, None, None, None),
                         };
                         EaReply::Command {
                             id,
@@ -1067,6 +1260,7 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
                             order,
                             close,
                             modify,
+                            rates,
                         }
                     }
                     // Ask for a pong on hello and until one has been seen for
@@ -1126,6 +1320,13 @@ fn payload_for(kind: CommandKind, data: Option<Value>) -> Result<CommandPayload,
             payload.validate()?;
             Ok(CommandPayload::ModifyOrder(payload))
         }
+        CommandKind::Rates => {
+            let value = data.ok_or_else(|| "rates ack is missing data".to_owned())?;
+            let payload: RatesPayload = serde_json::from_value(value)
+                .map_err(|error| format!("invalid rates payload: {error}"))?;
+            payload.validate()?;
+            Ok(CommandPayload::Rates(payload))
+        }
     }
 }
 
@@ -1148,6 +1349,11 @@ fn completed_summary(payload: &CommandPayload) -> Value {
             "executed": execution.executed,
             "retcode": execution.retcode,
             "ticket": execution.ticket
+        }),
+        CommandPayload::Rates(rates) => serde_json::json!({
+            "symbol": rates.symbol,
+            "timeframeMinutes": rates.timeframe_minutes,
+            "candles": rates.candles.len()
         }),
     }
 }
@@ -1199,9 +1405,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CommandRequest, EaAck, EaCloseRequest, EaLink, EaModifyRequest, EaOrderRequest, EaToken,
-        ORDER_MAGIC, OrderCheckPayload, hex_preview, payload_for,
+        CandlePayload, CommandRequest, EaAck, EaCloseRequest, EaLink, EaModifyRequest,
+        EaOrderRequest, EaRatesRequest, EaReply, EaToken, ORDER_MAGIC, OrderCheckPayload,
+        RatesPayload, hex_preview, payload_for,
     };
+    use crate::broker::Symbol as BrokerSymbol;
     use crate::broker::ea::{
         AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandState, PositionKind,
     };
@@ -1231,6 +1439,206 @@ mod tests {
         assert_eq!(CommandKind::OpenOrder.as_str(), "open_order");
         assert_eq!(CommandKind::CloseOrder.as_str(), "close_order");
         assert_eq!(CommandKind::ModifyOrder.as_str(), "modify_order");
+        assert_eq!(CommandKind::Rates.as_str(), "rates");
+    }
+
+    fn candle(time: i64) -> CandlePayload {
+        CandlePayload {
+            time,
+            open: 1.1,
+            high: 1.2,
+            low: 1.0,
+            close: 1.15,
+            volume: 42,
+        }
+    }
+
+    #[test]
+    fn rates_requests_validate_timeframes_and_bounds() {
+        let symbol = BrokerSymbol::parse("EURUSD").expect("symbol");
+        let request = EaRatesRequest::new(&symbol, 240, 48).expect("valid request");
+        assert_eq!(request.symbol(), "EURUSD");
+        assert_eq!(request.timeframe_minutes(), 240);
+        assert_eq!(request.bars(), 48);
+        assert_eq!(
+            serde_json::to_value(&request).expect("serializes"),
+            serde_json::json!({"symbol": "EURUSD", "timeframeMinutes": 240, "bars": 48})
+        );
+        for minutes in [0, 7, 90, 43_201] {
+            assert!(
+                EaRatesRequest::new(&symbol, minutes, 10).is_err(),
+                "must reject timeframe {minutes}"
+            );
+        }
+        for bars in [0, 241] {
+            assert!(
+                EaRatesRequest::new(&symbol, 240, bars).is_err(),
+                "must reject bars {bars}"
+            );
+        }
+        assert!(
+            EaRatesRequest::new(&symbol, 1, 240).is_ok(),
+            "the full M1 window is valid"
+        );
+    }
+
+    #[test]
+    fn rates_payloads_require_monotonic_sane_candles() {
+        let valid = RatesPayload {
+            symbol: "EURUSD".to_owned(),
+            timeframe_minutes: 240,
+            candles: vec![candle(1_700_000_000), candle(1_700_014_400)],
+        };
+        valid.validate().expect("valid series");
+
+        let broken = |mutate: &dyn Fn(&mut RatesPayload)| {
+            let mut payload = valid.clone();
+            mutate(&mut payload);
+            payload
+        };
+
+        assert!(
+            broken(&|p| p.symbol = "no spaces".to_owned())
+                .validate()
+                .is_err()
+        );
+        assert!(broken(&|p| p.timeframe_minutes = 90).validate().is_err());
+        assert!(broken(&|p| p.candles.clear()).validate().is_err());
+        assert!(
+            broken(&|p| p.candles = (0..241)
+                .map(|index| candle(1_700_000_000 + index))
+                .collect())
+            .validate()
+            .is_err()
+        );
+        assert!(broken(&|p| p.candles.swap(0, 1)).validate().is_err());
+        assert!(
+            broken(&|p| p.candles[1].time = p.candles[0].time)
+                .validate()
+                .is_err(),
+            "duplicate bar times are rejected"
+        );
+        assert!(
+            broken(&|p| p.candles[0].high = f64::NAN)
+                .validate()
+                .is_err()
+        );
+        assert!(broken(&|p| p.candles[0].high = 1.0).validate().is_err());
+        assert!(broken(&|p| p.candles[0].volume = -1).validate().is_err());
+    }
+
+    #[test]
+    fn rates_commands_deliver_and_serialize() {
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(15),
+        );
+        let symbol = BrokerSymbol::parse("EURUSD").expect("symbol");
+        let request = EaRatesRequest::new(&symbol, 240, 2).expect("request");
+        let id = link.enqueue_rates(request.clone());
+
+        let (delivered, kind, payload) = link.deliverable().expect("pending command");
+        assert_eq!(delivered, id);
+        assert_eq!(kind, CommandKind::Rates);
+        assert_eq!(payload, Some(CommandRequest::Rates(request.clone())));
+
+        let reply = EaReply::Command {
+            id,
+            kind,
+            order: None,
+            close: None,
+            modify: None,
+            rates: Some(Box::new(request)),
+        };
+        let wire = serde_json::to_value(&reply).expect("serializes");
+        assert_eq!(wire["t"], "cmd");
+        assert_eq!(wire["kind"], "rates");
+        assert_eq!(wire["rates"]["timeframeMinutes"], 240);
+        assert_eq!(wire["rates"]["bars"], 2);
+        assert!(wire.get("order").is_none(), "absent requests are omitted");
+    }
+
+    #[actix_web::test]
+    async fn rates_acks_complete_commands_and_await_observes() {
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(15),
+        );
+        let symbol = BrokerSymbol::parse("EURUSD").expect("symbol");
+        let id = link.enqueue_rates(EaRatesRequest::new(&symbol, 240, 2).expect("request"));
+        assert_eq!(
+            link.command(id).expect("record").state,
+            CommandState::Pending
+        );
+
+        link.apply_ack(&EaAck {
+            id,
+            ok: true,
+            data: Some(serde_json::json!({
+                "symbol": "EURUSD",
+                "timeframeMinutes": 240,
+                "candles": [
+                    {"time": 1_700_000_000, "open": 1.1, "high": 1.2, "low": 1.0, "close": 1.15, "volume": 42},
+                    {"time": 1_700_014_400, "open": 1.15, "high": 1.3, "low": 1.1, "close": 1.25, "volume": 77}
+                ]
+            })),
+            error: None,
+        });
+        match link.await_command(id, Duration::from_secs(1)).await {
+            CommandState::Completed {
+                payload: CommandPayload::Rates(rates),
+            } => {
+                assert_eq!(rates.symbol, "EURUSD");
+                assert_eq!(rates.candles.len(), 2);
+                assert_eq!(rates.candles[1].close, 1.25);
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+
+        // A malformed series fails the command instead of completing it.
+        let malformed = link.enqueue_rates(EaRatesRequest::new(&symbol, 240, 1).expect("request"));
+        link.apply_ack(&EaAck {
+            id: malformed,
+            ok: true,
+            data: Some(serde_json::json!({
+                "symbol": "EURUSD",
+                "timeframeMinutes": 240,
+                "candles": [{"time": 0, "open": 1.1, "high": 1.2, "low": 1.0, "close": 1.15, "volume": 1}]
+            })),
+            error: None,
+        });
+        match link.await_command(malformed, Duration::from_secs(1)).await {
+            CommandState::Failed { reason } => {
+                assert!(
+                    reason.contains("candle time"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+
+        // A command that never gets acknowledged fails on the caller's deadline.
+        let stalled = link.enqueue_rates(EaRatesRequest::new(&symbol, 240, 1).expect("request"));
+        match link
+            .await_command(stalled, Duration::from_millis(150))
+            .await
+        {
+            CommandState::Failed { reason } => assert_eq!(reason, "await timeout"),
+            other => panic!("unexpected state: {other:?}"),
+        }
+
+        // Unknown ids are observed as gone immediately.
+        match link
+            .await_command(CommandId::new(), Duration::from_millis(150))
+            .await
+        {
+            CommandState::Failed { reason } => {
+                assert_eq!(reason, "command left the retained history");
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
     }
 
     #[test]

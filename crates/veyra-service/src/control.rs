@@ -20,10 +20,12 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::audit::{AuditEvent, AuditKind};
+use crate::broker::Symbol;
 use crate::broker::ea::{
     CommandId, CommandKind, CommandPayload, CommandState, EaCloseRequest, EaLink, EaModifyRequest,
     EaOrderRequest, ORDER_MAGIC,
 };
+use crate::market::{CandleRequest, Timeframe};
 use crate::risk::RiskDecision;
 use crate::trading::TradeIntentDraft;
 
@@ -97,6 +99,88 @@ pub async fn request_account_snapshot(state: Data<AppState>) -> HttpResponse {
         "command_id": command.to_string(),
         "status": "pending"
     }))
+}
+
+/// Query for `GET /market/candles`; every field is optional.
+#[derive(Debug, Deserialize)]
+pub struct CandleQuery {
+    /// Instrument; defaults to the terminal's chart symbol.
+    pub symbol: Option<String>,
+    /// Timeframe name (M1 through MN1) or standard minutes; defaults to `H4`.
+    pub timeframe: Option<String>,
+    /// Closed candles to return (1-240); defaults to 48.
+    pub bars: Option<u16>,
+}
+
+#[get("/market/candles")]
+/// Returns recent closed candles from the active market feed.
+///
+/// Read-only: at most one `rates` command is queued on the control channel and
+/// no order path is touched. Invalid symbols, timeframes, or windows are
+/// rejected before anything is queued, and a terminal that does not answer
+/// within the configured window is reported as a gateway failure.
+pub async fn market_candles(state: Data<AppState>, query: web::Query<CandleQuery>) -> HttpResponse {
+    let Some(runtime) = state.market() else {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "market_feed_unavailable" }));
+    };
+    let symbol = match query.symbol.as_deref() {
+        Some(raw) => match Symbol::parse(raw) {
+            Ok(symbol) => symbol,
+            Err(_) => {
+                return HttpResponse::BadRequest().json(json!({ "error": "invalid_symbol" }));
+            }
+        },
+        None => match default_symbol(&state).await {
+            Some(symbol) => symbol,
+            None => {
+                return HttpResponse::Conflict().json(json!({ "error": "symbol_unavailable" }));
+            }
+        },
+    };
+    let timeframe = match query.timeframe.as_deref() {
+        Some(raw) => match Timeframe::parse(raw) {
+            Some(timeframe) => timeframe,
+            None => {
+                return HttpResponse::BadRequest().json(json!({ "error": "invalid_timeframe" }));
+            }
+        },
+        None => Timeframe::H4,
+    };
+    let request = match CandleRequest::new(symbol, timeframe, query.bars.unwrap_or(48)) {
+        Ok(request) => request,
+        Err(error) => {
+            return HttpResponse::BadRequest()
+                .json(json!({ "error": "invalid_window", "reason": error.to_string() }));
+        }
+    };
+    match runtime.feed().candles(request).await {
+        Ok(series) => HttpResponse::Ok().json(json!({
+            "symbol": series.symbol().as_str(),
+            "timeframe": series.timeframe().as_str(),
+            "candles": series
+                .candles()
+                .iter()
+                .map(|candle| json!({
+                    "time": candle.time(),
+                    "open": candle.open(),
+                    "high": candle.high(),
+                    "low": candle.low(),
+                    "close": candle.close(),
+                    "volume": candle.volume()
+                }))
+                .collect::<Vec<_>>()
+        })),
+        Err(error) => HttpResponse::BadGateway()
+            .json(json!({ "error": "market_feed_failed", "reason": error.to_string() })),
+    }
+}
+
+/// Falls back to the symbol of the terminal's hosting chart.
+async fn default_symbol(state: &AppState) -> Option<Symbol> {
+    let broker = state.broker()?;
+    let report = broker.link().report().await;
+    report.snapshot.map(|snapshot| snapshot.symbol().clone())
 }
 
 #[post("/intents/execute")]
@@ -431,6 +515,11 @@ fn command_result(payload: CommandPayload) -> serde_json::Value {
             "comment": check.comment,
             "margin": check.margin
         }),
+        CommandPayload::Rates(rates) => json!({
+            "symbol": rates.symbol,
+            "timeframeMinutes": rates.timeframe_minutes,
+            "candles": rates.candles
+        }),
         CommandPayload::OpenOrder(execution)
         | CommandPayload::CloseOrder(execution)
         | CommandPayload::ModifyOrder(execution) => json!({
@@ -440,5 +529,208 @@ fn command_result(payload: CommandPayload) -> serde_json::Value {
             "ticket": execution.ticket,
             "price": execution.price
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use actix_web::test;
+    use async_trait::async_trait;
+    use serde_json::Value;
+
+    use super::*;
+    use crate::app::create_app;
+    use crate::broker::{AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName};
+    use crate::config::{ConfigError, ServiceConfig};
+    use crate::market::{Candle, CandleSeries, MarketError, MarketFeed, MarketProvider};
+    use crate::risk::{RiskGate, RiskPolicy};
+
+    #[derive(Debug)]
+    struct StubFeed {
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl MarketFeed for StubFeed {
+        fn provider(&self) -> MarketProvider {
+            MarketProvider::Ea
+        }
+
+        async fn candles(&self, request: CandleRequest) -> Result<CandleSeries, MarketError> {
+            if self.fail {
+                return Err(MarketError::Unavailable {
+                    reason: "terminal did not answer".to_owned(),
+                });
+            }
+            Ok(CandleSeries::from_validated(
+                request.symbol().clone(),
+                request.timeframe(),
+                vec![Candle::from_validated(
+                    1_700_000_000,
+                    1.1,
+                    1.2,
+                    1.0,
+                    1.15,
+                    42,
+                )],
+            ))
+        }
+    }
+
+    fn config() -> ServiceConfig {
+        ServiceConfig::from_source(|name| match name {
+            "VEYRA_BIND_HOST" => Ok("127.0.0.1".to_owned()),
+            "VEYRA_BIND_PORT" => Ok("8080".to_owned()),
+            "VEYRA_ENV" => Ok("development".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        })
+        .expect("config must parse")
+    }
+
+    fn broker_with_chart() -> BrokerRuntime {
+        let settings = BrokerSettings::from_source(|name| match name {
+            "VEYRA_BROKER_PROVIDER" => Ok("ea".to_owned()),
+            "VEYRA_EA_TOKEN" => Ok("test-token-1234567890".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        })
+        .expect("settings must parse")
+        .expect("configured");
+        let runtime = BrokerRuntime::from_settings(settings).expect("runtime builds");
+        runtime
+            .ea_link()
+            .expect("ea link")
+            .record(AccountSnapshot::new(
+                AccountLogin::parse(94168).expect("login"),
+                ServerName::parse("IFCMarkets-Real").expect("server"),
+                Symbol::parse("EURUSD").expect("symbol"),
+                true,
+                true,
+                0,
+                0.0,
+            ));
+        runtime
+    }
+
+    fn state(feed: Option<StubFeed>, broker: bool) -> AppState {
+        let mut state = AppState::new(
+            config(),
+            if broker {
+                Some(broker_with_chart())
+            } else {
+                None
+            },
+            None,
+            RiskGate::new(RiskPolicy::default()),
+        );
+        if let Some(feed) = feed {
+            state = state.with_market(Some(crate::market::MarketRuntime::from_feed(Arc::new(
+                feed,
+            ))));
+        }
+        state
+    }
+
+    #[actix_web::test]
+    async fn candles_require_a_configured_feed() {
+        let app = test::init_service(create_app(state(None, true))).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/market/candles").to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 503);
+    }
+
+    #[actix_web::test]
+    async fn candles_validate_the_query_before_touching_the_feed() {
+        let app = test::init_service(create_app(state(Some(StubFeed { fail: false }), true))).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/market/candles?symbol=bad%20symbol")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "invalid_symbol");
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/market/candles?timeframe=H6")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "invalid_timeframe");
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/market/candles?symbol=EURUSD&bars=500")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "invalid_window");
+    }
+
+    #[actix_web::test]
+    async fn candles_use_the_chart_symbol_when_omitted() {
+        let app = test::init_service(create_app(state(Some(StubFeed { fail: false }), true))).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/market/candles?timeframe=H4&bars=2")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["symbol"], "EURUSD");
+        assert_eq!(body["timeframe"], "H4");
+        assert_eq!(body["candles"][0]["close"], 1.15);
+        assert_eq!(body["candles"][0]["volume"], 42);
+    }
+
+    #[actix_web::test]
+    async fn candles_report_a_missing_default_symbol() {
+        let app =
+            test::init_service(create_app(state(Some(StubFeed { fail: false }), false))).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/market/candles").to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 409);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "symbol_unavailable");
+    }
+
+    #[actix_web::test]
+    async fn candle_feed_failures_are_gateway_errors() {
+        let app = test::init_service(create_app(state(Some(StubFeed { fail: true }), true))).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/market/candles?symbol=EURUSD")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 502);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "market_feed_failed");
+        assert!(
+            body["reason"]
+                .as_str()
+                .expect("reason")
+                .contains("terminal")
+        );
     }
 }

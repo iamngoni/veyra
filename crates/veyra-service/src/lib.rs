@@ -11,6 +11,7 @@ pub mod broker;
 pub mod config;
 pub mod control;
 pub mod jev;
+pub mod market;
 pub mod model;
 pub mod observability;
 pub mod reconciliation;
@@ -24,6 +25,7 @@ use audit::AuditRuntime;
 use broker::BrokerRuntime;
 use config::ServiceConfig;
 use jev::JevRuntime;
+use market::MarketRuntime;
 use model::ModelRuntime;
 use risk::RiskGate;
 
@@ -32,6 +34,7 @@ use risk::RiskGate;
 pub struct AppState {
     config: ServiceConfig,
     broker: Option<BrokerRuntime>,
+    market: Option<MarketRuntime>,
     model: Option<ModelRuntime>,
     jev: Option<JevRuntime>,
     audit: Option<AuditRuntime>,
@@ -49,11 +52,18 @@ impl AppState {
         Self {
             config,
             broker,
+            market: None,
             model,
             jev: None,
             audit: None,
             risk,
         }
+    }
+
+    /// Attaches the configured market-data integration, if any.
+    pub fn with_market(mut self, market: Option<MarketRuntime>) -> Self {
+        self.market = market;
+        self
     }
 
     /// Attaches the configured audit trail, if any.
@@ -76,6 +86,11 @@ impl AppState {
     /// Returns the active broker integration, if one is configured.
     pub fn broker(&self) -> Option<&BrokerRuntime> {
         self.broker.as_ref()
+    }
+
+    /// Returns the active market-data integration, if one is configured.
+    pub fn market(&self) -> Option<&MarketRuntime> {
+        self.market.as_ref()
     }
 
     /// Returns the active model integration, if one is configured.

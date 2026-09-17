@@ -107,6 +107,7 @@ async fn status_reports_no_broker_connection() {
     assert!(response.status().is_success());
     let body: serde_json::Value = test::read_body_json(response).await;
     assert_eq!(body["broker_provider"], serde_json::Value::Null);
+    assert_eq!(body["market_provider"], serde_json::Value::Null);
     assert_eq!(body["model_provider"], serde_json::Value::Null);
     assert_eq!(body["broker_connected"], false);
     assert_eq!(body["trading_enabled"], false);
