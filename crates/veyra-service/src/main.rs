@@ -4,6 +4,7 @@
 
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
 use veyra_service::model::{ModelRuntime, settings::ModelSettings};
+use veyra_service::risk::{RiskGate, RiskPolicy};
 use veyra_service::{AppState, config::ServiceConfig, observability, server};
 
 #[actix_web::main]
@@ -25,8 +26,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // The gate is always present and restrictive by default: an unconfigured
+    // allowlist approves nothing, so a missing setting cannot widen behavior.
+    let risk = RiskGate::new(RiskPolicy::from_env()?);
+
     let listener = server::bind(&config)?;
-    let app = server::build_server(AppState::new(config, broker, model), listener)?;
+    let app = server::build_server(AppState::new(config, broker, model, risk), listener)?;
     server::serve(app, companion).await?;
     Ok(())
 }

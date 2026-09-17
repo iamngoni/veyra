@@ -308,6 +308,7 @@ pub struct EaLink {
     state: Mutex<Option<EaState>>,
     commands: Mutex<VecDeque<EaCommand>>,
     pongs: AtomicU64,
+    last_account: Mutex<Option<AccountSnapshotPayload>>,
 }
 
 impl EaLink {
@@ -322,6 +323,7 @@ impl EaLink {
             state: Mutex::new(None),
             commands: Mutex::new(VecDeque::new()),
             pongs: AtomicU64::new(0),
+            last_account: Mutex::new(None),
         }
     }
 
@@ -382,29 +384,42 @@ impl EaLink {
     }
 
     /// Applies an acknowledgement; unknown ids and duplicate acks are ignored,
-    /// so repeated delivery can never double-apply a result.
+    /// so repeated delivery can never double-apply a result. A validated
+    /// account snapshot is retained outside the command queue for callers that
+    /// need the latest venue state (risk facts, reconciliation).
     fn apply_ack(&self, ack: &EaAck) {
-        self.with_commands(|queue| {
-            let Some(command) = queue.iter_mut().find(|command| command.id == ack.id) else {
-                return;
-            };
+        let retained = self.with_commands(|queue| {
+            let command = queue.iter_mut().find(|command| command.id == ack.id)?;
             if !matches!(command.state, CommandState::Pending) {
-                return;
+                return None;
             }
-            command.state = if ack.ok {
-                match payload_for(command.kind, ack.data.clone()) {
-                    Ok(payload) => CommandState::Completed { payload },
-                    Err(reason) => CommandState::Failed { reason },
-                }
-            } else {
-                CommandState::Failed {
+            if !ack.ok {
+                command.state = CommandState::Failed {
                     reason: ack
                         .error
                         .clone()
                         .unwrap_or_else(|| "acknowledged failure".to_owned()),
+                };
+                return None;
+            }
+            match payload_for(command.kind, ack.data.clone()) {
+                Ok(payload) => {
+                    let retained = match &payload {
+                        CommandPayload::AccountSnapshot(snapshot) => Some(snapshot.clone()),
+                        CommandPayload::Ping => None,
+                    };
+                    command.state = CommandState::Completed { payload };
+                    retained
                 }
-            };
+                Err(reason) => {
+                    command.state = CommandState::Failed { reason };
+                    None
+                }
+            }
         });
+        if let Some(snapshot) = retained {
+            self.with_last_account(|slot| *slot = Some(snapshot));
+        }
     }
 
     fn with_commands<T>(&self, apply: impl FnOnce(&mut VecDeque<EaCommand>) -> T) -> T {
@@ -442,6 +457,27 @@ impl EaLink {
         self.pongs.load(Ordering::Relaxed)
     }
 
+    /// Latest validated `account_snapshot` acknowledgement, if any.
+    ///
+    /// `None` until the first snapshot command completes. Read-only callers
+    /// (risk facts, reconciliation) use it instead of querying the terminal.
+    pub fn last_account(&self) -> Option<AccountSnapshotPayload> {
+        self.with_last_account(|slot| slot.clone())
+    }
+
+    fn with_last_account<T>(
+        &self,
+        apply: impl FnOnce(&mut Option<AccountSnapshotPayload>) -> T,
+    ) -> T {
+        // Same poisoning stance as the other guards: the slot holds one whole
+        // value, so recovering the guard cannot observe a partial write.
+        let mut guard = match self.last_account.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        apply(&mut guard)
+    }
+
     fn with_state<T>(&self, apply: impl FnOnce(&mut Option<EaState>) -> T) -> T {
         // Poisoning cannot make this state unsound to reuse: every writer
         // replaces the whole value under the lock and readers only clone it.
@@ -457,6 +493,10 @@ impl EaLink {
 impl BrokerLink for EaLink {
     fn provider(&self) -> BrokerProvider {
         BrokerProvider::Ea
+    }
+
+    async fn open_orders(&self) -> Option<u32> {
+        self.last_account().map(|payload| payload.orders)
     }
 
     async fn report(&self) -> LinkReport {
@@ -654,5 +694,51 @@ mod tests {
             payload_for(CommandKind::Ping, None).expect("ping payload"),
             CommandPayload::Ping
         );
+    }
+
+    #[test]
+    fn validated_snapshot_acks_are_retained_for_risk_facts() {
+        use std::time::Duration;
+
+        use super::{CommandState, EaAck, EaLink, EaToken};
+
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        assert!(link.last_account().is_none(), "nothing retained yet");
+
+        let id = link.enqueue(CommandKind::AccountSnapshot);
+        link.apply_ack(&EaAck {
+            id,
+            ok: true,
+            data: Some(serde_json::json!({
+                "balance": 20.57,
+                "equity": 20.57,
+                "freeMargin": 20.57,
+                "orders": 3,
+                "serverTime": 1_758_000_000
+            })),
+            error: None,
+        });
+
+        let retained = link.last_account().expect("snapshot retained");
+        assert_eq!(retained.orders, 3);
+        assert_eq!(
+            link.command(id).expect("recorded").state,
+            CommandState::Completed {
+                payload: CommandPayload::AccountSnapshot(retained)
+            }
+        );
+
+        let failed = link.enqueue(CommandKind::AccountSnapshot);
+        link.apply_ack(&EaAck {
+            id: failed,
+            ok: false,
+            data: None,
+            error: Some("nope".to_owned()),
+        });
+        assert_eq!(link.last_account().expect("previous retained").orders, 3);
     }
 }

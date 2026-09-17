@@ -1,5 +1,5 @@
 //! HTTP assembly shared by the process and integration tests.
-//! Only read-only diagnostic routes are registered; no execution API exists.
+//! Diagnostic and non-executing evaluation routes only; no execution API exists.
 
 use crate::AppState;
 use actix_web::{App, Error, body::BoxBody, dev, web};
@@ -22,4 +22,5 @@ pub fn create_app(
         .service(crate::routes::health)
         .service(crate::routes::readiness)
         .service(crate::routes::status)
+        .service(crate::routes::evaluate_intent)
 }

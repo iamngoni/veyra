@@ -3,18 +3,19 @@
 ## Current implementation
 
 The first crate is `veyra-service`, a Rust 2024 Actix Web control plane. It
-exposes read-only health, readiness, and status endpoints. Runtime settings are
-parsed into refined types before they reach handlers. Status reports the active
-`broker_provider`, whether the broker link is fresh and connected, and
-`trading_enabled` (still false: no execution path exists).
+exposes health, readiness, status, and a non-executing intent-evaluation
+endpoint. Runtime settings are parsed into refined types before they reach
+handlers. Status reports the active `broker_provider`, whether the broker link
+is fresh and connected, and `trading_enabled` (still false: no execution path
+exists).
 
 ## Boundaries
 
 ```text
 Config -> Runtime state -> HTTP control plane
              |
-             +-- Decision adapter (future)
-             +-- Deterministic risk gate
+             +-- DecisionEngine (selected by VEYRA_MODEL_PROVIDER)
+             +-- Risk gate + typed trade intents (no execution path)
              +-- BrokerLink (selected by VEYRA_BROKER_PROVIDER)
              |      +-- Ea  (loopback HTTP control channel)
              |      +-- ... (hosted bridge / direct API, added later)
@@ -95,9 +96,33 @@ No account credentials are stored in Veyra or in the repository: the MT4
 terminal holds the session, and the EA token only authorizes the loopback
 control channel.
 
+### Trade intents and the proposal pipeline
+
+`trading/intent.rs` defines the only shape a strategy or model may propose
+(`TradeIntentDraft`) plus the model answer contract (`TradeProposal`). Drafts
+parse once at the boundary into validated values; illegal states such as a
+price on a market order or a zero volume cannot be represented, and a draft
+has no identity. `trading/pipeline.rs` runs one structured `DecisionEngine`
+answer through the gate and returns no-trade, a rejection, or an approved
+`TradeIntent`.
+
 ### Risk gate
 
-The gate is deterministic code, not a model prompt. It will enforce policy such as position limits, exposure limits, order quantity, instrument allowlist, market-session rules, duplicate suppression, and a kill switch. It must run before broker execution and persist an audit record.
+The gate is deterministic code, not a model prompt. `risk/mod.rs` parses the
+`VEYRA_RISK_*` policy; `risk/gate.rs` evaluates one draft in a fixed order —
+kill switch, instrument allowlist, UTC session window, per-order volume cap,
+account availability, trading permission, open-order cap, duplicate
+suppression — and mints a `TradeIntent` only on approval. Rejections carry
+stable codes and non-sensitive details.
+
+The gate fails closed: missing or stale account facts reject, and defaults
+allow no instrument until one is configured. `POST /intents/evaluate` on the
+loopback diagnostics listener returns advisory decisions only; it never
+queues, transmits, or executes, and an approved intent still requires the
+(future) command layer, which must reuse this gate. Account facts come from
+the fresh link report plus the open-order count every `BrokerLink`
+implementation reports from locally held state. Audit persistence arrives with
+the storage phase.
 
 ## Testing strategy
 

@@ -9,7 +9,12 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use veyra_service::broker::{EaLink, EaToken, build_server as build_ea_server};
+use veyra_service::risk::{RiskGate, RiskPolicy};
 use veyra_service::{AppState, config::ServiceConfig, server};
+
+fn gate() -> RiskGate {
+    RiskGate::new(RiskPolicy::default())
+}
 
 fn config(host: &str, port: &str) -> ServiceConfig {
     ServiceConfig::from_source(|name| {
@@ -62,7 +67,12 @@ fn bind_fails_when_the_address_is_occupied() {
 #[actix_web::test]
 async fn serves_health_then_stops_gracefully() {
     let (listener, address) = bind_ephemeral();
-    let state = AppState::new(config("127.0.0.1", &address.port().to_string()), None, None);
+    let state = AppState::new(
+        config("127.0.0.1", &address.port().to_string()),
+        None,
+        None,
+        gate(),
+    );
     let app = server::build_server(state, listener).expect("server build");
     let handle = app.handle();
     let task = actix_web::rt::spawn(server::serve(app, None));
@@ -109,6 +119,7 @@ async fn companion_listener_starts_and_stops_with_main() {
             config("127.0.0.1", &main_addr.port().to_string()),
             None,
             None,
+            gate(),
         ),
         main_listener,
     )

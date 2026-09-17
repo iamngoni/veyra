@@ -14,7 +14,12 @@ Findings that shaped this decision, each verified on the live terminal:
 - MQL4 `WebRequest` selects the server port from the scheme — 80 for `http://`,
   443 for `https://` — and rejects explicit ports with
   `5200 ERR_WEBREQUEST_INVALID_ADDRESS`.
-- The WebRequest allowlist matches the **full request URL**, not a host prefix.
+- The WebRequest allowlist matched the full request URL in the original
+  trial. Live evidence now shows the terminal also admits a deeper path under
+  a host-only entry (`https://veyra.antonlabs.cc` for
+  `https://veyra.antonlabs.cc/ea/poll`), so matching is prefix-based. Listing
+  the endpoint URL explicitly remains the habit that has held on every build
+  so far.
 - The MetaTrader macOS app runs the Windows terminal under Wine. Wine resolved
   the tunnel hostname to IPv6 only and does not fall back to IPv4, so requests
   failed instantly despite the host having working IPv4 connectivity.

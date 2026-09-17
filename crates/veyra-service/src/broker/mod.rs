@@ -227,6 +227,14 @@ pub trait BrokerLink: Send + Sync + fmt::Debug + 'static {
 
     /// Latest link report.
     async fn report(&self) -> LinkReport;
+
+    /// Latest count of open venue orders, when the implementation can report
+    /// it from locally held state (no network IO).
+    ///
+    /// Implementations return `None` when they cannot supply the count;
+    /// callers (risk facts, reconciliation) then fail closed instead of
+    /// assuming zero.
+    async fn open_orders(&self) -> Option<u32>;
 }
 
 /// Active broker integration plus the concrete implementation's extras.

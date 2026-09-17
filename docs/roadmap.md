@@ -53,10 +53,20 @@
 
 ## Phase 5 — deterministic risk and control
 
-- Explicit policy configuration with schema and audit trail.
-- Position/exposure/order limits, instrument and session allowlists.
-- Kill switch and fail-closed behavior.
-- Require two independent controls for any live mode transition.
+- [x] Typed trade intents parsed at the boundary; a draft carries no identity
+      until the gate approves it, and no execution path exists.
+- [x] Deterministic, fail-closed gate: kill switch, instrument allowlist, UTC
+      session window, per-order volume cap, open-order cap, duplicate
+      suppression.
+- [x] Model proposals run through the gate (`trading::pipeline`); rejections
+      are normal outcomes and approvals are never queued or executed.
+- [x] Non-executing `POST /intents/evaluate` on the loopback diagnostics
+      listener, backed by live link state.
+- [x] `VEYRA_RISK_*` configuration with restrictive defaults; malformed values
+      fail startup.
+- [ ] Exposure limits in lots (needs the EA to report open volume).
+- [ ] Policy persistence and audit trail (needs Phase 1 storage).
+- [ ] Require two independent controls for any live mode transition.
 
 ## Phase 6 — console
 

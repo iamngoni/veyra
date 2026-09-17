@@ -10,6 +10,7 @@ use veyra_service::broker::{
     AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName, Symbol,
 };
 use veyra_service::config::{ConfigError, ServiceConfig};
+use veyra_service::risk::{RiskGate, RiskPolicy};
 
 fn test_config() -> ServiceConfig {
     ServiceConfig::from_source(|name| match name {
@@ -21,8 +22,13 @@ fn test_config() -> ServiceConfig {
     .expect("test configuration must parse")
 }
 
+fn test_gate() -> RiskGate {
+    // The restrictive default approves nothing unless a test configures it.
+    RiskGate::new(RiskPolicy::default())
+}
+
 fn test_state(broker: Option<BrokerRuntime>) -> AppState {
-    AppState::new(test_config(), broker, None)
+    AppState::new(test_config(), broker, None, test_gate())
 }
 
 fn ea_broker() -> BrokerRuntime {
@@ -122,7 +128,13 @@ async fn status_reports_model_provider() {
         veyra_service::model::ModelRuntime::from_settings(settings).expect("model runtime builds");
     assert_eq!(model.engine().provider().as_str(), "openrouter");
 
-    let app = test::init_service(create_app(AppState::new(test_config(), None, Some(model)))).await;
+    let app = test::init_service(create_app(AppState::new(
+        test_config(),
+        None,
+        Some(model),
+        test_gate(),
+    )))
+    .await;
     let request = test::TestRequest::get().uri("/status").to_request();
     let response = test::call_service(&app, request).await;
 

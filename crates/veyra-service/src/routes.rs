@@ -1,15 +1,20 @@
 //! The currently supported HTTP contract.
 //!
-//! All routes are read-only diagnostics. They never expose credentials, account
-//! balances, model prompts, or broker state because no such subsystem exists
-//! yet. Adding an executable route requires an explicit design change.
+//! Every route is either a diagnostic or a deterministic, non-executing
+//! evaluation. Nothing here can place, modify, or cancel an order, and no
+//! response exposes credentials, account balances, or model prompts. Adding an
+//! executable route requires an explicit design change plus the risk gate.
 
-use actix_web::HttpResponse;
-use actix_web::get;
-use actix_web::web::Data;
+use std::time::SystemTime;
+
+use actix_web::web::{self, Data};
+use actix_web::{HttpResponse, get, post};
 use serde::Serialize;
 
 use crate::AppState;
+use crate::broker::BrokerRuntime;
+use crate::risk::{AccountFacts, RiskDecision};
+use crate::trading::TradeIntentDraft;
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -80,5 +85,43 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         model_provider,
         broker_connected,
         trading_enabled: state.config().trading_enabled(),
+    })
+}
+
+#[post("/intents/evaluate")]
+/// Evaluates one proposed intent against the deterministic risk gate.
+///
+/// The response is advisory and non-executing: nothing is queued, transmitted,
+/// or executed, and no broker call is made while evaluating. Account facts come
+/// from the latest link report; without a fresh report the gate rejects.
+pub async fn evaluate_intent(
+    state: Data<AppState>,
+    draft: web::Json<TradeIntentDraft>,
+) -> HttpResponse {
+    let account = account_facts(state.broker()).await;
+    let decision: RiskDecision =
+        state
+            .risk()
+            .evaluate(&draft.into_inner(), account, SystemTime::now());
+    HttpResponse::Ok().json(decision)
+}
+
+/// Assembles gate facts from a fresh link report plus the order count the
+/// active implementation can report. Any missing input fails closed.
+async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<AccountFacts> {
+    let runtime = broker?;
+    let link = runtime.link();
+    let report = link.report().await;
+    if !report.fresh {
+        return None;
+    }
+    let snapshot = report.snapshot?;
+    if !snapshot.connected() {
+        return None;
+    }
+    let open_orders = link.open_orders().await?;
+    Some(AccountFacts {
+        trade_allowed: snapshot.trade_allowed(),
+        open_orders,
     })
 }
