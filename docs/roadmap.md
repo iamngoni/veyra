@@ -49,7 +49,9 @@
       non-maximal choices, malformed probabilities, out-of-range confidence,
       and legends that disagree with the requested levels.
 - [ ] Confirm current pricing and per-request budget from the console.
-- [ ] Benchmark latency and cost under realistic batch questions.
+- [x] Benchmark latency and cost under realistic batch questions — see
+      `docs/benchmarks.md`: Jev 1.11-1.99 s (408/73 tokens per three-question
+      set), model 1.40-2.84 s, measured 5× each on the live machine.
 
 ## Phase 4 — broker integration
 
