@@ -3,10 +3,10 @@
 // Places no trades and touches no orders. Requires the endpoint to be listed
 // in Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.10"
+#property version   "1.12"
 #property description "Veyra control-channel probe over localhost HTTP. No trading logic."
 
-input string InUrl         = "http://127.0.0.1:7801/ea/poll"; // Veyra HTTP endpoint
+input string InUrl     = "__VEYRA_URL__";    // Veyra endpoint (loopback or tunnel)
 input string InToken       = "__VEYRA_TOKEN__";                          // shared token
 input int    InHeartbeatMs = 1000;                             // heartbeat interval
 input int    InTimeoutMs   = 1500;                             // WebRequest timeout
@@ -29,12 +29,17 @@ void OnDeinit(const int reason)
 
 int PostJson(string body, string &response)
   {
+   // Build the byte array ourselves: StringToCharArray's count/codepage
+   // semantics vary between builds, which produced malformed request bodies.
+   int len = StringLen(body);
    char data[];
-   StringToCharArray(body, data);
+   ArrayResize(data, len);
+   for(int i = 0; i < len; i++)
+      data[i] = (char)(StringGetChar(body, i) & 0xFF);
    char result[];
    string headers;
    ResetLastError();
-   int status = WebRequest("POST", InUrl, "", "", InTimeoutMs, data, StringLen(body), result, headers);
+   int status = WebRequest("POST", InUrl, "", "", InTimeoutMs, data, len, result, headers);
    if(status == -1)
      {
       response = "";

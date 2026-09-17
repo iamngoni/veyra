@@ -27,7 +27,13 @@ async fn ea_probe_round_trip() {
     let handle = server.handle();
     let task = actix_web::rt::spawn(server);
 
-    let deadline = Instant::now() + Duration::from_secs(90);
+    // How long to wait for the terminal to start polling. Defaults to two
+    // minutes; raise it when attaching the probe after starting this test.
+    let timeout_secs: u64 = std::env::var("VEYRA_EA_LIVE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(120);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut saw_heartbeat = false;
     while Instant::now() < deadline {
         if link.report().await.snapshot.is_some() {

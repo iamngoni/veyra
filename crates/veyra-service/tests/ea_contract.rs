@@ -76,13 +76,24 @@ async fn hello_is_answered_with_ping_and_records_snapshot() {
 }
 
 #[actix_web::test]
-async fn heartbeat_is_answered_with_none() {
+async fn heartbeat_pings_until_pong_then_goes_quiet() {
     let link = link(Duration::from_secs(10));
-    let (status, response) = post(link.clone(), body("hb")).await;
 
+    // Before a pong has ever been seen, heartbeats request one.
+    let (status, response) = post(link.clone(), body("hb")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["t"], "ping");
+    assert!(link.report().await.snapshot.is_some());
+
+    // The pong proves the return path.
+    let (status, _) = post(link.clone(), body("pong")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(link.pongs_received(), 1);
+
+    // Afterwards the channel is idle again.
+    let (status, response) = post(link.clone(), body("hb")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response["t"], "none");
-    assert!(link.report().await.snapshot.is_some());
 }
 
 #[actix_web::test]
@@ -124,6 +135,24 @@ async fn unknown_kind_and_malformed_json_are_rejected() {
         .to_request();
     let response = test::call_service(&app, request).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[actix_web::test]
+async fn trailing_nulls_are_tolerated() {
+    let link = link(Duration::from_secs(10));
+    let app = test::init_service(create_ea_app(link.clone())).await;
+
+    let mut payload = serde_json::to_vec(&body("hb")).expect("payload serializes");
+    payload.extend_from_slice(&[0, 0, 0]);
+
+    let request = test::TestRequest::post()
+        .uri("/ea/poll")
+        .insert_header(("content-type", "application/json"))
+        .set_payload(payload)
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(link.report().await.snapshot.is_some());
 }
 
 #[actix_web::test]

@@ -51,14 +51,17 @@ implementation plus a provider variant — no caller changes. Each
 implementation owns its transport and its own loopback listener when it needs
 one; nothing vendor-specific leaks into domain code.
 
-**Implementation 1 — MQL4 EA control channel (`broker/ea.rs`).** MT4's MQL4
+**Implementation 1 — MQL4 EA control channel (`broker/ea.rs`), proven live.**
+Transport and platform constraints are recorded in ADR 0002: MQL4
 has no socket API (verified against build 1476 and the MetaQuotes reference),
 so the EA polls a loopback-only HTTP endpoint using the terminal's built-in
 `WebRequest` client. The service authenticates a shared token in constant time,
 validates the payload into refined types (`AccountSnapshot`, `ServerName`,
 `Symbol`, `AccountLogin`), records heartbeat state, and answers the probe
 protocol (`ping`/`pong`). Order commands are deliberately absent; they will
-arrive as an idempotent command queue over this same channel.
+arrive as an idempotent command queue over this same channel. The transport is
+HTTPS through a Cloudflare Tunnel to the loopback listener; MQL4 supports no
+sockets and no explicit ports.
 
 **Rejected for now — hosted API bridges.** The evaluated vendors are paid
 services that run their own terminals; the account owner opted for the

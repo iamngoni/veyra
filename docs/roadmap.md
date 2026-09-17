@@ -38,7 +38,8 @@
       the zero-recurring-cost first implementation).
 - [x] Broker integration boundary (`BrokerLink`) with provider selection and
       the EA control channel as the first implementation.
-- [ ] Live probe round trip on the terminal (heartbeat + ping/pong).
+- [x] Live probe round trip on the terminal (heartbeat + ping/pong), via the
+      Cloudflare tunnel with Wine IPv4 pinning (ADR 0002).
 - [ ] Replace the probe protocol with an idempotent command/ack queue; add
       command acknowledgements and independent reconciliation.
 - [ ] Staged testing: read-only first, then demo, then minimal live exposure

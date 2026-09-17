@@ -222,10 +222,23 @@ impl BrokerLink for EaLink {
 /// client cannot set a JSON content type; requiring one would reject every
 /// real EA poll.
 pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse {
-    let poll: EaPoll = match serde_json::from_slice(&payload) {
+    // Some WebRequest clients append terminating NUL bytes; strip them so a
+    // well-formed body is never rejected for padding alone.
+    let mut bytes: &[u8] = &payload;
+    while bytes.last() == Some(&0) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+
+    let poll: EaPoll = match serde_json::from_slice(bytes) {
         Ok(poll) => poll,
         Err(error) => {
-            tracing::warn!(%error, "rejected EA poll: malformed JSON");
+            tracing::warn!(
+                %error,
+                len = payload.len(),
+                head = %hex_preview(&payload[..payload.len().min(24)]),
+                tail = %hex_preview(&payload[payload.len().saturating_sub(24)..]),
+                "rejected EA poll: malformed JSON"
+            );
             return HttpResponse::BadRequest().json(EaErrorBody::new("malformed_json"));
         }
     };
@@ -242,7 +255,10 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
         EaKind::Hello | EaKind::Hb => match poll.snapshot() {
             Ok(snapshot) => {
                 link.record(snapshot);
-                let reply = if matches!(poll.kind(), EaKind::Hello) {
+                // Ask for a pong on hello and until one has been seen for this
+                // process lifetime: it proves the return path before the
+                // channel is trusted with anything else.
+                let reply = if matches!(poll.kind(), EaKind::Hello) || link.pongs_received() == 0 {
                     EaReply::ping()
                 } else {
                     EaReply::none()
@@ -255,6 +271,12 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
             }
         },
     }
+}
+
+/// Hex preview used in malformed-payload diagnostics; never includes secrets by
+/// itself, but payloads are operator-supplied control messages.
+fn hex_preview(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Builds the EA-facing Actix application.
@@ -290,4 +312,15 @@ pub fn build_server(
         .run();
     tracing::info!(%address, "EA control channel listening (loopback only)");
     Ok(server)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hex_preview;
+
+    #[test]
+    fn hex_preview_formats_bytes() {
+        assert_eq!(hex_preview(&[0x7b, 0x22, 0x00]), "7b2200");
+        assert_eq!(hex_preview(&[]), "");
+    }
 }

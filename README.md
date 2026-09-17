@@ -11,7 +11,8 @@ This repository contains the first tested, safe service slice:
 - Broker integration abstraction (`BrokerLink`) with a configuration-selected
   provider; the MetaTrader 4 EA control channel is the first implementation.
 - Loopback-only EA endpoint with token authentication, refined payloads, and
-  heartbeat state (no command execution yet).
+  heartbeat state (no command execution yet) — **proven live** end-to-end with
+  MT4 under Wine through a Cloudflare Tunnel (heartbeat plus ping/pong).
 - Structured JSON logging, bind-failure propagation, and graceful shutdown.
 - Rust unit, integration, and line-coverage gates.
 - GitHub Actions quality workflow.
@@ -62,7 +63,26 @@ cargo test --all-targets
 cargo coverage
 ```
 
-Live proof for the EA channel (requires MT4 with the probe attached):
+## EA channel operation (MT4)
+
+One-time terminal setup:
+
+1. `./scripts/compile_ea.sh` (reads `VEYRA_EA_TOKEN` from `.env`; set
+   `VEYRA_EA_URL` to the tunnel endpoint when using Cloudflare).
+2. MT4 → Options → Expert Advisors: enable automated trading, and add the
+   **exact endpoint URL** (for example `https://veyra.antonlabs.cc/ea/poll`)
+   to the WebRequest allowlist — MT4 matches the full URL, not the host.
+3. Attach `VeyraProbe` to a chart. After recompiling the EA, remove and
+   re-attach it: MT4 does not hot-reload externally rebuilt `.ex4` files.
+
+Platform notes (see docs/decisions/0002):
+
+- MQL4 has no sockets, and WebRequest only supports the scheme-default port
+  (80/443), so the channel runs over HTTPS via the tunnel.
+- Wine does not fall back from IPv6 to IPv4; the tunnel hostname is pinned to
+  its Cloudflare IPv4 addresses in `/etc/hosts`.
+
+Live proof (requires MT4 with the probe attached):
 
 ```sh
 set -a; source .env; set +a
