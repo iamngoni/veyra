@@ -5,9 +5,10 @@
 //! presenting a shared token. This module records the venue state the EA
 //! reports, answers the probe protocol (`ping` requests a `pong`), and carries
 //! the idempotent command queue: commands are delivered on a poll, executed by
-//! the EA, and acknowledged by stable id. Only read-only commands exist today
-//! (`ping`, `account_snapshot`); mutating commands arrive later and must keep
-//! the same id/ack discipline. MQL4 has no socket API, so HTTP through the
+//! the EA, and acknowledged by stable id. No command places, modifies, or
+//! cancels an order: `order_check` only asks the terminal to validate a
+//! request, and mutating commands arrive later behind the risk gate with the
+//! same id/ack discipline. MQL4 has no socket API, so HTTP through the
 //! terminal's `WebRequest` client is the transport.
 
 use std::collections::VecDeque;
@@ -31,6 +32,7 @@ use crate::broker::{
     AccountLogin, AccountSnapshot, BrokerError, BrokerLink, BrokerProvider, LinkReport, ServerName,
     Symbol,
 };
+use crate::trading::intent::TradeIntent;
 
 /// Message kinds accepted from the EA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -59,6 +61,11 @@ impl CommandId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Parses an externally supplied identifier (for example a URL path).
+    pub fn parse(value: &str) -> Option<Self> {
+        Uuid::parse_str(value).ok().map(Self)
+    }
 }
 
 impl Default for CommandId {
@@ -73,7 +80,8 @@ impl fmt::Display for CommandId {
     }
 }
 
-/// Commands the EA can execute. Only read-only commands exist today.
+/// Commands the EA can execute. None of them places, modifies, or cancels an
+/// order; `order_check` only asks the terminal to validate a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandKind {
@@ -81,6 +89,8 @@ pub enum CommandKind {
     Ping,
     /// Report account state (balance, equity, free margin, order count).
     AccountSnapshot,
+    /// Ask the terminal to validate an order request without sending it.
+    OrderCheck,
 }
 
 impl CommandKind {
@@ -89,6 +99,7 @@ impl CommandKind {
         match self {
             Self::Ping => "ping",
             Self::AccountSnapshot => "account_snapshot",
+            Self::OrderCheck => "order_check",
         }
     }
 }
@@ -126,6 +137,73 @@ impl AccountSnapshotPayload {
     }
 }
 
+/// Terminal verdict for an `order_check` command: the request passed, or the
+/// classic MT4 trade code (131 volume, 134 money, 130 stops, 133 disabled)
+/// that would reject it. No order exists in the venue; the terminal applies
+/// its own market rules and margin engine.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OrderCheckPayload {
+    /// Whether the terminal accepted the request in principle.
+    pub passed: bool,
+    /// Classic MT4 trade code; zero when the check passed.
+    pub retcode: i64,
+    /// Broker explanation, echoed for operators.
+    pub comment: String,
+    /// Margin the venue would require for the order, in account currency.
+    pub margin: f64,
+}
+
+impl OrderCheckPayload {
+    /// Rejects values an operator must never act on.
+    fn validate(&self) -> Result<(), String> {
+        if !self.margin.is_finite() || self.margin < 0.0 {
+            return Err("margin must be a finite, non-negative number".to_owned());
+        }
+        if self.comment.len() > 256 || self.comment.chars().any(char::is_control) {
+            return Err(
+                "comment must be at most 256 characters without control characters".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Order request sent to the EA for validation, derived only from an approved
+/// intent. Fields mirror the intent wire contract so the EA can read them
+/// without a nested parser.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EaOrderRequest {
+    symbol: String,
+    side: &'static str,
+    order_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    price: Option<f64>,
+    volume: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_loss: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    take_profit: Option<f64>,
+}
+
+impl EaOrderRequest {
+    /// Maps an approved intent to the EA wire request.
+    ///
+    /// The intent type can only be minted by the risk gate, so an order
+    /// request cannot be built from a raw draft.
+    pub fn from_intent(intent: &TradeIntent) -> Self {
+        let draft = intent.draft();
+        Self {
+            symbol: draft.symbol().as_str().to_owned(),
+            side: draft.side().as_str(),
+            order_type: draft.order().as_str(),
+            price: draft.order().price().map(|price| price.value()),
+            volume: draft.volume().value(),
+            stop_loss: draft.stop_loss().map(|price| price.value()),
+            take_profit: draft.take_profit().map(|price| price.value()),
+        }
+    }
+}
+
 /// Typed result of a completed command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandPayload {
@@ -133,6 +211,8 @@ pub enum CommandPayload {
     Ping,
     /// Result of `account_snapshot`.
     AccountSnapshot(AccountSnapshotPayload),
+    /// Result of `order_check`; never an executed order.
+    OrderCheck(OrderCheckPayload),
 }
 
 /// Lifecycle state of one command.
@@ -193,6 +273,8 @@ pub struct EaPoll {
     connected: Option<bool>,
     #[serde(rename = "tradeAllowed", default)]
     trade_allowed: Option<bool>,
+    #[serde(default)]
+    orders: Option<u32>,
     #[serde(rename = "id", default)]
     command_id: Option<CommandId>,
     #[serde(default)]
@@ -241,12 +323,17 @@ impl EaPoll {
             field: "symbol",
             reason: "missing",
         })?)?;
+        let open_orders = self.orders.ok_or(BrokerError::InvalidPayload {
+            field: "orders",
+            reason: "missing",
+        })?;
         Ok(AccountSnapshot::new(
             login,
             server,
             symbol,
             self.connected.unwrap_or(false),
             self.trade_allowed.unwrap_or(false),
+            open_orders,
         ))
     }
 }
@@ -269,6 +356,9 @@ pub enum EaReply {
         id: CommandId,
         /// Command to execute.
         kind: CommandKind,
+        /// Present only for commands that carry a request payload.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        order: Option<EaOrderRequest>,
     },
 }
 
@@ -297,6 +387,7 @@ struct EaCommand {
     kind: CommandKind,
     state: CommandState,
     issued_at: Instant,
+    request: Option<EaOrderRequest>,
 }
 
 /// Shared state of the EA control channel.
@@ -327,10 +418,21 @@ impl EaLink {
         }
     }
 
-    /// Queues a command. It is delivered on the EA's next poll and re-delivered
-    /// until acknowledged (at-least-once delivery); read-only commands make
-    /// that safe, and mutating commands must stay idempotent per id.
+    /// Queues a payload-free command. It is delivered on the EA's next poll
+    /// and re-delivered until acknowledged (at-least-once delivery).
     pub fn enqueue(&self, kind: CommandKind) -> CommandId {
+        self.enqueue_with(kind, None)
+    }
+
+    /// Queues a broker-side order validation.
+    ///
+    /// Takes an [`EaOrderRequest`], which can only be derived from an approved
+    /// intent, so no raw draft can reach the terminal through this path.
+    pub fn enqueue_order_check(&self, request: EaOrderRequest) -> CommandId {
+        self.enqueue_with(CommandKind::OrderCheck, Some(request))
+    }
+
+    fn enqueue_with(&self, kind: CommandKind, request: Option<EaOrderRequest>) -> CommandId {
         let id = CommandId::new();
         self.with_commands(|queue| {
             queue.push_back(EaCommand {
@@ -338,6 +440,7 @@ impl EaLink {
                 kind,
                 state: CommandState::Pending,
                 issued_at: Instant::now(),
+                request,
             });
             while queue.len() > COMMAND_HISTORY {
                 queue.pop_front();
@@ -362,8 +465,8 @@ impl EaLink {
     }
 
     /// Marks timed-out commands as failed and returns the oldest pending
-    /// command for delivery.
-    fn deliverable(&self) -> Option<(CommandId, CommandKind)> {
+    /// command for delivery, including its request payload when one exists.
+    fn deliverable(&self) -> Option<(CommandId, CommandKind, Option<EaOrderRequest>)> {
         let timeout = self.command_timeout;
         self.with_commands(|queue| {
             let now = Instant::now();
@@ -379,7 +482,7 @@ impl EaLink {
             queue
                 .iter()
                 .find(|command| matches!(command.state, CommandState::Pending))
-                .map(|command| (command.id, command.kind))
+                .map(|command| (command.id, command.kind, command.request.clone()))
         })
     }
 
@@ -406,7 +509,7 @@ impl EaLink {
                 Ok(payload) => {
                     let retained = match &payload {
                         CommandPayload::AccountSnapshot(snapshot) => Some(snapshot.clone()),
-                        CommandPayload::Ping => None,
+                        CommandPayload::Ping | CommandPayload::OrderCheck(_) => None,
                     };
                     command.state = CommandState::Completed { payload };
                     retained
@@ -495,10 +598,6 @@ impl BrokerLink for EaLink {
         BrokerProvider::Ea
     }
 
-    async fn open_orders(&self) -> Option<u32> {
-        self.last_account().map(|payload| payload.orders)
-    }
-
     async fn report(&self) -> LinkReport {
         let entry = self.with_state(|slot| {
             slot.as_ref()
@@ -574,7 +673,7 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
             Ok(snapshot) => {
                 link.record(snapshot);
                 let reply = match link.deliverable() {
-                    Some((id, kind)) => EaReply::Command { id, kind },
+                    Some((id, kind, order)) => EaReply::Command { id, kind, order },
                     // Ask for a pong on hello and until one has been seen for
                     // this process lifetime: it proves the return path before
                     // the channel is trusted with anything else.
@@ -603,6 +702,13 @@ fn payload_for(kind: CommandKind, data: Option<Value>) -> Result<CommandPayload,
                 .map_err(|error| format!("invalid snapshot payload: {error}"))?;
             payload.validate()?;
             Ok(CommandPayload::AccountSnapshot(payload))
+        }
+        CommandKind::OrderCheck => {
+            let value = data.ok_or_else(|| "order_check ack is missing data".to_owned())?;
+            let payload: OrderCheckPayload = serde_json::from_value(value)
+                .map_err(|error| format!("invalid order_check payload: {error}"))?;
+            payload.validate()?;
+            Ok(CommandPayload::OrderCheck(payload))
         }
     }
 }
@@ -650,8 +756,17 @@ pub fn build_server(
 
 #[cfg(test)]
 mod tests {
-    use super::{hex_preview, payload_for};
-    use crate::broker::ea::{AccountSnapshotPayload, CommandId, CommandKind, CommandPayload};
+    use std::time::Duration;
+
+    use super::{
+        EaAck, EaLink, EaOrderRequest, EaToken, OrderCheckPayload, hex_preview, payload_for,
+    };
+    use crate::broker::ea::{
+        AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandState,
+    };
+    use crate::trading::intent::{
+        OrderKind, Price, Side, TradeIntent, TradeIntentDraft, Volume, parse_instrument,
+    };
 
     #[test]
     fn hex_preview_formats_bytes() {
@@ -671,6 +786,7 @@ mod tests {
     fn command_names_are_stable() {
         assert_eq!(CommandKind::Ping.as_str(), "ping");
         assert_eq!(CommandKind::AccountSnapshot.as_str(), "account_snapshot");
+        assert_eq!(CommandKind::OrderCheck.as_str(), "order_check");
     }
 
     #[test]
@@ -694,14 +810,118 @@ mod tests {
             payload_for(CommandKind::Ping, None).expect("ping payload"),
             CommandPayload::Ping
         );
+
+        let check = payload_for(
+            CommandKind::OrderCheck,
+            Some(serde_json::json!({
+                "passed": true,
+                "retcode": 0,
+                "comment": "Done",
+                "margin": 2.19
+            })),
+        )
+        .expect("valid order check payload");
+        assert_eq!(
+            check,
+            CommandPayload::OrderCheck(OrderCheckPayload {
+                passed: true,
+                retcode: 0,
+                comment: "Done".to_owned(),
+                margin: 2.19,
+            })
+        );
+
+        let missing = payload_for(CommandKind::OrderCheck, None).expect_err("missing data");
+        assert!(
+            missing.contains("missing data"),
+            "unexpected error: {missing}"
+        );
+
+        let negative = payload_for(
+            CommandKind::OrderCheck,
+            Some(serde_json::json!({
+                "passed": false,
+                "retcode": 10019,
+                "comment": "no money",
+                "margin": -1.0
+            })),
+        )
+        .expect_err("negative margin must be rejected");
+        assert!(negative.contains("margin"), "unexpected error: {negative}");
+    }
+
+    #[test]
+    fn order_requests_map_only_from_approved_intents() {
+        let draft = TradeIntentDraft::new(
+            parse_instrument("eurusd").expect("symbol"),
+            Side::Buy,
+            OrderKind::Market,
+            Volume::parse(0.01).expect("volume"),
+            None,
+            None,
+            None,
+        );
+        let intent = TradeIntent::approve(draft);
+        let request = EaOrderRequest::from_intent(&intent);
+        let wire = serde_json::to_value(&request).expect("serializable");
+        assert_eq!(wire["symbol"], "EURUSD");
+        assert_eq!(wire["side"], "buy");
+        assert_eq!(wire["order_type"], "market");
+        assert_eq!(wire["volume"], 0.01);
+        assert!(wire.get("price").is_none(), "market orders carry no price");
+        assert!(wire.get("stop_loss").is_none());
+
+        let limit = TradeIntentDraft::new(
+            parse_instrument("EURUSD").expect("symbol"),
+            Side::Sell,
+            OrderKind::Limit(Price::parse(1.2).expect("price")),
+            Volume::parse(0.02).expect("volume"),
+            Some(Price::parse(1.25).expect("price")),
+            None,
+            None,
+        );
+        let wire = serde_json::to_value(EaOrderRequest::from_intent(&TradeIntent::approve(limit)))
+            .expect("serializable");
+        assert_eq!(wire["order_type"], "limit");
+        assert_eq!(wire["price"], 1.2);
+        assert_eq!(wire["stop_loss"], 1.25);
+    }
+
+    #[test]
+    fn order_checks_are_delivered_with_their_request() {
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        let intent = TradeIntent::approve(TradeIntentDraft::new(
+            parse_instrument("EURUSD").expect("symbol"),
+            Side::Buy,
+            OrderKind::Market,
+            Volume::parse(0.01).expect("volume"),
+            None,
+            None,
+            None,
+        ));
+        let id = link.enqueue_order_check(EaOrderRequest::from_intent(&intent));
+        let (delivered_id, kind, order) = link.deliverable().expect("pending command");
+        assert_eq!(delivered_id, id);
+        assert_eq!(kind, CommandKind::OrderCheck);
+        assert_eq!(order, Some(EaOrderRequest::from_intent(&intent)));
+
+        let record = link.command(id).expect("record");
+        assert_eq!(record.state, CommandState::Pending);
+    }
+
+    #[test]
+    fn command_ids_parse_from_strings() {
+        let id = CommandId::new();
+        assert_eq!(CommandId::parse(&id.to_string()), Some(id));
+        assert_eq!(CommandId::parse("not-a-uuid"), None);
     }
 
     #[test]
     fn validated_snapshot_acks_are_retained_for_risk_facts() {
-        use std::time::Duration;
-
-        use super::{CommandState, EaAck, EaLink, EaToken};
-
         let link = EaLink::new(
             EaToken::parse("test-token-1234567890").expect("token"),
             Duration::from_secs(10),

@@ -12,7 +12,8 @@ pub mod settings;
 
 pub use ea::{
     AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandRecord, CommandState,
-    EaErrorBody, EaLink, EaPoll, EaReply, build_server, create_ea_app,
+    EaErrorBody, EaLink, EaOrderRequest, EaPoll, EaReply, OrderCheckPayload, build_server,
+    create_ea_app,
 };
 pub use settings::{BrokerSettings, EaToken};
 
@@ -160,6 +161,7 @@ pub struct AccountSnapshot {
     symbol: Symbol,
     connected: bool,
     trade_allowed: bool,
+    open_orders: u32,
 }
 
 impl AccountSnapshot {
@@ -170,6 +172,7 @@ impl AccountSnapshot {
         symbol: Symbol,
         connected: bool,
         trade_allowed: bool,
+        open_orders: u32,
     ) -> Self {
         Self {
             login,
@@ -177,6 +180,7 @@ impl AccountSnapshot {
             symbol,
             connected,
             trade_allowed,
+            open_orders,
         }
     }
 
@@ -204,6 +208,11 @@ impl AccountSnapshot {
     pub fn trade_allowed(&self) -> bool {
         self.trade_allowed
     }
+
+    /// Number of open venue orders (MT4 counts positions and pending orders).
+    pub fn open_orders(&self) -> u32 {
+        self.open_orders
+    }
 }
 
 /// Current link state: the latest snapshot, if any, and whether it is fresh.
@@ -227,14 +236,6 @@ pub trait BrokerLink: Send + Sync + fmt::Debug + 'static {
 
     /// Latest link report.
     async fn report(&self) -> LinkReport;
-
-    /// Latest count of open venue orders, when the implementation can report
-    /// it from locally held state (no network IO).
-    ///
-    /// Implementations return `None` when they cannot supply the count;
-    /// callers (risk facts, reconciliation) then fail closed instead of
-    /// assuming zero.
-    async fn open_orders(&self) -> Option<u32>;
 }
 
 /// Active broker integration plus the concrete implementation's extras.

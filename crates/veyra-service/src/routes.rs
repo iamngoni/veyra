@@ -106,12 +106,11 @@ pub async fn evaluate_intent(
     HttpResponse::Ok().json(decision)
 }
 
-/// Assembles gate facts from a fresh link report plus the order count the
-/// active implementation can report. Any missing input fails closed.
-async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<AccountFacts> {
+/// Assembles gate facts from a fresh link report. Any missing input fails
+/// closed, so a stale heartbeat or a broken link cannot widen behavior.
+pub(crate) async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<AccountFacts> {
     let runtime = broker?;
-    let link = runtime.link();
-    let report = link.report().await;
+    let report = runtime.link().report().await;
     if !report.fresh {
         return None;
     }
@@ -119,9 +118,8 @@ async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<AccountFacts> {
     if !snapshot.connected() {
         return None;
     }
-    let open_orders = link.open_orders().await?;
     Some(AccountFacts {
         trade_allowed: snapshot.trade_allowed(),
-        open_orders,
+        open_orders: snapshot.open_orders(),
     })
 }

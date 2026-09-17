@@ -8,6 +8,7 @@
 pub mod app;
 pub mod broker;
 pub mod config;
+pub mod control;
 pub mod model;
 pub mod observability;
 pub mod risk;

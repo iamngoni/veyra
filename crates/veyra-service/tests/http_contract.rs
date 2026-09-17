@@ -52,6 +52,7 @@ fn snapshot() -> AccountSnapshot {
         Symbol::parse("EURUSD").expect("symbol must validate"),
         true,
         true,
+        0,
     )
 }
 

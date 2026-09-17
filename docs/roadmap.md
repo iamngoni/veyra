@@ -45,6 +45,10 @@
       Cloudflare tunnel with Wine IPv4 pinning (ADR 0002).
 - [x] Idempotent command/ack queue with typed payload validation, timeouts,
       and read-only commands (`ping`, `account_snapshot`) — proven live.
+- [x] Broker-side order validation (`order_check`) for gate-approved intents,
+      proven live on the real terminal (retcode 0 for a valid market buy, 129
+      for a wrong-side limit) without sending an order; exposed through the
+      loopback `POST /intents/check` and `GET /commands/{id}` control surface.
 - [ ] Mutating commands (open/close/modify) with the same id/ack discipline,
       restricted by the deterministic risk gate.
 - [ ] Independent reconciliation against broker state.

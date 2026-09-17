@@ -15,7 +15,7 @@ exists).
 Config -> Runtime state -> HTTP control plane
              |
              +-- DecisionEngine (selected by VEYRA_MODEL_PROVIDER)
-             +-- Risk gate + typed trade intents (no execution path)
+             +-- Risk gate + typed trade intents + check-only control surface
              +-- BrokerLink (selected by VEYRA_BROKER_PROVIDER)
              |      +-- Ea  (loopback HTTP control channel)
              |      +-- ... (hosted bridge / direct API, added later)
@@ -78,11 +78,17 @@ so the EA polls a loopback-only HTTP endpoint using the terminal's built-in
 validates the payload into refined types (`AccountSnapshot`, `ServerName`,
 `Symbol`, `AccountLogin`), records heartbeat state, and answers the probe
 protocol (`ping`/`pong`) and carries the command queue. Commands are typed
-(`ping`, `account_snapshot` today), delivered on a poll, re-delivered until
-acknowledged, and failed after a timeout; acknowledgements carry a stable id
-and are validated against the command's typed payload before being recorded.
-Order commands are deliberately absent; they will reuse this id/ack discipline
-and must be idempotent per id. The transport is HTTPS through a Cloudflare
+(`ping`, `account_snapshot`, `order_check` today), delivered on a poll,
+re-delivered until acknowledged, and failed after a timeout; acknowledgements
+carry a stable id and are validated against the command's typed payload before
+being recorded. `order_check` carries a gate-approved intent to the terminal,
+which applies its own market rules and margin engine (`MarketInfo`,
+`AccountFreeMarginCheck`) and returns a classic MT4 trade code (for example 129
+wrong-side price, 131 volume, 134 margin) without ever sending an order; the
+loopback control surface (`control.rs`) exposes `POST /intents/check` and
+`GET /commands/{id}` for operators and tests. Mutating commands are
+deliberately absent; they will reuse this id/ack discipline and must be
+idempotent per id. The transport is HTTPS through a Cloudflare
 Tunnel to the loopback listener; MQL4 supports no sockets and no explicit
 ports.
 

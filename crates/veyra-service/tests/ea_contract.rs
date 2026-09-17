@@ -33,7 +33,8 @@ fn body(kind: &str) -> Value {
         "server": "IFCMarkets-Real",
         "symbol": "EURUSD",
         "connected": true,
-        "tradeAllowed": true
+        "tradeAllowed": true,
+        "orders": 0
     })
 }
 

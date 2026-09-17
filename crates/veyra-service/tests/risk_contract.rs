@@ -61,7 +61,8 @@ fn heartbeat() -> Value {
         "server": "IFCMarkets-Real",
         "symbol": "EURUSD",
         "connected": true,
-        "tradeAllowed": true
+        "tradeAllowed": true,
+        "orders": 0
     })
 }
 
@@ -160,15 +161,16 @@ async fn fresh_state_with_room_approves_and_reports_order_limits() {
 #[actix_web::test]
 async fn missing_and_disallowed_state_fail_closed() {
     let (runtime, link) = broker();
-    // Fresh heartbeat, but no account snapshot: order state is unknown.
-    let (status, _) = poll(link, heartbeat()).await;
-    assert_eq!(status, StatusCode::OK);
-
     let state = AppState::new(test_config(), Some(runtime), None, gate(2, "0.5"));
+
+    // No heartbeat yet: the link holds no state, so the gate rejects.
     let (status, decision) = evaluate(&state, market_draft("EURUSD")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(decision["code"], "account_state_unavailable");
 
+    // Fresh heartbeat, but the instrument is not on the allowlist.
+    let (status, _) = poll(link, heartbeat()).await;
+    assert_eq!(status, StatusCode::OK);
     let (status, decision) = evaluate(&state, market_draft("GBPUSD")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(decision["code"], "symbol_not_allowed");
