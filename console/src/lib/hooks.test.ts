@@ -9,16 +9,18 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { clockTime, money, relativeTime, useEventFeed, usePoll } from './hooks'
+import type { LogLevel } from './api'
+import { clockTime, money, relativeTime, useEventFeed, useLogFeed, usePoll } from './hooks'
 
-const mocks = vi.hoisted(() => ({ events: vi.fn() }))
+const mocks = vi.hoisted(() => ({ events: vi.fn(), logs: vi.fn() }))
 
-vi.mock('./api', () => ({ api: { events: mocks.events } }))
+vi.mock('./api', () => ({ api: { events: mocks.events, logs: mocks.logs } }))
 
 beforeEach(() => {
   vi.useFakeTimers()
   vi.setSystemTime(new Date('2026-09-18T10:00:00.000Z'))
   mocks.events.mockReset()
+  mocks.logs.mockReset()
 })
 
 afterEach(() => {
@@ -192,5 +194,113 @@ describe('useEventFeed', () => {
       await vi.advanceTimersByTimeAsync(0)
     })
     expect(result.current.events.map((event) => event.seq)).toEqual([2])
+  })
+})
+
+describe('useLogFeed', () => {
+  const record = (seq: number) => ({
+    seq,
+    atMs: seq,
+    level: 'info',
+    target: 'veyra_service::test',
+    message: `line ${seq}`,
+    fields: {},
+  })
+
+  it('tails, follows the cursor, and caps the list', async () => {
+    mocks.logs
+      .mockResolvedValueOnce({ logs: [record(1), record(2)], latest: 2 })
+      .mockResolvedValueOnce({ logs: [record(3)], latest: 3 })
+      .mockImplementation(() => new Promise(() => undefined))
+
+    const { result } = renderHook(() => useLogFeed('info', 2))
+    await act(async () => undefined)
+    expect(result.current.logs.map((entry) => entry.seq)).toEqual([1, 2])
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000)
+    })
+    expect(result.current.logs.map((entry) => entry.seq)).toEqual([2, 3])
+    expect(mocks.logs).toHaveBeenLastCalledWith(2, 'info')
+  })
+
+  it('re-tails from the start when the level changes', async () => {
+    mocks.logs
+      .mockResolvedValueOnce({ logs: [record(1)], latest: 1 })
+      .mockResolvedValueOnce({ logs: [record(2)], latest: 2 })
+      .mockImplementation(() => new Promise(() => undefined))
+
+    const { result, rerender } = renderHook(({ level }) => useLogFeed(level), {
+      initialProps: { level: 'info' as LogLevel },
+    })
+    await act(async () => undefined)
+    expect(result.current.logs.map((entry) => entry.seq)).toEqual([1])
+
+    rerender({ level: 'error' })
+    await act(async () => undefined)
+    expect(mocks.logs).toHaveBeenLastCalledWith(undefined, 'error')
+    expect(result.current.logs.map((entry) => entry.seq)).toEqual([2])
+  })
+
+  it('keeps the last page when a poll fails', async () => {
+    mocks.logs
+      .mockResolvedValueOnce({ logs: [record(1)], latest: 1 })
+      .mockRejectedValueOnce(new Error('logs down'))
+      .mockImplementation(() => new Promise(() => undefined))
+
+    const { result } = renderHook(() => useLogFeed('warn'))
+    await act(async () => undefined)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000)
+    })
+    expect(result.current.error).toBe('logs down')
+    expect(result.current.logs.map((entry) => entry.seq)).toEqual([1])
+  })
+
+  it('stringifies non-Error failures', async () => {
+    mocks.logs.mockRejectedValueOnce('nope').mockImplementation(() => new Promise(() => undefined))
+    const { result } = renderHook(() => useLogFeed('info'))
+    await act(async () => undefined)
+    expect(result.current.error).toBe('nope')
+  })
+
+  it('ignores a page that resolves after unmount', async () => {
+    const late = deferred<{ logs: ReturnType<typeof record>[]; latest: number }>()
+    mocks.logs.mockImplementation(() => late.promise)
+
+    const { result, unmount } = renderHook(() => useLogFeed('info'))
+    await act(async () => undefined)
+    unmount()
+    await act(async () => {
+      late.resolve({ logs: [record(1)], latest: 1 })
+      await Promise.resolve()
+    })
+    expect(result.current.logs).toEqual([])
+  })
+
+  it('ignores a failure that lands after unmount', async () => {
+    const late = deferred<{ logs: ReturnType<typeof record>[]; latest: number }>()
+    mocks.logs.mockImplementation(() => late.promise)
+
+    const { result, unmount } = renderHook(() => useLogFeed('info'))
+    await act(async () => undefined)
+    unmount()
+    await act(async () => {
+      late.reject(new Error('late'))
+      await Promise.resolve()
+    })
+    expect(result.current.error).toBeUndefined()
+  })
+
+  it('stops polling after unmount', async () => {
+    mocks.logs
+      .mockResolvedValueOnce({ logs: [], latest: 0 })
+      .mockImplementation(() => new Promise(() => undefined))
+    const { unmount } = renderHook(() => useLogFeed('trace'))
+    await act(async () => undefined)
+    const calls = mocks.logs.mock.calls.length
+    unmount()
+    await vi.advanceTimersByTimeAsync(6_000)
+    expect(mocks.logs.mock.calls.length).toBe(calls)
   })
 })

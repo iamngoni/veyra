@@ -9,7 +9,7 @@
 
 use crate::AppState;
 use crate::audit::{AuditEvent, AuditKind};
-use crate::broker::ea::{AccountSnapshotPayload, CommandKind, ORDER_MAGIC, PositionPayload};
+use crate::broker::{AccountSnapshotPayload, CommandKind, ORDER_MAGIC, PositionPayload};
 
 /// One open order classified by ownership.
 #[derive(Debug, Clone, PartialEq)]
@@ -101,14 +101,12 @@ pub async fn refresh_once(state: &AppState) -> bool {
     let Some(runtime) = state.broker() else {
         return false;
     };
-    let Some(link) = runtime.ea_link() else {
-        return false;
-    };
+    let link = runtime.link();
     let fresh = runtime.link().report().await.fresh;
     if !should_refresh(fresh, link.has_pending(CommandKind::AccountSnapshot)) {
         return false;
     }
-    let command = link.enqueue(CommandKind::AccountSnapshot);
+    let command = link.enqueue_account_snapshot();
     if let Some(audit) = state.audit() {
         audit
             .try_record(AuditEvent::new(
@@ -127,7 +125,7 @@ pub async fn refresh_once(state: &AppState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker::ea::{PositionKind, PositionPayload};
+    use crate::broker::{PositionKind, PositionPayload};
 
     fn position(ticket: i64, magic: u32) -> PositionPayload {
         PositionPayload {

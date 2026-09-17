@@ -11,13 +11,14 @@ import { useState } from 'react'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type { Account, CandleSeries, CommandRecord, FeedEvent, Status } from '../lib/api'
+import type { Account, CandleSeries, CommandRecord, FeedEvent, LogRecord, Status } from '../lib/api'
 import { VEYRA_MAGIC } from '../lib/api'
 import {
   AccountPanel,
   ActivityFeed,
   AutopilotPanel,
   CommandsPanel,
+  LogsPanel,
   MarketPanel,
   MetricsPanel,
   Panel,
@@ -36,6 +37,7 @@ const autopilot: NonNullable<Status['autopilot']> = {
   tier: 'balanced',
   bars: 48,
   symbol: 'EURUSD',
+  symbols: ['EURUSD'],
   jev: 'auto',
   breakeven_r: 1,
   trail_r: 1,
@@ -240,6 +242,16 @@ describe('AutopilotPanel', () => {
     expect(screen.getByText('48 bars')).toBeTruthy()
     expect(screen.getByText('BE 1R · trail 1R')).toBeTruthy()
     expect(screen.getByText('5/120 h · 5/2000 d')).toBeTruthy()
+    expect(screen.getByText('EURUSD')).toBeTruthy()
+  })
+
+  it('renders a multi-symbol rotation and the chart-symbol fallback', () => {
+    const { rerender } = render(
+      <AutopilotPanel status={{ ...autopilot, symbols: ['EURUSD', 'GBPUSD'] }} budget={status.model_budget} />,
+    )
+    expect(screen.getByText('EURUSD · GBPUSD')).toBeTruthy()
+    rerender(<AutopilotPanel status={{ ...autopilot, symbols: [] }} />)
+    expect(screen.getByText('chart symbol')).toBeTruthy()
   })
 
   it('renders the disabled shape', () => {
@@ -519,5 +531,61 @@ describe('ActivityFeed unknown shapes', () => {
     )
     fireEvent.click(screen.getByText('{}').closest('button') as HTMLButtonElement)
     expect(screen.getAllByText('{}').length).toBeGreaterThan(1)
+  })
+})
+
+describe('LogsPanel', () => {
+  const records: LogRecord[] = [
+    {
+      seq: 1,
+      atMs: 1_700_000_000_000,
+      level: 'info',
+      target: 'veyra_service::trading',
+      message: 'autopilot tick',
+      fields: { symbol: 'EURUSD' },
+    },
+    {
+      seq: 2,
+      atMs: 1_700_000_001_000,
+      level: 'warn',
+      target: 'veyra_service::broker',
+      message: 'stale heartbeat',
+      fields: {},
+    },
+  ]
+
+  it('renders records newest first with levels and fields', () => {
+    render(<LogsPanel logs={records} level="info" onLevelChange={vi.fn()} />)
+    const items = screen.getAllByRole('listitem')
+    expect(items[0].textContent).toContain('stale heartbeat')
+    expect(screen.getByText('autopilot tick')).toBeTruthy()
+    expect(screen.getByText(/"symbol":"EURUSD"/)).toBeTruthy()
+  })
+
+  it('reports filter changes', () => {
+    const onLevelChange = vi.fn()
+    render(<LogsPanel logs={records} level="info" onLevelChange={onLevelChange} />)
+    fireEvent.click(screen.getByRole('button', { name: 'warn' }))
+    expect(onLevelChange).toHaveBeenCalledWith('warn')
+  })
+
+  it('renders unknown levels with the fallback tone', () => {
+    render(
+      <LogsPanel
+        logs={[{ ...records[0], seq: 9, level: 'notice', message: 'custom level' }]}
+        level="info"
+        onLevelChange={vi.fn()}
+      />,
+    )
+    expect(screen.getByText('custom level')).toBeTruthy()
+    expect(screen.getByText('notice')).toBeTruthy()
+  })
+
+  it('renders empty and error states', () => {
+    const { rerender } = render(<LogsPanel logs={[]} level="info" onLevelChange={vi.fn()} />)
+    expect(screen.getByText('No log records yet.')).toBeTruthy()
+    rerender(<LogsPanel logs={[]} error="logs down" level="info" onLevelChange={vi.fn()} />)
+    expect(screen.getByText('logs down')).toBeTruthy()
+    expect(screen.getByText('Log tail unavailable.')).toBeTruthy()
   })
 })

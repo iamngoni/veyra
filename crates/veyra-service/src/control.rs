@@ -20,10 +20,11 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::audit::{AuditEvent, AuditKind};
+use crate::broker::BrokerLink;
 use crate::broker::Symbol;
-use crate::broker::ea::{
-    CommandId as EaCommandId, CommandKind, CommandPayload, CommandState, EaCloseRequest, EaLink,
-    EaModifyRequest, EaOrderRequest, ORDER_MAGIC,
+use crate::broker::{
+    CloseOrderRequest, CommandId, CommandPayload, CommandState, ModifyOrderRequest, ORDER_MAGIC,
+    OrderRequest,
 };
 use crate::market::{CandleRequest, Timeframe};
 use crate::risk::RiskDecision;
@@ -52,7 +53,7 @@ pub async fn check_intent(
             HttpResponse::Ok().json(RiskDecision::Rejected(rejection))
         }
         RiskDecision::Approved(intent) => {
-            let command = link.enqueue_order_check(EaOrderRequest::from_intent(&intent));
+            let command = link.enqueue_order_check(OrderRequest::from_intent(&intent));
             audit(
                 &state,
                 AuditKind::CommandQueued,
@@ -84,7 +85,7 @@ pub async fn request_account_snapshot(state: Data<AppState>) -> HttpResponse {
         return HttpResponse::ServiceUnavailable()
             .json(json!({ "error": "command_channel_unavailable" }));
     };
-    let command = link.enqueue(CommandKind::AccountSnapshot);
+    let command = link.enqueue_account_snapshot();
     audit(
         &state,
         AuditKind::CommandQueued,
@@ -192,11 +193,8 @@ pub async fn account_state(state: Data<AppState>) -> HttpResponse {
     let Some(broker) = state.broker() else {
         return HttpResponse::ServiceUnavailable().json(json!({ "error": "broker_unavailable" }));
     };
-    let Some(link) = broker.ea_link() else {
-        return HttpResponse::ServiceUnavailable()
-            .json(json!({ "error": "command_channel_unavailable" }));
-    };
-    let report = broker.link().report().await;
+    let link = broker.link();
+    let report = link.report().await;
     let snapshot = report.snapshot.as_ref();
     let mut body = json!({
         "fresh": report.fresh,
@@ -360,7 +358,7 @@ pub enum StagedExecution {
     /// The order command was queued and audited; poll it by id.
     Queued {
         /// Identifier of the queued command.
-        command: EaCommandId,
+        command: CommandId,
         /// Identifier of the approved intent the command carries.
         intent_id: String,
     },
@@ -374,7 +372,7 @@ pub enum StagedExecution {
 ///
 /// This is the single execution path shared by the control surface and the
 /// autonomous loop: it re-checks both operator controls, stamps the Veyra
-/// magic through [`EaOrderRequest::from_intent`], and audits the queueing.
+/// magic through [`OrderRequest::from_intent`], and audits the queueing.
 /// Approval alone can never trade.
 pub async fn queue_staged_order(state: &AppState, intent: &TradeIntent) -> StagedExecution {
     let Some(link) = command_link(state) else {
@@ -383,7 +381,7 @@ pub async fn queue_staged_order(state: &AppState, intent: &TradeIntent) -> Stage
     if !state.config().trading_enabled() {
         return StagedExecution::TradingDisabled;
     }
-    let command = link.enqueue_order(EaOrderRequest::from_intent(intent));
+    let command = link.enqueue_open_order(OrderRequest::from_intent(intent));
     audit(
         state,
         AuditKind::CommandQueued,
@@ -456,7 +454,7 @@ pub enum StagedClose {
     /// The close command was queued and audited; poll it by id.
     Queued {
         /// Identifier of the queued command.
-        command: EaCommandId,
+        command: CommandId,
         /// Ticket being closed.
         ticket: i64,
     },
@@ -498,7 +496,7 @@ pub async fn queue_staged_close(state: &AppState, ticket: i64) -> StagedClose {
     if position.magic != ORDER_MAGIC {
         return StagedClose::NotVeyra;
     }
-    let command = link.enqueue_close(EaCloseRequest::new(position.ticket, position.magic));
+    let command = link.enqueue_close_order(CloseOrderRequest::new(position.ticket, position.magic));
     audit(
         state,
         AuditKind::CommandQueued,
@@ -587,7 +585,7 @@ pub enum StagedModify {
     /// The modify command was queued and audited; poll it by id.
     Queued {
         /// Identifier of the queued command.
-        command: EaCommandId,
+        command: CommandId,
         /// Ticket whose stops change.
         ticket: i64,
     },
@@ -634,7 +632,7 @@ pub async fn queue_staged_modify(
     if position.magic != ORDER_MAGIC {
         return StagedModify::NotVeyra;
     }
-    let command = link.enqueue_modify(EaModifyRequest::new(
+    let command = link.enqueue_modify_order(ModifyOrderRequest::new(
         position.ticket,
         position.magic,
         stop_loss,
@@ -666,9 +664,7 @@ pub async fn reconciliation(state: Data<AppState>) -> HttpResponse {
     let Some(runtime) = state.broker() else {
         return HttpResponse::Ok().json(json!({ "status": "unavailable" }));
     };
-    let Some(link) = runtime.ea_link() else {
-        return HttpResponse::Ok().json(json!({ "status": "unavailable" }));
-    };
+    let link = runtime.link();
     if !runtime.link().report().await.fresh {
         return HttpResponse::Ok().json(json!({ "status": "stale" }));
     }
@@ -744,7 +740,7 @@ pub async fn command_status(state: Data<AppState>, id: web::Path<String>) -> Htt
         return HttpResponse::ServiceUnavailable()
             .json(json!({ "error": "command_channel_unavailable" }));
     };
-    let Some(command_id) = EaCommandId::parse(id.as_str()) else {
+    let Some(command_id) = CommandId::parse(id.as_str()) else {
         return HttpResponse::BadRequest().json(json!({ "error": "invalid_command_id" }));
     };
     let Some(record) = link.command(command_id) else {
@@ -774,8 +770,8 @@ pub async fn command_status(state: Data<AppState>, id: web::Path<String>) -> Htt
 }
 
 /// Returns the EA command channel of the active provider, when it exposes one.
-fn command_link(state: &AppState) -> Option<Arc<EaLink>> {
-    state.broker()?.ea_link()
+fn command_link(state: &AppState) -> Option<Arc<dyn BrokerLink>> {
+    Some(state.broker()?.link())
 }
 
 /// Records an audit event best-effort, when a trail is configured.
@@ -1087,7 +1083,7 @@ mod tests {
     async fn command_list_reports_pending_commands() {
         let (state, _) = audited_state(None);
         let link = state.broker().expect("broker").ea_link().expect("ea link");
-        let id = link.enqueue(crate::broker::ea::CommandKind::AccountSnapshot);
+        let id = link.enqueue_account_snapshot();
 
         let app = test::init_service(create_app(state.clone())).await;
         let response =
@@ -1129,7 +1125,7 @@ mod tests {
         assert!(body["balance"].is_null(), "no snapshot payload yet");
 
         // Deliver one account_snapshot ack through the real poll path.
-        link.enqueue(crate::broker::ea::CommandKind::AccountSnapshot);
+        link.enqueue_account_snapshot();
         let ea_app =
             actix_web::test::init_service(crate::broker::ea::create_ea_app(link.clone())).await;
         let hello = serde_json::json!({

@@ -28,6 +28,7 @@
 //! smaller than a tenth of the entry risk are suppressed to bound churn.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
@@ -35,7 +36,7 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::audit::{AuditEvent, AuditKind};
 use crate::broker::Symbol;
-use crate::broker::ea::{ORDER_MAGIC, PositionPayload};
+use crate::broker::{ORDER_MAGIC, PositionPayload};
 use crate::config::ConfigError;
 use crate::control::{
     StagedClose, StagedExecution, StagedModify, queue_staged_close, queue_staged_modify,
@@ -53,6 +54,8 @@ use crate::trading::pipeline::{PipelineOutcome, evaluate_proposal};
 
 /// Default proposal cadence in seconds.
 const DEFAULT_INTERVAL_SECS: u64 = 300;
+/// Largest number of instruments one autopilot rotation accepts.
+const MAX_SYMBOLS: usize = 8;
 /// Smallest accepted cadence: frequent enough to act, slow enough to be sane.
 const MIN_INTERVAL_SECS: u64 = 30;
 /// Largest accepted cadence.
@@ -100,7 +103,7 @@ impl JevPreference {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutopilotSettings {
     enabled: bool,
-    symbol: Option<Symbol>,
+    symbols: Vec<Symbol>,
     timeframe: Timeframe,
     bars: u16,
     tier: ModelTier,
@@ -132,6 +135,7 @@ impl AutopilotSettings {
     ) -> Result<Option<Self>, ConfigError> {
         let enabled_raw = optional(&mut source, "VEYRA_AUTOPILOT_ENABLED");
         let symbol_raw = optional(&mut source, "VEYRA_AUTOPILOT_SYMBOL");
+        let symbols_raw = optional(&mut source, "VEYRA_AUTOPILOT_SYMBOLS");
         let timeframe_raw = optional(&mut source, "VEYRA_AUTOPILOT_TIMEFRAME");
         let bars_raw = optional(&mut source, "VEYRA_AUTOPILOT_BARS");
         let tier_raw = optional(&mut source, "VEYRA_AUTOPILOT_TIER");
@@ -143,6 +147,7 @@ impl AutopilotSettings {
 
         if enabled_raw.is_empty()
             && symbol_raw.is_empty()
+            && symbols_raw.is_empty()
             && timeframe_raw.is_empty()
             && bars_raw.is_empty()
             && tier_raw.is_empty()
@@ -165,14 +170,23 @@ impl AutopilotSettings {
                 });
             }
         };
-        let symbol = match symbol_raw.as_str() {
-            "" => None,
-            other => Some(Symbol::parse(other).map_err(|_| {
+        if !symbol_raw.is_empty() && !symbols_raw.is_empty() {
+            return Err(ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_AUTOPILOT_SYMBOLS",
+                reason: "set either VEYRA_AUTOPILOT_SYMBOL or VEYRA_AUTOPILOT_SYMBOLS, not both",
+            });
+        }
+        let symbols = if !symbols_raw.is_empty() {
+            parse_symbol_list(&symbols_raw)?
+        } else if !symbol_raw.is_empty() {
+            vec![Symbol::parse(&symbol_raw).map_err(|_| {
                 ConfigError::InvalidEnvironmentVariable {
                     name: "VEYRA_AUTOPILOT_SYMBOL",
                     reason: "must be 1-24 characters of letters, digits, '.', '_', '#', '+' or '-'",
                 }
-            })?),
+            })?]
+        } else {
+            Vec::new()
         };
         let timeframe = match timeframe_raw.as_str() {
             "" => Timeframe::H4,
@@ -261,7 +275,7 @@ impl AutopilotSettings {
 
         Ok(Some(Self {
             enabled,
-            symbol,
+            symbols,
             timeframe,
             bars,
             tier,
@@ -278,9 +292,11 @@ impl AutopilotSettings {
         self.enabled
     }
 
-    /// Explicit instrument, when configured; otherwise the chart symbol.
-    pub fn symbol(&self) -> Option<&Symbol> {
-        self.symbol.as_ref()
+    /// Configured instruments, in rotation order; empty means the terminal's
+    /// chart symbol. Open Veyra positions are appended at tick time so their
+    /// lifecycle is managed even when they are outside the configured list.
+    pub fn symbols(&self) -> &[Symbol] {
+        &self.symbols
     }
 
     /// Timeframe for market data and judgements.
@@ -410,12 +426,19 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             reason: "stale_link",
         };
     }
-    let symbol = settings.symbol().cloned().or_else(|| {
+    // Rotation: configured symbols first, then any symbol carrying an open
+    // Veyra position, so every managed position still gets lifecycle checks.
+    let managed = managed_positions(state);
+    let rotation = rotation_symbols(settings.symbols(), &managed);
+    let symbol = if rotation.is_empty() {
         report
             .snapshot
             .as_ref()
             .map(|snapshot| snapshot.symbol().clone())
-    });
+    } else {
+        let index = state.rotation().fetch_add(1, Ordering::Relaxed) % rotation.len();
+        Some(rotation[index].clone())
+    };
     let Some(symbol) = symbol else {
         return TickOutcome::Skipped {
             reason: "symbol_unavailable",
@@ -468,7 +491,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     // While a Veyra-managed position is open, review it instead of hunting
     // for entries: the open-order cap would reject any entry anyway, and the
     // position needs a lifecycle decision.
-    let positions = managed_positions(state);
+    let positions = positions_for_symbol(managed, &symbol);
     if !positions.is_empty() {
         // Capital preservation first: one action per tick, and moving the
         // stop is cheaper and safer than any entry or exit decision.
@@ -615,6 +638,7 @@ impl ManagedSide {
 #[derive(Debug, Clone, PartialEq)]
 struct ManagedPosition {
     ticket: i64,
+    symbol: String,
     side: ManagedSide,
     lots: f64,
     entry: f64,
@@ -632,8 +656,7 @@ struct ManagedPosition {
 fn managed_positions(state: &AppState) -> Vec<ManagedPosition> {
     state
         .broker()
-        .and_then(|broker| broker.ea_link())
-        .and_then(|link| link.last_account())
+        .and_then(|broker| broker.link().last_account())
         .map(|snapshot| {
             snapshot
                 .positions
@@ -646,9 +669,10 @@ fn managed_positions(state: &AppState) -> Vec<ManagedPosition> {
 }
 
 fn managed_from_payload(position: &PositionPayload) -> ManagedPosition {
-    use crate::broker::ea::PositionKind;
+    use crate::broker::PositionKind;
     ManagedPosition {
         ticket: position.ticket,
+        symbol: position.symbol.clone(),
         side: match position.kind {
             PositionKind::Buy
             | PositionKind::BuyLimit
@@ -667,6 +691,65 @@ fn managed_from_payload(position: &PositionPayload) -> ManagedPosition {
         opened_at: position.opened_at,
         current: position.current,
     }
+}
+
+/// Positions of one instrument, so a review never mixes series and symbols.
+fn positions_for_symbol(managed: Vec<ManagedPosition>, symbol: &Symbol) -> Vec<ManagedPosition> {
+    managed
+        .into_iter()
+        .filter(|position| position.symbol == symbol.as_str())
+        .collect()
+}
+
+/// Merges the configured rotation with symbols of open managed positions,
+/// de-duplicated in first-seen order.
+fn rotation_symbols(configured: &[Symbol], managed: &[ManagedPosition]) -> Vec<Symbol> {
+    let mut symbols: Vec<Symbol> = configured.to_vec();
+    for position in managed {
+        if let Ok(symbol) = Symbol::parse(&position.symbol)
+            && !symbols
+                .iter()
+                .any(|known| known.as_str() == symbol.as_str())
+        {
+            symbols.push(symbol);
+        }
+    }
+    symbols
+}
+
+/// Parses a comma-separated symbol list: 1-8 distinct validated instruments.
+fn parse_symbol_list(raw: &str) -> Result<Vec<Symbol>, ConfigError> {
+    let invalid = |reason: &'static str| ConfigError::InvalidEnvironmentVariable {
+        name: "VEYRA_AUTOPILOT_SYMBOLS",
+        reason,
+    };
+    let mut symbols = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err(invalid(
+                "entries must be non-empty symbols separated by commas",
+            ));
+        }
+        let symbol = Symbol::parse(trimmed).map_err(|_| {
+            invalid(
+                "each entry must be 1-24 characters of letters, digits, '.', '_', '#', '+' or '-'",
+            )
+        })?;
+        if !symbols
+            .iter()
+            .any(|known: &Symbol| known.as_str() == symbol.as_str())
+        {
+            symbols.push(symbol);
+        }
+    }
+    if symbols.is_empty() {
+        return Err(invalid("at least one symbol is required"));
+    }
+    if symbols.len() > MAX_SYMBOLS {
+        return Err(invalid("at most 8 symbols may rotate"));
+    }
+    Ok(symbols)
 }
 
 /// Which policy produced a stop move.
@@ -979,8 +1062,7 @@ async fn review_positions(
             };
             let snapshot_server_time = state
                 .broker()
-                .and_then(|broker| broker.ea_link())
-                .and_then(|link| link.last_account())
+                .and_then(|broker| broker.link().last_account())
                 .map(|snapshot| snapshot.server_time)
                 .unwrap_or(0);
             match position_age_secs(snapshot_server_time, position.opened_at) {
@@ -1214,8 +1296,7 @@ fn review_input(
 
     let server_time = state
         .broker()
-        .and_then(|broker| broker.ea_link())
-        .and_then(|link| link.last_account())
+        .and_then(|broker| broker.link().last_account())
         .map(|snapshot| snapshot.server_time)
         .unwrap_or(0);
     let open_positions: Vec<Value> = positions
@@ -1570,8 +1651,8 @@ mod tests {
 
     use super::*;
     use crate::audit::{AuditRuntime, MemoryTrail};
-    use crate::broker::ea::{AccountSnapshotPayload, CommandKind};
     use crate::broker::{AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName};
+    use crate::broker::{AccountSnapshotPayload, CommandKind};
     use crate::config::ServiceConfig;
     use crate::jev::{
         JevError, JevProvider, JevRequest as JudgeRequest, JevResponse, SemanticJudge,
@@ -1893,7 +1974,7 @@ mod tests {
         assert_eq!(defaults.min_hold(), Duration::from_secs(300));
         assert_eq!(defaults.breakeven_r(), 0.0, "break-even is opt-in");
         assert_eq!(defaults.trail_r(), 0.0, "trailing is opt-in");
-        assert!(defaults.symbol().is_none());
+        assert!(defaults.symbols().is_empty());
 
         let custom = settings_from(|name| match name {
             "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
@@ -1912,12 +1993,41 @@ mod tests {
         assert_eq!(custom.min_hold(), Duration::ZERO);
         assert_eq!(custom.breakeven_r(), 1.5);
         assert_eq!(custom.trail_r(), 2.0);
-        assert_eq!(custom.symbol().expect("symbol").as_str(), "gbpusd");
+        assert_eq!(custom.symbols().first().expect("symbol").as_str(), "gbpusd");
         assert_eq!(custom.timeframe(), Timeframe::H4);
         assert_eq!(custom.bars(), 96);
         assert_eq!(custom.tier(), ModelTier::Reasoning);
         assert_eq!(custom.interval(), Duration::from_secs(60));
         assert_eq!(custom.jev(), JevPreference::Off);
+        let multi = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_SYMBOLS" => Ok(" eurusd, GBPUSD ,eurusd, XAUUSD ".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        assert_eq!(
+            multi
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["eurusd", "GBPUSD", "XAUUSD"],
+            "lists trim, validate, and de-duplicate in order"
+        );
+
+        let conflict = AutopilotSettings::from_source(|requested| match requested {
+            "VEYRA_AUTOPILOT_SYMBOL" => Ok("EURUSD".to_owned()),
+            "VEYRA_AUTOPILOT_SYMBOLS" => Ok("GBPUSD".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name: requested }),
+        })
+        .expect_err("single and list forms are mutually exclusive");
+        assert!(matches!(
+            conflict,
+            ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_AUTOPILOT_SYMBOLS",
+                ..
+            }
+        ));
+
         assert_eq!(JevPreference::parse(" TRUE "), Some(JevPreference::Auto));
         assert_eq!(JevPreference::parse("no"), None);
         assert_eq!(JevPreference::Auto.as_str(), "auto");
@@ -1926,6 +2036,10 @@ mod tests {
         for (name, value) in [
             ("VEYRA_AUTOPILOT_ENABLED", "sure"),
             ("VEYRA_AUTOPILOT_SYMBOL", "bad symbol"),
+            ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,,GBPUSD"),
+            ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,"),
+            ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,bad symbol"),
+            ("VEYRA_AUTOPILOT_SYMBOLS", "A,B,C,D,E,F,G,H,I"),
             ("VEYRA_AUTOPILOT_TIMEFRAME", "H6"),
             ("VEYRA_AUTOPILOT_BARS", "9"),
             ("VEYRA_AUTOPILOT_BARS", "241"),
@@ -2237,7 +2351,7 @@ mod tests {
             .ea_link()
             .expect("link");
         assert!(link.has_pending(CommandKind::OpenOrder));
-        let id = crate::broker::ea::CommandId::parse(&command).expect("command id");
+        let id = crate::broker::CommandId::parse(&command).expect("command id");
         let record = link.command(id).expect("record retained");
         assert_eq!(record.kind, CommandKind::OpenOrder);
     }
@@ -2448,10 +2562,10 @@ mod tests {
             free_margin: 20.0,
             orders: 1,
             lots: 0.01,
-            positions: vec![crate::broker::ea::PositionPayload {
+            positions: vec![crate::broker::PositionPayload {
                 ticket,
                 symbol: "EURUSD".to_owned(),
-                kind: crate::broker::ea::PositionKind::Sell,
+                kind: crate::broker::PositionKind::Sell,
                 lots: 0.01,
                 price: 1.14757,
                 profit: -0.2,
@@ -2459,7 +2573,7 @@ mod tests {
                 take_profit: 1.14554,
                 opened_at,
                 current,
-                magic: crate::broker::ea::ORDER_MAGIC,
+                magic: crate::broker::ORDER_MAGIC,
             }],
             positions_truncated: false,
             server_time,
@@ -2762,6 +2876,7 @@ mod tests {
     fn managed_position(side: ManagedSide, entry: f64, stop: f64, current: f64) -> ManagedPosition {
         ManagedPosition {
             ticket: 1,
+            symbol: "EURUSD".to_owned(),
             side,
             lots: 0.01,
             entry,
@@ -2771,6 +2886,50 @@ mod tests {
             opened_at: 1_758_000_000,
             current,
         }
+    }
+
+    fn managed_position_named(symbol: &str) -> ManagedPosition {
+        let mut position = managed_position(ManagedSide::Buy, 1.1, 1.09, 1.1);
+        position.symbol = symbol.to_owned();
+        position
+    }
+
+    #[test]
+    fn rotation_merges_configured_and_open_position_symbols() {
+        let configured = vec![Symbol::parse("EURUSD").expect("symbol")];
+        let managed = vec![
+            managed_position_named("XAUUSD"),
+            managed_position_named("EURUSD"),
+        ];
+        let rotation = rotation_symbols(&configured, &managed);
+        assert_eq!(
+            rotation
+                .iter()
+                .map(|symbol| symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["EURUSD", "XAUUSD"],
+            "configured order wins and open-position symbols are appended once"
+        );
+
+        let from_positions = rotation_symbols(&[], &[managed_position_named("GBPUSD")]);
+        assert_eq!(
+            from_positions.first().map(|symbol| symbol.as_str()),
+            Some("GBPUSD"),
+            "an open position is managed even without a configured list"
+        );
+    }
+
+    #[test]
+    fn positions_for_symbol_keeps_only_the_requested_instrument() {
+        let positions = positions_for_symbol(
+            vec![
+                managed_position_named("EURUSD"),
+                managed_position_named("GBPUSD"),
+            ],
+            &Symbol::parse("EURUSD").expect("symbol"),
+        );
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, "EURUSD");
     }
 
     fn planned(ticket: i64, stop: f64, kind: StopMoveKind) -> Option<StopMove> {

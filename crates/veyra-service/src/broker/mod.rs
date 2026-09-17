@@ -7,21 +7,28 @@
 //! [`BrokerRuntime`]. Adding a venue means adding an implementation plus a
 //! provider selector; no caller changes.
 
+pub mod command;
 pub mod ea;
 pub mod settings;
 
-pub use ea::{
-    AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandRecord, CommandState,
-    EaCloseRequest, EaErrorBody, EaLink, EaModifyRequest, EaOrderRequest, EaPoll, EaReply,
-    ListedCommand, ORDER_MAGIC, OrderCheckPayload, OrderExecutionPayload, PositionKind,
-    PositionPayload, build_server, create_ea_app,
+/// Provider-neutral command and report types every venue integration speaks.
+pub use command::{
+    AccountSnapshotPayload, CandlePayload, CloseOrderRequest, CommandId, CommandKind,
+    CommandPayload, CommandRecord, CommandState, ListedCommand, ModifyOrderRequest, ORDER_MAGIC,
+    OrderCheckPayload, OrderExecutionPayload, OrderRequest, PositionKind, PositionPayload,
+    RatesPayload, RatesRequest, SUPPORTED_TIMEFRAME_MINUTES,
 };
+/// EA-specific transport surface, used by the EA server and its contract tests.
+pub use ea::{EaErrorBody, EaLink, EaPoll, EaReply, build_server, create_ea_app};
 pub use settings::{BrokerSettings, EaToken};
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
+
+use crate::audit::AuditRuntime;
 
 /// Errors raised while validating venue data or constructing a link.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -249,11 +256,17 @@ pub struct LinkReport {
     pub fresh: bool,
 }
 
-/// Narrow contract every venue integration implements.
+/// Contract every venue integration implements.
 ///
-/// Implementations must not block on network IO inside [`BrokerLink::report`];
-/// they report the latest locally held state. Outbound calls belong to the
-/// execution methods that will be added with the command layer.
+/// Two halves: reporting (`report`, retained `account_snapshot` state) and the
+/// asynchronous command channel (`enqueue_*`, `command`, `await_command`).
+/// Implementations must not block on network IO inside these methods — the
+/// venue is pumped by its own transport (the EA polls; a REST venue would run
+/// its own task) and every method only touches locally held state.
+///
+/// The trading, risk, control, and console layers depend on this trait alone,
+/// so adding a venue means adding one implementation plus a provider selector;
+/// no caller changes.
 #[async_trait]
 pub trait BrokerLink: Send + Sync + fmt::Debug + 'static {
     /// Provider identifier for status output and logs.
@@ -261,6 +274,47 @@ pub trait BrokerLink: Send + Sync + fmt::Debug + 'static {
 
     /// Latest link report.
     async fn report(&self) -> LinkReport;
+
+    /// Queues a read-only account snapshot.
+    fn enqueue_account_snapshot(&self) -> CommandId;
+
+    /// Queues a broker-side order validation (never places an order).
+    fn enqueue_order_check(&self, request: OrderRequest) -> CommandId;
+
+    /// Queues a live order for a gate-approved intent.
+    fn enqueue_open_order(&self, request: OrderRequest) -> CommandId;
+
+    /// Queues a close for one validated Veyra-owned ticket.
+    fn enqueue_close_order(&self, request: CloseOrderRequest) -> CommandId;
+
+    /// Queues a stop change for one validated Veyra-owned ticket.
+    fn enqueue_modify_order(&self, request: ModifyOrderRequest) -> CommandId;
+
+    /// Queues a read-only market-rates request.
+    fn enqueue_rates(&self, request: RatesRequest) -> CommandId;
+
+    /// Whether a command of `kind` is still awaiting acknowledgement.
+    fn has_pending(&self, kind: CommandKind) -> bool;
+
+    /// Newest-first commands for the control surface, capped at `limit`.
+    fn recent_commands(&self, limit: usize) -> Vec<ListedCommand>;
+
+    /// Current record for a command inside the bounded history.
+    fn command(&self, id: CommandId) -> Option<CommandRecord>;
+
+    /// Waits until a command reaches a terminal state; the transport owns
+    /// delivery and timeout classification.
+    async fn await_command(&self, id: CommandId, timeout: Duration) -> CommandState;
+
+    /// Latest validated account snapshot, if the venue ever reported one.
+    fn last_account(&self) -> Option<AccountSnapshotPayload>;
+
+    /// Age of the latest validated snapshot, if there is one.
+    fn last_account_age(&self, now: SystemTime) -> Option<Duration>;
+
+    /// Attaches the audit trail so command lifecycle events are recorded.
+    /// Providers that already emit equivalent events may ignore this.
+    fn attach_audit(&self, _audit: Arc<AuditRuntime>) {}
 }
 
 /// Active broker integration plus the concrete implementation's extras.
@@ -324,6 +378,95 @@ impl BrokerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second implementation with no EA transport at all. Its existence is
+    /// the seam test: the generic layers compile against `dyn BrokerLink`, so a
+    /// new venue only has to answer this contract.
+    #[derive(Debug)]
+    struct StubLink;
+
+    #[async_trait]
+    impl BrokerLink for StubLink {
+        fn provider(&self) -> BrokerProvider {
+            BrokerProvider::Ea
+        }
+
+        async fn report(&self) -> LinkReport {
+            LinkReport {
+                snapshot: None,
+                fresh: false,
+            }
+        }
+
+        fn enqueue_account_snapshot(&self) -> CommandId {
+            CommandId::new()
+        }
+
+        fn enqueue_order_check(&self, _request: OrderRequest) -> CommandId {
+            CommandId::new()
+        }
+
+        fn enqueue_open_order(&self, _request: OrderRequest) -> CommandId {
+            CommandId::new()
+        }
+
+        fn enqueue_close_order(&self, _request: CloseOrderRequest) -> CommandId {
+            CommandId::new()
+        }
+
+        fn enqueue_modify_order(&self, _request: ModifyOrderRequest) -> CommandId {
+            CommandId::new()
+        }
+
+        fn enqueue_rates(&self, _request: RatesRequest) -> CommandId {
+            CommandId::new()
+        }
+
+        fn has_pending(&self, _kind: CommandKind) -> bool {
+            false
+        }
+
+        fn recent_commands(&self, _limit: usize) -> Vec<ListedCommand> {
+            Vec::new()
+        }
+
+        fn command(&self, _id: CommandId) -> Option<CommandRecord> {
+            None
+        }
+
+        async fn await_command(&self, _id: CommandId, _timeout: Duration) -> CommandState {
+            CommandState::Failed {
+                reason: "stub".to_owned(),
+            }
+        }
+
+        fn last_account(&self) -> Option<AccountSnapshotPayload> {
+            None
+        }
+
+        fn last_account_age(&self, _now: SystemTime) -> Option<Duration> {
+            None
+        }
+    }
+
+    #[actix_web::test]
+    async fn a_non_ea_link_satisfies_the_generic_contract() {
+        use crate::audit::{AuditRuntime, MemoryTrail};
+
+        let link: Arc<dyn BrokerLink> = Arc::new(StubLink);
+        assert!(!link.report().await.fresh);
+        assert!(link.last_account().is_none());
+        assert!(link.command(CommandId::new()).is_none());
+        assert!(!link.has_pending(CommandKind::OpenOrder));
+        link.attach_audit(Arc::new(AuditRuntime::new(
+            Arc::new(MemoryTrail::default()),
+        )));
+        assert!(matches!(
+            link.await_command(CommandId::new(), Duration::from_millis(1))
+                .await,
+            CommandState::Failed { .. }
+        ));
+    }
 
     #[test]
     fn server_name_accepts_and_rejects() {

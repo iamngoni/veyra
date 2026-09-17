@@ -12,7 +12,6 @@
 //! terminal's `WebRequest` client is the transport.
 
 use std::collections::VecDeque;
-use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,15 +24,18 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use subtle::ConstantTimeEq;
-use uuid::Uuid;
 
 use crate::audit::{AuditEvent, AuditKind, AuditRuntime};
+use crate::broker::command::{
+    AccountSnapshotPayload, CloseOrderRequest, CommandId, CommandKind, CommandPayload,
+    CommandRecord, CommandState, ListedCommand, ModifyOrderRequest, OrderCheckPayload,
+    OrderExecutionPayload, OrderRequest, PositionPayload, RatesPayload, RatesRequest,
+};
 use crate::broker::settings::EaToken;
 use crate::broker::{
-    AccountLogin, AccountSnapshot, BrokerError, BrokerLink, BrokerProvider, LinkReport, ServerName,
-    Symbol,
+    AccountLogin, AccountSnapshot, BrokerError, BrokerLink, BrokerProvider, LinkReport,
+    ORDER_MAGIC, ServerName, Symbol,
 };
-use crate::trading::intent::TradeIntent;
 
 /// Message kinds accepted from the EA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -51,599 +53,6 @@ enum EaKind {
 
 /// How many finished commands stay queryable.
 const COMMAND_HISTORY: usize = 64;
-
-/// Stable identifier for one command; identical across delivery and ack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct CommandId(Uuid);
-
-impl CommandId {
-    /// Generates a fresh random identifier.
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    /// Parses an externally supplied identifier (for example a URL path).
-    pub fn parse(value: &str) -> Option<Self> {
-        Uuid::parse_str(value).ok().map(Self)
-    }
-}
-
-impl Default for CommandId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for CommandId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.0)
-    }
-}
-
-/// Commands the EA can execute. None of them places, modifies, or cancels an
-/// order; `order_check` only asks the terminal to validate a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CommandKind {
-    /// Return-path check with no payload.
-    Ping,
-    /// Report account state (balance, equity, free margin, order count).
-    AccountSnapshot,
-    /// Ask the terminal to validate an order request without sending it.
-    OrderCheck,
-    /// Ask the terminal to execute an order (subject to the terminal's own
-    /// live-orders control).
-    OpenOrder,
-    /// Ask the terminal to close one Veyra-owned market position.
-    CloseOrder,
-    /// Ask the terminal to change the stops on a Veyra-owned position.
-    ModifyOrder,
-    /// Report recent closed candles for one symbol and timeframe.
-    Rates,
-}
-
-impl CommandKind {
-    /// Returns the stable wire name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ping => "ping",
-            Self::AccountSnapshot => "account_snapshot",
-            Self::OrderCheck => "order_check",
-            Self::OpenOrder => "open_order",
-            Self::CloseOrder => "close_order",
-            Self::ModifyOrder => "modify_order",
-            Self::Rates => "rates",
-        }
-    }
-}
-
-/// Largest position list the payload accepts; the terminal caps earlier and
-/// flags truncation.
-const MAX_POSITIONS: usize = 64;
-
-/// Magic number stamped on Veyra orders so the terminal and the reconciler can
-/// recognise them.
-pub const ORDER_MAGIC: u32 = 77_041;
-
-/// Standard MT4 periods in minutes; the `rates` contract accepts only these.
-pub const SUPPORTED_TIMEFRAME_MINUTES: [u32; 9] = [1, 5, 15, 30, 60, 240, 1_440, 10_080, 43_200];
-
-/// One open or pending order as the terminal reports it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PositionPayload {
-    /// Venue ticket.
-    pub ticket: i64,
-    /// Instrument.
-    pub symbol: String,
-    /// Magic number stamped on the order; [`ORDER_MAGIC`] marks Veyra orders.
-    pub magic: u32,
-    /// Order kind.
-    pub kind: PositionKind,
-    /// Volume in lots.
-    pub lots: f64,
-    /// Entry or trigger price.
-    pub price: f64,
-    /// Floating profit in account currency.
-    pub profit: f64,
-    /// Stop loss as an absolute price, or zero when the position carries
-    /// none. Absent on older terminals that do not report it.
-    #[serde(rename = "sl", default)]
-    pub stop_loss: f64,
-    /// Take profit as an absolute price, or zero when the position carries
-    /// none. Absent on older terminals that do not report it.
-    #[serde(rename = "tp", default)]
-    pub take_profit: f64,
-    /// Position open time (broker server seconds), or zero when the terminal
-    /// does not report it. The autopilot refuses to close positions whose age
-    /// it cannot verify.
-    #[serde(rename = "openedAt", default)]
-    pub opened_at: i64,
-    /// Current close price for the position, or zero when the terminal does
-    /// not report it. The break-even policy is skipped without it.
-    #[serde(default)]
-    pub current: f64,
-}
-
-/// Order kinds the terminal can report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PositionKind {
-    /// Market buy position.
-    Buy,
-    /// Market sell position.
-    Sell,
-    /// Buy limit order.
-    BuyLimit,
-    /// Sell limit order.
-    SellLimit,
-    /// Buy stop order.
-    BuyStop,
-    /// Sell stop order.
-    SellStop,
-    /// Buy stop-limit order.
-    BuyStopLimit,
-    /// Sell stop-limit order.
-    SellStopLimit,
-}
-
-/// Account state reported by an `account_snapshot` command.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct AccountSnapshotPayload {
-    /// Account balance.
-    pub balance: f64,
-    /// Account equity.
-    pub equity: f64,
-    /// Free margin.
-    #[serde(rename = "freeMargin")]
-    pub free_margin: f64,
-    /// Open orders; MT4 counts positions and pending orders here.
-    pub orders: u32,
-    /// Total open volume across every open order, in lots.
-    pub lots: f64,
-    /// Bounded snapshot of the open orders.
-    pub positions: Vec<PositionPayload>,
-    /// Whether the terminal omitted orders beyond its own cap.
-    #[serde(rename = "positionsTruncated")]
-    pub positions_truncated: bool,
-    /// Terminal server time.
-    #[serde(rename = "serverTime")]
-    pub server_time: i64,
-}
-
-impl AccountSnapshotPayload {
-    /// Rejects non-finite money values and unusable exposure data before they
-    /// reach callers.
-    fn validate(&self) -> Result<(), String> {
-        for (name, value) in [
-            ("balance", self.balance),
-            ("equity", self.equity),
-            ("freeMargin", self.free_margin),
-        ] {
-            if !value.is_finite() {
-                return Err(format!("{name} must be a finite number"));
-            }
-        }
-        if !self.lots.is_finite() || self.lots < 0.0 {
-            return Err("lots must be a finite, non-negative number".to_owned());
-        }
-        if self.positions.len() > MAX_POSITIONS {
-            return Err(format!(
-                "positions must contain at most {MAX_POSITIONS} entries"
-            ));
-        }
-        for position in &self.positions {
-            if position.ticket <= 0 {
-                return Err("position ticket must be positive".to_owned());
-            }
-            Symbol::parse(&position.symbol)
-                .map_err(|error| format!("position symbol is invalid: {error}"))?;
-            if !position.lots.is_finite() || position.lots <= 0.0 {
-                return Err("position lots must be a finite, positive number".to_owned());
-            }
-            if !position.price.is_finite() || position.price <= 0.0 {
-                return Err("position price must be a finite, positive number".to_owned());
-            }
-            if !position.profit.is_finite() {
-                return Err("position profit must be a finite number".to_owned());
-            }
-            for (name, value) in [("sl", position.stop_loss), ("tp", position.take_profit)] {
-                if !value.is_finite() || value < 0.0 {
-                    return Err(format!(
-                        "position {name} must be a finite, non-negative price (zero means none)"
-                    ));
-                }
-            }
-            if position.opened_at < 0 {
-                return Err("position openedAt must be non-negative".to_owned());
-            }
-            if !position.current.is_finite() || position.current < 0.0 {
-                return Err("position current must be a finite, non-negative price".to_owned());
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Terminal verdict for an `order_check` command: the request passed, or the
-/// classic MT4 trade code (131 volume, 134 money, 130 stops, 133 disabled)
-/// that would reject it. No order exists in the venue; the terminal applies
-/// its own market rules and margin engine.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct OrderCheckPayload {
-    /// Whether the terminal accepted the request in principle.
-    pub passed: bool,
-    /// Classic MT4 trade code; zero when the check passed.
-    pub retcode: i64,
-    /// Broker explanation, echoed for operators.
-    pub comment: String,
-    /// Margin the venue would require for the order, in account currency.
-    pub margin: f64,
-}
-
-impl OrderCheckPayload {
-    /// Rejects values an operator must never act on.
-    fn validate(&self) -> Result<(), String> {
-        if !self.margin.is_finite() || self.margin < 0.0 {
-            return Err("margin must be a finite, non-negative number".to_owned());
-        }
-        if self.comment.len() > 256 || self.comment.chars().any(char::is_control) {
-            return Err(
-                "comment must be at most 256 characters without control characters".to_owned(),
-            );
-        }
-        Ok(())
-    }
-}
-
-/// Terminal verdict for an `open_order` command.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct OrderExecutionPayload {
-    /// Whether an order was actually sent to the broker.
-    pub executed: bool,
-    /// Validation or broker return code; zero means the request was acceptable.
-    pub retcode: i64,
-    /// Terminal commentary, echoed for operators.
-    pub comment: String,
-    /// Ticket of the placed order; zero when nothing was sent.
-    pub ticket: i64,
-    /// Fill or trigger price; zero when nothing was sent.
-    pub price: f64,
-}
-
-impl OrderExecutionPayload {
-    /// Rejects values an operator must never act on.
-    fn validate(&self) -> Result<(), String> {
-        if self.comment.len() > 256 || self.comment.chars().any(char::is_control) {
-            return Err(
-                "comment must be at most 256 characters without control characters".to_owned(),
-            );
-        }
-        if self.ticket < 0 {
-            return Err("ticket must not be negative".to_owned());
-        }
-        if !self.price.is_finite() || self.price < 0.0 {
-            return Err("price must be a finite, non-negative number".to_owned());
-        }
-        if self.executed && (self.ticket <= 0 || self.price <= 0.0) {
-            return Err("an executed order must report a ticket and price".to_owned());
-        }
-        Ok(())
-    }
-}
-
-/// Close request sent to the EA: one Veyra-owned ticket plus the magic number
-/// the terminal must confirm before touching it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct EaCloseRequest {
-    ticket: i64,
-    magic: u32,
-}
-
-impl EaCloseRequest {
-    /// Builds a close request for a validated, Veyra-owned ticket.
-    pub fn new(ticket: i64, magic: u32) -> Self {
-        Self { ticket, magic }
-    }
-
-    /// Ticket to close.
-    pub fn ticket(&self) -> i64 {
-        self.ticket
-    }
-
-    /// Magic number the terminal must find on the selected order.
-    pub fn magic(&self) -> u32 {
-        self.magic
-    }
-}
-
-/// Stop-change request sent to the EA for one Veyra-owned ticket. At least one
-/// of the two stops must be present; the terminal re-validates distances.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct EaModifyRequest {
-    ticket: i64,
-    magic: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stop_loss: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    take_profit: Option<f64>,
-}
-
-impl EaModifyRequest {
-    /// Builds a stop change for a validated, Veyra-owned ticket.
-    pub fn new(ticket: i64, magic: u32, stop_loss: Option<f64>, take_profit: Option<f64>) -> Self {
-        Self {
-            ticket,
-            magic,
-            stop_loss,
-            take_profit,
-        }
-    }
-
-    /// Ticket whose stops change.
-    pub fn ticket(&self) -> i64 {
-        self.ticket
-    }
-
-    /// Magic number the terminal must find on the selected order.
-    pub fn magic(&self) -> u32 {
-        self.magic
-    }
-
-    /// New stop loss, when provided.
-    pub fn stop_loss(&self) -> Option<f64> {
-        self.stop_loss
-    }
-
-    /// New take profit, when provided.
-    pub fn take_profit(&self) -> Option<f64> {
-        self.take_profit
-    }
-}
-
-/// Market-rates request sent to the EA: `bars` closed candles for a symbol
-/// and timeframe, oldest first. The symbol is an already validated [`Symbol`]
-/// and the timeframe must be one of [`SUPPORTED_TIMEFRAME_MINUTES`].
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct EaRatesRequest {
-    symbol: String,
-    #[serde(rename = "timeframeMinutes")]
-    timeframe_minutes: u32,
-    bars: u16,
-}
-
-impl EaRatesRequest {
-    /// Largest candle count one request may ask for.
-    pub const MAX_BARS: u16 = 240;
-
-    /// Builds a validated request.
-    ///
-    /// # Errors
-    /// Returns [`BrokerError::InvalidPayload`] when the timeframe is not a
-    /// standard MT4 period or the bar count is outside 1-240.
-    pub fn new(symbol: &Symbol, timeframe_minutes: u32, bars: u16) -> Result<Self, BrokerError> {
-        if !SUPPORTED_TIMEFRAME_MINUTES.contains(&timeframe_minutes) {
-            return Err(BrokerError::InvalidPayload {
-                field: "timeframeMinutes",
-                reason: "must be a standard MT4 period in minutes (1, 5, 15, 30, 60, 240, 1440, 10080, 43200)",
-            });
-        }
-        if bars == 0 || bars > Self::MAX_BARS {
-            return Err(BrokerError::InvalidPayload {
-                field: "bars",
-                reason: "must be from 1 through 240",
-            });
-        }
-        Ok(Self {
-            symbol: symbol.as_str().to_owned(),
-            timeframe_minutes,
-            bars,
-        })
-    }
-
-    /// Instrument the candles are requested for.
-    pub fn symbol(&self) -> &str {
-        &self.symbol
-    }
-
-    /// Requested timeframe in minutes.
-    pub fn timeframe_minutes(&self) -> u32 {
-        self.timeframe_minutes
-    }
-
-    /// Requested number of closed candles.
-    pub fn bars(&self) -> u16 {
-        self.bars
-    }
-}
-
-/// One closed OHLC candle as the terminal reports it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CandlePayload {
-    /// Bar open time (Unix seconds, broker server time).
-    pub time: i64,
-    /// Open price.
-    pub open: f64,
-    /// High price.
-    pub high: f64,
-    /// Low price.
-    pub low: f64,
-    /// Close price.
-    pub close: f64,
-    /// Tick volume reported by MT4.
-    pub volume: i64,
-}
-
-impl CandlePayload {
-    fn validate(&self) -> Result<(), String> {
-        if self.time <= 0 {
-            return Err("candle time must be positive".to_owned());
-        }
-        for (name, value) in [
-            ("open", self.open),
-            ("high", self.high),
-            ("low", self.low),
-            ("close", self.close),
-        ] {
-            if !value.is_finite() || value <= 0.0 {
-                return Err(format!("candle {name} must be a finite, positive price"));
-            }
-        }
-        if self.high < self.low {
-            return Err("candle high must not be below its low".to_owned());
-        }
-        if self.high < self.open.max(self.close) {
-            return Err("candle high must not be below its body prices".to_owned());
-        }
-        if self.low > self.open.min(self.close) {
-            return Err("candle low must not be above its body prices".to_owned());
-        }
-        if self.volume < 0 {
-            return Err("candle volume must be non-negative".to_owned());
-        }
-        Ok(())
-    }
-}
-
-/// Result of a `rates` command: the requested window of closed candles.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RatesPayload {
-    /// Instrument the candles belong to.
-    pub symbol: String,
-    /// Timeframe in minutes.
-    #[serde(rename = "timeframeMinutes")]
-    pub timeframe_minutes: u32,
-    /// Closed candles, oldest first.
-    pub candles: Vec<CandlePayload>,
-}
-
-impl RatesPayload {
-    /// Rejects unusable series before they reach callers: unknown
-    /// symbol/timeframe, an empty or oversized series, non-monotonic times,
-    /// or any candle that fails OHLC sanity. Market-feed implementations call
-    /// this again when converting to domain types, so a hand-built payload
-    /// cannot bypass the checks.
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        Symbol::parse(&self.symbol).map_err(|error| format!("rates symbol is invalid: {error}"))?;
-        if !SUPPORTED_TIMEFRAME_MINUTES.contains(&self.timeframe_minutes) {
-            return Err("rates timeframeMinutes is not a standard MT4 period".to_owned());
-        }
-        let max = usize::from(EaRatesRequest::MAX_BARS);
-        if self.candles.is_empty() || self.candles.len() > max {
-            return Err(format!("rates candles must be 1-{max} entries"));
-        }
-        let mut previous = None;
-        for candle in &self.candles {
-            candle.validate()?;
-            if previous.is_some_and(|previous| candle.time <= previous) {
-                return Err("candle times must be strictly increasing".to_owned());
-            }
-            previous = Some(candle.time);
-        }
-        Ok(())
-    }
-}
-
-/// Order request sent to the EA for validation or execution, derived only from
-/// an approved intent. Fields mirror the intent wire contract so the EA can
-/// read them without a nested parser.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct EaOrderRequest {
-    symbol: String,
-    side: &'static str,
-    order_type: &'static str,
-    magic: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    price: Option<f64>,
-    volume: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stop_loss: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    take_profit: Option<f64>,
-}
-
-impl EaOrderRequest {
-    /// Maps an approved intent to the EA wire request.
-    ///
-    /// The intent type can only be minted by the risk gate, so an order
-    /// request cannot be built from a raw draft.
-    pub fn from_intent(intent: &TradeIntent) -> Self {
-        let draft = intent.draft();
-        Self {
-            symbol: draft.symbol().as_str().to_owned(),
-            side: draft.side().as_str(),
-            order_type: draft.order().as_str(),
-            magic: ORDER_MAGIC,
-            price: draft.order().price().map(|price| price.value()),
-            volume: draft.volume().value(),
-            stop_loss: draft.stop_loss().map(|price| price.value()),
-            take_profit: draft.take_profit().map(|price| price.value()),
-        }
-    }
-}
-
-/// Typed result of a completed command.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CommandPayload {
-    /// `ping` carries no payload.
-    Ping,
-    /// Result of `account_snapshot`.
-    AccountSnapshot(AccountSnapshotPayload),
-    /// Result of `order_check`; never an executed order.
-    OrderCheck(OrderCheckPayload),
-    /// Result of `open_order`; reports whether anything reached the broker.
-    OpenOrder(OrderExecutionPayload),
-    /// Result of `close_order`; reports whether anything reached the broker.
-    CloseOrder(OrderExecutionPayload),
-    /// Result of `modify_order`; reports whether the stops were changed.
-    ModifyOrder(OrderExecutionPayload),
-    /// Result of `rates`; the requested window of closed candles.
-    Rates(RatesPayload),
-}
-
-/// Lifecycle state of one command.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CommandState {
-    /// Delivered (or awaiting delivery) and not yet acknowledged.
-    Pending,
-    /// Acknowledged successfully with a validated payload.
-    Completed {
-        /// Validated result payload.
-        payload: CommandPayload,
-    },
-    /// Timed out or acknowledged as failed.
-    Failed {
-        /// Non-sensitive explanation.
-        reason: String,
-    },
-}
-
-/// One command as seen by callers and tests.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CommandRecord {
-    /// Identifier.
-    pub id: CommandId,
-    /// Requested kind.
-    pub kind: CommandKind,
-    /// Current state.
-    pub state: CommandState,
-}
-
-/// One command as listed for operators: identity, lifecycle, and a bounded
-/// result summary that never carries raw account balances.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListedCommand {
-    /// Identifier.
-    pub id: CommandId,
-    /// Requested kind.
-    pub kind: CommandKind,
-    /// Lifecycle status: pending, completed, or failed.
-    pub status: &'static str,
-    /// Bounded result summary for completed commands.
-    pub summary: Option<Value>,
-    /// Non-sensitive failure reason for failed commands.
-    pub reason: Option<String>,
-}
 
 /// Acknowledgement sent by the EA.
 #[derive(Debug, Deserialize)]
@@ -775,16 +184,16 @@ pub enum EaReply {
         kind: CommandKind,
         /// Present for order validation and execution commands.
         #[serde(skip_serializing_if = "Option::is_none")]
-        order: Option<Box<EaOrderRequest>>,
+        order: Option<Box<OrderRequest>>,
         /// Present for close commands.
         #[serde(skip_serializing_if = "Option::is_none")]
-        close: Option<Box<EaCloseRequest>>,
+        close: Option<Box<CloseOrderRequest>>,
         /// Present for stop-change commands.
         #[serde(skip_serializing_if = "Option::is_none")]
-        modify: Option<Box<EaModifyRequest>>,
+        modify: Option<Box<ModifyOrderRequest>>,
         /// Present for market-rates commands.
         #[serde(skip_serializing_if = "Option::is_none")]
-        rates: Option<Box<EaRatesRequest>>,
+        rates: Option<Box<RatesRequest>>,
     },
 }
 
@@ -820,13 +229,13 @@ struct EaCommand {
 #[derive(Debug, Clone, PartialEq)]
 enum CommandRequest {
     /// Validation or execution request for a new order.
-    Order(EaOrderRequest),
+    Order(OrderRequest),
     /// Close request for a validated Veyra position.
-    Close(EaCloseRequest),
+    Close(CloseOrderRequest),
     /// Stop change for a validated Veyra position.
-    Modify(EaModifyRequest),
+    Modify(ModifyOrderRequest),
     /// Market-rates request for one symbol and timeframe.
-    Rates(EaRatesRequest),
+    Rates(RatesRequest),
 }
 
 /// Retained account snapshot plus the instant it was validated.
@@ -876,9 +285,9 @@ impl EaLink {
 
     /// Queues a broker-side order validation.
     ///
-    /// Takes an [`EaOrderRequest`], which can only be derived from an approved
+    /// Takes an [`OrderRequest`], which can only be derived from an approved
     /// intent, so no raw draft can reach the terminal through this path.
-    pub fn enqueue_order_check(&self, request: EaOrderRequest) -> CommandId {
+    pub fn enqueue_order_check(&self, request: OrderRequest) -> CommandId {
         self.enqueue_with(
             CommandKind::OrderCheck,
             Some(CommandRequest::Order(request)),
@@ -891,12 +300,12 @@ impl EaLink {
     /// an approved intent. The terminal still refuses to trade until its own
     /// live-orders input is enabled, so real money needs two independent
     /// controls plus a gate approval.
-    pub fn enqueue_order(&self, request: EaOrderRequest) -> CommandId {
+    pub fn enqueue_order(&self, request: OrderRequest) -> CommandId {
         self.enqueue_with(CommandKind::OpenOrder, Some(CommandRequest::Order(request)))
     }
 
     /// Queues a close for one validated Veyra-owned ticket.
-    pub fn enqueue_close(&self, request: EaCloseRequest) -> CommandId {
+    pub fn enqueue_close(&self, request: CloseOrderRequest) -> CommandId {
         self.enqueue_with(
             CommandKind::CloseOrder,
             Some(CommandRequest::Close(request)),
@@ -904,7 +313,7 @@ impl EaLink {
     }
 
     /// Queues a stop change for one validated Veyra-owned ticket.
-    pub fn enqueue_modify(&self, request: EaModifyRequest) -> CommandId {
+    pub fn enqueue_modify(&self, request: ModifyOrderRequest) -> CommandId {
         self.enqueue_with(
             CommandKind::ModifyOrder,
             Some(CommandRequest::Modify(request)),
@@ -912,7 +321,7 @@ impl EaLink {
     }
 
     /// Queues a read-only market-rates request.
-    pub fn enqueue_rates(&self, request: EaRatesRequest) -> CommandId {
+    pub fn enqueue_rates(&self, request: RatesRequest) -> CommandId {
         self.enqueue_with(CommandKind::Rates, Some(CommandRequest::Rates(request)))
     }
 
@@ -1318,8 +727,59 @@ impl BrokerLink for EaLink {
             }
         }
     }
-}
 
+    fn enqueue_account_snapshot(&self) -> CommandId {
+        self.enqueue(CommandKind::AccountSnapshot)
+    }
+
+    fn enqueue_order_check(&self, request: OrderRequest) -> CommandId {
+        EaLink::enqueue_order_check(self, request)
+    }
+
+    fn enqueue_open_order(&self, request: OrderRequest) -> CommandId {
+        EaLink::enqueue_order(self, request)
+    }
+
+    fn enqueue_close_order(&self, request: CloseOrderRequest) -> CommandId {
+        EaLink::enqueue_close(self, request)
+    }
+
+    fn enqueue_modify_order(&self, request: ModifyOrderRequest) -> CommandId {
+        EaLink::enqueue_modify(self, request)
+    }
+
+    fn enqueue_rates(&self, request: RatesRequest) -> CommandId {
+        EaLink::enqueue_rates(self, request)
+    }
+
+    fn has_pending(&self, kind: CommandKind) -> bool {
+        EaLink::has_pending(self, kind)
+    }
+
+    fn recent_commands(&self, limit: usize) -> Vec<ListedCommand> {
+        EaLink::recent_commands(self, limit)
+    }
+
+    fn command(&self, id: CommandId) -> Option<CommandRecord> {
+        EaLink::command(self, id)
+    }
+
+    async fn await_command(&self, id: CommandId, timeout: Duration) -> CommandState {
+        EaLink::await_command(self, id, timeout).await
+    }
+
+    fn last_account(&self) -> Option<AccountSnapshotPayload> {
+        EaLink::last_account(self)
+    }
+
+    fn last_account_age(&self, now: SystemTime) -> Option<Duration> {
+        EaLink::last_account_age(self, now)
+    }
+
+    fn attach_audit(&self, audit: Arc<AuditRuntime>) {
+        EaLink::set_audit(self, audit)
+    }
+}
 #[post("/ea/poll")]
 /// Accepts one EA poll after authenticating the shared token.
 ///
@@ -1566,14 +1026,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CandlePayload, CommandRequest, EaAck, EaCloseRequest, EaLink, EaModifyRequest,
-        EaOrderRequest, EaRatesRequest, EaReply, EaToken, ORDER_MAGIC, OrderCheckPayload,
-        RatesPayload, closed_managed_positions, hex_preview, payload_for,
+        CloseOrderRequest, CommandRequest, EaAck, EaLink, EaReply, EaToken, ModifyOrderRequest,
+        ORDER_MAGIC, OrderCheckPayload, OrderRequest, RatesPayload, RatesRequest,
+        closed_managed_positions, hex_preview, payload_for,
     };
     use crate::broker::Symbol as BrokerSymbol;
-    use crate::broker::ea::{
-        AccountSnapshotPayload, CommandId, CommandKind, CommandPayload, CommandState, PositionKind,
-        PositionPayload,
+    use crate::broker::{
+        AccountSnapshotPayload, CandlePayload, CommandId, CommandKind, CommandPayload,
+        CommandState, PositionKind, PositionPayload,
     };
     use crate::trading::intent::{
         OrderKind, Price, Side, TradeIntent, TradeIntentDraft, Volume, parse_instrument,
@@ -1618,7 +1078,7 @@ mod tests {
     #[test]
     fn rates_requests_validate_timeframes_and_bounds() {
         let symbol = BrokerSymbol::parse("EURUSD").expect("symbol");
-        let request = EaRatesRequest::new(&symbol, 240, 48).expect("valid request");
+        let request = RatesRequest::new(&symbol, 240, 48).expect("valid request");
         assert_eq!(request.symbol(), "EURUSD");
         assert_eq!(request.timeframe_minutes(), 240);
         assert_eq!(request.bars(), 48);
@@ -1628,18 +1088,18 @@ mod tests {
         );
         for minutes in [0, 7, 90, 43_201] {
             assert!(
-                EaRatesRequest::new(&symbol, minutes, 10).is_err(),
+                RatesRequest::new(&symbol, minutes, 10).is_err(),
                 "must reject timeframe {minutes}"
             );
         }
         for bars in [0, 241] {
             assert!(
-                EaRatesRequest::new(&symbol, 240, bars).is_err(),
+                RatesRequest::new(&symbol, 240, bars).is_err(),
                 "must reject bars {bars}"
             );
         }
         assert!(
-            EaRatesRequest::new(&symbol, 1, 240).is_ok(),
+            RatesRequest::new(&symbol, 1, 240).is_ok(),
             "the full M1 window is valid"
         );
     }
@@ -1697,7 +1157,7 @@ mod tests {
             Duration::from_secs(15),
         );
         let symbol = BrokerSymbol::parse("EURUSD").expect("symbol");
-        let request = EaRatesRequest::new(&symbol, 240, 2).expect("request");
+        let request = RatesRequest::new(&symbol, 240, 2).expect("request");
         let id = link.enqueue_rates(request.clone());
 
         let (delivered, kind, payload) = link.deliverable().expect("pending command");
@@ -1729,7 +1189,7 @@ mod tests {
             Duration::from_secs(15),
         );
         let symbol = BrokerSymbol::parse("EURUSD").expect("symbol");
-        let id = link.enqueue_rates(EaRatesRequest::new(&symbol, 240, 2).expect("request"));
+        let id = link.enqueue_rates(RatesRequest::new(&symbol, 240, 2).expect("request"));
         assert_eq!(
             link.command(id).expect("record").state,
             CommandState::Pending
@@ -1760,7 +1220,7 @@ mod tests {
         }
 
         // A malformed series fails the command instead of completing it.
-        let malformed = link.enqueue_rates(EaRatesRequest::new(&symbol, 240, 1).expect("request"));
+        let malformed = link.enqueue_rates(RatesRequest::new(&symbol, 240, 1).expect("request"));
         link.apply_ack(&EaAck {
             id: malformed,
             ok: true,
@@ -1782,7 +1242,7 @@ mod tests {
         }
 
         // A command that never gets acknowledged fails on the caller's deadline.
-        let stalled = link.enqueue_rates(EaRatesRequest::new(&symbol, 240, 1).expect("request"));
+        let stalled = link.enqueue_rates(RatesRequest::new(&symbol, 240, 1).expect("request"));
         match link
             .await_command(stalled, Duration::from_millis(150))
             .await
@@ -2205,7 +1665,7 @@ mod tests {
             None,
         );
         let intent = TradeIntent::approve(draft);
-        let request = EaOrderRequest::from_intent(&intent);
+        let request = OrderRequest::from_intent(&intent);
         let wire = serde_json::to_value(&request).expect("serializable");
         assert_eq!(wire["symbol"], "EURUSD");
         assert_eq!(wire["side"], "buy");
@@ -2223,7 +1683,7 @@ mod tests {
             None,
             None,
         );
-        let wire = serde_json::to_value(EaOrderRequest::from_intent(&TradeIntent::approve(limit)))
+        let wire = serde_json::to_value(OrderRequest::from_intent(&TradeIntent::approve(limit)))
             .expect("serializable");
         assert_eq!(wire["order_type"], "limit");
         assert_eq!(wire["price"], 1.2);
@@ -2246,13 +1706,13 @@ mod tests {
             None,
             None,
         ));
-        let id = link.enqueue_order_check(EaOrderRequest::from_intent(&intent));
+        let id = link.enqueue_order_check(OrderRequest::from_intent(&intent));
         let (delivered_id, kind, order) = link.deliverable().expect("pending command");
         assert_eq!(delivered_id, id);
         assert_eq!(kind, CommandKind::OrderCheck);
         assert_eq!(
             order,
-            Some(CommandRequest::Order(EaOrderRequest::from_intent(&intent)))
+            Some(CommandRequest::Order(OrderRequest::from_intent(&intent)))
         );
 
         let record = link.command(id).expect("record");
@@ -2312,7 +1772,7 @@ mod tests {
             None,
             None,
         ));
-        let request = EaOrderRequest::from_intent(&intent);
+        let request = OrderRequest::from_intent(&intent);
         let wire = serde_json::to_value(&request).expect("serializable");
         assert_eq!(wire["magic"], ORDER_MAGIC);
 
@@ -2330,7 +1790,7 @@ mod tests {
 
     #[test]
     fn close_orders_carry_the_ticket_and_magic() {
-        let request = EaCloseRequest::new(123, ORDER_MAGIC);
+        let request = CloseOrderRequest::new(123, ORDER_MAGIC);
         let wire = serde_json::to_value(&request).expect("serializable");
         assert_eq!(wire["ticket"], 123);
         assert_eq!(wire["magic"], ORDER_MAGIC);
@@ -2396,7 +1856,7 @@ mod tests {
 
     #[test]
     fn modify_orders_carry_their_stops_and_magic() {
-        let request = EaModifyRequest::new(123, ORDER_MAGIC, Some(1.05), None);
+        let request = ModifyOrderRequest::new(123, ORDER_MAGIC, Some(1.05), None);
         let wire = serde_json::to_value(&request).expect("serializable");
         assert_eq!(wire["ticket"], 123);
         assert_eq!(wire["magic"], ORDER_MAGIC);

@@ -11,6 +11,7 @@ pub mod broker;
 pub mod config;
 pub mod control;
 pub mod jev;
+pub mod logs;
 pub mod market;
 pub mod model;
 pub mod observability;
@@ -22,11 +23,13 @@ pub mod store;
 pub mod trading;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use audit::AuditRuntime;
 use broker::BrokerRuntime;
 use config::ServiceConfig;
 use jev::JevRuntime;
+use logs::LogBuffer;
 use market::MarketRuntime;
 use model::ModelRuntime;
 use risk::RiskGate;
@@ -42,8 +45,10 @@ pub struct AppState {
     model: Option<ModelRuntime>,
     jev: Option<JevRuntime>,
     audit: Option<AuditRuntime>,
+    logs: Option<Arc<LogBuffer>>,
     risk: RiskGate,
     stop_basis: Arc<StopBasis>,
+    rotation: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -62,8 +67,10 @@ impl AppState {
             model,
             jev: None,
             audit: None,
+            logs: None,
             risk,
             stop_basis: Arc::new(StopBasis::default()),
+            rotation: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -88,6 +95,12 @@ impl AppState {
     /// Attaches the configured judgement integration, if any.
     pub fn with_jev(mut self, jev: Option<JevRuntime>) -> Self {
         self.jev = jev;
+        self
+    }
+
+    /// Attaches the in-process log buffer shown by the console, if any.
+    pub fn with_logs(mut self, logs: Arc<LogBuffer>) -> Self {
+        self.logs = Some(logs);
         self
     }
 
@@ -132,8 +145,19 @@ impl AppState {
         self.audit.as_ref()
     }
 
+    /// Returns the in-process log buffer shown by the console, if any.
+    pub fn logs(&self) -> Option<&Arc<LogBuffer>> {
+        self.logs.as_ref()
+    }
+
     /// Returns the deterministic risk gate every intent must pass.
     pub fn risk(&self) -> &RiskGate {
         &self.risk
+    }
+
+    /// Cursor the multi-symbol autopilot advances once per tick so each
+    /// configured instrument gets its turn.
+    pub fn rotation(&self) -> &Arc<AtomicUsize> {
+        &self.rotation
     }
 }

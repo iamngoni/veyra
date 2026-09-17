@@ -7,12 +7,14 @@ import type {
   CandleSeries,
   CommandRecord,
   FeedEvent,
+  LogLevel,
+  LogRecord,
   Metrics,
   Position,
   RiskPolicy,
   Status,
 } from '../lib/api'
-import { VEYRA_MAGIC } from '../lib/api'
+import { LOG_LEVELS, VEYRA_MAGIC } from '../lib/api'
 import {
   commandTone,
   detailRows,
@@ -268,7 +270,10 @@ export function AutopilotPanel({
         <Field label="Window" value={on && status ? `${status.bars} bars` : '—'} />
         <Field label="Model tier" value={status?.tier ?? '—'} />
         <Field label="Judgements" value={status?.jev ?? '—'} />
-        <Field label="Symbol" value={status?.symbol ?? 'chart symbol'} />
+        <Field
+          label="Symbols"
+          value={status && status.symbols.length > 0 ? status.symbols.join(' · ') : 'chart symbol'}
+        />
         <Field
           label="Stops"
           value={
@@ -527,6 +532,83 @@ export function ActivityFeed({
               </li>
             )
           })}
+        </ul>
+      )}
+    </Panel>
+  )
+}
+
+/* ---------- agent log ---------- */
+
+const logLevelTone: Record<string, string> = {
+  error: 'text-rose-300 bg-rose-500/15',
+  warn: 'text-amber-300 bg-amber-500/15',
+  info: 'text-sky-300 bg-sky-500/10',
+  debug: 'text-slate-400 bg-slate-700/30',
+  trace: 'text-slate-500 bg-slate-700/20',
+}
+
+export function LogsPanel({
+  logs,
+  error,
+  level,
+  onLevelChange,
+}: {
+  logs: LogRecord[]
+  error?: string
+  level: LogLevel
+  onLevelChange: (level: LogLevel) => void
+}) {
+  const ordered = [...logs].reverse()
+  return (
+    <Panel
+      title="Agent log"
+      className="min-h-[280px]"
+      detail={
+        <span className="flex items-center gap-1">
+          {LOG_LEVELS.map((candidate) => (
+            <button
+              key={candidate}
+              type="button"
+              onClick={() => onLevelChange(candidate)}
+              className={`rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wider transition-colors ${
+                candidate === level
+                  ? 'border-slate-500 text-slate-200'
+                  : 'border-slate-800 text-slate-500 hover:border-slate-600'
+              }`}
+            >
+              {candidate}
+            </button>
+          ))}
+        </span>
+      }
+    >
+      {error ? <div className="px-3 py-2 text-[11px] text-rose-400">{error}</div> : null}
+      {ordered.length === 0 ? (
+        <div className="p-3 text-xs text-slate-500">{error ? 'Log tail unavailable.' : 'No log records yet.'}</div>
+      ) : (
+        <ul className="divide-y divide-slate-800/40">
+          {ordered.map((record) => (
+            <li key={record.seq} className="flex items-start gap-2 px-3 py-1 text-xs">
+              <span className="w-14 shrink-0 pt-0.5 font-mono text-[10px] text-slate-500">
+                {clockTime(record.atMs)}
+              </span>
+              <span
+                className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] uppercase ${
+                  logLevelTone[record.level] ?? 'bg-slate-700/30 text-slate-300'
+                }`}
+              >
+                {record.level}
+              </span>
+              <span className="min-w-0 flex-1 font-mono text-[11px] leading-relaxed text-slate-300">
+                <span className="text-slate-500">{record.target}</span>{' '}
+                <span>{record.message}</span>
+                {Object.keys(record.fields).length > 0 ? (
+                  <span className="text-slate-500"> {JSON.stringify(record.fields)}</span>
+                ) : null}
+              </span>
+            </li>
+          ))}
         </ul>
       )}
     </Panel>

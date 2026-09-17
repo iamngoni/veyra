@@ -71,6 +71,19 @@ describe('api', () => {
     ])
   })
 
+  it('builds the log tail with level and cursor', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.logs(undefined, 'info')
+    await api.logs(7, 'error', 50)
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      '/api/logs?limit=300&level=info',
+      '/api/logs?limit=50&level=error&after=7',
+    ])
+  })
+
   it('returns parsed JSON', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ status: 'ok' })))
     await expect(api.status()).resolves.toEqual({ status: 'ok' })

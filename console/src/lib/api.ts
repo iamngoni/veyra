@@ -11,7 +11,10 @@ export type AutopilotStatus = {
   timeframe: string
   tier: string
   bars: number
+  /** First configured instrument, or null when the chart symbol is used. */
   symbol: string | null
+  /** Instruments the loop rotates through; empty means the chart symbol. */
+  symbols: string[]
   jev: string
   /** Break-even multiple of the entry risk; zero when disabled. */
   breakeven_r: number
@@ -97,6 +100,22 @@ export type FeedEvent = {
 
 export type Feed = { events: FeedEvent[]; latest: number; next: number }
 
+/** Levels the service log tail accepts, most severe first. */
+export type LogLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace'
+
+export const LOG_LEVELS: LogLevel[] = ['error', 'warn', 'info', 'debug', 'trace']
+
+export type LogRecord = {
+  seq: number
+  atMs: number
+  level: string
+  target: string
+  message: string
+  fields: Record<string, unknown>
+}
+
+export type LogTail = { logs: LogRecord[]; latest: number }
+
 export type CommandRecord = {
   id: string
   kind: string
@@ -148,6 +167,8 @@ export const api = {
   candles: (bars = 48) => get<CandleSeries>(`/market/candles?timeframe=H4&bars=${bars}`),
   events: (after: number | undefined, waitMs = 15000) =>
     get<Feed>(after === undefined ? '/events' : `/events?after=${after}&wait_ms=${waitMs}`),
+  logs: (after: number | undefined, level: LogLevel, limit = 300) =>
+    get<LogTail>(`/logs?limit=${limit}&level=${level}${after === undefined ? '' : `&after=${after}`}`),
 }
 
 export const VEYRA_MAGIC = 77041

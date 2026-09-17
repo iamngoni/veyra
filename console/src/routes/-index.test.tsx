@@ -14,10 +14,12 @@ const mocks = vi.hoisted(() => ({
   candles: vi.fn(),
   metrics: vi.fn(),
   events: vi.fn(),
+  logs: vi.fn(),
 }))
 
 vi.mock('../lib/api', () => ({
   VEYRA_MAGIC: 77041,
+  LOG_LEVELS: ['error', 'warn', 'info', 'debug', 'trace'],
   api: {
     status: mocks.status,
     account: mocks.account,
@@ -25,6 +27,7 @@ vi.mock('../lib/api', () => ({
     candles: mocks.candles,
     metrics: mocks.metrics,
     events: mocks.events,
+    logs: mocks.logs,
   },
 }))
 
@@ -52,6 +55,7 @@ beforeEach(() => {
       tier: 'balanced',
       bars: 48,
       symbol: 'EURUSD',
+      symbols: ['EURUSD'],
       jev: 'auto',
       breakeven_r: 1,
       trail_r: 1,
@@ -94,6 +98,7 @@ beforeEach(() => {
   })
   mocks.metrics.mockResolvedValue({ service: 'veyra', version: '0.1.0', counters: { 'event.proposal_evaluated': 3 }, feedLatest: 12 })
   mocks.events.mockImplementation(() => new Promise(() => undefined))
+  mocks.logs.mockResolvedValue({ logs: [], latest: 0 })
 })
 
 describe('Dashboard', () => {
@@ -109,6 +114,7 @@ describe('Dashboard', () => {
     expect(screen.getByText('Commands')).toBeTruthy()
     expect(screen.getByText('Risk')).toBeTruthy()
     expect(screen.getByText('Metrics')).toBeTruthy()
+    expect(screen.getByText('Agent log')).toBeTruthy()
     expect(screen.getByText(/v0.1.0/)).toBeTruthy()
   })
 })

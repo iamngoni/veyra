@@ -1,319 +1,221 @@
 # Veyra architecture
 
-## Current implementation
+Veyra is an autonomous MetaTrader 4 trading service: a Rust/Actix process that decides on a cadence, but can only act through a deterministic risk gate and two independent arming switches. Every external integration sits behind a narrow trait selected by configuration, and every decision, command, and acknowledgement is journaled.
 
-The first crate is `veyra-service`, a Rust 2024 Actix Web control plane. It
-exposes health, readiness, status, and a non-executing intent-evaluation
-endpoint. Runtime settings are parsed into refined types before they reach
-handlers. Status reports the active `broker_provider`, whether the broker link
-is fresh and connected, and `trading_enabled` (still false: no execution path
-exists).
+This page describes the code as it is in this repository: what is live, how the pieces fit, and where to change things.
 
-## Boundaries
+## What Veyra is
 
-```text
-Config -> Runtime state -> HTTP control plane
-             |
-             +-- DecisionEngine (selected by VEYRA_MODEL_PROVIDER)
-             +-- Risk gate + typed trade intents + check-only control surface
-             +-- BrokerLink (selected by VEYRA_BROKER_PROVIDER)
-             |      +-- Ea  (loopback HTTP control channel)
-             |      +-- ... (hosted bridge / direct API, added later)
-             +-- Audit trail (PostgreSQL via SQLx)
-             +-- Persistence/reconciliation
+- **An autonomous MT4 trading service** (`crates/veyra-service`) behind a loopback control surface. The MT4 terminal holds the broker session; the service never sees broker credentials.
+- **Two independent arming switches** in front of real money: `VEYRA_TRADING_ENABLED` in the service and the EA's `InAllowLiveOrders` input (armed at build time via `VEYRA_EA_ALLOW_LIVE` and `scripts/compile_ea.sh`). Either one alone yields dry runs or rejections, never an order.
+- **A deterministic risk gate** (`risk/gate.rs`): the only authority that mints an executable intent. Model confidence cannot override limits.
+- **Provider-neutral integration** — broker, market data, decision model, judgements, and audit storage are traits with configuration-selected implementations.
+
+Status at a glance (see `README.md` and `docs/roadmap.md` for evidence):
+
+| Area | State |
+| --- | --- |
+| EA control channel | Live-proven: heartbeat, ping/pong, and an `account_snapshot` round trip through the tunnel |
+| Decision model | Live-proven structured answers over the OpenRouter preset |
+| Jev judgements | Live-proven (`jev-1.13.0`, ~1.3 s per request) |
+| Risk gate + `order_check` | Live-proven (retcode 0 and 129 for validation, without sending an order) |
+| Autonomous entry | Live-proven first autonomous order (EURUSD 0.01 sell, ticket 10650805, retcode 0) after explicit owner approval of both switches |
+| Audit trail, console, alerting, launchd supervision, backups | Running under supervision on this machine |
+| Durable always-on host, managed secrets, remote monitoring, versioned deploys | Open roadmap items (`docs/deployment.md` prepares the move) |
+
+## Runtime topology
+
+| Piece | Role | Where |
+| --- | --- | --- |
+| Service (`veyra-service`) | configuration, risk gate, command queue, autopilot, HTTP surface | Rust 2024 + Actix Web + Tokio, `crates/veyra-service` |
+| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/market/candles`, `/reconciliation` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
+| EA channel listener | token-authenticated `POST /ea/poll` carrying heartbeats and the command queue | `127.0.0.1:7801` (`VEYRA_EA_BIND_*`); non-loopback binds are rejected at startup |
+| MT4 terminal + `VeyraProbe` EA | holds the broker session, polls the channel, executes acknowledged commands, reports dry runs while disarmed | `ea/VeyraProbe.mq4` inside MetaTrader 4 (Wine) |
+| Cloudflare tunnel | `veyra.antonlabs.cc` → `127.0.0.1:7801` — the EA channel only | launchd agent, `KeepAlive` |
+| PostgreSQL | append-only `audit_events` via SQLx (`migrations/0001_audit_events.sql`) | `VEYRA_DATABASE_URL`; unreachable configured database fails startup |
+| Console | operations UI reading the loopback service through its own `/api` proxy | TanStack Start + React + Tailwind, `127.0.0.1:3000` |
+| launchd agents | terminal, tunnel, service, console, alert probe, log rotation, audit backups | `scripts/launchd/`, `scripts/install-launchd.sh` |
+
+```mermaid
+flowchart LR
+    subgraph mac["Supervised Mac (launchd)"]
+        Browser["Browser<br/>http://127.0.0.1:3000"]
+        Console["Console — TanStack Start<br/>Vite preview · no auth"]
+        Service["veyra-service (Rust · Actix Web · Tokio)<br/>diagnostics 127.0.0.1:8080<br/>EA channel 127.0.0.1:7801"]
+        EA["VeyraProbe EA (MQL4)"]
+        MT4["MetaTrader 4 terminal (Wine)"]
+        PG[("PostgreSQL 17<br/>audit_events")]
+        Tunnel["cloudflared tunnel<br/>veyra.antonlabs.cc"]
+    end
+
+    Model["OpenRouter — DecisionEngine"]
+    Jev["TypeSafe Jev — SemanticJudge"]
+    Broker[("Broker — IFC Markets")]
+
+    Browser -->|"loads UI"| Console
+    Console -->|"proxies /api to 127.0.0.1:8080"| Service
+
+    EA -->|"HTTPS POST /ea/poll (WebRequest + token)"| Tunnel
+    Tunnel -->|"127.0.0.1:7801"| Service
+    Service -->|"poll reply: cmd / ping / none"| EA
+    MT4 -.->|"hosts"| EA
+    MT4 -->|"orders and prices"| Broker
+
+    Service -->|"structured proposals (HTTPS)"| Model
+    Service -->|"judgement requests (HTTPS)"| Jev
+    Service -->|"append-only audit events"| PG
 ```
 
-### Model providers (swappable)
+Operational notes:
 
-Model access mirrors the broker pattern. `DecisionEngine` in `model/mod.rs` is
-the contract: `provider()` plus a structured `answer(request)` returning a
-parsed JSON value. The implementation is selected by `VEYRA_MODEL_PROVIDER`
-and constructed once at startup by `ModelRuntime`.
+- Everything is deployed loopback-only except the tunnel: the EA channel rejects non-loopback binds at startup, and the diagnostics/control bind is configured to `127.0.0.1` and must not be exposed directly. The tunnel carries the EA channel only; diagnostics are never exposed publicly. Exposing `/account` or the console beyond loopback requires authentication first.
+- MQL4 has no sockets and `WebRequest` only supports the scheme-default port, so the channel runs over HTTPS (443) to the tunnel; see ADR 0002.
+- The EA polls about once per second; state older than 10 s is stale. Commands are typed, delivered on a poll, redelivered until acknowledged, and fail after 15 s.
+- The service runs both listeners from one process: the main Actix app on 8080 and a one-route Actix app on 7801; the companion listener is stopped with the main server.
+- The service tees its structured tracing events into a bounded in-process ring (2,048 records) served at `GET /logs`; like the event feed it is process-lifetime and carries no request bodies, credentials, or account data.
 
-**Implementation 1 — `agent-runtime` adapter (`model/agent_runtime_engine.rs`).**
-It owns every `agent-runtime` type, so the rest of the service never imports the
-dependency. The crate is pinned to a Git revision; Veyra contributed the
-dynamic-schema entry point (`run_structured_with_format`) upstream so callers
-can constrain responses to schemas only known at runtime. Models come from
-explicitly configured tiers — never from library defaults — and are sent
-through the OpenAI-compatible path (OpenRouter preset), with a bounded retry
-policy for transient failures.
+## Provider abstraction model
 
-Operational constraint: tier models must accept forced tool calls, because the
-schema is enforced through `tool_choice`. Reasoning modes that reject it (for
-example DeepSeek thinking) return provider errors; verified working models are
-listed in `model/settings.rs`.
+Every integration follows the same five-part shape: **a narrow trait + a provider enum with `parse()` + a validated settings parser + a runtime factory chosen by an environment variable + shared contract tests**. Construction happens once at startup; callers hold `Arc<dyn Trait>` and never see vendor types.
 
-Known gaps for later increments:
+| Integration | Env var | Value | Contract | Selector | Settings parser | Runtime factory | Implementation |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Broker | `VEYRA_BROKER_PROVIDER` | `ea` | `BrokerLink` (`broker/mod.rs`) with the neutral command/report types in `broker/command.rs` | `BrokerProvider` | `broker/settings.rs` (`BrokerSettings::from_source`) | `BrokerRuntime::from_settings` (`broker/mod.rs`) | `broker/ea.rs` (`EaLink`, implementing `BrokerLink`) |
+| Market data | `VEYRA_MARKET_PROVIDER` | `ea` | `MarketFeed` (`market/mod.rs`) | `MarketProvider` | `market/settings.rs` (`MarketSettings::from_source`) | `MarketRuntime::from_settings` (`market/mod.rs`) | `market/ea.rs` (`EaMarketFeed`) |
+| Decision model | `VEYRA_MODEL_PROVIDER` | `openrouter` | `DecisionEngine` (`model/mod.rs`) | `ModelProvider` | `model/settings.rs` (`ModelSettings::from_source`) | `ModelRuntime::from_settings` (`model/mod.rs`) | `model/agent_runtime_engine.rs` (`AgentRuntimeEngine`), wrapped in `BudgetedEngine` (`model/budget.rs`) |
+| Judgements | `VEYRA_JEV_PROVIDER` | `typesafe` | `SemanticJudge` (`jev/mod.rs`) | `JevProvider` | `jev/settings.rs` (`JevSettings::from_source`) | `JevRuntime::from_settings` (`jev/mod.rs`) | `jev/http.rs` (`HttpJev`); contract types in `jev/contract.rs` |
+| Audit trail | `VEYRA_DATABASE_URL` enables it | `postgres` | `AuditTrail` (`audit.rs`) | `AuditProvider` | — (URL is the switch) | `main.rs`: `Store::connect` + embedded migrations | `store.rs` (`Store`) |
 
-- Native Gemini/Cohere/Bedrock providers do not all implement the structured
-  path; the OpenAI-compatible surface is what Veyra relies on today.
-- Bedrock support remains bearer-token based (no SigV4/IAM).
-- Rate limiting is delegated to the provider; per-provider budgets belong with
-  the risk/ops layer.
+Rules that hold across all five:
 
-### Jev (TypeSafe System One), proven live
+- An absent provider with no related variables disables the integration; a **partially configured section fails startup**. Malformed values name the setting and never echo its raw value; secrets are redacted from `Debug`.
+- The `ea` market provider refuses to build without an active broker command channel, because it reads candles through it.
+- The broker contract covers reporting *and* the command channel: `BrokerLink` exposes `enqueue_order_check` / `enqueue_open_order` / `enqueue_close_order` / `enqueue_modify_order` / `enqueue_rates`, `command` / `await_command` / `recent_commands`, and the retained account snapshot. `control.rs`, `reconciliation.rs`, `market/`, and `trading/autopilot.rs` depend on the trait alone, so a new venue is one implementation module plus selector arms — no caller edits. A test-only second implementation in `broker/mod.rs` holds that seam in place.
+- `/status` reports the active provider identifiers, the broker link state, both switches, the autopilot settings, the model budget, and the effective risk policy.
 
-Jev is a structured judgement interface, not an ordinary text provider, so it
-is a separate boundary rather than a `DecisionEngine` implementation
-(ADR 0004). `jev/mod.rs` owns the `SemanticJudge` contract and the provider
-selector (`VEYRA_JEV_PROVIDER`, default `typesafe`); `jev/contract.rs` owns
-meaning: typed `Choice` (2-32 rubric options), `Noul` (yes/no), and `Score`
-(2-16 ordered levels) questions over validated state and instructions.
+### Adding a provider
 
-Responses are validated against the request that produced them — answer ids
-and types must match, a chosen option must have been offered *and* carry the
-maximum probability, a score legend must equal the requested levels, and
-distributions must sum to one — so a contradictory or hallucinated answer
-fails closed instead of reaching trading code. Transport is one shared
-`reqwest` client with a 5 s connect timeout and a 20 s total timeout; `401/403`
-maps to unauthorized, `422` to a rejected request with the service detail,
-`429/529` to a backoff signal, and anything else to a transport error. The API
-key never appears in `Debug` output.
+1. **Implement the trait** in a new module (for example `broker/myvenue.rs`), owning every wire type so nothing vendor-specific leaks into domain code.
+2. **Add the enum variant** plus its `parse()`/`as_str()` arms to the provider enum.
+3. **Add the settings variant and parse arm**, validating strictly and failing closed on partial input.
+4. **Add the runtime factory arm** constructing the implementation once at startup (a broker provider may also expose its own listener, as the EA does).
+5. **Reuse the contract tests.** `tests/ea_contract.rs`, `tests/risk_contract.rs`, and the module-level tests exercise the contracts in-process; a new implementation should satisfy the same tests through the trait, not just its own happy path.
 
-Live proof on 2026-09-17: `jev-1.13.0` answered a three-question request in
-~1.3 s (408 input / 73 output tokens) with a choice at 0.92 confidence, a noul
-at 0.76, and a score of 1.95 on a 0-2 legend. Judgements are inputs code may
-consult; they grant no execution authority — only the risk gate approves an
-intent.
+## One autopilot tick
 
-### Broker integrations (swappable)
+`trading/autopilot.rs::tick` runs once per `VEYRA_AUTOPILOT_INTERVAL_SECS` (default 300 s, disabled by default; the first tick lands one interval after startup). Every missing input skips the tick; provider failures are audited as `unavailable`; nothing can be queued without a gate approval.
 
-Every venue integration implements the `BrokerLink` contract in
-`broker/mod.rs`:
+1. **Preconditions.** Autopilot enabled, model + market + broker configured, link fresh, account facts available, and a symbol from the rotation. The rotation list is the configured `VEYRA_AUTOPILOT_SYMBOLS` list (or a single `VEYRA_AUTOPILOT_SYMBOL`; setting both is a configuration error), plus the symbols of any open Veyra positions, advanced one step per tick; an empty list falls back to the terminal's chart symbol. Any failure → `Skipped`, no cost.
+2. **Market candles.** `MarketFeed` queues a read-only `rates` command and awaits its acknowledgement; the EA returns closed bars oldest-first (forming bar excluded) from `iOpen/iHigh/iLow/iClose/iVolume`, and the service re-validates OHLC sanity, ordering, symbol, and timeframe into a `CandleSeries`.
+3. **Jev judgements (when configured, `VEYRA_AUTOPILOT_JEV=auto`).** Three typed questions over a compact market narrative — direction (`choice`), trending (`noul`), momentum (`score`) — are validated against the request that produced them and reduced to a JSON summary. Judgements are inputs code may consult; they grant no execution authority.
+4. **Open managed position for this symbol?** Veyra-managed positions (magic `77041`) on the tick's symbol are reviewed instead of entries, so a review never mixes instruments. Stop policies run first (capital preservation beats everything, one action per tick). Then the model answers `hold` or `close` for a single ticket; closes go through the shared staged close with a minimum-hold and age check.
+5. **Entry path.** The model receives recent candles, account facts, and the judgements, and answers the `veyra_trade_proposal` schema: `none`, or one bracketed draft (the prompt requires a market order, so `price` is omitted). `normalize_proposal` drops exactly three execution-neutral phrasings (an echoed `price` on a market order, an over-long `comment`, a stray `intent` beside `action: "none"`); everything else must pass strict parsing into a `TradeIntentDraft`.
+6. **Deterministic risk gate.** The draft is evaluated in fixed order (see Safety model). Only approval mints a `TradeIntent` with identity.
+7. **Command queue.** `queue_staged_order` stamps the Veyra magic, re-checks the service switch, queues an `open_order` command, and audits `command_queued` with the intent id (the terminal applies its own arming when the command arrives). Entries without both `stop_loss` and `take_profit` are rejected before this step.
+8. **EA poll → MT4.** On the next poll the EA receives `cmd`, executes (or dry-runs) in the terminal, and acknowledges by id. Delivery is at-least-once; acks are validated against the command's typed payload before being recorded.
+9. **Audit and console.** The tick records `proposal_evaluated` (with `intent_id`/`command_id` where they exist); the command lifecycle and broker snapshots follow; the console's `/events` long-poll surfaces them within about 250 ms.
 
-- `provider() -> BrokerProvider` identifies the implementation.
-- `report() -> LinkReport` returns the latest locally held state.
+### Stops and the `StopBasis` memory
 
-`BrokerRuntime::from_settings` is the single construction point; the provider
-is selected by `VEYRA_BROKER_PROVIDER`. Decision, risk, and reporting code
-depend only on `Arc<dyn BrokerLink>`, so swapping venues means adding an
-implementation plus a provider variant — no caller changes. Each
-implementation owns its transport and its own loopback listener when it needs
-one; nothing vendor-specific leaks into domain code.
+While a managed position is open, deterministic policies feed one planned stop move:
 
-**Implementation 1 — MQL4 EA control channel (`broker/ea.rs`), proven live.**
-Transport and platform constraints are recorded in ADR 0002: MQL4
-has no socket API (verified against build 1476 and the MetaQuotes reference),
-so the EA polls a loopback-only HTTP endpoint using the terminal's built-in
-`WebRequest` client. The service authenticates a shared token in constant time,
-validates the payload into refined types (`AccountSnapshot`, `ServerName`,
-`Symbol`, `AccountLogin`), records heartbeat state, and answers the probe
-protocol (`ping`/`pong`) and carries the command queue. Commands are typed
-(`ping`, `account_snapshot`, `order_check` today), delivered on a poll,
-re-delivered until acknowledged, and failed after a timeout; acknowledgements
-carry a stable id and are validated against the command's typed payload before
-being recorded. The heartbeat also carries open volume in lots, and `account_snapshot`
-returns a bounded, validated order list (ticket, symbol, kind, lots, price,
-profit, plus a truncation flag) that feeds the gate's exposure cap and the
-future reconciler. `order_check` carries a gate-approved intent to the terminal,
-which applies its own market rules and margin engine (`MarketInfo`,
-`AccountFreeMarginCheck`) and returns a classic MT4 trade code (for example 129
-wrong-side price, 131 volume, 134 margin) without ever sending an order; the
-loopback control surface (`control.rs`) exposes `POST /intents/check` and
-`GET /commands/{id}` for operators and tests. Mutating commands are
-deliberately absent; they will reuse this id/ack discipline and must be
-idempotent per id. The transport is HTTPS through a Cloudflare
-Tunnel to the loopback listener; MQL4 supports no sockets and no explicit
-ports.
+- **Break-even** (`VEYRA_AUTOPILOT_BREAKEVEN_R`): once the trade has travelled that many multiples of its entry risk in favour, the stop moves to the entry price.
+- **Trailing** (`VEYRA_AUTOPILOT_TRAIL_R`): once that many risk units in favour, the stop stays that far behind the best favourable price.
 
-**Rejected for now — hosted API bridges.** The evaluated vendors are paid
-services that run their own terminals; the account owner opted for the
-zero-recurring-cost EA path. A bridge can still be added later as a second
-`BrokerLink` implementation without disturbing anything else, and a direct
-broker API likewise if IFC ever exposes one.
+The most protective candidate wins, stops only ever move in the favourable direction, an improvement must beat the current stop by at least a tenth of the entry risk, and both policies are opt-in (0 = off). Moves go through the same staged `modify_order` path as the control surface and are audited with the policy name (`break_even` / `trailing_stop`).
 
-No account credentials are stored in Veyra or in the repository: the MT4
-terminal holds the session, and the EA token only authorizes the loopback
-control channel.
+The terminal reports only a position's **current** stop, so the service cannot derive the original risk from any one payload. `StopBasis` (process lifetime, in `AppState`) remembers each ticket's first observed entry-to-stop distance while the stop still sits behind the entry; a position first seen after a stop move has no basis and is left alone until it closes. Tickets no longer open are dropped.
 
-### Trade intents and the proposal pipeline
+## Audit trail as source of truth
 
-`trading/intent.rs` defines the only shape a strategy or model may propose
-(`TradeIntentDraft`) plus the model answer contract (`TradeProposal`). Drafts
-parse once at the boundary into validated values; illegal states such as a
-price on a market order or a zero volume cannot be represented, and a draft
-has no identity. `trading/pipeline.rs` runs one structured `DecisionEngine`
-answer through the gate and returns no-trade, a rejection, or an approved
-`TradeIntent`.
+One append-only PostgreSQL table (`audit_events`: id, timestamp, kind, JSONB payload) with embedded migrations. A configured but unreachable database fails startup; individual writes are best-effort so storage can never block or fail a command. Retention defaults to `VEYRA_AUDIT_RETENTION_DAYS=30`, pruned hourly; launchd backs the database up daily (local generations plus an off-machine R2 upload).
 
-### Risk gate
+| Event kind | Written when |
+| --- | --- |
+| `service_started` | Process start; carries the effective risk policy so every later decision can be read against the rules in force |
+| `command_queued` | A command enters the queue (`kind`, `command_id`, plus `intent_id` for orders) |
+| `command_completed` | A validated ack completes (`kind`, bounded result summary) |
+| `command_failed` | A failed acknowledgement is processed, or an acknowledgement arrives for a command the queue already marked failed (for example a timeout) |
+| `broker_snapshot` | A validated `account_snapshot` ack is retained |
+| `proposal_evaluated` | Every autopilot decision attempt (`outcome`: `no_trade`, `rejected`, `approved_dry_run`, `queued`, `unavailable`, `held`, `close_queued`, `close_rejected`, `stop_rejected`, `break_even`, `trailing_stop`, …) |
+| `reconciliation_drift` | A snapshot shows orders Veyra does not own, or a truncated position list |
+| `position_closed` | A managed ticket disappears from the book (last observed values, including P/L) |
 
-The gate is deterministic code, not a model prompt. `risk/mod.rs` parses the
-`VEYRA_RISK_*` policy; `risk/gate.rs` evaluates one draft in a fixed order —
-kill switch, instrument allowlist, UTC session window, per-order volume cap,
-account availability, trading permission, open-order cap, total-exposure cap,
-duplicate suppression — and mints a `TradeIntent` only on approval. The
-exposure cap compares open volume (reported by the link) plus the requested
-volume against `VEYRA_RISK_MAX_TOTAL_LOTS`. Rejections carry stable codes and
-non-sensitive details.
+Read routes on the loopback surface:
 
-The gate fails closed: missing or stale account facts reject, and defaults
-allow no instrument until one is configured. `POST /intents/evaluate` on the
-loopback diagnostics listener returns advisory decisions only; it never
-queues, transmits, or executes, and an approved intent still requires the
-(future) command layer, which must reuse this gate. Account facts come from
-the fresh link report plus the open-order count every `BrokerLink`
-implementation reports from locally held state. Audit persistence arrives with
-the storage phase.
+- **`GET /events`** — the live feed: an in-memory ring of the 512 most recent events with a monotonic sequence cursor. No cursor returns the buffered tail; a cursor long-polls up to `wait_ms` (max 25 s), checking every 250 ms. The durable trail remains the source of truth; the ring is just a fast reader.
+- **`GET /metrics`** — process-lifetime counters derived from the same stream: `event.<kind>`, `proposal.<outcome>`, and `command.<event>.<kind>`, plus `feedLatest`. Cheap for dashboards and the alert probe; resets with the process.
+- **`GET /audit?limit=`** — newest rows straight from PostgreSQL, newest first.
+- **`GET /reconciliation`** — every order in the retained snapshot classified as Veyra-managed or unknown, with the snapshot age and a `reconciled`/`drift` verdict (or `unavailable`, `stale`, or `no_snapshot` when the channel or a snapshot is missing).
 
-### Execution (staged, two switches)
+Traceability: a `proposal_evaluated` event carries the `intent_id` and `command_id` it produced, command events carry the `command_id` and kind, and review events carry the ticket — so a venue ticket can be traced back through its command and ack to the decision that opened it.
 
-`POST /intents/execute` is the only execution entry point. It refuses with
-`403 trading_disabled` unless the operator sets `VEYRA_TRADING_ENABLED=true`,
-and it refuses outright when no command channel exists. With the service switch
-on, a gate-approved intent becomes a typed `open_order` command carrying the
-Veyra magic number; the terminal validates the request against its market rules
-and margin engine and, unless it was deliberately recompiled with
-`InAllowLiveOrders = true`, acknowledges a dry run (`executed:false`,
-`retcode:0`) without sending anything. Real money therefore needs a gate
-approval plus two independent, deliberate switches. Order ids, acks, and
-timeouts reuse the same at-least-once discipline as read-only commands.
+## Safety model
 
-`POST /intents/close` closes one Veyra-owned position by ticket. Ownership is
-enforced twice: the service only accepts tickets present in the latest
-completed `account_snapshot` whose magic number is the Veyra magic, and the
-terminal re-checks the magic on the selected order before touching it. Pending
-orders are refused (they need cancellation, not a close), and everything else
-goes through the same switch, dry-run, and ack validation as `open_order`.
-`POST /intents/modify` changes stops on the same terms: at least one finite,
-positive stop is required, `0`/absent stops keep their current values, and the
-terminal re-validates distance rules before acting. All three mutating commands
-(open, close, modify) share one contract, one switch pair, and one validated
-ack shape.
+Four independent controls, each of which can only reduce activity:
 
-### Model call budget
+| Control | Can do | Cannot do |
+| --- | --- | --- |
+| Model proposal (`DecisionEngine`) | Propose one schema-constrained bracketed trade, hold, or close | Approve, queue, or execute anything; rejections are normal outcomes |
+| Jev judgement (`SemanticJudge`) | Supply calibrated, validated inputs to the proposal | Grant execution authority; contradictory answers fail closed |
+| Risk gate (deterministic code) | Mint the only executable `TradeIntent` | Be influenced by model confidence; it never fetches state itself |
+| Arming switches (`VEYRA_TRADING_ENABLED`, EA `InAllowLiveOrders`) | Authorise real money | Trade alone: with either off, the command is refused or dry-runs |
 
-`ModelRuntime` wraps whatever engine an implementation provides in a
-`BudgetedEngine`: fixed hourly and daily windows admit or refuse calls before
-the provider is reached, so a runaway loop records `unavailable: ... budget
-...` instead of spending. Zero limits (the default) mean unlimited — the
-guard bounds accidents, not normal operation; `GET /status` reports current
-usage against the configured caps.
+The gate evaluates one draft in a fixed order: **kill switch → instrument allowlist → UTC session window → per-order volume cap → account facts available and connected → trading permission → open-order cap → total-exposure cap → duplicate suppression**. Rejections carry stable codes (`kill_switch`, `symbol_not_allowed`, `session_closed`, `volume_above_limit`, `account_state_unavailable`, `trading_not_allowed`, `order_limit_reached`, `exposure_above_limit`, `duplicate_intent`).
 
-### Persistence (audit trail)
+The surrounding guards:
 
-Durable history lives in one append-only `audit_events` table (id, timestamp,
-kind, JSONB payload) managed by embedded SQLx migrations. Command queueing,
-acknowledgements, validated broker snapshots, and process starts are recorded;
-a configured-but-unreachable database fails startup, while individual writes
-are best-effort so a storage hiccup never blocks a command. `GET /audit`
-returns the newest rows. PostgreSQL runs as a Homebrew service on this machine
-(auto-start at login). Rows older than `VEYRA_AUDIT_RETENTION_DAYS` (default
-30, zero keeps everything) are pruned hourly, best-effort. Backups and
-monitoring are still open.
+- **Kill switch** — `VEYRA_RISK_KILL_SWITCH=true` rejects every intent.
+- **Symbol allowlist** — `VEYRA_RISK_SYMBOLS`; the default is empty, which approves nothing, so a missing setting cannot widen behaviour.
+- **Bounded model budget** — `BudgetedEngine` wraps whatever engine a provider builds; `VEYRA_MODEL_MAX_CALLS_PER_HOUR` / `_PER_DAY` (0 = unlimited, the default) refuse calls past a fixed window, and `/status` reports usage against the caps.
+- **Duplicate window** — `VEYRA_RISK_DUPLICATE_WINDOW_SECS` (default 60) suppresses an identical approved draft.
+- **Missing or stale state rejects.** No fresh link report or no connected terminal means `account_state_unavailable`, not an assumption.
+- `POST /intents/check` performs a broker-side `order_check` without the trading switch because it never sends an order; `POST /intents/execute`, `/intents/close`, and `/intents/modify` all refuse with `403 trading_disabled` unless the service switch is on.
 
-### Reconciliation
+## Console
 
-`reconciliation.rs` classifies every order in the retained `account_snapshot`
-as Veyra-managed (its magic number is `ORDER_MAGIC`) or unknown, and treats a
-truncated list as drift even when every visible order is ours. `GET
-/reconciliation` exposes the assessment with its snapshot age and one of
-`unavailable`, `stale`, `no_snapshot`, `reconciled`, or `drift`. A background
-refresh (`VEYRA_RECONCILE_SECS`, default 30 s, zero disables) queues one
-`account_snapshot` per interval but only while the channel is fresh and no
-snapshot is already pending, so a terminal that is down cannot accumulate
-stale commands. Ticket-level tracing to specific approved intents lands with
-durable storage.
+`console/` is a TanStack Start application served by a supervised Vite preview on `http://127.0.0.1:3000`. It reads only the loopback control surface, proxying `/api` so the browser never needs cross-origin access. There is no authentication: keep it on loopback.
 
-## Hosting (24/7)
+| Panel | Shows |
+| --- | --- |
+| Status pills | Terminal live/stale, EA armed/disarmed, trading enabled/disabled, autopilot cadence, audit provider, environment |
+| Account | Balance, equity, free margin, open orders, open lots, open P/L, server/login/symbol, freshness |
+| Market | 48 closed H4 candles via `/market/candles`: sparkline, last close, window change, last high/low |
+| Autopilot | Enabled, cadence, timeframe, window, model tier, Jev mode, symbol rotation list, stop policies, model-budget usage |
+| Activity | `/events` cursor feed (streaming indicator); "focus" mode hides routine snapshots and read-only commands |
+| Positions | Ticket, side, lots, entry, SL, TP, P/L, and owner (Veyra by magic 77041 vs manual); truncation flag |
+| Commands | Recent command lifecycle (`pending`/`completed`/`failed`) with bounded summaries |
+| Risk | The effective gate policy plus both switch states |
+| Metrics | Top counters from `/metrics` and the feed sequence |
+| Agent log | `/logs` tail with a level filter (`error`…`trace`), polled every 2 s; shows the tracing target, message, and structured fields |
 
-The stack runs unattended on this Mac through seven launchd agents rendered
-from portable templates (`scripts/launchd/`) by `scripts/install-launchd.sh`:
-the MT4 terminal at login, the named Cloudflare tunnel, the service (via
-`scripts/run-service.sh`, which sources `.env` and execs the release binary),
-hourly log rotation, a daily verified audit-trail backup, the console, and
-the alert probe (two-minute cadence). Tunnel and
-service carry `KeepAlive`, so a crash recovers without a session; the terminal
-deliberately does not, so a clean quit stays quit. The rotation agent
-copy-truncates logs under `~/Library/Logs/veyra` above 5 MiB, keeping three
-generations. The backup agent dumps PostgreSQL in custom format, verifies the
-archive with `pg_restore --list` before it replaces the previous generation,
-keeps the newest fourteen dumps under `~/Library/Application Support/veyra/backups`,
-uploads each fresh dump off-machine to an R2 bucket through the authenticated
-`wrangler` CLI when `VEYRA_BACKUP_R2_BUCKET` is set (best-effort; a network or
-auth failure never fails the local backup, and the alert probe warns when the
-upload marker is more than a day old),
-and runs once at load plus daily at 03:30. `/ready` reports broker and audit
-health, degrading instead of hiding an unhealthy dependency; the audit probe
-is bounded at two seconds, so a wedged database degrades the answer instead
-of hanging it. The alert probe reads only the loopback surface, keeps its
-cursor in `~/Library/Application Support/veyra/alert-state.json`, and posts
-one webhook message per finding batch (readiness transitions, control-state
-transitions, three consecutive unavailable autopilot ticks, service restarts,
-reconciliation drift, executed opens, and closed positions with last P/L). Secrets remain
-in `.env`; plists carry only absolute paths. Exactly one supervised instance
-owns ports 8080 and 7801, and the installer stops stray session-bound
-processes first. See ADR 0005.
+**Decision/command drill-down.** Clicking an activity row expands priority-ordered detail rows (`outcome`, `reason`, `origin`, `symbol`, `side`, `volume`, `ticket`, `intent_id`, `command_id`, stops, …) plus the raw JSON payload, so a decision can be followed into the command and on to its ack (`GET /commands/{id}`). Clicking a command row expands its result summary or failure reason. Expanding a position's story therefore runs: proposal outcome → queued command → terminal ack/result → later stop, close, or `position_closed` events.
 
-### Autonomy (autopilot)
+## Known limits
 
-`trading/autopilot.rs` runs one decision tick per configured interval
-(`VEYRA_AUTOPILOT_*`, disabled by default; the first tick lands one interval
-after startup): it resolves the symbol (configured or the chart's), fetches a
-closed-candle window through the market feed, optionally asks Jev for
-calibrated judgements over the same state, then asks the decision engine for
-one structured proposal with the account facts embedded. The proposal passes
-`normalize_proposal` (two narrow tolerances: a reference `price` echoed on a
-market order and an embellished `comment` are dropped, and a decline carrying
-a stray `intent` is treated as a decline — none of these change execution
-meaning), then the strict draft parser, then the risk gate. Approvals go
-through the same `queue_staged_order` path as the control surface, so both
-operator controls and the audit trail still apply. Every tick records a
-`proposal_evaluated` audit event with its outcome — `no_trade`, `rejected`,
-`approved_dry_run`, `queued`, or `unavailable` — plus the command events when
-one is queued. Decisions carry the `intent_id` and `command_id` they produced,
-so a venue ticket can be traced back through its command and ack to the
-decision that opened it, and the service start event records the effective
-risk policy so every decision can be read against the rules in force. Every autonomous entry must carry both a stop loss and a take
-profit; unbracketed proposals are rejected before the command layer sees them.
+- **One position, one action at a time.** The risk cap defaults to one open order (`VEYRA_RISK_MAX_OPEN_ORDERS=1`) and the autopilot takes at most one action (stop move, review, or entry) per tick; it rotates across up to eight configured instruments (`VEYRA_AUTOPILOT_SYMBOLS`), and what may actually trade is still bounded by `VEYRA_RISK_SYMBOLS`.
+- **H4 by default.** The supervised configuration runs H4 (`VEYRA_AUTOPILOT_TIMEFRAME`, console candles fixed at H4 in `console/src/lib/api.ts`). Other timeframes exist in the contract (`M1`…`MN1`) but are not what is exercised today.
+- **EA-specific wire transport.** Command channels are provider-neutral (`BrokerLink` + `broker/command.rs`), but the only implemented transport today is the EA poll loop in `broker/ea.rs`; the `ea_link()` accessor remains for its transport and tests, and no other venue implementation exists yet.
+- **No console authentication.** The console and `/account` expose owner-facing money state on loopback only; exposing either beyond loopback requires authentication first.
+- **Always-on deployment pending.** Supervision runs on one local Mac; a durable 24/7 host/VPS, managed secrets, remote monitoring, and a versioned deployment pipeline are open roadmap items.
+- **One implementation per provider today** (`ea`, `openrouter`, `typesafe`, `postgres`); the abstraction is the extension point, not a menu of built-ins.
 
-While a managed position is open the tick first applies the deterministic
-stop policies (break-even with `VEYRA_AUTOPILOT_BREAKEVEN_R` and trailing with
-`VEYRA_AUTOPILOT_TRAIL_R`, both off by default, both expressed as multiples of
-the entry risk): the most protective candidate wins, stops only ever move in
-the favourable direction, and improvements smaller than a tenth of the entry
-risk are suppressed, all through the shared staged-modify path. Because the
-terminal only reports a position's *current* stop, the service remembers each
-ticket's original risk — observed the first time it appears with its stop
-behind the entry — and a position first seen after a move is left alone until
-it closes. When no stop policy applies, the tick reviews the position instead
-of hunting for entries:
-the model answers `hold` (the bracket stands) or `close` (flatten), with its
-own constrained schema. Closes are risk-reducing but the loop cannot
-churn: the ticket must match a reviewed managed position, the close goes
-through the same guarded staged-close path as the control surface, and a
-position younger than `VEYRA_AUTOPILOT_MIN_HOLD_SECS` (default 300) — or one
-whose age the terminal does not report — is refused.
+## Where to change things
 
-### Console
+| Change | Files / settings |
+| --- | --- |
+| New broker/venue | Implement `BrokerLink` (report + enqueue/await command surface) in a new `broker/<provider>.rs`, add the variant to `BrokerProvider` + `broker/settings.rs` + `BrokerRuntime::from_settings`, and mirror `tests/ea_contract.rs`; `control.rs`, `reconciliation.rs`, `market/`, and `autopilot.rs` need no changes |
+| New market-data provider | `market/mod.rs` (trait + enum + factory arm), `market/settings.rs`, new `market/<provider>.rs` (use `market/ea.rs` as the template) |
+| New model provider | `model/mod.rs` (enum + parse + factory arm), `model/settings.rs` arms, new engine module (or extend `agent_runtime_engine.rs`); `BudgetedEngine` wraps it automatically |
+| New judgement provider | `jev/mod.rs` (enum + factory arm), `jev/settings.rs` arms, new transport module alongside `jev/http.rs`; contract types live in `jev/contract.rs` |
+| Different audit storage | Implement `AuditTrail` (see `audit.rs` and `store.rs`) and swap the construction in `main.rs` |
+| New symbols | `VEYRA_RISK_SYMBOLS` + `VEYRA_AUTOPILOT_SYMBOLS` (up to 8, comma-separated; `VEYRA_AUTOPILOT_SYMBOL` remains the single-symbol form); no code change |
+| New timeframe | `VEYRA_AUTOPILOT_TIMEFRAME`; update the console's fixed H4 call in `console/src/lib/api.ts` if the UI should follow |
+| More positions | `VEYRA_RISK_MAX_OPEN_ORDERS` + `VEYRA_RISK_MAX_TOTAL_LOTS`; revisit the single-position assumptions in the autopilot prompts and review if the product should manage several |
+| New risk limit | `risk/mod.rs` (policy parse + `summary`) and `risk/gate.rs` (fixed check order), plus the gate tests |
+| New terminal command | `broker/command.rs` (`CommandKind`, request/payload types, validation), `broker/ea.rs` (wire mapping + ack handling), `ea/VeyraProbe.mq4`, and the caller in `control.rs`/`autopilot.rs` |
+| Console behaviour | `console/src/components/veyra.tsx`, typed client `console/src/lib/api.ts`, feed hooks `console/src/lib/hooks.ts`, formatting rules `console/src/lib/format.ts` |
+| Log capture and tail | Buffer and level parsing in `logs.rs`, tracing tee in `observability.rs`, route contract in `routes.rs` (`GET /logs`), console panel in `console/src/components/veyra.tsx` |
+| Deployment / supervision | `docs/deployment.md`, `scripts/launchd/*`, `scripts/install-launchd.sh` |
 
-`console/` is a TanStack Start application served by a supervised Vite
-preview process on `http://127.0.0.1:3000`. It reads only the loopback control
-surface, proxying `/api` so the browser never needs cross-origin access:
-`/status` and `/account` for state, `/events` (cursor long-poll over an
-in-memory ring of recent audit events) for the activity feed, `/commands` for
-command lifecycle, `/reconciliation`, and `/market/candles` for the chart.
-`/account` exposes owner-facing money fields (balance, equity, positions) and
-is loopback-only by design; exposing it beyond loopback requires
-authentication first.
-
-### Observability
-
-The service spans its two hot paths (`autopilot.tick`, `ea.poll`) with
-`tracing`, so nested events carry symbol and command context even when
-nothing is sampled. `GET /metrics` exposes process-lifetime counters derived
-from the audit stream — `event.*` totals, `proposal.<outcome>`, and
-`command.<event>.<kind>` — cheap enough for dashboards and alerts; the
-durable trail remains the source of truth.
-
-## Testing strategy
-
-- Unit tests for refined types and policy rules.
-- Integration tests for HTTP and transport behavior.
-- Broker contract tests against an explicit adapter interface.
-- Adversarial tests for malformed and unsafe model output.
-- Property tests for risk invariants.
-- End-to-end tests only after a broker path is selected, with paper/testing accounts first.
-
-Coverage remains at least 95% per first-party crate.
+Related documents: [roadmap](roadmap.md), [deployment](deployment.md), and the decision records in [`docs/decisions/`](decisions/).

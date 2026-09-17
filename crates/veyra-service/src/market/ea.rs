@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::broker::BrokerLink;
 use crate::broker::Symbol;
-use crate::broker::ea::{CommandPayload, CommandState, EaLink, EaRatesRequest, RatesPayload};
+use crate::broker::{CommandPayload, CommandState, RatesPayload, RatesRequest};
 use crate::market::{
     Candle, CandleRequest, CandleSeries, MarketError, MarketFeed, MarketProvider, Timeframe,
 };
@@ -19,13 +20,13 @@ use crate::market::{
 /// Market feed served by the in-terminal EA over the command channel.
 #[derive(Debug)]
 pub struct EaMarketFeed {
-    link: Arc<EaLink>,
+    link: Arc<dyn BrokerLink>,
     await_timeout: Duration,
 }
 
 impl EaMarketFeed {
     /// Builds a feed over an existing EA link.
-    pub fn new(link: Arc<EaLink>, await_timeout: Duration) -> Self {
+    pub fn new(link: Arc<dyn BrokerLink>, await_timeout: Duration) -> Self {
         Self {
             link,
             await_timeout,
@@ -40,7 +41,7 @@ impl MarketFeed for EaMarketFeed {
     }
 
     async fn candles(&self, request: CandleRequest) -> Result<CandleSeries, MarketError> {
-        let wire = EaRatesRequest::new(
+        let wire = RatesRequest::new(
             request.symbol(),
             request.timeframe().minutes(),
             request.bars(),
@@ -102,7 +103,8 @@ fn series_from_payload(payload: &RatesPayload) -> Result<CandleSeries, MarketErr
 mod tests {
     use super::*;
     use crate::broker::EaToken;
-    use crate::broker::ea::{CandlePayload, create_ea_app};
+    use crate::broker::ea::create_ea_app;
+    use crate::broker::{CandlePayload, EaLink};
 
     fn valid_payload() -> RatesPayload {
         RatesPayload {

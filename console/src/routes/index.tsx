@@ -7,14 +7,15 @@ import {
   ActivityFeed,
   AutopilotPanel,
   CommandsPanel,
+  LogsPanel,
   MarketPanel,
   MetricsPanel,
   PositionsPanel,
   RiskPanel,
   StatusPills,
 } from '../components/veyra'
-import { api } from '../lib/api'
-import { useEventFeed, usePoll } from '../lib/hooks'
+import { api, type LogLevel } from '../lib/api'
+import { useEventFeed, useLogFeed, usePoll } from '../lib/hooks'
 
 export const Route = createFileRoute('/')({ component: Dashboard })
 
@@ -26,6 +27,8 @@ export function Dashboard() {
   const { data: metrics, error: metricsError } = usePoll(api.metrics, 10000)
   const { events, connected } = useEventFeed(80)
   const [focus, setFocus] = useState(true)
+  const [logLevel, setLogLevel] = useState<LogLevel>('info')
+  const { logs, error: logsError } = useLogFeed(logLevel)
 
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-[1500px] flex-col gap-3 p-4">
@@ -67,6 +70,8 @@ export function Dashboard() {
         <RiskPanel policy={status?.risk_policy} status={status} />
         <MetricsPanel metrics={metrics} error={metricsError} />
       </div>
+
+      <LogsPanel logs={logs} error={logsError} level={logLevel} onLevelChange={setLogLevel} />
 
       <footer className="pb-1 text-center font-mono text-[10px] text-slate-600">
         loopback console · {status?.broker_provider ?? '—'} broker · {status?.market_provider ?? '—'} market ·{' '}

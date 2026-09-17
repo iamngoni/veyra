@@ -9,11 +9,13 @@ use std::time::{Duration, SystemTime};
 
 use actix_web::web::{self, Data};
 use actix_web::{HttpResponse, get, post};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::Level;
 
 use crate::AppState;
 use crate::broker::BrokerRuntime;
+use crate::logs::parse_level;
 use crate::risk::{AccountFacts, RiskDecision};
 use crate::trading::TradeIntentDraft;
 
@@ -143,7 +145,12 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
             "timeframe": settings.timeframe().as_str(),
             "tier": settings.tier().as_str(),
             "bars": settings.bars(),
-            "symbol": settings.symbol().map(|symbol| symbol.as_str()),
+            "symbol": settings.symbols().first().map(|symbol| symbol.as_str()),
+            "symbols": settings
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.as_str())
+                .collect::<Vec<_>>(),
             "jev": settings.jev().as_str(),
             "breakeven_r": settings.breakeven_r(),
             "trail_r": settings.trail_r()
@@ -195,6 +202,45 @@ pub async fn metrics(state: Data<AppState>) -> HttpResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "counters": runtime.counters(),
         "feedLatest": runtime.feed_latest()
+    }))
+}
+
+/// Query for `GET /logs`.
+#[derive(Debug, Deserialize)]
+pub struct LogsQuery {
+    /// Cursor: return records with a sequence number greater than this; zero
+    /// tails the newest records instead.
+    pub after: Option<u64>,
+    /// Maximum records per response (1-500); defaults to 200.
+    pub limit: Option<u32>,
+    /// Minimum level (`trace`, `debug`, `info`, `warn`, `error`); defaults to
+    /// `trace`, since `RUST_LOG` already decided what is captured.
+    pub level: Option<String>,
+}
+
+#[get("/logs")]
+/// Returns recent structured service log records for the loopback console.
+///
+/// The buffer is bounded and process-lifetime; records carry no request
+/// bodies, credentials, or account data. Exposing this beyond loopback would
+/// follow the same authentication rule as every other diagnostic route.
+pub async fn log_tail(state: Data<AppState>, query: web::Query<LogsQuery>) -> HttpResponse {
+    let Some(buffer) = state.logs() else {
+        return HttpResponse::ServiceUnavailable().json(json!({ "error": "logs_unavailable" }));
+    };
+    let level = match query.level.as_deref() {
+        None => Level::TRACE,
+        Some(raw) => match parse_level(raw) {
+            Some(level) => level,
+            None => return HttpResponse::BadRequest().json(json!({ "error": "invalid_level" })),
+        },
+    };
+    let limit = query.limit.unwrap_or(200).clamp(1, 500) as usize;
+    let after = query.after.unwrap_or(0);
+    let logs = buffer.tail(after, limit, level);
+    HttpResponse::Ok().json(json!({
+        "logs": logs,
+        "latest": buffer.latest()
     }))
 }
 
@@ -326,6 +372,94 @@ mod tests {
             &unaudited,
             actix_web::test::TestRequest::get()
                 .uri("/metrics")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 503);
+    }
+
+    #[actix_web::test]
+    async fn logs_route_tails_filters_and_validates() {
+        use crate::AppState;
+        use crate::app::create_app;
+        use crate::broker::BrokerRuntime;
+        use crate::config::{ConfigError, ServiceConfig};
+        use crate::logs::LogBuffer;
+        use crate::risk::{RiskGate, RiskPolicy};
+
+        let config = ServiceConfig::from_source(|name| match name {
+            "VEYRA_BIND_HOST" => Ok("127.0.0.1".to_owned()),
+            "VEYRA_BIND_PORT" => Ok("8080".to_owned()),
+            "VEYRA_ENV" => Ok("development".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        })
+        .expect("config parses");
+        let logs = LogBuffer::new(8);
+        logs.push(
+            "info".to_owned(),
+            "t".to_owned(),
+            "hello".to_owned(),
+            serde_json::Map::new(),
+        );
+        logs.push(
+            "error".to_owned(),
+            "t".to_owned(),
+            "boom".to_owned(),
+            serde_json::Map::new(),
+        );
+        let state = AppState::new(
+            config.clone(),
+            None::<BrokerRuntime>,
+            None,
+            RiskGate::new(RiskPolicy::default()),
+        )
+        .with_logs(logs);
+        let app = actix_web::test::init_service(create_app(state)).await;
+
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/logs")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+        assert_eq!(body["latest"], 2);
+        assert_eq!(body["logs"].as_array().map(Vec::len), Some(2));
+        assert_eq!(body["logs"][1]["message"], "boom");
+
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/logs?after=1&level=error")
+                .to_request(),
+        )
+        .await;
+        let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+        assert_eq!(body["logs"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["logs"][0]["level"], "error");
+
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/logs?level=verbose")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+
+        let unaudited = actix_web::test::init_service(create_app(AppState::new(
+            config,
+            None::<BrokerRuntime>,
+            None,
+            RiskGate::new(RiskPolicy::default()),
+        )))
+        .await;
+        let response = actix_web::test::call_service(
+            &unaudited,
+            actix_web::test::TestRequest::get()
+                .uri("/logs")
                 .to_request(),
         )
         .await;

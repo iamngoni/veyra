@@ -1,7 +1,12 @@
 //! Process-wide JSON tracing setup. A bad log filter fails startup rather than
 //! silently suppressing diagnostics; no request bodies or credentials are logged.
+//! A capture layer also tees events into the bounded console log buffer.
+
+use std::sync::Arc;
 
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::logs::{LogBuffer, LogLayer};
 
 /// Builds the tracing filter. Only an absent `RUST_LOG` selects `info`;
 /// blank, malformed, and unreadable values are startup errors.
@@ -15,9 +20,10 @@ fn build_filter(
     }
 }
 
-/// Installs JSON logging exactly once. Malformed `RUST_LOG` and duplicate setup
-/// are returned as errors so operators cannot mistake partial telemetry for health.
-pub fn init() -> Result<(), Box<dyn std::error::Error>> {
+/// Installs JSON logging exactly once and tees events into `logs` for the
+/// console. Malformed `RUST_LOG` and duplicate setup are returned as errors so
+/// operators cannot mistake partial telemetry for health.
+pub fn init(logs: Arc<LogBuffer>) -> Result<(), Box<dyn std::error::Error>> {
     let filter = build_filter(|| std::env::var("RUST_LOG"))?;
     tracing_subscriber::registry()
         .with(
@@ -25,6 +31,7 @@ pub fn init() -> Result<(), Box<dyn std::error::Error>> {
                 .json()
                 .with_writer(std::io::stderr),
         )
+        .with(LogLayer::new(logs))
         .with(filter)
         .try_init()?;
     Ok(())
@@ -50,6 +57,10 @@ mod tests {
 
 #[test]
 fn init_installs_once_and_rejects_duplicate_setup() {
-    assert!(init().is_ok(), "first initialization must succeed");
-    assert!(init().is_err(), "duplicate initialization must fail");
+    let logs = LogBuffer::new(8);
+    assert!(
+        init(logs.clone()).is_ok(),
+        "first initialization must succeed"
+    );
+    assert!(init(logs).is_err(), "duplicate initialization must fail");
 }

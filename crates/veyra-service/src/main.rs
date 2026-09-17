@@ -8,6 +8,7 @@ use std::time::Duration;
 use veyra_service::audit::{AuditEvent, AuditKind, AuditRuntime};
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
 use veyra_service::jev::{JevRuntime, JevSettings};
+use veyra_service::logs::{self, LogBuffer};
 use veyra_service::market::{MarketRuntime, MarketSettings};
 use veyra_service::model::{ModelRuntime, settings::ModelSettings};
 use veyra_service::reconciliation;
@@ -19,7 +20,8 @@ use veyra_service::{AppState, config::ServiceConfig, observability, server};
 #[actix_web::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServiceConfig::from_env()?;
-    observability::init()?;
+    let logs = LogBuffer::new(logs::DEFAULT_CAPACITY);
+    observability::init(logs.clone())?;
 
     let broker = match BrokerSettings::from_env()? {
         Some(settings) => Some(BrokerRuntime::from_settings(settings)?),
@@ -70,11 +72,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_market(market)
         .with_autopilot(autopilot)
         .with_jev(jev)
+        .with_logs(logs)
         .with_audit(audit.as_ref().map(|runtime| (**runtime).clone()));
 
     if let Some(runtime) = &audit {
-        if let Some(link) = state.broker().and_then(|broker| broker.ea_link()) {
-            link.set_audit(runtime.clone());
+        if let Some(broker) = state.broker() {
+            broker.link().attach_audit(runtime.clone());
         }
         runtime
             .try_record(AuditEvent::new(

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::broker::ea::EaRatesRequest;
+use crate::broker::RatesRequest;
 use crate::broker::{BrokerRuntime, Symbol};
 
 /// Supported market-data provider implementations.
@@ -161,7 +161,7 @@ pub struct Candle {
 
 impl Candle {
     /// Builds a candle from fields a provider already validated (see
-    /// `broker::ea::RatesPayload::validate`); never called on raw input.
+    /// `broker::RatesPayload::validate`); never called on raw input.
     pub(crate) fn from_validated(
         time: i64,
         open: f64,
@@ -226,9 +226,9 @@ impl CandleRequest {
     /// Returns [`MarketError::InvalidRequest`] when `bars` is zero or larger
     /// than the provider contract allows.
     pub fn new(symbol: Symbol, timeframe: Timeframe, bars: u16) -> Result<Self, MarketError> {
-        if bars == 0 || bars > EaRatesRequest::MAX_BARS {
+        if bars == 0 || bars > RatesRequest::MAX_BARS {
             return Err(MarketError::InvalidRequest {
-                reason: format!("bars must be from 1 through {}", EaRatesRequest::MAX_BARS),
+                reason: format!("bars must be from 1 through {}", RatesRequest::MAX_BARS),
             });
         }
         Ok(Self {
@@ -360,11 +360,12 @@ impl MarketRuntime {
     ) -> Result<Self, MarketError> {
         match settings {
             MarketSettings::Ea(ea_settings) => {
-                let link = broker
-                    .and_then(|runtime| runtime.ea_link())
-                    .ok_or_else(|| MarketError::Construction {
-                        reason: "the ea market provider requires the ea broker provider".to_owned(),
-                    })?;
+                let link = broker.map(|runtime| runtime.link()).ok_or_else(|| {
+                    MarketError::Construction {
+                        reason: "the ea market provider requires an active broker command channel"
+                            .to_owned(),
+                    }
+                })?;
                 Ok(Self {
                     provider: MarketProvider::Ea,
                     feed: Arc::new(ea::EaMarketFeed::new(link, ea_settings.await_timeout())),
@@ -469,7 +470,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires the ea broker provider")
+                .contains("requires an active broker command channel")
         );
 
         let broker = BrokerRuntime::from_settings(BrokerSettings::Ea(EaSettings::new(

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
-import { api, type FeedEvent } from './api'
+import { api, type FeedEvent, type LogLevel, type LogRecord } from './api'
 
 /** Polls an async source on an interval, keeping the last good value on error. */
 export function usePoll<T>(load: () => Promise<T>, intervalMs: number) {
@@ -65,6 +65,43 @@ export function useEventFeed(capacity = 80) {
   }, [capacity])
 
   return { events, connected }
+}
+
+/**
+ * Tails `/logs` on a short interval, resetting the cursor whenever the level
+ * filter changes so the list always reflects the selected severity.
+ */
+export function useLogFeed(level: LogLevel, capacity = 300, intervalMs = 2000) {
+  const [logs, setLogs] = useState<LogRecord[]>([])
+  const [error, setError] = useState<string>()
+  const cursor = useRef<number | undefined>(undefined)
+
+  useEffect(() => {
+    let alive = true
+    cursor.current = undefined
+    setLogs([])
+    const tick = async () => {
+      try {
+        const tail = await api.logs(cursor.current, level)
+        if (!alive) return
+        cursor.current = tail.latest
+        if (tail.logs.length > 0) {
+          setLogs((previous) => [...previous, ...tail.logs].slice(-capacity))
+        }
+        setError(undefined)
+      } catch (cause) {
+        if (alive) setError(cause instanceof Error ? cause.message : String(cause))
+      }
+    }
+    void tick()
+    const timer = setInterval(tick, intervalMs)
+    return () => {
+      alive = false
+      clearInterval(timer)
+    }
+  }, [level, capacity, intervalMs])
+
+  return { logs, error }
 }
 
 export function relativeTime(ms: number): string {
