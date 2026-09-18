@@ -57,6 +57,7 @@ const status: Status = {
   ea_live_orders: true,
   autopilot,
   model_budget: { hourLimit: 120, hourCalls: 5, dayLimit: 2000, dayCalls: 5 },
+  jev_usage: { calls: 12, failures: 0, inputTokens: 4800, outputTokens: 720 },
   risk_policy: {
     killSwitch: false,
     symbols: ['EURUSD'],
@@ -246,12 +247,15 @@ describe('MarketPanel', () => {
 
 describe('AutopilotPanel', () => {
   it('renders cadence, stops, and budget', () => {
-    render(<AutopilotPanel status={autopilot} budget={status.model_budget} />)
+    render(
+      <AutopilotPanel status={autopilot} budget={status.model_budget} jevUsage={status.jev_usage} />,
+    )
     expect(screen.getByText('60s')).toBeTruthy()
     expect(screen.getByText('48 bars')).toBeTruthy()
     expect(screen.getByText('BE 1R · trail 1R')).toBeTruthy()
     expect(screen.getByText('5/120 h · 5/2000 d')).toBeTruthy()
     expect(screen.getByText('EURUSD')).toBeTruthy()
+    expect(screen.getByText('12 calls · 5.5k tok')).toBeTruthy()
   })
 
   it('renders a multi-symbol rotation and the chart-symbol fallback', () => {
@@ -301,6 +305,97 @@ describe('RiskPanel', () => {
     expect(screen.getByText('kill switch on')).toBeTruthy()
     rerender(<RiskPanel />)
     expect(screen.getAllByText('—').length).toBeGreaterThan(0)
+  })
+})
+
+describe('RiskPanel editing', () => {
+  it('applies a patched policy and leaves edit mode', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByText('edit'))
+    fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: '7' } })
+    fireEvent.change(screen.getByLabelText('Net USD cap (lots)'), { target: { value: '0.02' } })
+    fireEvent.click(screen.getByText('save'))
+
+    await screen.findByText('gate active')
+    expect(onApply).toHaveBeenCalledTimes(1)
+    const patch = onApply.mock.calls[0][0]
+    expect(patch.maxOpenOrders).toBe(7)
+    expect(patch.maxNetFactorLots).toBe(0.02)
+    expect(patch.symbols).toEqual(['EURUSD'])
+    expect(patch.killSwitch).toBe(false)
+  })
+
+  it('refuses non-numeric input without calling the service', () => {
+    const onApply = vi.fn()
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByText('edit'))
+    fireEvent.change(screen.getByLabelText('Max total (lots)'), { target: { value: 'lots' } })
+    fireEvent.click(screen.getByText('save'))
+
+    expect(onApply).not.toHaveBeenCalled()
+    expect(screen.getByText(/Max total \(lots\): must be a number/)).toBeTruthy()
+  })
+
+  it('rejects fractional whole-number fields', () => {
+    const onApply = vi.fn()
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByText('edit'))
+    fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: '2.5' } })
+    fireEvent.click(screen.getByText('save'))
+
+    expect(onApply).not.toHaveBeenCalled()
+    expect(screen.getByText(/Max open orders: must be a whole number/)).toBeTruthy()
+  })
+
+  it('shows a service rejection and stays editable', async () => {
+    const onApply = vi.fn().mockResolvedValue('maxOpenOrders: must be an integer from 0 through 1000')
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByText('edit'))
+    fireEvent.click(screen.getByText('save'))
+
+    await screen.findByText(/must be an integer from 0 through 1000/)
+    expect(screen.getByText('save')).toBeTruthy()
+  })
+
+  it('applies a kill-switch toggle and cancels cleanly', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByText('edit'))
+    fireEvent.click(screen.getByLabelText(/Kill switch/))
+    fireEvent.click(screen.getByText('save'))
+    await screen.findByText('gate active')
+    expect(onApply.mock.calls[0][0].killSwitch).toBe(true)
+
+    fireEvent.click(screen.getByText('edit'))
+    fireEvent.click(screen.getByText('cancel'))
+    expect(screen.getByText('edit')).toBeTruthy()
+    expect(screen.queryByText('save')).toBeNull()
+  })
+
+  it('projects the session and symbol edits into the patch', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByText('edit'))
+    fireEvent.change(screen.getByLabelText(/^Symbols/), { target: { value: 'eurusd, gbpusd' } })
+    fireEvent.change(screen.getByLabelText(/^Session UTC/), { target: { value: '8-17' } })
+    fireEvent.click(screen.getByText('save'))
+    await screen.findByText('gate active')
+
+    const patch = onApply.mock.calls[0][0]
+    expect(patch.symbols).toEqual(['eurusd', 'gbpusd'])
+    expect(patch.sessionUtc).toBe('8-17')
+  })
+
+  it('offers no edit affordance without a handler', () => {
+    render(<RiskPanel policy={status.risk_policy} status={status} />)
+    expect(screen.queryByText('edit')).toBeNull()
   })
 })
 

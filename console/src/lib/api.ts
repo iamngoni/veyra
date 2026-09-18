@@ -37,6 +37,8 @@ export type Status = {
   autopilot: AutopilotStatus | null
   /** Model call usage against the configured caps; null without a model. */
   model_budget: { hourLimit: number; hourCalls: number; dayLimit: number; dayCalls: number } | null
+  /** Judge usage as this service observed it; null without a judge. */
+  jev_usage: { calls: number; failures: number; inputTokens: number; outputTokens: number } | null
   /** Effective risk gate policy; always present. */
   risk_policy: RiskPolicy
 }
@@ -124,6 +126,21 @@ export type LogRecord = {
 
 export type LogTail = { logs: LogRecord[]; latest: number }
 
+/** Partial update to the live risk policy; omitted fields keep their value. */
+export type RiskPolicyPatch = {
+  killSwitch?: boolean
+  symbols?: string[]
+  maxVolumePerOrder?: number
+  maxTotalLots?: number
+  maxOpenOrders?: number
+  duplicateWindowSecs?: number
+  sessionUtc?: string
+  maxRiskPercent?: number
+  maxDailyLossPercent?: number
+  maxPeakDrawdownPercent?: number
+  maxNetFactorLots?: number
+}
+
 export type CommandRecord = {
   id: string
   kind: string
@@ -166,6 +183,25 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
   return (await response.json()) as T
 }
 
+async function post<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(`${BASE}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) {
+    let detail = `${path} → ${response.status}`
+    try {
+      const payload = (await response.json()) as { field?: string; reason?: string }
+      if (payload.field && payload.reason) detail = `${payload.field}: ${payload.reason}`
+    } catch {
+      // Keep the status-only detail when the body is not JSON.
+    }
+    throw new Error(detail)
+  }
+  return (await response.json()) as T
+}
+
 export const api = {
   status: () => get<Status>('/status'),
   account: () => get<Account>('/account'),
@@ -177,6 +213,7 @@ export const api = {
     get<Feed>(after === undefined ? '/events' : `/events?after=${after}&wait_ms=${waitMs}`),
   logs: (after: number | undefined, level: LogLevel, limit = 300) =>
     get<LogTail>(`/logs?limit=${limit}&level=${level}${after === undefined ? '' : `&after=${after}`}`),
+  updatePolicy: (patch: RiskPolicyPatch) => post<RiskPolicy>('/risk/policy', patch),
 }
 
 export const VEYRA_MAGIC = 77041

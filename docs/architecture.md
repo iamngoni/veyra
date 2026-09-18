@@ -158,6 +158,7 @@ One append-only PostgreSQL table (`audit_events`: id, timestamp, kind, JSONB pay
 | `command_failed` | A failed acknowledgement is processed, or an acknowledgement arrives for a command the queue already marked failed (for example a timeout) |
 | `broker_snapshot` | A validated `account_snapshot` ack is retained |
 | `agent_tool_called` | The decision loop executed one read-only tool (tool, bounded arguments and result, step, rationale) |
+| `risk_policy_updated` | The live risk policy was replaced from the control surface (full resulting policy attached) |
 | `proposal_evaluated` | Every autopilot decision attempt (`outcome`: `no_trade`, `rejected`, `approved_dry_run`, `queued`, `unavailable`, `held`, `close_queued`, `close_rejected`, `stop_rejected`, `break_even`, `trailing_stop`, …). Entry and review decisions carry the model's `rationale` and, when a judge is configured, the chosen asset's `judgements`, so the why is queryable next to the what |
 | `reconciliation_drift` | A snapshot shows orders Veyra does not own, or a truncated position list |
 | `position_closed` | A managed ticket disappears from the book (last observed values, including P/L) |
@@ -193,9 +194,19 @@ The surrounding guards:
 - **Drawdown breakers** — `VEYRA_RISK_MAX_DAILY_LOSS_PERCENT` (default 10, below the UTC day's opening equity) and `VEYRA_RISK_MAX_PEAK_DRAWDOWN_PERCENT` (default 25, below the highest equity since startup). Both refuse *new* risk (`daily_loss_limit`, `peak_drawdown_limit`) while stops and reviews keep running. Baselines live in memory, so a restart re-baselines.
 - **Net directional cap** — `VEYRA_RISK_MAX_NET_FACTOR_LOTS` (default 0.01): the gate sums signed USD exposure across open positions and the draft, so long EURUSD plus long USDJPY is one bet, not two (`factor_exposure_above_limit`). Opposing directions offset.
 - **Bounded model budget** — `BudgetedEngine` wraps whatever engine a provider builds; `VEYRA_MODEL_MAX_CALLS_PER_HOUR` / `_PER_DAY` (0 = unlimited, the default) refuse calls past a fixed window, and `/status` reports usage against the caps.
+- **Judge usage counters** — the Jev runtime counts calls, failures, and the provider-reported input/output tokens; `/status` carries the process-lifetime totals and the console shows them in the Autopilot panel, so the service's actual usage can always be checked against the provider's dashboard (which can lag, aggregate differently, or belong to another project).
 - **Duplicate window** — `VEYRA_RISK_DUPLICATE_WINDOW_SECS` (default 60) suppresses an identical approved draft.
 - **Missing or stale state rejects.** No fresh link report or no connected terminal means `account_state_unavailable`, not an assumption.
 - `POST /intents/check` performs a broker-side `order_check` without the trading switch because it never sends an order; `POST /intents/execute`, `/intents/close`, and `/intents/modify` all refuse with `403 trading_disabled` unless the service switch is on.
+
+## Live policy control
+
+Environment variables are **startup defaults and secrets** (bind addresses, tokens, provider selection, database URL) — nothing a bad edit over a UI should be able to break. Everything an operator tunes day to day lives in the **risk policy** and can be changed from the console while the service runs:
+
+- `GET /risk/policy` returns the effective policy; `POST /risk/policy` applies a partial patch (omitted fields keep their value).
+- The patch is validated by exactly the same rules as the environment parser — caps, booleans, symbol list, session window, breaks — so a console edit can never widen behaviour beyond what a restart would accept. Unknown fields are rejected, and failures name the field and reason.
+- Every accepted change is journaled as `risk_policy_updated` (with the resulting policy) and takes effect atomically for all decisions; the kill switch is just one field of the patch.
+- Changes are runtime-only: a restart restores the `.env` values. The console's editor panel exposes the fields directly, and the control surface is loopback-only like everything else.
 
 ## Console
 
@@ -206,11 +217,12 @@ The surrounding guards:
 | Status pills | Terminal live/stale, EA armed/disarmed, trading enabled/disabled, autopilot cadence, audit provider, environment |
 | Account | Balance, equity, free margin, open orders, open lots, open P/L, server/login/symbol, freshness |
 | Market | 48 closed H4 candles via `/market/candles`: sparkline, last close, window change, last high/low |
-| Autopilot | Enabled, cadence, timeframe, window, model tier, Jev mode, symbol rotation list, stop policies, model-budget usage |
+| Autopilot | Enabled, cadence, timeframe, window, model tier, Jev mode, symbol menu, stop policies, model-budget usage, and the service's own Jev call/token counters |
 | Activity | `/events` cursor feed (streaming indicator); "focus" mode hides routine snapshots and read-only commands |
 | Positions | Ticket, side, lots, entry, SL, TP, P/L, and owner (Veyra by magic 77041 vs manual); truncation flag |
 | Commands | Recent command lifecycle (`pending`/`completed`/`failed`) with bounded summaries |
 | Risk | The effective gate policy plus both switch states |
+| Risk | Effective gate policy: symbols, caps, risk/drawdown brakes, net-exposure cap, execution/terminal state — with an inline editor for live changes |
 | Metrics | Top counters from `/metrics` and the feed sequence |
 | Agent log | `/logs` tail with a level filter (`error`…`trace`), polled every 2 s; shows the tracing target, message, and structured fields |
 

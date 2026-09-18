@@ -38,6 +38,8 @@ pub enum AuditKind {
     PositionClosed,
     /// The decision loop executed one read-only tool for the model.
     AgentToolCalled,
+    /// The live risk policy was replaced from the control surface.
+    RiskPolicyUpdated,
 }
 
 impl AuditKind {
@@ -53,6 +55,7 @@ impl AuditKind {
             Self::ProposalEvaluated => "proposal_evaluated",
             Self::PositionClosed => "position_closed",
             Self::AgentToolCalled => "agent_tool_called",
+            Self::RiskPolicyUpdated => "risk_policy_updated",
         }
     }
 }

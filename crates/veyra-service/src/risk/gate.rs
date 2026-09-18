@@ -9,7 +9,7 @@
 //! Missing or stale account state rejects instead of guessing, and only an
 //! approved draft is minted into a [`TradeIntent`].
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::ser::SerializeStruct;
@@ -204,7 +204,7 @@ struct Approval {
 /// Deterministic, fail-closed intent gate. Clones share the duplicate memory.
 #[derive(Debug, Clone)]
 pub struct RiskGate {
-    policy: RiskPolicy,
+    policy: Arc<RwLock<RiskPolicy>>,
     approvals: Arc<Mutex<Vec<Approval>>>,
 }
 
@@ -212,14 +212,39 @@ impl RiskGate {
     /// Builds a gate with an empty approval memory.
     pub fn new(policy: RiskPolicy) -> Self {
         Self {
-            policy,
+            policy: Arc::new(RwLock::new(policy)),
             approvals: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Returns the active policy.
-    pub fn policy(&self) -> &RiskPolicy {
-        &self.policy
+    /// Returns a snapshot of the active policy.
+    ///
+    /// The policy can be replaced at runtime from the control surface; every
+    /// decision reads one consistent snapshot rather than a live reference.
+    pub fn policy(&self) -> RiskPolicy {
+        self.read().clone()
+    }
+
+    /// Replaces the active policy. Callers validate the new policy first;
+    /// the write is atomic for every concurrent decision.
+    pub fn update_policy(&self, policy: RiskPolicy) {
+        *self.write() = policy;
+    }
+
+    /// Reads the policy lock, recovering a poisoned guard the same way the
+    /// approval memory does: whole values are written, so recovery is safe.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, RiskPolicy> {
+        match self.policy.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, RiskPolicy> {
+        match self.policy.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// Evaluates one draft in the documented check order.
@@ -263,10 +288,11 @@ impl RiskGate {
         account: Option<AccountFacts>,
         now: SystemTime,
     ) -> Result<(), RiskCode> {
-        if self.policy.kill_switch() {
+        let policy = self.policy();
+        if policy.kill_switch() {
             return Err(RiskCode::KillSwitch);
         }
-        if !self.policy.allows_symbol(draft.symbol()) {
+        if !policy.allows_symbol(draft.symbol()) {
             return Err(RiskCode::SymbolNotAllowed);
         }
         // Built-in calendar guards: rollover blackout and the weekend cutoff.
@@ -274,12 +300,12 @@ impl RiskGate {
         if crate::risk::window::entry_block(now, None).is_some() {
             return Err(RiskCode::MarketWindowClosed);
         }
-        if let Some(window) = self.policy.session()
+        if let Some(window) = policy.session()
             && !window.contains(utc_hour(now))
         {
             return Err(RiskCode::SessionClosed);
         }
-        if draft.volume().value() > self.policy.max_volume_per_order().value() {
+        if draft.volume().value() > policy.max_volume_per_order().value() {
             return Err(RiskCode::VolumeAboveLimit);
         }
         let Some(account) = account else {
@@ -288,17 +314,17 @@ impl RiskGate {
         if !account.trade_allowed {
             return Err(RiskCode::TradingNotAllowed);
         }
-        if self.policy.max_daily_loss_percent() > 0.0
+        if policy.max_daily_loss_percent() > 0.0
             && account
                 .day_drawdown_percent
-                .is_some_and(|value| value >= self.policy.max_daily_loss_percent())
+                .is_some_and(|value| value >= policy.max_daily_loss_percent())
         {
             return Err(RiskCode::DailyLossLimitReached);
         }
-        if self.policy.max_peak_drawdown_percent() > 0.0
+        if policy.max_peak_drawdown_percent() > 0.0
             && account
                 .peak_drawdown_percent
-                .is_some_and(|value| value >= self.policy.max_peak_drawdown_percent())
+                .is_some_and(|value| value >= policy.max_peak_drawdown_percent())
         {
             return Err(RiskCode::PeakDrawdownLimitReached);
         }
@@ -309,15 +335,15 @@ impl RiskGate {
         {
             return Err(RiskCode::SymbolAlreadyOpen);
         }
-        if account.open_orders >= self.policy.max_open_orders() {
+        if account.open_orders >= policy.max_open_orders() {
             return Err(RiskCode::OrderLimitReached);
         }
         if account.open_lots + draft.volume().value()
-            > self.policy.max_total_lots().value() + EXPOSURE_EPSILON
+            > policy.max_total_lots().value() + EXPOSURE_EPSILON
         {
             return Err(RiskCode::ExposureAboveLimit);
         }
-        if self.policy.max_risk_percent() > 0.0 && draft.stop_loss().is_some() {
+        if policy.max_risk_percent() > 0.0 && draft.stop_loss().is_some() {
             let reference = draft
                 .order()
                 .price()
@@ -333,7 +359,7 @@ impl RiskGate {
                 && let Some(equity) = account.equity
             {
                 match valuation::risk_percent(draft, Some(reference), equity) {
-                    Some(risk) if risk > self.policy.max_risk_percent() + EXPOSURE_EPSILON => {
+                    Some(risk) if risk > policy.max_risk_percent() + EXPOSURE_EPSILON => {
                         return Err(RiskCode::RiskAboveLimit);
                     }
                     Some(_) => {}
@@ -341,9 +367,9 @@ impl RiskGate {
                 }
             }
         }
-        if self.policy.max_net_factor_lots() > 0.0 {
+        if policy.max_net_factor_lots() > 0.0 {
             let net = valuation::net_usd_lots(&account.open_positions, draft);
-            if net.abs() > self.policy.max_net_factor_lots() + EXPOSURE_EPSILON {
+            if net.abs() > policy.max_net_factor_lots() + EXPOSURE_EPSILON {
                 return Err(RiskCode::FactorExposureAboveLimit);
             }
         }
@@ -361,7 +387,7 @@ impl RiskGate {
     /// observe a half-written state; a lock error therefore degrades to normal
     /// operation instead of blocking trading outright.
     fn suppress_duplicate(&self, draft: &TradeIntentDraft, now: SystemTime) -> bool {
-        let window = self.policy.duplicate_window();
+        let window = self.policy().duplicate_window();
         if window.is_zero() {
             return false;
         }

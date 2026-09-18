@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import type { ChangeEvent } from 'react'
 import type { ReactNode } from 'react'
 
 import type {
@@ -15,6 +16,7 @@ import type {
   Status,
 } from '../lib/api'
 import { LOG_LEVELS, VEYRA_MAGIC } from '../lib/api'
+import type { RiskPolicyPatch } from '../lib/api'
 import {
   commandTone,
   detailRows,
@@ -254,12 +256,19 @@ export function MarketPanel({ series, error }: { series?: CandleSeries; error?: 
 
 /* ---------- autopilot ---------- */
 
+/** Compact token count for the panel (1234 -> 1.2k). */
+function compactTokens(value: number): string {
+  return value >= 1000 ? `${(value / 1000).toFixed(1)}k` : String(value)
+}
+
 export function AutopilotPanel({
   status,
   budget,
+  jevUsage,
 }: {
   status?: Status['autopilot']
   budget?: Status['model_budget']
+  jevUsage?: Status['jev_usage']
 }) {
   const on = status?.enabled === true
   return (
@@ -292,6 +301,16 @@ export function AutopilotPanel({
               : '—'
           }
         />
+        <Field
+          label="Jev usage"
+          value={
+            jevUsage && jevUsage.calls > 0
+              ? `${jevUsage.calls} calls · ${compactTokens(
+                  jevUsage.inputTokens + jevUsage.outputTokens,
+                )} tok${jevUsage.failures > 0 ? ` · ${jevUsage.failures} failed` : ''}`
+              : '—'
+          }
+        />
       </div>
       <div className="border-t border-slate-800/80 px-3 py-2 text-[11px] leading-relaxed text-slate-500">
         Every entry carries both stops, passes the deterministic risk gate, and still needs both armed switches
@@ -303,11 +322,229 @@ export function AutopilotPanel({
 
 /* ---------- risk ---------- */
 
-export function RiskPanel({ policy, status }: { policy?: RiskPolicy; status?: Status }) {
+/** Editable mirror of the live policy; numbers stay strings until save. */
+type PolicyDraft = {
+  killSwitch: boolean
+  symbols: string
+  maxVolumePerOrder: string
+  maxTotalLots: string
+  maxOpenOrders: string
+  duplicateWindowSecs: string
+  sessionUtc: string
+  maxRiskPercent: string
+  maxDailyLossPercent: string
+  maxPeakDrawdownPercent: string
+  maxNetFactorLots: string
+}
+
+const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer: boolean }> = [
+  { key: 'maxVolumePerOrder', label: 'Max / order (lots)', integer: false },
+  { key: 'maxTotalLots', label: 'Max total (lots)', integer: false },
+  { key: 'maxOpenOrders', label: 'Max open orders', integer: true },
+  { key: 'duplicateWindowSecs', label: 'Duplicate window (s)', integer: true },
+  { key: 'maxRiskPercent', label: 'Max risk (% / trade)', integer: false },
+  { key: 'maxDailyLossPercent', label: 'Daily brake (%)', integer: false },
+  { key: 'maxPeakDrawdownPercent', label: 'Peak brake (%)', integer: false },
+  { key: 'maxNetFactorLots', label: 'Net USD cap (lots)', integer: false },
+]
+
+type NumericDraftKey =
+  | 'maxVolumePerOrder'
+  | 'maxTotalLots'
+  | 'maxOpenOrders'
+  | 'duplicateWindowSecs'
+  | 'maxRiskPercent'
+  | 'maxDailyLossPercent'
+  | 'maxPeakDrawdownPercent'
+  | 'maxNetFactorLots'
+
+function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
+  return {
+    killSwitch: policy.killSwitch,
+    symbols: policy.symbols.join(', '),
+    maxVolumePerOrder: String(policy.maxVolumePerOrder),
+    maxTotalLots: String(policy.maxTotalLots),
+    maxOpenOrders: String(policy.maxOpenOrders),
+    duplicateWindowSecs: String(policy.duplicateWindowSecs),
+    sessionUtc: policy.sessionUtc ?? '',
+    maxRiskPercent: String(policy.maxRiskPercent),
+    maxDailyLossPercent: String(policy.maxDailyLossPercent),
+    maxPeakDrawdownPercent: String(policy.maxPeakDrawdownPercent),
+    maxNetFactorLots: String(policy.maxNetFactorLots),
+  }
+}
+
+/** Parses the draft into a patch, or returns the first input error. */
+function patchFromDraft(draft: PolicyDraft): { patch?: RiskPolicyPatch; error?: string } {
+  const patch: RiskPolicyPatch = {
+    killSwitch: draft.killSwitch,
+    symbols: draft.symbols
+      .split(',')
+      .map((symbol) => symbol.trim())
+      .filter(Boolean),
+    sessionUtc: draft.sessionUtc.trim(),
+  }
+  for (const field of POLICY_NUMBER_FIELDS) {
+    const raw = draft[field.key].trim()
+    const value = Number(raw)
+    if (raw === '' || Number.isNaN(value)) {
+      return { error: `${field.label}: must be a number` }
+    }
+    if (field.integer && !Number.isInteger(value)) {
+      return { error: `${field.label}: must be a whole number` }
+    }
+    patch[field.key] = value
+  }
+  return { patch }
+}
+
+export function RiskPanel({
+  policy,
+  status,
+  onApply,
+}: {
+  policy?: RiskPolicy
+  status?: Status
+  /** Applies a patch; resolves to an error message or undefined on success. */
+  onApply?: (patch: RiskPolicyPatch) => Promise<string | undefined>
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState<PolicyDraft>()
+  const [error, setError] = useState<string>()
+  const [saving, setSaving] = useState(false)
+
+  const startEditing = (current: RiskPolicy) => {
+    setDraft(draftFromPolicy(current))
+    setError(undefined)
+    setEditing(true)
+  }
+  const cancelEditing = () => {
+    setEditing(false)
+    setError(undefined)
+  }
+  /** One handler for every editor input; the field name rides on the element. */
+  const handleField = (event: ChangeEvent<HTMLInputElement>) => {
+    const key = event.target.dataset.field as keyof PolicyDraft
+    const value =
+      event.target.type === 'checkbox' ? event.target.checked : event.target.value
+    setDraft((current) => (current ? { ...current, [key]: value } : current))
+  }
+  const save = async () => {
+    if (!draft || !onApply) return
+    const { patch, error: inputError } = patchFromDraft(draft)
+    if (!patch) {
+      setError(inputError ?? 'invalid policy')
+      return
+    }
+    setSaving(true)
+    setError(undefined)
+    const failure = await onApply(patch)
+    setSaving(false)
+    if (failure) {
+      setError(failure)
+    } else {
+      setEditing(false)
+    }
+  }
+
+  const detail = editing ? (
+    <span className="flex items-center gap-2">
+      {error ? <span className="text-rose-400">{error}</span> : null}
+      <button
+        type="button"
+        onClick={cancelEditing}
+        className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-slate-400 hover:border-slate-500"
+      >
+        cancel
+      </button>
+      <button
+        type="button"
+        onClick={() => void save()}
+        disabled={saving}
+        className="rounded border border-emerald-600/60 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300 hover:border-emerald-400 disabled:opacity-50"
+      >
+        {saving ? 'saving…' : 'save'}
+      </button>
+    </span>
+  ) : (
+    <span className="flex items-center gap-2">
+      {policy?.killSwitch ? <span className="text-rose-400">kill switch on</span> : 'gate active'}
+      {onApply && policy ? (
+        <button
+          type="button"
+          onClick={() => startEditing(policy)}
+          className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-slate-400 hover:border-slate-500"
+        >
+          edit
+        </button>
+      ) : null}
+    </span>
+  )
+
+  if (editing && draft) {
+    const inputClass =
+      'w-full rounded border border-slate-700 bg-slate-900 px-1.5 py-1 font-mono text-[11px] text-slate-200'
+    const labelClass = 'flex flex-col gap-1'
+    return (
+      <Panel
+        title="Risk"
+        detail={detail}
+        className="min-h-[320px]"
+      >
+        <div className="grid grid-cols-1 gap-x-4 gap-y-3 p-3 sm:grid-cols-2">
+          <label className={labelClass}>
+            <span className="text-[10px] uppercase tracking-wider text-slate-500">Symbols (comma separated)</span>
+            <input
+              className={inputClass}
+              data-field="symbols"
+              value={draft.symbols}
+              onChange={handleField}
+            />
+          </label>
+          <label className={labelClass}>
+            <span className="text-[10px] uppercase tracking-wider text-slate-500">Session UTC (8-17, empty = always open)</span>
+            <input
+              className={inputClass}
+              data-field="sessionUtc"
+              value={draft.sessionUtc}
+              onChange={handleField}
+            />
+          </label>
+          {POLICY_NUMBER_FIELDS.map((field) => (
+            <label key={field.key} className={labelClass}>
+              <span className="text-[10px] uppercase tracking-wider text-slate-500">{field.label}</span>
+              <input
+                className={inputClass}
+                data-field={field.key}
+                value={draft[field.key]}
+                onChange={handleField}
+              />
+            </label>
+          ))}
+          <label className="flex items-center gap-2 pt-1">
+            <input
+              type="checkbox"
+              data-field="killSwitch"
+              checked={draft.killSwitch}
+              onChange={handleField}
+            />
+            <span className="text-[10px] uppercase tracking-wider text-slate-400">
+              Kill switch (refuses every new intent)
+            </span>
+          </label>
+        </div>
+        <div className="border-t border-slate-800/80 px-3 py-2 text-[11px] leading-relaxed text-slate-500">
+          Changes apply to the live gate immediately and are journaled with the resulting policy. Restarting the
+          service restores the environment defaults.
+        </div>
+      </Panel>
+    )
+  }
+
   return (
     <Panel
       title="Risk"
-      detail={policy?.killSwitch ? <span className="text-rose-400">kill switch on</span> : 'gate active'}
+      detail={detail}
     >
       <div className="grid grid-cols-2 gap-x-4 gap-y-3 p-3 sm:grid-cols-4">
         <Field
@@ -352,8 +589,9 @@ export function RiskPanel({ policy, status }: { policy?: RiskPolicy; status?: St
         />
       </div>
       <div className="border-t border-slate-800/80 px-3 py-2 text-[11px] leading-relaxed text-slate-500">
-        Every intent passes the gate in order: kill switch, allowlist, session, per-order cap, account
-        facts, order cap, exposure, duplicates. Both armed switches are still required for real money.
+        Every intent passes the gate in order: kill switch, allowlist, entry window, session, per-order cap,
+        account facts, permission, drawdown brakes, one-per-asset, order cap, exposure, per-trade risk, net
+        exposure, duplicates.
       </div>
     </Panel>
   )

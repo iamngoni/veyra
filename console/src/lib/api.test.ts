@@ -84,6 +84,34 @@ describe('api', () => {
     ])
   })
 
+  it('posts policy patches as JSON to the control surface', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ killSwitch: true }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.updatePolicy({ killSwitch: true, maxOpenOrders: 3 })
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/risk/policy')
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ killSwitch: true, maxOpenOrders: 3 }),
+    })
+  })
+
+  it('surfaces the field and reason of a rejected patch', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValue(
+          jsonResponse({ error: 'invalid_policy', field: 'maxOpenOrders', reason: 'too large' }, 400),
+        ),
+    )
+    await expect(api.updatePolicy({ maxOpenOrders: 1001 })).rejects.toThrow(
+      'maxOpenOrders: too large',
+    )
+  })
+
   it('returns parsed JSON', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ status: 'ok' })))
     await expect(api.status()).resolves.toEqual({ status: 'ok' })

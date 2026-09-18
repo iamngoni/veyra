@@ -52,7 +52,7 @@ export function Dashboard() {
           <MarketPanel series={series} error={marketError} />
         </div>
         <div className="min-w-0">
-          <AutopilotPanel status={status?.autopilot} budget={status?.model_budget} />
+          <AutopilotPanel status={status?.autopilot} budget={status?.model_budget} jevUsage={status?.jev_usage} />
         </div>
       </div>
 
@@ -67,7 +67,18 @@ export function Dashboard() {
       </div>
 
       <div className="grid gap-3 lg:grid-cols-2">
-        <RiskPanel policy={status?.risk_policy} status={status} />
+        <RiskPanel
+          policy={status?.risk_policy}
+          status={status}
+          onApply={async (patch) => {
+            try {
+              await api.updatePolicy(patch)
+              return undefined
+            } catch (error) {
+              return error instanceof Error ? error.message : String(error)
+            }
+          }}
+        />
         <MetricsPanel metrics={metrics} error={metricsError} />
       </div>
 

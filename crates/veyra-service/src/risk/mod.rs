@@ -18,6 +18,8 @@ pub use gate::{AccountFacts, RiskCode, RiskDecision, RiskGate, RiskRejection};
 
 use std::time::Duration;
 
+use serde::Deserialize;
+
 use crate::broker::Symbol;
 use crate::trading::intent::{Volume, parse_instrument};
 
@@ -61,6 +63,70 @@ pub struct RiskError {
     pub name: &'static str,
     /// Non-sensitive acceptance rule.
     pub reason: &'static str,
+}
+
+/// Partial update to the live policy, as the control surface submits it.
+/// Every field is optional; omitted fields keep their current value.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RiskPolicyPatch {
+    /// Engage or release the kill switch.
+    pub kill_switch: Option<bool>,
+    /// Replacement instrument allowlist (1-64 symbols; empty is rejected —
+    /// stop trading with the kill switch instead).
+    pub symbols: Option<Vec<String>>,
+    /// Largest lot volume a single intent may request.
+    pub max_volume_per_order: Option<f64>,
+    /// Largest total open volume.
+    pub max_total_lots: Option<f64>,
+    /// Largest number of open venue orders.
+    pub max_open_orders: Option<u32>,
+    /// Duplicate-suppression window in seconds.
+    pub duplicate_window_secs: Option<u64>,
+    /// Session window (`8-17`, may wrap); an empty string clears it.
+    pub session_utc: Option<String>,
+    /// Per-trade risk cap, percent of equity (0 disables).
+    pub max_risk_percent: Option<f64>,
+    /// Daily-loss breaker, percent (0 disables).
+    pub max_daily_loss_percent: Option<f64>,
+    /// Peak-drawdown breaker, percent (0 disables).
+    pub max_peak_drawdown_percent: Option<f64>,
+    /// Net USD-direction cap in lots (0 disables).
+    pub max_net_factor_lots: Option<f64>,
+}
+
+/// Validates one symbol list from the control surface.
+fn parse_symbol_entries(entries: &[String]) -> Result<Vec<Symbol>, RiskError> {
+    let invalid = |reason: &'static str| RiskError {
+        name: "symbols",
+        reason,
+    };
+    let mut symbols: Vec<Symbol> = Vec::new();
+    for entry in entries.iter().map(|entry| entry.trim()) {
+        if entry.is_empty() {
+            return Err(invalid(SYMBOLS_RULE));
+        }
+        let symbol = parse_instrument(entry).map_err(|error| invalid(error.reason))?;
+        if !symbols.contains(&symbol) {
+            symbols.push(symbol);
+        }
+    }
+    if symbols.is_empty() || symbols.len() > MAX_SYMBOLS {
+        return Err(invalid(SYMBOLS_RULE));
+    }
+    Ok(symbols)
+}
+
+/// Validates one control-surface percentage.
+fn percent_value(name: &'static str, value: f64) -> Result<f64, RiskError> {
+    if value.is_finite() && (0.0..=100.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(RiskError {
+            name,
+            reason: PERCENT_RULE,
+        })
+    }
 }
 
 /// A UTC hour window; `22-6` wraps midnight and the bounds must differ.
@@ -323,6 +389,103 @@ impl RiskPolicy {
         ))
     }
 
+    /// Applies a partial update from the control surface, keeping every field
+    /// the patch omits. Values are validated with the same rules as the
+    /// environment parser, so a console edit can never widen behaviour beyond
+    /// what a restart would accept.
+    ///
+    /// # Errors
+    /// Returns [`RiskError`] naming the field that failed validation.
+    pub fn apply_patch(&self, patch: &RiskPolicyPatch) -> Result<Self, RiskError> {
+        let kill_switch = patch.kill_switch.unwrap_or(self.kill_switch);
+
+        let symbols = match &patch.symbols {
+            None => self.symbols.clone(),
+            Some(entries) => parse_symbol_entries(entries)?,
+        };
+
+        let max_volume_per_order = match patch.max_volume_per_order {
+            None => self.max_volume_per_order,
+            Some(value) => Volume::parse(value).map_err(|error| RiskError {
+                name: "maxVolumePerOrder",
+                reason: error.reason,
+            })?,
+        };
+        let max_total_lots = match patch.max_total_lots {
+            None => self.max_total_lots,
+            Some(value) => Volume::parse(value).map_err(|error| RiskError {
+                name: "maxTotalLots",
+                reason: error.reason,
+            })?,
+        };
+        let max_open_orders = match patch.max_open_orders {
+            None => self.max_open_orders,
+            Some(value) if value <= MAX_OPEN_ORDERS_CEILING => value,
+            Some(_) => {
+                return Err(RiskError {
+                    name: "maxOpenOrders",
+                    reason: OPEN_ORDERS_RULE,
+                });
+            }
+        };
+        let duplicate_window = match patch.duplicate_window_secs {
+            None => self.duplicate_window,
+            Some(seconds) if seconds <= MAX_DUPLICATE_WINDOW_SECS => Duration::from_secs(seconds),
+            Some(_) => {
+                return Err(RiskError {
+                    name: "duplicateWindowSecs",
+                    reason: DUPLICATE_WINDOW_RULE,
+                });
+            }
+        };
+        let session = match &patch.session_utc {
+            None => self.session,
+            Some(raw) if raw.trim().is_empty() => None,
+            Some(raw) => Some(SessionWindow::parse(raw.trim()).map_err(|error| RiskError {
+                name: "sessionUtc",
+                reason: error.reason,
+            })?),
+        };
+        let max_risk_percent = match patch.max_risk_percent {
+            None => self.max_risk_percent,
+            Some(value) => percent_value("maxRiskPercent", value)?,
+        };
+        let max_daily_loss_percent = match patch.max_daily_loss_percent {
+            None => self.max_daily_loss_percent,
+            Some(value) => percent_value("maxDailyLossPercent", value)?,
+        };
+        let max_peak_drawdown_percent = match patch.max_peak_drawdown_percent {
+            None => self.max_peak_drawdown_percent,
+            Some(value) => percent_value("maxPeakDrawdownPercent", value)?,
+        };
+        let max_net_factor_lots = match patch.max_net_factor_lots {
+            None => self.max_net_factor_lots,
+            Some(value) if value.is_finite() && (0.0..=100.0).contains(&value) => value,
+            Some(_) => {
+                return Err(RiskError {
+                    name: "maxNetFactorLots",
+                    reason: FACTOR_LOTS_RULE,
+                });
+            }
+        };
+
+        Ok(Self::new(
+            kill_switch,
+            symbols,
+            max_volume_per_order,
+            max_total_lots,
+            max_open_orders,
+            duplicate_window,
+            session,
+        )
+        .with_limits(
+            max_risk_percent,
+            max_daily_loss_percent,
+            max_peak_drawdown_percent,
+            max_net_factor_lots,
+        ))
+    }
+
     /// Whether the kill switch is engaged; engaged means every intent fails.
     pub fn kill_switch(&self) -> bool {
         self.kill_switch
@@ -556,6 +719,133 @@ mod tests {
         assert_eq!(policy.max_net_factor_lots(), DEFAULT_MAX_NET_FACTOR_LOTS);
         assert!(!policy.allows_symbol(&parse_instrument("EURUSD").expect("symbol")));
         assert_eq!(RiskPolicy::default(), policy);
+    }
+
+    #[test]
+    fn control_surface_patches_validate_with_env_rules() {
+        let base = RiskPolicy::new(
+            false,
+            vec![Symbol::parse("EURUSD").expect("symbol")],
+            Volume::parse(0.01).expect("volume"),
+            Volume::parse(0.02).expect("volume"),
+            5,
+            Duration::from_secs(60),
+            None,
+        )
+        .with_limits(12.0, 10.0, 25.0, 0.01);
+
+        // A partial patch changes only what it names.
+        let patched = base
+            .apply_patch(&RiskPolicyPatch {
+                kill_switch: Some(true),
+                max_open_orders: Some(3),
+                ..Default::default()
+            })
+            .expect("patch applies");
+        assert!(patched.kill_switch());
+        assert_eq!(patched.max_open_orders(), 3);
+        assert_eq!(patched.symbols().len(), 1);
+        assert_eq!(patched.max_risk_percent(), 12.0, "omitted fields survive");
+
+        // Every field is settable, including clearing the session.
+        let full = base
+            .apply_patch(&RiskPolicyPatch {
+                symbols: Some(vec!["eurusd".to_owned(), "GBPUSD".to_owned()]),
+                max_volume_per_order: Some(0.05),
+                max_total_lots: Some(0.1),
+                duplicate_window_secs: Some(5),
+                session_utc: Some("8-17".to_owned()),
+                max_risk_percent: Some(3.0),
+                max_daily_loss_percent: Some(0.0),
+                max_peak_drawdown_percent: Some(40.0),
+                max_net_factor_lots: Some(0.05),
+                ..Default::default()
+            })
+            .expect("patch applies");
+        assert_eq!(full.symbols().len(), 2);
+        assert_eq!(full.max_volume_per_order().value(), 0.05);
+        assert_eq!(full.max_total_lots().value(), 0.1);
+        assert_eq!(full.duplicate_window(), Duration::from_secs(5));
+        assert_eq!(
+            full.session(),
+            Some(SessionWindow::parse("8-17").expect("window"))
+        );
+        assert_eq!(full.max_risk_percent(), 3.0);
+        assert_eq!(full.max_daily_loss_percent(), 0.0);
+        assert_eq!(full.max_peak_drawdown_percent(), 40.0);
+        assert_eq!(full.max_net_factor_lots(), 0.05);
+
+        let cleared = full
+            .apply_patch(&RiskPolicyPatch {
+                session_utc: Some("   ".to_owned()),
+                ..Default::default()
+            })
+            .expect("blank clears the session");
+        assert_eq!(cleared.session(), None);
+
+        // Rejections name the control-surface field.
+        let cases: [(RiskPolicyPatch, &str); 8] = [
+            (
+                RiskPolicyPatch {
+                    symbols: Some(Vec::new()),
+                    ..Default::default()
+                },
+                "symbols",
+            ),
+            (
+                RiskPolicyPatch {
+                    symbols: Some(vec![String::new()]),
+                    ..Default::default()
+                },
+                "symbols",
+            ),
+            (
+                RiskPolicyPatch {
+                    max_volume_per_order: Some(0.0),
+                    ..Default::default()
+                },
+                "maxVolumePerOrder",
+            ),
+            (
+                RiskPolicyPatch {
+                    max_open_orders: Some(1_001),
+                    ..Default::default()
+                },
+                "maxOpenOrders",
+            ),
+            (
+                RiskPolicyPatch {
+                    duplicate_window_secs: Some(86_401),
+                    ..Default::default()
+                },
+                "duplicateWindowSecs",
+            ),
+            (
+                RiskPolicyPatch {
+                    max_risk_percent: Some(101.0),
+                    ..Default::default()
+                },
+                "maxRiskPercent",
+            ),
+            (
+                RiskPolicyPatch {
+                    max_net_factor_lots: Some(-1.0),
+                    ..Default::default()
+                },
+                "maxNetFactorLots",
+            ),
+            (
+                RiskPolicyPatch {
+                    session_utc: Some("24-3".to_owned()),
+                    ..Default::default()
+                },
+                "sessionUtc",
+            ),
+        ];
+        for (patch, field) in cases {
+            let error = base.apply_patch(&patch).expect_err(field);
+            assert_eq!(error.name, field);
+        }
     }
 
     #[test]

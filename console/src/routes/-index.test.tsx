@@ -4,7 +4,7 @@
  * promise is left pending so the polling loops stay quiet in the test.
  */
 
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   metrics: vi.fn(),
   events: vi.fn(),
   logs: vi.fn(),
+  updatePolicy: vi.fn(),
 }))
 
 vi.mock('../lib/api', () => ({
@@ -28,6 +29,7 @@ vi.mock('../lib/api', () => ({
     metrics: mocks.metrics,
     events: mocks.events,
     logs: mocks.logs,
+    updatePolicy: mocks.updatePolicy,
   },
 }))
 
@@ -61,6 +63,7 @@ beforeEach(() => {
       trail_r: 1,
     },
     model_budget: { hourLimit: 120, hourCalls: 5, dayLimit: 2000, dayCalls: 5 },
+    jev_usage: { calls: 12, failures: 0, inputTokens: 4800, outputTokens: 720 },
     risk_policy: {
       killSwitch: false,
       symbols: ['EURUSD'],
@@ -103,6 +106,7 @@ beforeEach(() => {
   mocks.metrics.mockResolvedValue({ service: 'veyra', version: '0.1.0', counters: { 'event.proposal_evaluated': 3 }, feedLatest: 12 })
   mocks.events.mockImplementation(() => new Promise(() => undefined))
   mocks.logs.mockResolvedValue({ logs: [], latest: 0 })
+  mocks.updatePolicy.mockReset()
 })
 
 describe('Dashboard', () => {
@@ -120,5 +124,31 @@ describe('Dashboard', () => {
     expect(screen.getByText('Metrics')).toBeTruthy()
     expect(screen.getByText('Agent log')).toBeTruthy()
     expect(screen.getByText(/v0.1.0/)).toBeTruthy()
+  })
+
+  it('applies policy edits through the control surface', async () => {
+    mocks.updatePolicy.mockResolvedValue({})
+    render(<Dashboard />)
+    await screen.findByText('Balance')
+
+    fireEvent.click(screen.getByText('edit'))
+    fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: '4' } })
+    fireEvent.click(screen.getByText('save'))
+
+    await screen.findByText('gate active')
+    expect(mocks.updatePolicy).toHaveBeenCalledTimes(1)
+    expect(mocks.updatePolicy.mock.calls[0][0].maxOpenOrders).toBe(4)
+  })
+
+  it('surfaces control-surface rejections in the editor', async () => {
+    mocks.updatePolicy.mockRejectedValue(new Error('maxOpenOrders: too large'))
+    render(<Dashboard />)
+    await screen.findByText('Balance')
+
+    fireEvent.click(screen.getByText('edit'))
+    fireEvent.click(screen.getByText('save'))
+
+    await screen.findByText('maxOpenOrders: too large')
+    expect(screen.getByText('save')).toBeTruthy()
   })
 })

@@ -102,6 +102,46 @@ pub async fn request_account_snapshot(state: Data<AppState>) -> HttpResponse {
     }))
 }
 
+/// Returns the live risk policy exactly as the console edits it.
+#[get("/risk/policy")]
+pub async fn risk_policy(state: Data<AppState>) -> HttpResponse {
+    HttpResponse::Ok().json(state.risk().policy().summary())
+}
+
+#[post("/risk/policy")]
+/// Applies a validated partial update to the live risk policy.
+///
+/// The same rules that validate `.env` validate this route, so a console edit
+/// can never widen behaviour beyond what a restart would accept. Every change
+/// is journaled with the resulting policy, and the kill switch is just one of
+/// the fields.
+pub async fn update_risk_policy(
+    state: Data<AppState>,
+    patch: web::Json<crate::risk::RiskPolicyPatch>,
+) -> HttpResponse {
+    let current = state.risk().policy();
+    match current.apply_patch(&patch.into_inner()) {
+        Err(error) => HttpResponse::BadRequest().json(json!({
+            "error": "invalid_policy",
+            "field": error.name,
+            "reason": error.reason
+        })),
+        Ok(updated) => {
+            state.risk().update_policy(updated.clone());
+            audit(
+                &state,
+                AuditKind::RiskPolicyUpdated,
+                json!({
+                    "origin": "control_surface",
+                    "policy": updated.summary()
+                }),
+            )
+            .await;
+            HttpResponse::Ok().json(updated.summary())
+        }
+    }
+}
+
 /// Query for `GET /commands`.
 #[derive(Debug, Deserialize)]
 pub struct CommandsQuery {

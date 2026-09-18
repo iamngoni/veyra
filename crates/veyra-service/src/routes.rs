@@ -48,6 +48,8 @@ struct StatusResponse {
     ea_live_orders: bool,
     autopilot: Option<serde_json::Value>,
     model_budget: Option<serde_json::Value>,
+    /// Process-lifetime judge usage (calls, failures, reported tokens).
+    jev_usage: Option<serde_json::Value>,
     /// Effective risk gate policy; always present (the gate never sleeps).
     risk_policy: serde_json::Value,
 }
@@ -166,6 +168,15 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         })
     });
     let jev_provider = state.jev().map(|runtime| runtime.provider().as_str());
+    let jev_usage = state.jev().map(|runtime| {
+        let usage = runtime.usage();
+        json!({
+            "calls": usage.calls,
+            "failures": usage.failures,
+            "inputTokens": usage.input_tokens,
+            "outputTokens": usage.output_tokens
+        })
+    });
     let persistence = state.audit().map(|runtime| runtime.provider().as_str());
 
     HttpResponse::Ok().json(StatusResponse {
@@ -182,6 +193,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         ea_live_orders,
         autopilot,
         model_budget,
+        jev_usage,
         risk_policy: state.risk().policy().summary(),
     })
 }
@@ -445,6 +457,82 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), 503);
+    }
+
+    #[actix_web::test]
+    async fn risk_policy_route_reads_and_updates_with_validation() {
+        use crate::AppState;
+        use crate::app::create_app;
+        use crate::audit::{AuditKind, AuditRuntime, MemoryTrail};
+        use crate::config::{ConfigError, ServiceConfig};
+        use crate::risk::{RiskGate, RiskPolicy};
+
+        let config = ServiceConfig::from_source(|name| match name {
+            "VEYRA_BIND_HOST" => Ok("127.0.0.1".to_owned()),
+            "VEYRA_BIND_PORT" => Ok("8080".to_owned()),
+            "VEYRA_ENV" => Ok("development".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        })
+        .expect("config parses");
+        let trail = std::sync::Arc::new(MemoryTrail::default());
+        let state = AppState::new(
+            config,
+            None::<crate::broker::BrokerRuntime>,
+            None,
+            RiskGate::new(RiskPolicy::default()),
+        )
+        .with_audit(Some(AuditRuntime::new(trail.clone())));
+        let app = actix_web::test::init_service(create_app(state)).await;
+
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/risk/policy")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+        assert_eq!(body["killSwitch"], false);
+        assert_eq!(body["maxRiskPercent"], 12.0);
+
+        // An out-of-range value is rejected with the field named.
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/risk/policy")
+                .set_json(serde_json::json!({ "maxOpenOrders": 1001 }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+        assert_eq!(body["field"], "maxOpenOrders");
+
+        // A valid patch applies and is journaled.
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/risk/policy")
+                .set_json(serde_json::json!({
+                    "killSwitch": true,
+                    "symbols": ["eurusd"],
+                    "maxOpenOrders": 3
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+        assert_eq!(body["killSwitch"], true);
+        assert_eq!(body["maxOpenOrders"], 3);
+        assert_eq!(body["symbols"][0], "EURUSD", "symbols normalise upper-case");
+
+        let audited = trail.events().into_iter().any(|event| {
+            event.kind() == AuditKind::RiskPolicyUpdated
+                && event.payload()["policy"]["maxOpenOrders"] == 3
+        });
+        assert!(audited, "policy changes are journaled");
     }
 
     #[actix_web::test]

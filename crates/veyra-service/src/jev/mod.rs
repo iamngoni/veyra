@@ -26,6 +26,7 @@ pub use settings::{JevApiKey, JevSettings};
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
@@ -111,11 +112,38 @@ pub trait SemanticJudge: Send + Sync + fmt::Debug + 'static {
     async fn judge(&self, request: JevRequest) -> Result<JevResponse, JevError>;
 }
 
+/// Process-lifetime count of judge calls and the token usage they reported.
+///
+/// The provider's own dashboard can lag, aggregate differently, or belong to a
+/// different project; this is the service's authoritative view of what it
+/// actually spent.
+#[derive(Debug, Default)]
+pub struct JevUsage {
+    calls: AtomicU64,
+    failures: AtomicU64,
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+}
+
+/// Snapshot of [`JevUsage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JevUsageSnapshot {
+    /// Judgement calls attempted.
+    pub calls: u64,
+    /// Calls that returned an error.
+    pub failures: u64,
+    /// Prompt tokens reported by the provider.
+    pub input_tokens: u64,
+    /// Completion tokens reported by the provider.
+    pub output_tokens: u64,
+}
+
 /// Active judgement integration selected by configuration.
 #[derive(Debug, Clone)]
 pub struct JevRuntime {
     provider: JevProvider,
     judge: Arc<dyn SemanticJudge>,
+    usage: Arc<JevUsage>,
 }
 
 impl JevRuntime {
@@ -130,6 +158,7 @@ impl JevRuntime {
                 Ok(Self {
                     provider: settings.provider(),
                     judge: Arc::new(judge),
+                    usage: Arc::new(JevUsage::default()),
                 })
             }
         }
@@ -145,10 +174,49 @@ impl JevRuntime {
         &self.judge
     }
 
+    /// Runs one judgement request, counting the call and the token usage the
+    /// provider reports. Errors are counted as failures and returned as-is.
+    ///
+    /// # Errors
+    /// Returns [`JevError`] from the active judge unchanged.
+    pub async fn evaluate(&self, request: JevRequest) -> Result<JevResponse, JevError> {
+        self.usage.calls.fetch_add(1, Ordering::Relaxed);
+        match self.judge.judge(request).await {
+            Ok(response) => {
+                let usage = response.usage();
+                self.usage
+                    .input_tokens
+                    .fetch_add(usage.input_tokens, Ordering::Relaxed);
+                self.usage
+                    .output_tokens
+                    .fetch_add(usage.output_tokens, Ordering::Relaxed);
+                Ok(response)
+            }
+            Err(error) => {
+                self.usage.failures.fetch_add(1, Ordering::Relaxed);
+                Err(error)
+            }
+        }
+    }
+
+    /// Returns a snapshot of the process-lifetime judge usage.
+    pub fn usage(&self) -> JevUsageSnapshot {
+        JevUsageSnapshot {
+            calls: self.usage.calls.load(Ordering::Relaxed),
+            failures: self.usage.failures.load(Ordering::Relaxed),
+            input_tokens: self.usage.input_tokens.load(Ordering::Relaxed),
+            output_tokens: self.usage.output_tokens.load(Ordering::Relaxed),
+        }
+    }
+
     /// Builds a runtime around an injected judge; used by tests.
     #[cfg(test)]
     pub(crate) fn with_judge(provider: JevProvider, judge: Arc<dyn SemanticJudge>) -> Self {
-        Self { provider, judge }
+        Self {
+            provider,
+            judge,
+            usage: Arc::new(JevUsage::default()),
+        }
     }
 }
 
@@ -166,6 +234,80 @@ mod tests {
         );
         assert_eq!(JevProvider::parse("openai"), None);
         assert_eq!(JevProvider::TypeSafe.to_string(), "typesafe");
+    }
+
+    /// Stub judge returning the canonical contract sample, or failing.
+    #[derive(Debug)]
+    struct StubJudge {
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl SemanticJudge for StubJudge {
+        fn provider(&self) -> JevProvider {
+            JevProvider::TypeSafe
+        }
+
+        async fn judge(&self, _request: JevRequest) -> Result<JevResponse, JevError> {
+            if self.fail {
+                return Err(JevError::Transport {
+                    reason: "probe down".to_owned(),
+                });
+            }
+            let body = serde_json::json!({
+                "model": "jev-test",
+                "answers": {
+                    "trending": {"type": "noul", "noul": 0.6}
+                },
+                "usage": {"input_tokens": 402, "output_tokens": 73}
+            });
+            crate::jev::contract::parse_response_body(body.to_string().as_bytes())
+        }
+    }
+
+    fn sample_request() -> JevRequest {
+        let state = State::text("EURUSD H4 probe").expect("state");
+        let mut questions = std::collections::BTreeMap::new();
+        questions.insert(
+            "trending".to_owned(),
+            Question::noul(
+                Instructions::text("Does this look trending?").expect("instructions"),
+                NoulCriteria::default(),
+            ),
+        );
+        JevRequest::new(state, questions).expect("request")
+    }
+
+    #[actix_web::test]
+    async fn evaluate_counts_calls_and_reported_tokens() {
+        let runtime =
+            JevRuntime::with_judge(JevProvider::TypeSafe, Arc::new(StubJudge { fail: false }));
+        assert_eq!(runtime.usage().calls, 0);
+
+        runtime
+            .evaluate(sample_request())
+            .await
+            .expect("judgement succeeds");
+        runtime
+            .evaluate(sample_request())
+            .await
+            .expect("judgement succeeds");
+
+        let usage = runtime.usage();
+        assert_eq!(usage.calls, 2);
+        assert_eq!(usage.failures, 0);
+        assert_eq!(usage.input_tokens, 804);
+        assert_eq!(usage.output_tokens, 146);
+    }
+
+    #[actix_web::test]
+    async fn evaluate_counts_failures_without_tokens() {
+        let runtime =
+            JevRuntime::with_judge(JevProvider::TypeSafe, Arc::new(StubJudge { fail: true }));
+        runtime.evaluate(sample_request()).await.expect_err("fails");
+        let usage = runtime.usage();
+        assert_eq!((usage.calls, usage.failures), (1, 1));
+        assert_eq!((usage.input_tokens, usage.output_tokens), (0, 0));
     }
 
     #[test]

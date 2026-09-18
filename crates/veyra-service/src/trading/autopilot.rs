@@ -1751,8 +1751,7 @@ pub(crate) async fn judgements_for(
 
     let request = JevRequest::new(state, questions).map_err(|error| error.to_string())?;
     let response = jev
-        .judge()
-        .judge(request.clone())
+        .evaluate(request.clone())
         .await
         .map_err(|error| error.to_string())?;
     request
