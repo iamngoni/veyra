@@ -84,6 +84,8 @@ pub struct ModelSettings {
     base_url: Option<String>,
     tiers: TierModels,
     http_referer: Option<String>,
+    app_title: Option<String>,
+    app_hidden: bool,
     budget: crate::model::BudgetPolicy,
 }
 
@@ -116,6 +118,8 @@ impl ModelSettings {
         let balanced_raw = optional(&mut source, "VEYRA_MODEL_BALANCED");
         let reasoning_raw = optional(&mut source, "VEYRA_MODEL_REASONING");
         let referer_raw = optional(&mut source, "VEYRA_MODEL_HTTP_REFERER");
+        let title_raw = optional(&mut source, "VEYRA_MODEL_APP_TITLE");
+        let hidden_raw = optional(&mut source, "VEYRA_MODEL_APP_HIDDEN");
         let hourly_cap_raw = optional(&mut source, "VEYRA_MODEL_MAX_CALLS_PER_HOUR");
         let daily_cap_raw = optional(&mut source, "VEYRA_MODEL_MAX_CALLS_PER_DAY");
 
@@ -197,6 +201,25 @@ impl ModelSettings {
         } else {
             Some(referer_raw)
         };
+        let app_title = if title_raw.is_empty() {
+            None
+        } else {
+            Some(title_raw)
+        };
+        // Unset means the provider's own default applies: the header is only
+        // sent to opt out. Visibility is fixed on the first request the
+        // provider ever sees, so diverging from that default silently would be
+        // a decision nobody could reverse later.
+        let app_hidden = match hidden_raw.as_str() {
+            "" | "false" => false,
+            "true" => true,
+            _ => {
+                return Err(ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_MODEL_APP_HIDDEN",
+                    reason: "must be `true` or `false`",
+                });
+            }
+        };
 
         Ok(Some(Self {
             provider,
@@ -204,6 +227,8 @@ impl ModelSettings {
             base_url,
             tiers,
             http_referer,
+            app_title,
+            app_hidden,
             budget,
         }))
     }
@@ -231,6 +256,16 @@ impl ModelSettings {
     /// Optional OpenRouter attribution header.
     pub fn http_referer(&self) -> Option<&str> {
         self.http_referer.as_deref()
+    }
+
+    /// Display name reported alongside the attribution URL.
+    pub fn app_title(&self) -> Option<&str> {
+        self.app_title.as_deref()
+    }
+
+    /// Whether the attributed app asks to stay out of public rankings.
+    pub fn app_hidden(&self) -> bool {
+        self.app_hidden
     }
 
     /// Call budget applied to the active engine.

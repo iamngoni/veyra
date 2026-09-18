@@ -90,8 +90,17 @@ impl AgentRuntimeEngine {
             .retry(RetryPolicy::with_retries(2))
             .verbose(false);
 
+        // Attribution is keyed on the URL: the provider creates no app entry
+        // without it, so the title and visibility headers only carry meaning
+        // when it is present.
         if let Some(referer) = settings.http_referer() {
             builder = builder.header("HTTP-Referer", referer);
+            if let Some(title) = settings.app_title() {
+                builder = builder.header("X-OpenRouter-Title", title);
+            }
+            if settings.app_hidden() {
+                builder = builder.header("X-OpenRouter-App-Visibility", "hidden");
+            }
         }
         if let Some(client) = client {
             builder = builder.http_client(client);

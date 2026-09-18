@@ -937,9 +937,11 @@ fn with_reference_prices(
         let Some(last) = series.last() else {
             continue;
         };
-        match account.prices.iter_mut().find(|(known, _)| known == symbol) {
-            Some((_, price)) => *price = last.close(),
-            None => account.prices.push((symbol.clone(), last.close())),
+        // Only fill a gap. A symbol already carrying a price got it from the
+        // account snapshot, which is the live close for an open position and
+        // therefore fresher than a candle that may be hours old.
+        if !account.prices.iter().any(|(known, _)| known == symbol) {
+            account.prices.push((symbol.clone(), last.close()));
         }
     }
     account
@@ -4040,6 +4042,58 @@ mod tests {
             Some("GBPUSD"),
             "an open position is managed even without a configured menu"
         );
+    }
+
+    #[test]
+    fn candle_closes_fill_missing_prices_without_replacing_live_ones() {
+        let series = |symbol: &str| {
+            CandleSeries::from_validated(
+                Symbol::parse(symbol).expect("symbol"),
+                Timeframe::H4,
+                vec![Candle::from_validated(
+                    1_700_000_000,
+                    1.0,
+                    1.2,
+                    0.9,
+                    1.1,
+                    10,
+                )],
+            )
+        };
+        let markets = vec![
+            (Symbol::parse("EURUSD").expect("symbol"), series("EURUSD")),
+            (Symbol::parse("GBPUSD").expect("symbol"), series("GBPUSD")),
+        ];
+        // EURUSD already carries the venue's live close for an open position;
+        // GBPUSD has none, so only it should take the candle's price.
+        let facts = AccountFacts {
+            trade_allowed: true,
+            open_orders: 1,
+            open_lots: 0.01,
+            open_symbols: vec![Symbol::parse("EURUSD").expect("symbol")],
+            open_positions: Vec::new(),
+            prices: vec![(Symbol::parse("EURUSD").expect("symbol"), 1.9)],
+            equity: None,
+            free_margin: None,
+            day_drawdown_percent: None,
+            peak_drawdown_percent: None,
+        };
+
+        let priced = with_reference_prices(facts, &markets);
+
+        let price = |symbol: &str| {
+            priced
+                .prices
+                .iter()
+                .find(|(known, _)| known.as_str() == symbol)
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(
+            price("EURUSD"),
+            Some(1.9),
+            "a candle hours old must not displace the live snapshot price"
+        );
+        assert_eq!(price("GBPUSD"), Some(1.1));
     }
 
     #[test]
