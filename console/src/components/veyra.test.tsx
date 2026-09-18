@@ -72,6 +72,7 @@ const status: Status = {
   autopilot,
   model_budget: { hourLimit: 120, hourCalls: 5, dayLimit: 2000, dayCalls: 5 },
   jev_usage: { calls: 12, failures: 0, inputTokens: 4800, outputTokens: 720 },
+  decisions: { consecutiveFailures: 0, lastFailure: null, lastFailureAt: null },
   risk_policy: {
     killSwitch: false,
     allowTradingWithoutJev: false,
@@ -523,6 +524,32 @@ describe('systemPosture', () => {
     // Service armed but the terminal still validating only.
     expect(systemPosture({ ...status, ea_live_orders: false }).label).toBe('DRY RUN')
     expect(systemPosture(status).label).toBe('LIVE')
+  })
+
+  it('names a decision outage that every other signal reports as healthy', () => {
+    // The exact shape of today's failures: service up, terminal live, trading
+    // armed — and every request refused.
+    const refusing = {
+      ...status,
+      decisions: {
+        consecutiveFailures: 4,
+        lastFailure: 'openrouter call returned 400: Thinking mode does not support this tool_choice',
+        lastFailureAt: 1_700_000_000,
+      },
+    }
+    expect(systemPosture(refusing).label).toBe('NOT DECIDING')
+    expect(systemPosture(refusing).tone).toBe('bad')
+    expect(systemPosture(refusing).detail).toContain('Thinking mode')
+
+    // One failure is a hiccup, not an outage.
+    expect(
+      systemPosture({ ...status, decisions: { consecutiveFailures: 1, lastFailure: 'x', lastFailureAt: 1 } }).label,
+    ).toBe('LIVE')
+
+    // A halted gate still outranks it: the owner stopped this deliberately.
+    expect(
+      systemPosture({ ...refusing, risk_policy: { ...status.risk_policy, killSwitch: true } }).label,
+    ).toBe('HALTED')
   })
 
   it('renders the verdict and its explanation', () => {

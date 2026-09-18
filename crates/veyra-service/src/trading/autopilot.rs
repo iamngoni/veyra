@@ -717,10 +717,16 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                     PipelineError::AgentLoopLimit { reason } => format!("agent loop: {reason}"),
                     other => format!("model unavailable: {other}"),
                 };
+                // A refused request fails this tick and nothing else, so the
+                // run has to be counted somewhere a surface can read it.
+                state
+                    .decision_health()
+                    .failed(&reason, unix_secs(SystemTime::now()));
                 record(state, "unavailable", None, None, Some(&reason)).await;
                 TickOutcome::Unavailable { reason }
             }
             Ok(outcome) => {
+                state.decision_health().succeeded();
                 let AgentDecision::Proposal(evaluation) = outcome.decision else {
                     let reason = "agent returned a review for an entry decision".to_owned();
                     record(state, "unavailable", None, None, Some(&reason)).await;
@@ -1281,6 +1287,53 @@ impl ReviewWatch {
     }
 }
 
+/// Whether decisions are actually completing.
+///
+/// A model that refuses every request fails the tick, not the process: the
+/// service stays healthy, the broker link stays live, and the console reads
+/// green while nothing is ever decided. The only symptom is an absence of
+/// trades, which is indistinguishable from a market offering nothing. This
+/// counts consecutive failures so that absence becomes something a surface can
+/// state outright.
+#[derive(Debug, Default)]
+pub struct DecisionHealth {
+    consecutive_failures: std::sync::atomic::AtomicU32,
+    last_failure: std::sync::Mutex<Option<(String, i64)>>,
+}
+
+impl DecisionHealth {
+    /// Records a decision that reached a verdict, clearing any failure run.
+    pub fn succeeded(&self) {
+        self.consecutive_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut last) = self.last_failure.lock() {
+            *last = None;
+        }
+    }
+
+    /// Records a decision that could not be reached, and why.
+    pub fn failed(&self, reason: &str, at: i64) {
+        self.consecutive_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut last) = self.last_failure.lock() {
+            // Bounded: this travels to a status payload, and a provider error
+            // body can be long enough to bury everything around it.
+            *last = Some((reason.chars().take(300).collect(), at));
+        }
+    }
+
+    /// Consecutive failures since the last verdict.
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The most recent failure and when it happened, while a run is unbroken.
+    pub fn last_failure(&self) -> Option<(String, i64)> {
+        self.last_failure.lock().ok().and_then(|last| last.clone())
+    }
+}
+
 /// Judge answers, keyed to the candle they were formed on.
 ///
 /// The judge is shown nothing but the market narrative, and that narrative is
@@ -1575,12 +1628,18 @@ async fn review_positions(
     let instructions = review_instructions(series, positions);
     let input = review_input(state, series, positions, judgements);
     let outcome = match agent::run(session, &instructions, &input).await {
-        Ok(outcome) => outcome,
+        Ok(outcome) => {
+            state.decision_health().succeeded();
+            outcome
+        }
         Err(error) => {
             let reason = match error {
                 PipelineError::AgentLoopLimit { reason } => format!("agent loop: {reason}"),
                 other => format!("model unavailable: {other}"),
             };
+            state
+                .decision_health()
+                .failed(&reason, unix_secs(SystemTime::now()));
             record(
                 state,
                 "unavailable",
@@ -3661,6 +3720,72 @@ mod tests {
             "a failed judgement must not reach the model"
         );
         assert_eq!(outcomes(&harness.trail), vec!["unavailable".to_owned()]);
+    }
+
+    #[test]
+    fn a_failure_run_is_counted_until_a_verdict_clears_it() {
+        let health = DecisionHealth::default();
+        assert_eq!(health.consecutive_failures(), 0);
+        assert!(health.last_failure().is_none());
+
+        health.failed("openrouter call returned 400: thinking mode", 1_700_000_000);
+        health.failed("openrouter call returned 400: thinking mode", 1_700_000_060);
+        assert_eq!(health.consecutive_failures(), 2);
+        let (reason, at) = health.last_failure().expect("a run is open");
+        assert!(reason.contains("thinking mode"));
+        assert_eq!(at, 1_700_000_060);
+
+        // One verdict means the provider is answering again.
+        health.succeeded();
+        assert_eq!(health.consecutive_failures(), 0);
+        assert!(
+            health.last_failure().is_none(),
+            "a cleared run must not leave a stale reason on the status surface"
+        );
+    }
+
+    #[test]
+    fn a_recorded_failure_reason_cannot_swamp_the_status_payload() {
+        let health = DecisionHealth::default();
+        // Provider error bodies embed the whole upstream response.
+        health.failed(&"x".repeat(5_000), 1_700_000_000);
+        let (reason, _) = health.last_failure().expect("failure recorded");
+        assert!(
+            reason.chars().count() <= 300,
+            "got {}",
+            reason.chars().count()
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_refused_model_leaves_a_failure_run_behind() {
+        // The engine refuses every request, exactly as a thinking model does
+        // when handed a compelled tool choice.
+        let engine = StubEngine::failing();
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+
+        assert!(matches!(
+            tick(&harness.state).await,
+            TickOutcome::Unavailable { .. }
+        ));
+        assert_eq!(
+            harness.state.decision_health().consecutive_failures(),
+            1,
+            "a tick that never reached a verdict must be visible as a failure"
+        );
+        assert!(harness.state.decision_health().last_failure().is_some());
     }
 
     #[test]

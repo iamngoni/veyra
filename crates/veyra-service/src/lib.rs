@@ -59,6 +59,7 @@ pub struct AppState {
     entry_watch: Arc<crate::trading::autopilot::EntryWatch>,
     judgements: Arc<crate::trading::autopilot::JudgementCache>,
     review_watch: Arc<crate::trading::autopilot::ReviewWatch>,
+    decision_health: Arc<crate::trading::autopilot::DecisionHealth>,
     rotation: Arc<AtomicUsize>,
     equity_guard: Arc<EquityGuard>,
 }
@@ -87,6 +88,7 @@ impl AppState {
             entry_watch: Arc::new(crate::trading::autopilot::EntryWatch::default()),
             judgements: Arc::new(crate::trading::autopilot::JudgementCache::default()),
             review_watch: Arc::new(crate::trading::autopilot::ReviewWatch::default()),
+            decision_health: Arc::new(crate::trading::autopilot::DecisionHealth::default()),
             rotation: Arc::new(AtomicUsize::new(0)),
             equity_guard: Arc::new(EquityGuard::new()),
         }
@@ -184,6 +186,11 @@ impl AppState {
     /// Candle each open position was last reviewed on.
     pub fn review_watch(&self) -> &Arc<crate::trading::autopilot::ReviewWatch> {
         &self.review_watch
+    }
+
+    /// Whether decisions are completing, so a surface can say when they stop.
+    pub fn decision_health(&self) -> &Arc<crate::trading::autopilot::DecisionHealth> {
+        &self.decision_health
     }
 
     /// Returns the active model integration, if one is configured.

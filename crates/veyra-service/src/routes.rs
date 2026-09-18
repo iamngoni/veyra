@@ -54,6 +54,11 @@ struct StatusResponse {
     jev_usage: Option<serde_json::Value>,
     /// Effective risk gate policy; always present (the gate never sleeps).
     risk_policy: serde_json::Value,
+    /// Whether decisions are completing. A provider that refuses every request
+    /// leaves every other field here healthy, so this is the only place the
+    /// difference between "nothing worth trading" and "nothing can be decided"
+    /// is visible.
+    decisions: serde_json::Value,
 }
 
 #[get("/health")]
@@ -201,6 +206,20 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         model_budget,
         jev_usage,
         risk_policy: state.risk().policy().summary(),
+        decisions: {
+            // Named for the concept, not `health`: the `/health` route macro
+            // generates a unit struct by that name in this module.
+            let decisions = state.decision_health();
+            let (reason, at) = match decisions.last_failure() {
+                Some((reason, at)) => (Some(reason), Some(at)),
+                None => (None, None),
+            };
+            serde_json::json!({
+                "consecutiveFailures": decisions.consecutive_failures(),
+                "lastFailure": reason,
+                "lastFailureAt": at,
+            })
+        },
     })
 }
 

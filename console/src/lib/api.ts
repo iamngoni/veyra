@@ -41,6 +41,16 @@ export type Status = {
   jev_usage: { calls: number; failures: number; inputTokens: number; outputTokens: number } | null
   /** Effective risk gate policy; always present. */
   risk_policy: RiskPolicy
+  /**
+   * Whether decisions are completing. Every other field can read healthy while
+   * a provider refuses every request, so this is the only signal separating
+   * "nothing worth trading" from "nothing can be decided".
+   */
+  decisions: {
+    consecutiveFailures: number
+    lastFailure: string | null
+    lastFailureAt: number | null
+  } | null
 }
 
 export type RiskPolicy = {

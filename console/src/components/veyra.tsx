@@ -216,6 +216,17 @@ export function systemPosture(status?: Status): {
   if (status.risk_policy?.killSwitch) {
     return { label: 'HALTED', detail: 'kill switch engaged — every intent refused', tone: 'bad' }
   }
+  // Ranked above the link and the switches because it is the failure that
+  // looks like health: the service answers, the terminal is live, and nothing
+  // is ever decided. Two in a row rules out one transient provider hiccup.
+  const failures = status.decisions?.consecutiveFailures ?? 0
+  if (failures >= 2) {
+    return {
+      label: 'NOT DECIDING',
+      detail: `${failures} decisions in a row failed — ${status.decisions?.lastFailure ?? 'no reason reported'}`,
+      tone: 'bad',
+    }
+  }
   if (!status.broker_connected) {
     return { label: 'NO LINK', detail: 'terminal is not reporting', tone: 'bad' }
   }
