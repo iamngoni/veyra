@@ -672,10 +672,11 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     } else if policy.max_total_lots().value() - account.open_lots <= 0.0 {
         record(state, "no_trade", None, None, Some("exposure_cap")).await;
         TickOutcome::NoTrade
-    } else if !state
-        .entry_watch()
-        .should_evaluate(&observations, settings.entry_move_atr_fraction())
-    {
+    } else if !state.entry_watch().should_evaluate(
+        &observations,
+        settings.entry_move_atr_fraction(),
+        unix_secs(SystemTime::now()),
+    ) {
         // Nothing moved since the last proposal, so the model would be asked
         // an identical question. Stops and reviews already ran above.
         TickOutcome::Unchanged
@@ -683,6 +684,8 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         // Marked before the proposal, not after: whatever this sweep decides,
         // the question has now been asked about this market, and an error on
         // the way to the answer must not leave it asking again every tick.
+        // A sweep that dies before a verdict arms a retry instead (see
+        // `mark_failed`), so the mark costs minutes rather than the candle.
         state.entry_watch().record(&observations);
         // Fetch the venue contract for every menu instrument once: the model
         // gets spread, stop-level, lot-band, and margin facts to size its
@@ -694,6 +697,9 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         let events = match calendar_events(state).await {
             Ok(events) => events,
             Err(reason) => {
+                state
+                    .entry_watch()
+                    .mark_failed(unix_secs(SystemTime::now()));
                 record(state, "unavailable", None, None, Some(&reason)).await;
                 return TickOutcome::Unavailable { reason };
             }
@@ -719,14 +725,16 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                 };
                 // A refused request fails this tick and nothing else, so the
                 // run has to be counted somewhere a surface can read it.
-                state
-                    .decision_health()
-                    .failed(&reason, unix_secs(SystemTime::now()));
+                let now = unix_secs(SystemTime::now());
+                state.decision_health().failed(&reason, now);
+                // The gate was marked for a market this sweep never judged.
+                state.entry_watch().mark_failed(now);
                 record(state, "unavailable", None, None, Some(&reason)).await;
                 TickOutcome::Unavailable { reason }
             }
             Ok(outcome) => {
                 state.decision_health().succeeded();
+                state.entry_watch().mark_settled();
                 let AgentDecision::Proposal(evaluation) = outcome.decision else {
                     let reason = "agent returned a review for an entry decision".to_owned();
                     record(state, "unavailable", None, None, Some(&reason)).await;
@@ -1243,7 +1251,23 @@ pub struct EntryObservation<'a> {
 #[derive(Debug, Default)]
 pub struct EntryWatch {
     seen: std::sync::Mutex<std::collections::HashMap<String, EntrySeen>>,
+    /// When the last sweep died before reaching a verdict, if it did.
+    ///
+    /// The gate is marked before the model is asked, so a sweep that fails on
+    /// the way to an answer would otherwise hold the gate shut for the rest of
+    /// the candle — up to four hours of silence on H4 from one transient
+    /// refusal. Arming a retry keeps the anti-hammer property (a sustained
+    /// outage re-asks every [`ENTRY_RETRY_AFTER_SECS`], not every tick) while
+    /// bounding what a single failure costs.
+    failed_at: std::sync::Mutex<Option<i64>>,
 }
+
+/// How long a failed entry sweep holds the gate before it is asked again.
+///
+/// Short enough that one bad answer costs minutes rather than a whole candle,
+/// long enough that a provider outage cannot drain the hourly model budget and
+/// leave nothing for the recovery.
+pub const ENTRY_RETRY_AFTER_SECS: i64 = 300;
 
 /// The candle each open position was last reviewed on.
 ///
@@ -1371,7 +1395,21 @@ impl EntryWatch {
     ///
     /// An instrument never seen before always qualifies, so a restart or a
     /// newly configured symbol gets one look before the gate starts applying.
-    pub fn should_evaluate(&self, observations: &[EntryObservation<'_>], fraction: f64) -> bool {
+    pub fn should_evaluate(
+        &self,
+        observations: &[EntryObservation<'_>],
+        fraction: f64,
+        now: i64,
+    ) -> bool {
+        // A sweep that never reached a verdict left the gate marked anyway, so
+        // the market it recorded was never actually judged. Re-ask once the
+        // retry window has passed rather than waiting out the candle.
+        if let Ok(failed_at) = self.failed_at.lock()
+            && let Some(at) = *failed_at
+            && now.saturating_sub(at) >= ENTRY_RETRY_AFTER_SECS
+        {
+            return true;
+        }
         let Ok(seen) = self.seen.lock() else {
             // A poisoned lock must not silently stop trading; ask instead.
             return true;
@@ -1408,6 +1446,20 @@ impl EntryWatch {
                     price: observation.price,
                 },
             );
+        }
+    }
+
+    /// Notes that this sweep died before reaching a verdict, arming a retry.
+    pub fn mark_failed(&self, now: i64) {
+        if let Ok(mut failed_at) = self.failed_at.lock() {
+            *failed_at = Some(now);
+        }
+    }
+
+    /// Clears an armed retry once a sweep reaches a verdict of any kind.
+    pub fn mark_settled(&self) {
+        if let Ok(mut failed_at) = self.failed_at.lock() {
+            *failed_at = None;
         }
     }
 }
@@ -4001,8 +4053,63 @@ mod tests {
             harness
                 .state
                 .entry_watch()
-                .should_evaluate(&[observation], 0.25),
+                .should_evaluate(&[observation], 0.25, GATE_NOW),
             "a newer closed candle must reopen the entry question"
+        );
+    }
+
+    /// Wall clock for gate tests that are not about the retry window.
+    const GATE_NOW: i64 = 1_700_000_000;
+
+    /// A sweep that dies before a verdict must not hold the gate for the candle.
+    ///
+    /// The gate is marked before the model is asked, so a failed sweep leaves
+    /// every instrument recorded against a market nothing actually judged. On
+    /// H4 that silently withheld entries for the rest of a four-hour candle,
+    /// from a single malformed answer, with the console still reading LIVE.
+    #[test]
+    fn a_failed_sweep_reopens_the_question_without_waiting_for_the_candle() {
+        let watch = EntryWatch::default();
+        let observation = || EntryObservation {
+            symbol: "EURUSD",
+            candle_time: GATE_NOW,
+            price: Some(1.1000),
+            atr: Some(0.0040),
+        };
+        // The sweep runs and marks the gate, then fails on the way to a verdict.
+        watch.record(&[observation()]);
+        watch.mark_failed(GATE_NOW);
+
+        // Nothing moved, so the ordinary gate is shut and would stay shut until
+        // the next candle.
+        assert!(
+            !watch.should_evaluate(&[observation()], 0.25, GATE_NOW + 1),
+            "a failure must not re-ask on the very next tick"
+        );
+        assert!(
+            !watch.should_evaluate(
+                &[observation()],
+                0.25,
+                GATE_NOW + ENTRY_RETRY_AFTER_SECS - 1
+            ),
+            "the retry window must actually hold"
+        );
+        // Once the window passes, the question the sweep never answered is
+        // asked again rather than waiting out the candle.
+        assert!(
+            watch.should_evaluate(&[observation()], 0.25, GATE_NOW + ENTRY_RETRY_AFTER_SECS),
+            "a failed sweep must be retried within the candle"
+        );
+
+        // A sweep that reaches a verdict disarms the retry.
+        watch.mark_settled();
+        assert!(
+            !watch.should_evaluate(
+                &[observation()],
+                0.25,
+                GATE_NOW + ENTRY_RETRY_AFTER_SECS * 10
+            ),
+            "a settled sweep must fall back to the ordinary gate"
         );
     }
 
@@ -4016,19 +4123,19 @@ mod tests {
             atr: Some(0.0040),
         };
         // Never seen before: always worth one look.
-        assert!(watch.should_evaluate(&[seen(1.1000)], 0.25));
+        assert!(watch.should_evaluate(&[seen(1.1000)], 0.25, GATE_NOW));
         watch.record(&[seen(1.1000)]);
 
         // A quarter of ATR is 0.0010, so drift below it stays quiet. The exact
         // boundary is deliberately not asserted: at these magnitudes it lands
         // inside float error, and no decision should hinge on which side of a
         // rounding step a price fell.
-        assert!(!watch.should_evaluate(&[seen(1.1005)], 0.25));
+        assert!(!watch.should_evaluate(&[seen(1.1005)], 0.25, GATE_NOW));
         // Clearly past it, in either direction.
-        assert!(watch.should_evaluate(&[seen(1.1012)], 0.25));
-        assert!(watch.should_evaluate(&[seen(1.0988)], 0.25));
+        assert!(watch.should_evaluate(&[seen(1.1012)], 0.25, GATE_NOW));
+        assert!(watch.should_evaluate(&[seen(1.0988)], 0.25, GATE_NOW));
         // Zero disables the mid-candle trigger entirely.
-        assert!(!watch.should_evaluate(&[seen(1.5000)], 0.0));
+        assert!(!watch.should_evaluate(&[seen(1.5000)], 0.0, GATE_NOW));
         // Without a live price there is nothing to compare, so candles rule.
         let unpriced = EntryObservation {
             symbol: "EURUSD",
@@ -4036,7 +4143,7 @@ mod tests {
             price: None,
             atr: Some(0.0040),
         };
-        assert!(!watch.should_evaluate(&[unpriced], 0.25));
+        assert!(!watch.should_evaluate(&[unpriced], 0.25, GATE_NOW));
     }
 
     #[actix_web::test]
