@@ -592,8 +592,23 @@ pub async fn tick(state: &AppState) -> TickOutcome {
 
     // One position review per tick, rotating through the open book; a close
     // ends the tick, a hold falls through so entries can still be considered.
+    //
+    // A position the minimum hold still protects cannot be closed whatever the
+    // answer, so asking costs a model call to produce a verdict the close path
+    // would only reject as `position_too_young`. The same applies when the
+    // venue reports no verifiable age: that close is refused too. Stop moves
+    // above are deliberately not gated — they guard money already at risk.
     let mut reviewed_hold = false;
+    let server_time = state
+        .broker()
+        .and_then(|broker| broker.link().last_account())
+        .map(|snapshot| snapshot.server_time)
+        .unwrap_or(0);
     if let Some(position) = next_review_position(&managed, state.rotation())
+        && matches!(
+            position_age_secs(server_time, position.opened_at),
+            Some(age) if age >= settings.min_hold().as_secs()
+        )
         && let Some(series) = series_for_symbol(&markets, &position.symbol)
     {
         let engine = model.engine();
@@ -3597,6 +3612,40 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_position_inside_the_minimum_hold_is_not_reviewed() {
+        // The close path refuses a position this young, so the review would buy
+        // a verdict that cannot be acted on.
+        let settings = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_MIN_HOLD_SECS" => Ok("86400".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let harness = build_harness(
+            settings,
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+
+        let outcome = tick(&harness.state).await;
+
+        // The entry sweep still runs; only the review was skipped.
+        assert_eq!(outcome, TickOutcome::NoTrade);
+        assert!(
+            !outcomes(&harness.trail).contains(&"close_rejected".to_owned()),
+            "a review that cannot act must not run at all"
+        );
+    }
+
+    #[actix_web::test]
     async fn the_judge_is_asked_once_per_candle() {
         let engine = StubEngine::answering(json!({"action": "none"}));
         let judge = StubJudge::responding(judgements_response());
@@ -4098,15 +4147,16 @@ mod tests {
             .ea_link()
             .expect("link")
             .retain_snapshot(managed_snapshot(10650805, 1_758_003_540, 1_758_003_600));
-        assert_eq!(
-            tick(&harness.state).await,
-            TickOutcome::Rejected {
-                code: "position_too_young"
-            }
+        // The tick no longer reviews a position the minimum hold protects: the
+        // close would be refused, so the verdict is never bought. The guard in
+        // the close path below stays as the backstop for any other caller.
+        assert!(
+            !outcomes(&harness.trail).contains(&"close_rejected".to_owned()),
+            "a position that cannot be closed must not be reviewed"
         );
-        assert_eq!(outcomes(&harness.trail), vec!["close_rejected".to_owned()]);
 
-        // Age cannot be verified.
+        // Age cannot be verified: the close path refuses that too, so the same
+        // skip applies rather than paying for an unusable verdict.
         let engine = StubEngine::answering(json!({"action": "close", "ticket": 7}));
         let harness = build_harness(
             enabled_settings(),
@@ -4128,11 +4178,10 @@ mod tests {
             .ea_link()
             .expect("link")
             .retain_snapshot(managed_snapshot(7, 0, 1_758_003_600));
-        assert_eq!(
-            tick(&harness.state).await,
-            TickOutcome::Rejected {
-                code: "position_age_unknown"
-            }
+        tick(&harness.state).await;
+        assert!(
+            !outcomes(&harness.trail).contains(&"close_rejected".to_owned()),
+            "an unverifiable age cannot authorise a close, so it is not asked"
         );
 
         // An unknown ticket is refused before any command exists.
