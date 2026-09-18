@@ -261,6 +261,7 @@ mod tests {
             trade_allowed: true,
             open_orders: 0,
             open_lots: 0.0,
+            open_symbols: Vec::new(),
         })
     }
 

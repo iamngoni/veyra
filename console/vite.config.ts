@@ -12,10 +12,19 @@ import tailwindcss from '@tailwindcss/vite'
 // by changing the target here.
 const SERVICE = process.env.VEYRA_API_TARGET ?? 'http://127.0.0.1:8080'
 
+// Extra host names the preview server accepts, for example the machine's
+// Tailscale name when the console is reached through `tailscale serve`.
+// Comma-separated; empty keeps Vite's localhost-only default.
+const ALLOWED_HOSTS = (process.env.VEYRA_CONSOLE_ALLOWED_HOSTS ?? '')
+  .split(',')
+  .map((host) => host.trim())
+  .filter(Boolean)
+
 const config = defineConfig({
   resolve: { tsconfigPaths: true },
   plugins: [devtools(), tailwindcss(), tanstackStart(), viteReact()],
   server: {
+    allowedHosts: ALLOWED_HOSTS,
     proxy: {
       '/api': {
         target: SERVICE,
@@ -25,6 +34,7 @@ const config = defineConfig({
     },
   },
   preview: {
+    allowedHosts: ALLOWED_HOSTS,
     proxy: {
       '/api': {
         target: SERVICE,

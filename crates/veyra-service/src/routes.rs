@@ -263,7 +263,9 @@ pub async fn evaluate_intent(
 }
 
 /// Assembles gate facts from a fresh link report. Any missing input fails
-/// closed, so a stale heartbeat or a broken link cannot widen behavior.
+/// closed, so a stale heartbeat, a broken link, or a snapshot that has not
+/// landed yet cannot widen behavior. The open-symbol list comes from the
+/// latest validated account snapshot and enforces one position per asset.
 pub(crate) async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<AccountFacts> {
     let runtime = broker?;
     let report = runtime.link().report().await;
@@ -274,10 +276,25 @@ pub(crate) async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<Acco
     if !snapshot.connected() {
         return None;
     }
+    let open_orders = snapshot.open_orders();
+    // The symbol list is only needed to enforce one position per asset. With
+    // no orders it is provably empty; with orders, the validated snapshot must
+    // be present and complete or the gate fails closed.
+    let open_symbols = match runtime.link().last_account() {
+        Some(account) if account.positions_truncated => return None,
+        Some(account) => account
+            .positions
+            .iter()
+            .filter_map(|position| crate::broker::Symbol::parse(&position.symbol).ok())
+            .collect(),
+        None if open_orders == 0 => Vec::new(),
+        None => return None,
+    };
     Some(AccountFacts {
         trade_allowed: snapshot.trade_allowed(),
-        open_orders: snapshot.open_orders(),
+        open_orders,
         open_lots: snapshot.open_lots(),
+        open_symbols,
     })
 }
 

@@ -28,7 +28,7 @@
 //! smaller than a tenth of the entry risk are suppressed to bound churn.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
@@ -396,7 +396,7 @@ pub enum TickOutcome {
 
 /// Runs one decision cycle. Never panics on provider failure: every external
 /// call degrades to an audited outcome or a skip.
-#[tracing::instrument(skip_all, name = "autopilot.tick", fields(symbol = tracing::field::Empty))]
+#[tracing::instrument(skip_all, name = "autopilot.tick", fields(symbols = tracing::field::Empty))]
 pub async fn tick(state: &AppState) -> TickOutcome {
     let Some(settings) = state.autopilot() else {
         return TickOutcome::Skipped {
@@ -426,193 +426,247 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             reason: "stale_link",
         };
     }
-    // Rotation: configured symbols first, then any symbol carrying an open
-    // Veyra position, so every managed position still gets lifecycle checks.
+    // Candidate menu: configured symbols first, then any symbol carrying an
+    // open Veyra position (so every managed position stays managed), capped by
+    // the settings parser. With nothing configured, the chart symbol is the
+    // whole menu.
     let managed = managed_positions(state);
-    let rotation = rotation_symbols(settings.symbols(), &managed);
-    let symbol = if rotation.is_empty() {
-        report
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.symbol().clone())
-    } else {
-        let index = state.rotation().fetch_add(1, Ordering::Relaxed) % rotation.len();
-        Some(rotation[index].clone())
-    };
-    let Some(symbol) = symbol else {
+    let mut candidates = candidate_symbols(settings.symbols(), &managed);
+    if candidates.is_empty()
+        && let Some(snapshot) = report.snapshot.as_ref()
+    {
+        candidates.push(snapshot.symbol().clone());
+    }
+    if candidates.is_empty() {
         return TickOutcome::Skipped {
             reason: "symbol_unavailable",
         };
-    };
-    tracing::Span::current().record("symbol", symbol.as_str());
+    }
+    let menu = candidates
+        .iter()
+        .map(|symbol| symbol.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    tracing::Span::current().record("symbols", menu.as_str());
+
     let Some(account) = crate::routes::account_facts(Some(broker)).await else {
         return TickOutcome::Skipped {
             reason: "account_unavailable",
         };
     };
 
-    let request = match CandleRequest::new(symbol.clone(), settings.timeframe(), settings.bars()) {
-        Ok(request) => request,
-        Err(error) => {
-            let reason = format!("market request: {error}");
-            record(state, "unavailable", Some(&symbol), None, Some(&reason)).await;
-            return TickOutcome::Unavailable { reason };
+    // Closed candles for every candidate; a candidate whose data is
+    // unavailable is dropped from this tick instead of failing the rest.
+    let mut markets: Vec<(Symbol, CandleSeries)> = Vec::new();
+    let mut market_error: Option<String> = None;
+    for symbol in &candidates {
+        let request =
+            match CandleRequest::new(symbol.clone(), settings.timeframe(), settings.bars()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let reason = format!("market request: {error}");
+                    record(state, "unavailable", Some(symbol), None, Some(&reason)).await;
+                    return TickOutcome::Unavailable { reason };
+                }
+            };
+        match market.feed().candles(request).await {
+            Ok(series) if !series.candles().is_empty() => markets.push((symbol.clone(), series)),
+            Ok(_) => {
+                tracing::warn!(
+                    symbol = symbol.as_str(),
+                    "candidate returned no candles; skipping"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(symbol = symbol.as_str(), %error, "candidate market data unavailable; skipping");
+                market_error = Some(error.to_string());
+            }
         }
-    };
-    let series = match market.feed().candles(request).await {
-        Ok(series) => series,
-        Err(error) => {
-            let reason = format!("market unavailable: {error}");
-            record(state, "unavailable", Some(&symbol), None, Some(&reason)).await;
-            return TickOutcome::Unavailable { reason };
-        }
-    };
-    if series.candles().is_empty() {
-        let reason = "market returned no candles".to_owned();
-        record(state, "unavailable", Some(&symbol), None, Some(&reason)).await;
+    }
+    if markets.is_empty() {
+        let reason = match market_error {
+            Some(error) => format!("market unavailable: {error}"),
+            None => "market returned no candles for any candidate".to_owned(),
+        };
+        record(state, "unavailable", None, None, Some(&reason)).await;
         return TickOutcome::Unavailable { reason };
     }
 
-    let judgements = match settings.jev() {
-        JevPreference::Off => None,
-        JevPreference::Auto => match state.jev() {
-            None => None,
-            Some(jev) => match judgements_for(jev, &series).await {
-                Ok(summary) => Some(summary),
+    // Calibrated judgements per candidate. They are advisory inputs, but a
+    // configured judge that fails still aborts the tick: no model call runs on
+    // partial inputs.
+    let mut judgements: Vec<(Symbol, Value)> = Vec::new();
+    if settings.jev() != JevPreference::Off
+        && let Some(jev) = state.jev()
+    {
+        for (symbol, series) in &markets {
+            match judgements_for(jev, series).await {
+                Ok(summary) => judgements.push((symbol.clone(), summary)),
                 Err(error) => {
                     let reason = format!("judgement unavailable: {error}");
-                    record(state, "unavailable", Some(&symbol), None, Some(&reason)).await;
+                    record(state, "unavailable", Some(symbol), None, Some(&reason)).await;
                     return TickOutcome::Unavailable { reason };
                 }
-            },
-        },
-    };
-
-    // While a Veyra-managed position is open, review it instead of hunting
-    // for entries: the open-order cap would reject any entry anyway, and the
-    // position needs a lifecycle decision.
-    let positions = positions_for_symbol(managed, &symbol);
-    if !positions.is_empty() {
-        // Capital preservation first: one action per tick, and moving the
-        // stop is cheaper and safer than any entry or exit decision.
-        if state.config().trading_enabled()
-            && let Some(plan) = stop_plan(
-                &positions,
-                settings.breakeven_r(),
-                settings.trail_r(),
-                state.stop_basis(),
-            )
-        {
-            return move_stop(state, &series, plan).await;
+            }
         }
-        return review_positions(
+    }
+
+    // Capital preservation first: any managed position whose stop policy is
+    // due moves before reviews or entries, and a stop move ends the tick.
+    if state.config().trading_enabled()
+        && let Some(plan) = stop_plan(
+            &managed,
+            settings.breakeven_r(),
+            settings.trail_r(),
+            state.stop_basis(),
+        )
+    {
+        let symbol = managed
+            .iter()
+            .find(|position| position.ticket == plan.ticket)
+            .map(|position| position.symbol.clone())
+            .unwrap_or_default();
+        return move_stop(state, &symbol, plan).await;
+    }
+
+    // One position review per tick, rotating through the open book; a close
+    // ends the tick, a hold falls through so entries can still be considered.
+    let mut reviewed_hold = false;
+    if let Some(position) = next_review_position(&managed, state.rotation())
+        && let Some(series) = series_for_symbol(&markets, &position.symbol)
+    {
+        let outcome = review_positions(
             state,
             settings,
             model,
-            &series,
-            &positions,
-            judgements.as_ref(),
+            series,
+            std::slice::from_ref(&position),
+            judgement_for_symbol(&judgements, series.symbol().as_str()),
         )
         .await;
+        if !matches!(outcome, TickOutcome::Held) {
+            return outcome;
+        }
+        reviewed_hold = true;
     }
 
-    let input = proposal_input(&series, account, judgements.as_ref());
-    let instructions = proposal_instructions(state, &series, account);
-    match evaluate_proposal(
-        model.engine().as_ref(),
-        state.risk(),
-        instructions,
-        input,
-        settings.tier(),
-        Some(account),
-        SystemTime::now(),
-    )
-    .await
-    {
-        Err(error) => {
-            let reason = format!("model unavailable: {error}");
-            record(state, "unavailable", Some(&symbol), None, Some(&reason)).await;
-            TickOutcome::Unavailable { reason }
-        }
-        Ok(PipelineOutcome::NoTrade) => {
-            record(state, "no_trade", Some(&symbol), None, None).await;
-            TickOutcome::NoTrade
-        }
-        Ok(PipelineOutcome::Rejected { rejection, draft }) => {
-            record(
-                state,
-                "rejected",
-                Some(&symbol),
-                Some(&draft),
-                Some(rejection.code().as_str()),
-            )
-            .await;
-            TickOutcome::Rejected {
-                code: rejection.code().as_str(),
+    // Entry: the deterministic caps decide whether another position is even
+    // possible; only then is the model asked to pick from the menu, and it may
+    // still answer `none` when no instrument is suitable.
+    let policy = state.risk().policy();
+    let entry_outcome = if account.open_orders >= policy.max_open_orders() {
+        record(state, "no_trade", None, None, Some("open_order_cap")).await;
+        TickOutcome::NoTrade
+    } else if policy.max_total_lots().value() - account.open_lots <= 0.0 {
+        record(state, "no_trade", None, None, Some("exposure_cap")).await;
+        TickOutcome::NoTrade
+    } else {
+        let input = proposal_input(&markets, &judgements, &account, &managed);
+        let instructions = proposal_instructions(state, &markets, &account);
+        match evaluate_proposal(
+            model.engine().as_ref(),
+            state.risk(),
+            instructions,
+            input,
+            settings.tier(),
+            Some(account.clone()),
+            SystemTime::now(),
+        )
+        .await
+        {
+            Err(error) => {
+                let reason = format!("model unavailable: {error}");
+                record(state, "unavailable", None, None, Some(&reason)).await;
+                TickOutcome::Unavailable { reason }
             }
-        }
-        Ok(PipelineOutcome::Approved(intent)) => {
-            let draft = intent.draft();
-            if draft.stop_loss().is_none() || draft.take_profit().is_none() {
+            Ok(PipelineOutcome::NoTrade) => {
+                record(state, "no_trade", None, None, None).await;
+                TickOutcome::NoTrade
+            }
+            Ok(PipelineOutcome::Rejected { rejection, draft }) => {
                 record(
                     state,
                     "rejected",
-                    Some(&symbol),
-                    Some(draft),
-                    Some("missing_stops"),
+                    Some(draft.symbol()),
+                    Some(&draft),
+                    Some(rejection.code().as_str()),
                 )
                 .await;
-                return TickOutcome::Rejected {
-                    code: "missing_stops",
-                };
+                TickOutcome::Rejected {
+                    code: rejection.code().as_str(),
+                }
             }
-            match queue_staged_order(state, &intent).await {
-                StagedExecution::Queued { command, intent_id } => {
-                    record_event(
+            Ok(PipelineOutcome::Approved(intent)) => {
+                let draft = intent.draft();
+                let symbol = draft.symbol().clone();
+                if draft.stop_loss().is_none() || draft.take_profit().is_none() {
+                    record(
                         state,
-                        "queued",
+                        "rejected",
                         Some(&symbol),
                         Some(draft),
-                        None,
-                        Some(&intent_id),
-                        Some(&command.to_string()),
+                        Some("missing_stops"),
                     )
                     .await;
-                    TickOutcome::Queued {
-                        command: command.to_string(),
+                    return TickOutcome::Rejected {
+                        code: "missing_stops",
+                    };
+                }
+                match queue_staged_order(state, &intent).await {
+                    StagedExecution::Queued { command, intent_id } => {
+                        record_event(
+                            state,
+                            "queued",
+                            Some(&symbol),
+                            Some(draft),
+                            None,
+                            Some(&intent_id),
+                            Some(&command.to_string()),
+                        )
+                        .await;
+                        TickOutcome::Queued {
+                            command: command.to_string(),
+                        }
                     }
-                }
-                StagedExecution::TradingDisabled => {
-                    let intent_id = intent.id().to_string();
-                    record_event(
-                        state,
-                        "approved_dry_run",
-                        Some(&symbol),
-                        Some(draft),
-                        None,
-                        Some(&intent_id),
-                        None,
-                    )
-                    .await;
-                    TickOutcome::ApprovedDryRun
-                }
-                StagedExecution::ChannelUnavailable => {
-                    let reason = "command channel unavailable".to_owned();
-                    let intent_id = intent.id().to_string();
-                    record_event(
-                        state,
-                        "unavailable",
-                        Some(&symbol),
-                        Some(draft),
-                        Some(&reason),
-                        Some(&intent_id),
-                        None,
-                    )
-                    .await;
-                    TickOutcome::Unavailable { reason }
+                    StagedExecution::TradingDisabled => {
+                        let intent_id = intent.id().to_string();
+                        record_event(
+                            state,
+                            "approved_dry_run",
+                            Some(&symbol),
+                            Some(draft),
+                            None,
+                            Some(&intent_id),
+                            None,
+                        )
+                        .await;
+                        TickOutcome::ApprovedDryRun
+                    }
+                    StagedExecution::ChannelUnavailable => {
+                        let reason = "command channel unavailable".to_owned();
+                        let intent_id = intent.id().to_string();
+                        record_event(
+                            state,
+                            "unavailable",
+                            Some(&symbol),
+                            Some(draft),
+                            Some(&reason),
+                            Some(&intent_id),
+                            None,
+                        )
+                        .await;
+                        TickOutcome::Unavailable { reason }
+                    }
                 }
             }
         }
+    };
+    // A hold review is the tick's primary outcome when the entry sweep also
+    // found nothing to do; both events are already recorded.
+    if reviewed_hold && matches!(entry_outcome, TickOutcome::NoTrade) {
+        TickOutcome::Held
+    } else {
+        entry_outcome
     }
 }
 
@@ -693,17 +747,9 @@ fn managed_from_payload(position: &PositionPayload) -> ManagedPosition {
     }
 }
 
-/// Positions of one instrument, so a review never mixes series and symbols.
-fn positions_for_symbol(managed: Vec<ManagedPosition>, symbol: &Symbol) -> Vec<ManagedPosition> {
-    managed
-        .into_iter()
-        .filter(|position| position.symbol == symbol.as_str())
-        .collect()
-}
-
-/// Merges the configured rotation with symbols of open managed positions,
-/// de-duplicated in first-seen order.
-fn rotation_symbols(configured: &[Symbol], managed: &[ManagedPosition]) -> Vec<Symbol> {
+/// The candidate menu: configured symbols first, then symbols of open
+/// managed positions, de-duplicated in first-seen order.
+fn candidate_symbols(configured: &[Symbol], managed: &[ManagedPosition]) -> Vec<Symbol> {
     let mut symbols: Vec<Symbol> = configured.to_vec();
     for position in managed {
         if let Ok(symbol) = Symbol::parse(&position.symbol)
@@ -715,6 +761,25 @@ fn rotation_symbols(configured: &[Symbol], managed: &[ManagedPosition]) -> Vec<S
         }
     }
     symbols
+}
+
+/// Series for one symbol from this tick's fetched markets.
+fn series_for_symbol<'a>(
+    markets: &'a [(Symbol, CandleSeries)],
+    symbol: &str,
+) -> Option<&'a CandleSeries> {
+    markets
+        .iter()
+        .find(|(candidate, _)| candidate.as_str() == symbol)
+        .map(|(_, series)| series)
+}
+
+/// Judgement summary for one symbol, when the judge produced one.
+fn judgement_for_symbol<'a>(judgements: &'a [(Symbol, Value)], symbol: &str) -> Option<&'a Value> {
+    judgements
+        .iter()
+        .find(|(candidate, _)| candidate.as_str() == symbol)
+        .map(|(_, summary)| summary)
 }
 
 /// Parses a comma-separated symbol list: 1-8 distinct validated instruments.
@@ -750,6 +815,19 @@ fn parse_symbol_list(raw: &str) -> Result<Vec<Symbol>, ConfigError> {
         return Err(invalid("at most 8 symbols may rotate"));
     }
     Ok(symbols)
+}
+
+/// The position to review this tick: one step of a round-robin over the open
+/// book, so several positions take turns instead of one starving the rest.
+fn next_review_position(
+    managed: &[ManagedPosition],
+    counter: &AtomicUsize,
+) -> Option<ManagedPosition> {
+    if managed.is_empty() {
+        return None;
+    }
+    let index = counter.fetch_add(1, Ordering::Relaxed) % managed.len();
+    managed.get(index).cloned()
 }
 
 /// Which policy produced a stop move.
@@ -1174,15 +1252,15 @@ async fn review_positions(
 }
 
 /// Submits one planned stop change through the shared modify path.
-async fn move_stop(state: &AppState, series: &CandleSeries, plan: StopMove) -> TickOutcome {
+async fn move_stop(state: &AppState, symbol: &str, plan: StopMove) -> TickOutcome {
     match queue_staged_modify(state, plan.ticket, Some(plan.stop), None).await {
         StagedModify::Queued { command, ticket } => {
             let command_id = command.to_string();
-            record_position_event(
+            record_symbol_event(
                 state,
                 plan.kind.as_str(),
                 "autopilot",
-                series,
+                symbol,
                 Some(ticket),
                 None,
                 Some(&command_id),
@@ -1193,13 +1271,14 @@ async fn move_stop(state: &AppState, series: &CandleSeries, plan: StopMove) -> T
             }
         }
         StagedModify::TradingDisabled => {
-            record_position(
+            record_symbol_event(
                 state,
                 "stop_rejected",
                 "autopilot",
-                series,
+                symbol,
                 Some(plan.ticket),
                 Some("trading_disabled"),
+                None,
             )
             .await;
             TickOutcome::Rejected {
@@ -1208,25 +1287,27 @@ async fn move_stop(state: &AppState, series: &CandleSeries, plan: StopMove) -> T
         }
         StagedModify::ChannelUnavailable => {
             let reason = "command channel unavailable".to_owned();
-            record_position(
+            record_symbol_event(
                 state,
                 "stop_rejected",
                 "autopilot",
-                series,
+                symbol,
                 Some(plan.ticket),
                 Some(&reason),
+                None,
             )
             .await;
             TickOutcome::Unavailable { reason }
         }
         StagedModify::NoPositions | StagedModify::UnknownTicket => {
-            record_position(
+            record_symbol_event(
                 state,
                 "stop_rejected",
                 "autopilot",
-                series,
+                symbol,
                 Some(plan.ticket),
                 Some("stale_position"),
+                None,
             )
             .await;
             TickOutcome::Rejected {
@@ -1234,13 +1315,14 @@ async fn move_stop(state: &AppState, series: &CandleSeries, plan: StopMove) -> T
             }
         }
         StagedModify::NotVeyra => {
-            record_position(
+            record_symbol_event(
                 state,
                 "stop_rejected",
                 "autopilot",
-                series,
+                symbol,
                 Some(plan.ticket),
                 Some("not_a_veyra_position"),
+                None,
             )
             .await;
             TickOutcome::Rejected {
@@ -1357,13 +1439,36 @@ async fn record_position_event(
     reason: Option<&str>,
     command_id: Option<&str>,
 ) {
+    record_symbol_event(
+        state,
+        outcome,
+        origin,
+        series.symbol().as_str(),
+        ticket,
+        reason,
+        command_id,
+    )
+    .await;
+}
+
+/// Records one position decision against a symbol, for callers that no longer
+/// hold the market series (deterministic stop moves).
+async fn record_symbol_event(
+    state: &AppState,
+    outcome: &'static str,
+    origin: &'static str,
+    symbol: &str,
+    ticket: Option<i64>,
+    reason: Option<&str>,
+    command_id: Option<&str>,
+) {
     let Some(audit) = state.audit() else {
         return;
     };
     let mut payload = json!({
         "outcome": outcome,
         "origin": origin,
-        "symbol": series.symbol().as_str()
+        "symbol": symbol
     });
     if let Some(ticket) = ticket {
         payload["ticket"] = json!(ticket);
@@ -1543,73 +1648,107 @@ fn market_narrative(series: &CandleSeries) -> String {
 
 /// Assembles the structured model input for one proposal.
 fn proposal_input(
-    series: &CandleSeries,
-    account: AccountFacts,
-    judgements: Option<&Value>,
+    markets: &[(Symbol, CandleSeries)],
+    judgements: &[(Symbol, Value)],
+    account: &AccountFacts,
+    managed: &[ManagedPosition],
 ) -> String {
-    let recent: Vec<Value> = series
-        .candles()
+    let assets: Vec<Value> = markets
         .iter()
-        .rev()
-        .take(RECENT_CANDLES)
-        .collect::<Vec<&Candle>>()
-        .into_iter()
-        .rev()
-        .map(|candle| {
-            json!({
-                "t": candle.time(),
-                "o": candle.open(),
-                "h": candle.high(),
-                "l": candle.low(),
-                "c": candle.close()
-            })
+        .map(|(symbol, series)| {
+            let recent: Vec<Value> = series
+                .candles()
+                .iter()
+                .rev()
+                .take(RECENT_CANDLES)
+                .collect::<Vec<&Candle>>()
+                .into_iter()
+                .rev()
+                .map(|candle| {
+                    json!({
+                        "t": candle.time(),
+                        "o": candle.open(),
+                        "h": candle.high(),
+                        "l": candle.low(),
+                        "c": candle.close()
+                    })
+                })
+                .collect();
+            let mut asset = json!({
+                "symbol": symbol.as_str(),
+                "market": {
+                    "bars": series.candles().len(),
+                    "last_close": series.last().map(|candle| candle.close()),
+                    "window_high": window_high(series),
+                    "window_low": window_low(series),
+                    "change_pct": change_pct(series),
+                    "recent": recent
+                }
+            });
+            if let Some(summary) = judgement_for_symbol(judgements, symbol.as_str()) {
+                asset["judgements"] = summary.clone();
+            }
+            if let Some(position) = managed
+                .iter()
+                .find(|position| position.symbol == symbol.as_str())
+            {
+                asset["open_position"] = json!({
+                    "ticket": position.ticket,
+                    "side": position.side.as_str(),
+                    "lots": position.lots,
+                    "entry": position.entry,
+                    "profit": position.profit,
+                    "stop_loss": position.stop_loss,
+                    "take_profit": position.take_profit
+                });
+            }
+            asset
         })
         .collect();
 
-    let mut input = json!({
-        "symbol": series.symbol().as_str(),
-        "timeframe": series.timeframe().as_str(),
-        "market": {
-            "bars": series.candles().len(),
-            "last_close": series.last().map(|candle| candle.close()),
-            "window_high": window_high(series),
-            "window_low": window_low(series),
-            "change_pct": change_pct(series),
-            "recent": recent
-        },
+    json!({
+        "timeframe": markets
+            .first()
+            .map(|(_, series)| series.timeframe().as_str())
+            .unwrap_or("H4"),
+        "assets": assets,
         "account": {
             "open_orders": account.open_orders,
             "open_lots": account.open_lots,
-            "trade_allowed": account.trade_allowed
+            "trade_allowed": account.trade_allowed,
+            "open_symbols": account
+                .open_symbols
+                .iter()
+                .map(|symbol| symbol.as_str())
+                .collect::<Vec<_>>()
         }
-    });
-    if let Some(judgements) = judgements {
-        input["judgements"] = judgements.clone();
-    }
-    input.to_string()
+    })
+    .to_string()
 }
 
 /// Assembles the analyst instructions, including the enforced volume cap.
-fn proposal_instructions(state: &AppState, series: &CandleSeries, account: AccountFacts) -> String {
-    let max_volume = state.risk().policy().max_volume_per_order().value();
+fn proposal_instructions(
+    state: &AppState,
+    markets: &[(Symbol, CandleSeries)],
+    account: &AccountFacts,
+) -> String {
+    let policy = state.risk().policy();
+    let menu = markets
+        .iter()
+        .map(|(symbol, _)| symbol.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "You are the analyst for Veyra, a single-instrument trading bot. Decide whether to open one \
-         {symbol} {timeframe} position right now.\n\
-         Your input carries recent {timeframe} candles plus optional calibrated judgements; the last \
-         candle is the most recent closed bar.\n\
-         Answer with the provided schema only. Choose `none` unless the evidence is clear and \
-         one-sided; answering none is normal and expected when the market is ambiguous.\n\
-         Constraints: at most one open position at a time (`{open_orders}` order(s) already open \
-         with {open_lots} lots); if you open, use a market order \u{2014} omit `price` entirely \u{2014} \
-         with volume at most {max_volume} lots, and include both `stop_loss` and `take_profit` as \
-         absolute prices bracketing the entry. Omit `comment` entirely (the bot annotates orders \
-         itself). A deterministic risk gate will reject anything outside the configured limits, and \
-         rejections are expected outcomes, not errors.",
-        symbol = series.symbol().as_str(),
-        timeframe = series.timeframe().as_str(),
-        open_orders = account.open_orders,
+        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles and optional calibrated judgements; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors.",
+        menu = menu,
+        timeframe = markets
+            .first()
+            .map(|(_, series)| series.timeframe().as_str())
+            .unwrap_or("H4"),
+        max_orders = policy.max_open_orders(),
+        max_total = policy.max_total_lots().value(),
         open_lots = account.open_lots,
-        max_volume = max_volume
+        max_volume = policy.max_volume_per_order().value()
     )
 }
 
@@ -1668,6 +1807,7 @@ mod tests {
     #[derive(Debug)]
     struct StubEngine {
         answer: Option<Value>,
+        review: Option<Value>,
         seen: Mutex<Vec<DecisionRequest>>,
     }
 
@@ -1675,6 +1815,17 @@ mod tests {
         fn answering(answer: Value) -> Arc<Self> {
             Arc::new(Self {
                 answer: Some(answer),
+                review: None,
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Answers the position-review and entry schemas differently, as a
+        /// tick that holds a position and then evaluates entries needs.
+        fn answering_review(review: Value, proposal: Value) -> Arc<Self> {
+            Arc::new(Self {
+                answer: Some(proposal),
+                review: Some(review),
                 seen: Mutex::new(Vec::new()),
             })
         }
@@ -1682,6 +1833,7 @@ mod tests {
         fn failing() -> Arc<Self> {
             Arc::new(Self {
                 answer: None,
+                review: None,
                 seen: Mutex::new(Vec::new()),
             })
         }
@@ -1698,8 +1850,14 @@ mod tests {
         }
 
         async fn answer(&self, request: DecisionRequest) -> Result<DecisionAnswer, ModelError> {
+            let is_review = request.format.name == "veyra_position_review";
             self.seen.lock().expect("lock").push(request);
-            match &self.answer {
+            let selected = if is_review {
+                self.review.as_ref().or(self.answer.as_ref())
+            } else {
+                self.answer.as_ref()
+            };
+            match selected {
                 Some(value) => Ok(DecisionAnswer {
                     value: value.clone(),
                 }),
@@ -2234,7 +2392,7 @@ mod tests {
             .find(|event| event.kind() == AuditKind::ProposalEvaluated)
             .expect("decision recorded");
         assert_eq!(event.payload()["reason"], "symbol_not_allowed");
-        assert_eq!(event.payload()["symbol"], "EURUSD");
+        assert_eq!(event.payload()["symbol"], "GBPUSD");
     }
 
     #[actix_web::test]
@@ -2376,10 +2534,17 @@ mod tests {
 
         let requests = engine.requests();
         let input: Value = serde_json::from_str(&requests[0].input).expect("input is JSON");
-        assert_eq!(input["judgements"]["direction"]["choice"], "long");
-        assert_eq!(input["judgements"]["trending"]["probability"], 0.7);
-        assert_eq!(input["judgements"]["momentum"]["score"], 1.5);
-        assert_eq!(input["market"]["bars"], 20);
+        assert_eq!(input["assets"][0]["symbol"], "EURUSD");
+        assert_eq!(
+            input["assets"][0]["judgements"]["direction"]["choice"],
+            "long"
+        );
+        assert_eq!(
+            input["assets"][0]["judgements"]["trending"]["probability"],
+            0.7
+        );
+        assert_eq!(input["assets"][0]["judgements"]["momentum"]["score"], 1.5);
+        assert_eq!(input["assets"][0]["market"]["bars"], 20);
     }
 
     #[actix_web::test]
@@ -2602,7 +2767,8 @@ mod tests {
 
     #[actix_web::test]
     async fn review_holds_when_the_analyst_holds() {
-        let engine = StubEngine::answering(json!({"action": "hold"}));
+        let engine =
+            StubEngine::answering_review(json!({"action": "hold"}), json!({"action": "none"}));
         let harness = build_harness(
             enabled_settings(),
             Some(engine.clone()),
@@ -2623,7 +2789,11 @@ mod tests {
             .retain_snapshot(managed_snapshot(10650805, 1_758_000_000, 1_758_003_600));
 
         assert_eq!(tick(&harness.state).await, TickOutcome::Held);
-        assert_eq!(outcomes(&harness.trail), vec!["held".to_owned()]);
+        assert_eq!(
+            outcomes(&harness.trail),
+            vec!["held".to_owned(), "no_trade".to_owned()],
+            "the hold review is recorded before the entry sweep declines"
+        );
         let request = &engine.requests()[0];
         assert!(
             request.instructions.contains("10650805"),
@@ -2868,7 +3038,9 @@ mod tests {
         assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
         let request = &engine.requests()[0];
         assert!(
-            request.instructions.contains("Decide whether to open"),
+            request
+                .instructions
+                .contains("Decide for each instrument independently"),
             "the entry prompt ran, not the review prompt"
         );
     }
@@ -2895,15 +3067,15 @@ mod tests {
     }
 
     #[test]
-    fn rotation_merges_configured_and_open_position_symbols() {
+    fn candidate_symbols_merge_the_menu_with_open_positions() {
         let configured = vec![Symbol::parse("EURUSD").expect("symbol")];
         let managed = vec![
             managed_position_named("XAUUSD"),
             managed_position_named("EURUSD"),
         ];
-        let rotation = rotation_symbols(&configured, &managed);
+        let candidates = candidate_symbols(&configured, &managed);
         assert_eq!(
-            rotation
+            candidates
                 .iter()
                 .map(|symbol| symbol.as_str())
                 .collect::<Vec<_>>(),
@@ -2911,25 +3083,52 @@ mod tests {
             "configured order wins and open-position symbols are appended once"
         );
 
-        let from_positions = rotation_symbols(&[], &[managed_position_named("GBPUSD")]);
+        let from_positions = candidate_symbols(&[], &[managed_position_named("GBPUSD")]);
         assert_eq!(
             from_positions.first().map(|symbol| symbol.as_str()),
             Some("GBPUSD"),
-            "an open position is managed even without a configured list"
+            "an open position is managed even without a configured menu"
         );
     }
 
     #[test]
-    fn positions_for_symbol_keeps_only_the_requested_instrument() {
-        let positions = positions_for_symbol(
-            vec![
-                managed_position_named("EURUSD"),
-                managed_position_named("GBPUSD"),
-            ],
-            &Symbol::parse("EURUSD").expect("symbol"),
+    fn series_and_judgements_resolve_per_symbol() {
+        let series = CandleSeries::from_validated(
+            Symbol::parse("EURUSD").expect("symbol"),
+            Timeframe::H4,
+            vec![Candle::from_validated(
+                1_700_000_000,
+                1.0,
+                1.1,
+                0.9,
+                1.05,
+                10,
+            )],
         );
-        assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].symbol, "EURUSD");
+        let markets = vec![(Symbol::parse("EURUSD").expect("symbol"), series)];
+        let judgements = vec![(
+            Symbol::parse("EURUSD").expect("symbol"),
+            json!({"direction": "long"}),
+        )];
+
+        assert!(series_for_symbol(&markets, "EURUSD").is_some());
+        assert!(series_for_symbol(&markets, "GBPUSD").is_none());
+        assert!(judgement_for_symbol(&judgements, "EURUSD").is_some());
+        assert!(judgement_for_symbol(&judgements, "GBPUSD").is_none());
+    }
+
+    #[test]
+    fn review_rotation_visits_every_position() {
+        let mut first_position = managed_position_named("EURUSD");
+        first_position.ticket = 101;
+        let mut second_position = managed_position_named("GBPUSD");
+        second_position.ticket = 202;
+        let managed = vec![first_position, second_position];
+        let counter = AtomicUsize::new(0);
+        let first = next_review_position(&managed, &counter).expect("position");
+        let second = next_review_position(&managed, &counter).expect("position");
+        assert_eq!((first.ticket, second.ticket), (101, 202));
+        assert!(next_review_position(&[], &AtomicUsize::new(0)).is_none());
     }
 
     fn planned(ticket: i64, stop: f64, kind: StopMoveKind) -> Option<StopMove> {
@@ -3081,7 +3280,8 @@ mod tests {
             "VEYRA_AUTOPILOT_BREAKEVEN_R" => Ok("1.0".to_owned()),
             _ => Err(ConfigError::MissingEnvironmentVariable { name }),
         });
-        let engine = StubEngine::answering(json!({"action": "hold"}));
+        let engine =
+            StubEngine::answering_review(json!({"action": "hold"}), json!({"action": "none"}));
         let harness = build_harness(
             settings,
             Some(engine.clone()),
@@ -3181,7 +3381,8 @@ mod tests {
 
     #[actix_web::test]
     async fn tick_holds_at_r_when_break_even_is_disabled() {
-        let engine = StubEngine::answering(json!({"action": "hold"}));
+        let engine =
+            StubEngine::answering_review(json!({"action": "hold"}), json!({"action": "none"}));
         let harness = build_harness(
             enabled_settings(),
             Some(engine.clone()),
@@ -3207,7 +3408,11 @@ mod tests {
             ));
 
         assert_eq!(tick(&harness.state).await, TickOutcome::Held);
-        assert_eq!(engine.requests().len(), 1, "the review still runs");
+        assert_eq!(
+            engine.requests().len(),
+            2,
+            "the review runs, then the entry sweep declines"
+        );
         let link = harness
             .state
             .broker()
@@ -3224,7 +3429,7 @@ mod tests {
             stop: 1.14757,
             kind: StopMoveKind::BreakEven,
         };
-        let series = CandleSeries::from_validated(
+        let _series = CandleSeries::from_validated(
             Symbol::parse("EURUSD").expect("symbol"),
             Timeframe::H4,
             vec![Candle::from_validated(
@@ -3246,7 +3451,7 @@ mod tests {
         // The service switch is off.
         let harness = build_harness(enabled_settings(), None, feed(), None, false, true);
         assert_eq!(
-            move_stop(&harness.state, &series, plan(10650805)).await,
+            move_stop(&harness.state, "EURUSD", plan(10650805)).await,
             TickOutcome::Rejected {
                 code: "trading_disabled"
             }
@@ -3256,14 +3461,14 @@ mod tests {
         let no_broker = AppState::new(config(true), None, None, gate())
             .with_autopilot(Some(enabled_settings()));
         assert!(matches!(
-            move_stop(&no_broker, &series, plan(1)).await,
+            move_stop(&no_broker, "EURUSD", plan(1)).await,
             TickOutcome::Unavailable { .. }
         ));
 
         // No completed snapshot has been retained.
         let harness = build_harness(enabled_settings(), None, feed(), None, true, false);
         assert_eq!(
-            move_stop(&harness.state, &series, plan(1)).await,
+            move_stop(&harness.state, "EURUSD", plan(1)).await,
             TickOutcome::Rejected {
                 code: "stale_position"
             }
@@ -3279,7 +3484,7 @@ mod tests {
             .expect("link")
             .retain_snapshot(managed_snapshot(7, 1_758_000_000, 1_758_003_600));
         assert_eq!(
-            move_stop(&harness.state, &series, plan(999)).await,
+            move_stop(&harness.state, "EURUSD", plan(999)).await,
             TickOutcome::Rejected {
                 code: "stale_position"
             }
@@ -3297,7 +3502,7 @@ mod tests {
             .expect("link")
             .retain_snapshot(manual);
         assert_eq!(
-            move_stop(&harness.state, &series, plan(7)).await,
+            move_stop(&harness.state, "EURUSD", plan(7)).await,
             TickOutcome::Rejected {
                 code: "not_a_veyra_position"
             }

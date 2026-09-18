@@ -16,6 +16,7 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
 use super::RiskPolicy;
+use crate::broker::Symbol;
 use crate::trading::intent::{TradeIntent, TradeIntentDraft};
 
 /// How many approvals are remembered for duplicate suppression.
@@ -26,7 +27,7 @@ const EXPOSURE_EPSILON: f64 = 1e-9;
 /// Facts the gate needs from the venue, assembled by the caller from a fresh
 /// link report. Nothing here is inferred: when the caller cannot supply fresh
 /// facts, it passes `None` and the gate rejects.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AccountFacts {
     /// The terminal currently allows trading operations.
     pub trade_allowed: bool,
@@ -34,6 +35,9 @@ pub struct AccountFacts {
     pub open_orders: u32,
     /// Total open volume across every open order, in lots.
     pub open_lots: f64,
+    /// Symbols carrying an open venue order (any magic), from the latest
+    /// validated snapshot. Used to enforce one position per asset.
+    pub open_symbols: Vec<Symbol>,
 }
 
 /// Stable rejection codes; additions are backwards-compatible for consumers
@@ -59,6 +63,8 @@ pub enum RiskCode {
     ExposureAboveLimit,
     /// An identical draft was approved inside the duplicate window.
     DuplicateIntent,
+    /// A position is already open on the requested instrument.
+    SymbolAlreadyOpen,
 }
 
 impl RiskCode {
@@ -74,6 +80,7 @@ impl RiskCode {
             Self::OrderLimitReached => "order_limit_reached",
             Self::ExposureAboveLimit => "exposure_above_limit",
             Self::DuplicateIntent => "duplicate_intent",
+            Self::SymbolAlreadyOpen => "symbol_already_open",
         }
     }
 
@@ -85,6 +92,9 @@ impl RiskCode {
             Self::SessionClosed => "the current UTC hour is outside the session window",
             Self::VolumeAboveLimit => "the requested volume exceeds the per-order cap",
             Self::AccountStateUnavailable => "no fresh account state is available",
+            Self::SymbolAlreadyOpen => {
+                "a position is already open on this instrument (one position per asset)"
+            }
             Self::TradingNotAllowed => "the terminal reports trading is not allowed",
             Self::OrderLimitReached => "the venue already holds the maximum tolerated orders",
             Self::ExposureAboveLimit => {
@@ -197,6 +207,13 @@ impl RiskGate {
         if !account.trade_allowed {
             return Self::reject(RiskCode::TradingNotAllowed);
         }
+        if account
+            .open_symbols
+            .iter()
+            .any(|open| open == draft.symbol())
+        {
+            return Self::reject(RiskCode::SymbolAlreadyOpen);
+        }
         if account.open_orders >= self.policy.max_open_orders() {
             return Self::reject(RiskCode::OrderLimitReached);
         }
@@ -303,7 +320,30 @@ mod tests {
             trade_allowed: true,
             open_orders,
             open_lots,
+            open_symbols: Vec::new(),
         })
+    }
+
+    #[test]
+    fn a_symbol_with_an_open_order_is_rejected() {
+        let gate = RiskGate::new(policy());
+        let now = at(10);
+        let rejection = expect_rejection(gate.evaluate(&draft(0.1), facts_holding("EURUSD"), now));
+        assert_eq!(rejection.code(), RiskCode::SymbolAlreadyOpen);
+        assert_eq!(rejection.code().as_str(), "symbol_already_open");
+
+        // A different instrument is unaffected by the one-per-asset rule.
+        assert!(matches!(
+            gate.evaluate(&draft(0.1), facts_holding("GBPUSD"), now),
+            RiskDecision::Approved(_)
+        ));
+    }
+
+    /// Facts that already hold an order on `symbol`.
+    fn facts_holding(symbol: &str) -> Option<AccountFacts> {
+        let mut facts = facts_with(1, 0.01).expect("facts");
+        facts.open_symbols = vec![crate::broker::Symbol::parse(symbol).expect("symbol")];
+        Some(facts)
     }
 
     /// Epoch plus `hour` hours, so session tests are deterministic.
@@ -459,6 +499,7 @@ mod tests {
             trade_allowed: false,
             open_orders: 0,
             open_lots: 0.0,
+            open_symbols: Vec::new(),
         });
         assert_eq!(
             expect_rejection(gate.evaluate(&draft(0.1), closed_account, now)).code(),
