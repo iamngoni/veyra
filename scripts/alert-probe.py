@@ -10,7 +10,9 @@ per run listing any findings:
 - terminal link, EA arming, and trading switch transitions
 - autopilot failures repeated three ticks in a row
 - audited events since the last cursor: service restarts, reconciliation
-  drift, executed opens, and closed positions
+  drift, executed opens, and closed positions (enriched with the realized
+  fill from `/performance`, so a close reports what it actually banked
+  rather than the reconciler's last floating snapshot)
 
 `VEYRA_ALERT_WEBHOOK` (sourced from `.env`) receives a JSON POST with both
 `text` and `content` keys, which Slack, Discord, and ntfy all accept. With no
@@ -97,12 +99,6 @@ def describe_event(event: dict) -> str | None:
             f"unknown tickets {payload.get('unknownTickets')} "
             f"truncated={payload.get('positionsTruncated')}"
         )
-    if kind == "position_closed":
-        profit = float(payload.get("profit", 0.0))
-        return (
-            f"Position closed: ticket {payload.get('ticket')} {payload.get('symbol')} "
-            f"{payload.get('kind')} {payload.get('lots')} lots, P/L {profit:+.2f}"
-        )
     if kind == "command_completed" and payload.get("kind") == "open_order":
         result = payload.get("result") or {}
         if result.get("executed"):
@@ -113,6 +109,47 @@ def describe_event(event: dict) -> str | None:
             return "proposal_unavailable"  # marker; aggregated as a streak
         return None
     return None
+
+
+def close_message(close: dict, trade: dict | None) -> str:
+    """One closed-position line: realized fill when the history answered,
+    the reconciler's floating snapshot when it did not."""
+    ticket = close.get("ticket")
+    symbol = close.get("symbol")
+    kind = close.get("kind")
+    lots = close.get("lots")
+    if trade is None:
+        profit = float(close.get("profit", 0.0) or 0.0)
+        return (
+            f"Position closed: ticket {ticket} {symbol} {kind} {lots} lots, "
+            f"P/L {profit:+.2f} (floating; realized fill unavailable)"
+        )
+    net = (
+        float(trade.get("profit", 0.0) or 0.0)
+        + float(trade.get("swap", 0.0) or 0.0)
+        + float(trade.get("commission", 0.0) or 0.0)
+    )
+    result = "win" if net > 0 else ("loss" if net < 0 else "flat")
+    return (
+        f"Trade closed — {result}: {symbol} {kind} {lots} lots "
+        f"{trade.get('openPrice')} → {trade.get('closePrice')}, net {net:+.2f}"
+    )
+
+
+def realized_trades() -> dict:
+    """Closed fills by ticket, from the venue history; empty on failure."""
+    try:
+        payload = http_json("/performance?days=7")
+    except (OSError, ValueError):
+        return {}
+    trades = payload.get("trades")
+    if not isinstance(trades, list):
+        return {}
+    return {
+        trade.get("ticket"): trade
+        for trade in trades
+        if isinstance(trade, dict) and trade.get("ticket") is not None
+    }
 
 
 def main() -> int:
@@ -187,9 +224,15 @@ def main() -> int:
                 )
                 severity = "warn"
 
+    closes: list[dict] = []
     try:
         events = http_json(f"/events?after={state.get('cursor', 0)}&wait_ms=0")
         for event in events.get("events", []):
+            if event.get("kind") == "position_closed":
+                payload = event.get("payload")
+                if isinstance(payload, dict):
+                    closes.append(payload)
+                continue
             described = describe_event(event)
             if described == "proposal_unavailable":
                 streak = int(state.get("unavailable_streak", 0)) + 1
@@ -210,6 +253,10 @@ def main() -> int:
             state["unavailable_streak"] = 0
     except (OSError, ValueError) as error:
         errors.append(f"event feed failed: {error}")
+
+    if closes:
+        fills = realized_trades()
+        findings.extend(close_message(close, fills.get(close.get("ticket"))) for close in closes)
 
     if findings:
         push(findings, webhook, severity)
