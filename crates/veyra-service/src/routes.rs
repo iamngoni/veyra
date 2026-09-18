@@ -489,12 +489,14 @@ mod tests {
         })
         .expect("config parses");
         let trail = std::sync::Arc::new(MemoryTrail::default());
+        let runtime_state = std::sync::Arc::new(crate::state::test_support::MemoryState::default());
         let state = AppState::new(
             config,
             None::<crate::broker::BrokerRuntime>,
             None,
             RiskGate::new(RiskPolicy::default()),
         )
+        .with_runtime_state(crate::state::RuntimeState::new(Some(runtime_state.clone())))
         .with_audit(Some(AuditRuntime::new(trail.clone())));
         let app = actix_web::test::init_service(create_app(state)).await;
 
@@ -547,6 +549,30 @@ mod tests {
                 && event.payload()["policy"]["maxOpenOrders"] == 3
         });
         assert!(audited, "policy changes are journaled");
+
+        // The accepted edit is persisted as an apply-able snapshot patch, so
+        // a restart resumes the operator's intent instead of the env baseline.
+        let saved = runtime_state
+            .saved(crate::state::StateKey::RiskPolicy)
+            .expect("policy persisted");
+        assert_eq!(saved["killSwitch"], true);
+        assert_eq!(saved["maxOpenOrders"], 3);
+        assert_eq!(saved["symbols"], serde_json::json!(["EURUSD"]));
+        assert_eq!(
+            saved["maxRiskPercent"], 12.0,
+            "unset fields carry the effective value"
+        );
+
+        // Rejections persist nothing new.
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/risk/policy")
+                .set_json(serde_json::json!({ "maxOpenOrders": 1001 }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
     }
 
     #[actix_web::test]

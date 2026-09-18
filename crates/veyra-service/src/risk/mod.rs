@@ -18,7 +18,7 @@ pub use gate::{AccountFacts, RiskCode, RiskDecision, RiskGate, RiskRejection};
 
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::broker::Symbol;
 use crate::trading::intent::{Volume, parse_instrument};
@@ -79,7 +79,7 @@ pub struct RiskError {
 
 /// Partial update to the live policy, as the control surface submits it.
 /// Every field is optional; omitted fields keep their current value.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RiskPolicyPatch {
     /// Engage or release the kill switch.
@@ -641,6 +641,32 @@ impl RiskPolicy {
         self.max_net_factor_lots
     }
 
+    /// Snapshot of the effective policy as an apply-able patch: every field is
+    /// present, so applying it over any baseline reproduces this policy
+    /// exactly. Used to persist operator edits across restarts.
+    pub fn snapshot_patch(&self) -> RiskPolicyPatch {
+        RiskPolicyPatch {
+            kill_switch: Some(self.kill_switch),
+            symbols: (!self.symbols.is_empty())
+                .then(|| self.symbols.iter().map(|s| s.as_str().to_owned()).collect()),
+            max_volume_per_order: Some(self.max_volume_per_order.value()),
+            max_total_lots: Some(self.max_total_lots.value()),
+            max_open_orders: Some(self.max_open_orders),
+            duplicate_window_secs: Some(self.duplicate_window.as_secs()),
+            session_utc: Some(
+                self.session
+                    .map(|session| format!("{}-{}", session.start_hour(), session.end_hour()))
+                    .unwrap_or_default(),
+            ),
+            max_risk_percent: Some(self.max_risk_percent),
+            max_daily_loss_percent: Some(self.max_daily_loss_percent),
+            max_peak_drawdown_percent: Some(self.max_peak_drawdown_percent),
+            max_net_factor_lots: Some(self.max_net_factor_lots),
+            calendar_blackout_minutes: Some(self.calendar_blackout_minutes),
+            min_stop_atr_fraction: Some(self.min_stop_atr_fraction),
+        }
+    }
+
     /// News blackout either side of a high-impact event, in minutes; zero
     /// disables the check.
     pub fn calendar_blackout_minutes(&self) -> u64 {
@@ -1081,6 +1107,35 @@ mod tests {
         let error = RiskPolicy::from_source(source(&[("VEYRA_RISK_SYMBOLS", &too_many)]))
             .expect_err("allowlist cap must fail");
         assert_eq!(error.name, "VEYRA_RISK_SYMBOLS");
+    }
+
+    #[test]
+    fn snapshot_patches_reproduce_a_policy_after_a_restart() {
+        let policy = RiskPolicy::from_source(source(&[
+            ("VEYRA_RISK_KILL_SWITCH", "true"),
+            ("VEYRA_RISK_SYMBOLS", "EURUSD,AUDUSD"),
+            ("VEYRA_RISK_MAX_VOLUME_PER_ORDER", "0.03"),
+            ("VEYRA_RISK_MAX_TOTAL_LOTS", "0.05"),
+            ("VEYRA_RISK_MAX_OPEN_ORDERS", "5"),
+            ("VEYRA_RISK_DUPLICATE_WINDOW_SECS", "5"),
+            ("VEYRA_RISK_SESSION_HOURS_UTC", "8-17"),
+            ("VEYRA_RISK_MAX_RISK_PERCENT", "3.5"),
+            ("VEYRA_RISK_MAX_DAILY_LOSS_PERCENT", "0"),
+            ("VEYRA_RISK_MAX_PEAK_DRAWDOWN_PERCENT", "40"),
+            ("VEYRA_RISK_MAX_NET_FACTOR_LOTS", "0.05"),
+            ("VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES", "45"),
+            ("VEYRA_RISK_MIN_STOP_ATR_FRACTION", "0.75"),
+        ]))
+        .expect("valid settings");
+
+        // The snapshot serializes with the control-surface field names and
+        // applies over a fresh baseline to the same effective policy.
+        let value = serde_json::to_value(policy.snapshot_patch()).expect("snapshot serializes");
+        let patch: RiskPolicyPatch = serde_json::from_value(value).expect("snapshot deserializes");
+        let rebuilt = RiskPolicy::default()
+            .apply_patch(&patch)
+            .expect("snapshot applies");
+        assert_eq!(rebuilt.summary(), policy.summary());
     }
 
     #[test]

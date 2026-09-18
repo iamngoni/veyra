@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use veyra_service::audit::{AuditEvent, AuditKind, AuditRuntime};
+use veyra_service::audit::{AuditEvent, AuditKind, AuditRuntime, AuditTrail};
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
 use veyra_service::calendar::{CalendarRuntime, CalendarSettings};
 use veyra_service::jev::{JevRuntime, JevSettings};
@@ -13,7 +13,8 @@ use veyra_service::logs::{self, LogBuffer};
 use veyra_service::market::{MarketRuntime, MarketSettings};
 use veyra_service::model::{ModelRuntime, settings::ModelSettings};
 use veyra_service::reconciliation;
-use veyra_service::risk::{RiskGate, RiskPolicy};
+use veyra_service::risk::{RiskGate, RiskPolicy, RiskPolicyPatch};
+use veyra_service::state::{RuntimeState, StateKey};
 use veyra_service::store::Store;
 use veyra_service::trading::autopilot::{AutopilotSettings, TickOutcome};
 use veyra_service::{AppState, config::ServiceConfig, observability, server};
@@ -23,6 +24,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServiceConfig::from_env()?;
     let logs = LogBuffer::new(logs::DEFAULT_CAPACITY);
     observability::init(logs.clone())?;
+
+    // The database opens before anything reads runtime state: durable
+    // counters, baselines, and the operator's live risk policy are restored
+    // from it, and a configured database that is unreachable fails startup
+    // rather than silently running without an audit trail.
+    let (runtime_state, audit) = match config.database_url() {
+        Some(url) => {
+            let store = Arc::new(Store::connect(url).await?);
+            store.migrate().await?;
+            let trail: Arc<dyn AuditTrail> = store.clone();
+            let state_store: Arc<dyn veyra_service::state::StateStore> = store.clone();
+            (
+                RuntimeState::new(Some(state_store)),
+                Some(Arc::new(AuditRuntime::new(trail))),
+            )
+        }
+        None => (RuntimeState::disabled(), None),
+    };
 
     let broker = match BrokerSettings::from_env()? {
         Some(settings) => Some(BrokerRuntime::from_settings(settings)?),
@@ -61,19 +80,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The gate is always present and restrictive by default: an unconfigured
     // allowlist approves nothing, so a missing setting cannot widen behavior.
-    let risk = RiskGate::new(RiskPolicy::from_env()?);
-
-    // A configured database must be reachable before the service listens: a
-    // missing audit trail is never mistaken for an empty one. Writes are
-    // best-effort once running.
-    let audit = match config.database_url() {
-        Some(url) => {
-            let store = Store::connect(url).await?;
-            store.migrate().await?;
-            Some(Arc::new(AuditRuntime::new(Arc::new(store))))
-        }
-        None => None,
-    };
+    // A stored policy snapshot (console edits) is applied over the environment
+    // baseline, validated by exactly the same rules.
+    let mut policy = RiskPolicy::from_env()?;
+    if let Some(stored) = runtime_state.load(StateKey::RiskPolicy).await {
+        let patch: RiskPolicyPatch = serde_json::from_value(stored)
+            .map_err(|error| format!("stored risk policy is unreadable: {error}"))?;
+        policy = policy
+            .apply_patch(&patch)
+            .map_err(|error| format!("stored risk policy is invalid: {error}"))?;
+        tracing::info!("restored the live risk policy from durable state");
+    }
+    let risk = RiskGate::new(policy);
 
     let listener = server::bind(&config)?;
     let state = AppState::new(config, broker, model, risk)
@@ -82,7 +100,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_autopilot(autopilot)
         .with_jev(jev)
         .with_logs(logs)
+        .with_runtime_state(runtime_state.clone())
         .with_audit(audit.as_ref().map(|runtime| (**runtime).clone()));
+
+    // Counters and baselines resume before the first tick can move them.
+    restore_runtime_state(&state, &runtime_state).await;
 
     if let Some(runtime) = &audit {
         if let Some(broker) = state.broker() {
@@ -113,6 +135,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if reconciliation::refresh_once(&refresh_state).await {
                     tracing::debug!("queued periodic account snapshot");
                 }
+            }
+        });
+    }
+
+    // Durable counters and baselines are snapshotted on a cadence: a crash
+    // loses at most one interval, a restart resumes where it left off. The
+    // risk policy is saved immediately on every accepted console edit.
+    if runtime_state.enabled() {
+        let snapshot_state = state.clone();
+        let snapshot_runtime = runtime_state.clone();
+        actix_web::rt::spawn(async move {
+            let period = Duration::from_secs(60);
+            loop {
+                actix_web::rt::time::sleep(period).await;
+                persist_runtime_state(&snapshot_state, &snapshot_runtime).await;
             }
         });
     }
@@ -156,4 +193,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = server::build_server(state, listener)?;
     server::serve(app, companion).await?;
     Ok(())
+}
+
+/// Restores durable counters and baselines. Unusable values log and fall back
+/// to in-memory defaults rather than blocking startup.
+async fn restore_runtime_state(state: &AppState, runtime: &RuntimeState) {
+    if let Some(value) = runtime.load(StateKey::JevUsage).await
+        && let Some(jev) = state.jev()
+        && let Err(error) = jev.restore_state(&value)
+    {
+        tracing::warn!(%error, "stored judge usage is unusable; starting from zero");
+    }
+    if let Some(value) = runtime.load(StateKey::ModelBudget).await
+        && let Some(model) = state.model()
+        && let Err(error) = model.restore_state(&value)
+    {
+        tracing::warn!(%error, "stored model budget is unusable; starting fresh");
+    }
+    if let Some(value) = runtime.load(StateKey::EquityBaselines).await
+        && let Err(error) = state.equity_guard().restore_state(&value)
+    {
+        tracing::warn!(%error, "stored equity baselines are unusable; re-baselining");
+    }
+    if let Some(value) = runtime.load(StateKey::StopBasis).await
+        && let Err(error) = state.stop_basis().restore_state(&value)
+    {
+        tracing::warn!(%error, "stored stop basis is unusable; re-learning");
+    }
+}
+
+/// Snapshots durable counters and baselines; best-effort by design.
+async fn persist_runtime_state(state: &AppState, runtime: &RuntimeState) {
+    if !runtime.enabled() {
+        return;
+    }
+    if let Some(jev) = state.jev() {
+        runtime
+            .save(StateKey::JevUsage, &jev.state_snapshot())
+            .await;
+    }
+    if let Some(model) = state.model() {
+        runtime
+            .save(StateKey::ModelBudget, &model.state_snapshot())
+            .await;
+    }
+    runtime
+        .save(
+            StateKey::EquityBaselines,
+            &state.equity_guard().state_snapshot(),
+        )
+        .await;
+    runtime
+        .save(StateKey::StopBasis, &state.stop_basis().state_snapshot())
+        .await;
 }

@@ -194,6 +194,19 @@ impl ModelRuntime {
         self.budget.snapshot()
     }
 
+    /// Serializable snapshot of the call-budget windows.
+    pub fn state_snapshot(&self) -> Value {
+        self.budget.state_snapshot()
+    }
+
+    /// Restores the call-budget windows from a stored snapshot.
+    ///
+    /// # Errors
+    /// Returns a description when the value is not a budget snapshot.
+    pub fn restore_state(&self, value: &Value) -> Result<(), String> {
+        self.budget.restore_state(value)
+    }
+
     /// Builds a runtime around an injected engine; used by tests.
     #[cfg(test)]
     pub(crate) fn with_engine(provider: ModelProvider, engine: Arc<dyn DecisionEngine>) -> Self {

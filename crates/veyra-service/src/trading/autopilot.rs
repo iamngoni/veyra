@@ -1123,6 +1123,47 @@ impl StopBasis {
         }
     }
 
+    /// Serializable snapshot of the entry-risk memory, keyed by ticket.
+    pub fn state_snapshot(&self) -> Value {
+        let risks = match self.risks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut entries = serde_json::Map::new();
+        for (ticket, risk) in risks.iter() {
+            entries.insert(ticket.to_string(), json!(risk));
+        }
+        Value::Object(entries)
+    }
+
+    /// Restores the entry-risk memory from a stored snapshot, replacing any
+    /// current contents.
+    ///
+    /// # Errors
+    /// Returns a description when the value is not a ticket-to-risk object.
+    pub fn restore_state(&self, value: &Value) -> Result<(), String> {
+        let Some(entries) = value.as_object() else {
+            return Err("stop basis must be an object keyed by ticket".to_owned());
+        };
+        let mut restored = std::collections::HashMap::new();
+        for (ticket, risk) in entries {
+            let ticket: i64 = ticket
+                .parse()
+                .map_err(|_| format!("stop basis ticket `{ticket}` is not an integer"))?;
+            let risk = risk
+                .as_f64()
+                .filter(|risk| risk.is_finite() && *risk > 0.0)
+                .ok_or_else(|| format!("stop basis risk for ticket {ticket} is unusable"))?;
+            restored.insert(ticket, risk);
+        }
+        let mut risks = match self.risks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *risks = restored;
+        Ok(())
+    }
+
     /// Remembered entry risk for one ticket.
     fn risk(&self, ticket: i64) -> Option<f64> {
         let risks = match self.risks.lock() {
@@ -4128,6 +4169,43 @@ mod tests {
         let bought = stop_plan(&[buy], 1.0, 1.0, &StopBasis::default()).expect("buy trail fires");
         assert_eq!(bought.kind, StopMoveKind::Trail);
         assert!((bought.stop - (1.14757 + risk)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stop_basis_survives_a_restart_through_a_snapshot() {
+        let risk = 1.1497 - 1.14757;
+        let basis = StopBasis::default();
+        // Half an R seeds the memory without moving the stop.
+        let seed = managed_position(ManagedSide::Sell, 1.14757, 1.1497, 1.14757 - 0.5 * risk);
+        assert_eq!(
+            stop_plan(std::slice::from_ref(&seed), 1.0, 1.0, &basis),
+            None
+        );
+        let snapshot = basis.state_snapshot();
+        assert_eq!(snapshot["1"], json!(risk));
+
+        // A restarted process resumes the memory, so trailing still ratchets
+        // once the stop has already been moved to break-even.
+        let restarted = StopBasis::default();
+        restarted
+            .restore_state(&snapshot)
+            .expect("snapshot restores");
+        assert_eq!(restarted.risk(1), Some(risk));
+        let moved = managed_position(ManagedSide::Sell, 1.14757, 1.14757, 1.14757 - 1.2 * risk);
+        assert!(
+            stop_plan(std::slice::from_ref(&moved), 1.0, 1.0, &restarted).is_some(),
+            "the restored basis keeps trailing alive"
+        );
+
+        // Malformed snapshots fail closed instead of adopting junk.
+        for broken in [
+            json!("nope"),
+            json!({"not-a-ticket": 0.001}),
+            json!({"7": -0.1}),
+            json!({"7": "wide"}),
+        ] {
+            assert!(restarted.restore_state(&broken).is_err(), "{broken}");
+        }
     }
 
     #[actix_web::test]

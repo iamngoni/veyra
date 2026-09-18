@@ -199,6 +199,42 @@ impl JevRuntime {
         }
     }
 
+    /// Serializable snapshot of the cumulative usage counters, so a restart
+    /// resumes the totals instead of resetting them.
+    pub fn state_snapshot(&self) -> serde_json::Value {
+        let usage = self.usage();
+        serde_json::json!({
+            "calls": usage.calls,
+            "failures": usage.failures,
+            "inputTokens": usage.input_tokens,
+            "outputTokens": usage.output_tokens
+        })
+    }
+
+    /// Restores the cumulative counters from a stored snapshot.
+    ///
+    /// # Errors
+    /// Returns a description when the value is not a usage snapshot.
+    pub fn restore_state(&self, value: &serde_json::Value) -> Result<(), String> {
+        let field = |name: &str| {
+            value
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| format!("usage snapshot is missing `{name}`"))
+        };
+        self.usage.calls.store(field("calls")?, Ordering::Relaxed);
+        self.usage
+            .failures
+            .store(field("failures")?, Ordering::Relaxed);
+        self.usage
+            .input_tokens
+            .store(field("inputTokens")?, Ordering::Relaxed);
+        self.usage
+            .output_tokens
+            .store(field("outputTokens")?, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Returns a snapshot of the process-lifetime judge usage.
     pub fn usage(&self) -> JevUsageSnapshot {
         JevUsageSnapshot {
@@ -298,6 +334,47 @@ mod tests {
         assert_eq!(usage.failures, 0);
         assert_eq!(usage.input_tokens, 804);
         assert_eq!(usage.output_tokens, 146);
+    }
+
+    #[actix_web::test]
+    async fn usage_survives_a_restart_through_a_snapshot() {
+        let runtime =
+            JevRuntime::with_judge(JevProvider::TypeSafe, Arc::new(StubJudge { fail: false }));
+        runtime
+            .evaluate(sample_request())
+            .await
+            .expect("judge answers");
+        runtime
+            .evaluate(sample_request())
+            .await
+            .expect("judge answers");
+        let snapshot = runtime.state_snapshot();
+        assert_eq!(snapshot["calls"], 2);
+        assert_eq!(snapshot["inputTokens"], 804);
+        assert_eq!(snapshot["outputTokens"], 146);
+
+        let restarted =
+            JevRuntime::with_judge(JevProvider::TypeSafe, Arc::new(StubJudge { fail: true }));
+        restarted
+            .evaluate(sample_request())
+            .await
+            .expect_err("failing judge counts a failure");
+        assert_eq!(restarted.usage().failures, 1);
+
+        restarted
+            .restore_state(&snapshot)
+            .expect("snapshot restores");
+        let usage = restarted.usage();
+        assert_eq!(usage.calls, 2, "totals resume instead of resetting");
+        assert_eq!(usage.failures, 0);
+        assert_eq!(usage.input_tokens, 804);
+        assert_eq!(usage.output_tokens, 146);
+
+        assert!(
+            restarted
+                .restore_state(&serde_json::json!({"calls": 1}))
+                .is_err()
+        );
     }
 
     #[actix_web::test]

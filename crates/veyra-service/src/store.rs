@@ -14,6 +14,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
 use crate::audit::{AuditError, AuditEvent, AuditProvider, AuditRow, AuditTrail};
+use crate::state::{StateError, StateStore};
 
 /// PostgreSQL-backed audit trail.
 #[derive(Debug)]
@@ -107,6 +108,49 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Reads one runtime-state row.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Storage`] when the query fails.
+    pub async fn load_state(&self, key: &str) -> Result<Option<Value>, StateError> {
+        let row = sqlx::query("select value from runtime_state where key = $1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| state_error("load", &error))?;
+        Ok(row.map(|row| row.get::<Value, _>("value")))
+    }
+
+    /// Writes one runtime-state row, replacing any previous value.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Storage`] when the upsert fails.
+    pub async fn save_state(&self, key: &str, value: &Value) -> Result<(), StateError> {
+        sqlx::query(
+            "insert into runtime_state (key, value) values ($1, $2) \
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| state_error("save", &error))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl StateStore for Store {
+    async fn load(&self, key: &str) -> Result<Option<Value>, StateError> {
+        self.load_state(key).await
+    }
+
+    async fn save(&self, key: &str, value: &Value) -> Result<(), StateError> {
+        self.save_state(key, value).await
+    }
+}
+
 #[async_trait]
 impl AuditTrail for Store {
     fn provider(&self) -> AuditProvider {
@@ -128,6 +172,12 @@ impl AuditTrail for Store {
 
 fn storage_error(action: &str, error: &impl std::fmt::Display) -> AuditError {
     AuditError::Storage {
+        reason: format!("{action} failed: {error}"),
+    }
+}
+
+fn state_error(action: &str, error: &impl std::fmt::Display) -> StateError {
+    StateError::Storage {
         reason: format!("{action} failed: {error}"),
     }
 }

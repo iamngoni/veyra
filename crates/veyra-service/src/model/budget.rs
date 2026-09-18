@@ -11,7 +11,9 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
 
 use async_trait::async_trait;
 
@@ -73,17 +75,22 @@ impl fmt::Display for BudgetRefusal {
 #[derive(Debug, Clone, Copy)]
 struct WindowState {
     hour_start: Instant,
+    hour_start_epoch: u64,
     hour_calls: u32,
     day_start: Instant,
+    day_start_epoch: u64,
     day_calls: u32,
 }
 
 impl WindowState {
     fn new(now: Instant) -> Self {
+        let epoch = epoch_secs();
         Self {
             hour_start: now,
+            hour_start_epoch: epoch,
             hour_calls: 0,
             day_start: now,
+            day_start_epoch: epoch,
             day_calls: 0,
         }
     }
@@ -91,13 +98,23 @@ impl WindowState {
     fn roll(&mut self, now: Instant) {
         if now.duration_since(self.hour_start) >= HOUR {
             self.hour_start = now;
+            self.hour_start_epoch = epoch_secs();
             self.hour_calls = 0;
         }
         if now.duration_since(self.day_start) >= DAY {
             self.day_start = now;
+            self.day_start_epoch = epoch_secs();
             self.day_calls = 0;
         }
     }
+}
+
+/// Wall-clock seconds since the Unix epoch, or zero for clocks before it.
+fn epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 /// Admits or refuses one call against the policy at instant `now`.
@@ -164,6 +181,63 @@ impl BudgetTracker {
             Err(poisoned) => poisoned.into_inner(),
         };
         admit(&mut state, &self.policy, Instant::now())
+    }
+
+    /// Serializable snapshot of the window anchors and counts, so a restart
+    /// resumes the same windows instead of resetting the budget.
+    pub fn state_snapshot(&self) -> Value {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.roll(Instant::now());
+        serde_json::json!({
+            "hourStart": state.hour_start_epoch,
+            "hourCalls": state.hour_calls,
+            "dayStart": state.day_start_epoch,
+            "dayCalls": state.day_calls
+        })
+    }
+
+    /// Restores window anchors and counts from a stored snapshot. Windows
+    /// that already expired relative to the wall clock stay empty, so a
+    /// long-dormant snapshot cannot ration a fresh hour.
+    ///
+    /// # Errors
+    /// Returns a description when the value is not a budget snapshot.
+    pub fn restore_state(&self, value: &Value) -> Result<(), String> {
+        let field = |name: &str| {
+            value
+                .get(name)
+                .and_then(Value::as_u64)
+                .ok_or_else(|| format!("budget snapshot is missing `{name}`"))
+        };
+        let hour_start = field("hourStart")?;
+        let hour_calls = u32::try_from(field("hourCalls")?)
+            .map_err(|_| "budget hourCalls is out of range".to_owned())?;
+        let day_start = field("dayStart")?;
+        let day_calls = u32::try_from(field("dayCalls")?)
+            .map_err(|_| "budget dayCalls is out of range".to_owned())?;
+
+        let now = Instant::now();
+        let epoch = epoch_secs();
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if epoch.saturating_sub(hour_start) < HOUR.as_secs() {
+            let elapsed = Duration::from_secs(epoch - hour_start);
+            state.hour_start = now.checked_sub(elapsed).unwrap_or(now);
+            state.hour_start_epoch = hour_start;
+            state.hour_calls = hour_calls;
+        }
+        if epoch.saturating_sub(day_start) < DAY.as_secs() {
+            let elapsed = Duration::from_secs(epoch - day_start);
+            state.day_start = now.checked_sub(elapsed).unwrap_or(now);
+            state.day_start_epoch = day_start;
+            state.day_calls = day_calls;
+        }
+        Ok(())
     }
 
     /// Current usage against the configured limits.
@@ -247,6 +321,55 @@ mod tests {
         // A new day resets everything.
         let next_day = start + DAY + Duration::from_secs(1);
         assert!(admit(&mut state, &hourly, next_day).is_ok());
+    }
+
+    #[test]
+    fn budget_windows_survive_a_restart_through_a_snapshot() {
+        let tracker = BudgetTracker::new(policy(2, 100));
+        assert!(tracker.admit().is_ok());
+        assert!(tracker.admit().is_ok());
+        assert_eq!(
+            tracker.admit(),
+            Err(BudgetRefusal::Hourly { limit: 2 }),
+            "the live window is exhausted"
+        );
+
+        let snapshot = tracker.state_snapshot();
+        let restored = BudgetTracker::new(policy(2, 100));
+        restored
+            .restore_state(&snapshot)
+            .expect("snapshot restores");
+        assert_eq!(
+            restored.admit(),
+            Err(BudgetRefusal::Hourly { limit: 2 }),
+            "the restored window still refuses calls"
+        );
+
+        // Windows that expired while the process was down start empty.
+        let stale = serde_json::json!({
+            "hourStart": 1_u64,
+            "hourCalls": 5_u64,
+            "dayStart": 1_u64,
+            "dayCalls": 5_u64
+        });
+        let fresh = BudgetTracker::new(policy(2, 100));
+        fresh
+            .restore_state(&stale)
+            .expect("stale snapshot restores");
+        assert!(fresh.admit().is_ok(), "expired windows are not restored");
+
+        // Malformed snapshots name what is missing or out of range.
+        for broken in [
+            serde_json::json!({ "hourStart": 1_u64 }),
+            serde_json::json!({
+                "hourStart": u64::MAX,
+                "hourCalls": u64::from(u32::MAX) + 1,
+                "dayStart": 1_u64,
+                "dayCalls": 0_u64
+            }),
+        ] {
+            assert!(fresh.restore_state(&broken).is_err(), "{broken}");
+        }
     }
 
     #[test]

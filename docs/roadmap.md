@@ -104,6 +104,11 @@
       broker's minimum distance, or a console-editable ATR(14) noise floor
       (`minStopAtrFraction`, default 0.25) — proven live against IFC Markets
       for the whole menu (EURUSD/USDJPY/GBPUSD/XAUUSD).
+- [x] Durable runtime state (`runtime_state` in Postgres): judge usage,
+      model-budget windows, drawdown baselines, stop-policy memory, and the
+      live risk policy all survive service restarts and reboots; volatile by
+      design are the pending command queue, event/log rings, and `/metrics`
+      views (the audit trail is the durable record).
 - [x] Realized performance: a read-only `order_history` command returns the
       terminal's closed fills (profit + swap + commission), `GET /performance`
       aggregates wins/losses/win rate, net P/L, profit factor, and per-symbol

@@ -28,6 +28,7 @@ use crate::broker::{
 };
 use crate::market::{CandleRequest, Timeframe};
 use crate::risk::RiskDecision;
+use crate::state::StateKey;
 use crate::trading::{TradeIntent, TradeIntentDraft};
 
 #[post("/intents/check")]
@@ -128,6 +129,19 @@ pub async fn update_risk_policy(
         })),
         Ok(updated) => {
             state.risk().update_policy(updated.clone());
+            // Persist the effective policy so a restart resumes the operator's
+            // intent instead of reverting to the environment baseline.
+            match serde_json::to_value(updated.snapshot_patch()) {
+                Ok(value) => {
+                    state
+                        .runtime_state()
+                        .save(StateKey::RiskPolicy, &value)
+                        .await
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "risk policy snapshot could not be serialized")
+                }
+            }
             audit(
                 &state,
                 AuditKind::RiskPolicyUpdated,

@@ -21,6 +21,7 @@ pub mod reconciliation;
 pub mod risk;
 pub mod routes;
 pub mod server;
+pub mod state;
 pub mod store;
 pub mod trading;
 
@@ -37,6 +38,7 @@ use market::MarketRuntime;
 use model::ModelRuntime;
 use risk::RiskGate;
 use risk::guard::EquityGuard;
+use state::RuntimeState;
 use trading::autopilot::{AutopilotSettings, StopBasis};
 
 /// Immutable runtime state shared by HTTP handlers.
@@ -52,6 +54,7 @@ pub struct AppState {
     audit: Option<AuditRuntime>,
     logs: Option<Arc<LogBuffer>>,
     risk: RiskGate,
+    runtime_state: RuntimeState,
     stop_basis: Arc<StopBasis>,
     rotation: Arc<AtomicUsize>,
     equity_guard: Arc<EquityGuard>,
@@ -76,6 +79,7 @@ impl AppState {
             audit: None,
             logs: None,
             risk,
+            runtime_state: RuntimeState::disabled(),
             stop_basis: Arc::new(StopBasis::default()),
             rotation: Arc::new(AtomicUsize::new(0)),
             equity_guard: Arc::new(EquityGuard::new()),
@@ -85,6 +89,12 @@ impl AppState {
     /// Attaches the configured market-data integration, if any.
     pub fn with_market(mut self, market: Option<MarketRuntime>) -> Self {
         self.market = market;
+        self
+    }
+
+    /// Attaches the durable runtime-state facade.
+    pub fn with_runtime_state(mut self, runtime_state: RuntimeState) -> Self {
+        self.runtime_state = runtime_state;
         self
     }
 
@@ -136,6 +146,11 @@ impl AppState {
     /// Returns the active calendar integration, if one is configured.
     pub fn calendar(&self) -> Option<&CalendarRuntime> {
         self.calendar.as_ref()
+    }
+
+    /// Durable runtime-state facade (disabled without a database).
+    pub fn runtime_state(&self) -> &RuntimeState {
+        &self.runtime_state
     }
 
     /// Returns the autonomous loop settings, if any were configured.

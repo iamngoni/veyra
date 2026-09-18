@@ -5,6 +5,7 @@
 //! `cargo test --test store_live -- --ignored --nocapture`
 
 use veyra_service::audit::{AuditEvent, AuditKind, AuditTrail};
+use veyra_service::state::{StateKey, StateStore};
 use veyra_service::store::Store;
 
 #[actix_web::test]
@@ -74,4 +75,32 @@ async fn postgres_round_trips_audit_events() {
     );
     assert_eq!(store.delete_older_than(0).await.expect("zero keeps"), 0);
     println!("pruned {pruned} aged row(s); recent rows survived");
+
+    // Runtime state round-trips through the same database.
+    let value = serde_json::json!({ "calls": 42, "marker": marker });
+    store
+        .save(StateKey::JevUsage.as_str(), &value)
+        .await
+        .expect("state save must succeed");
+    let loaded = store
+        .load(StateKey::JevUsage.as_str())
+        .await
+        .expect("state load must succeed");
+    assert_eq!(loaded, Some(value), "stored state must read back");
+    store
+        .save(
+            StateKey::JevUsage.as_str(),
+            &serde_json::json!({ "calls": 43 }),
+        )
+        .await
+        .expect("state replace must succeed");
+    assert_eq!(
+        store
+            .load(StateKey::JevUsage.as_str())
+            .await
+            .expect("state reload"),
+        Some(serde_json::json!({ "calls": 43 })),
+        "saves replace the previous value"
+    );
+    println!("runtime state round-tripped");
 }
