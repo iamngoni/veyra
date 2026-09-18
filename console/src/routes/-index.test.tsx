@@ -76,6 +76,7 @@ beforeEach(() => {
       maxDailyLossPercent: 10,
       maxPeakDrawdownPercent: 25,
       maxNetFactorLots: 0.01,
+      calendarBlackoutMinutes: 30,
     },
   })
   mocks.account.mockResolvedValue({

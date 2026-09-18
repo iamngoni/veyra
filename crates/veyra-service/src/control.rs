@@ -342,6 +342,57 @@ pub async fn market_candles(state: Data<AppState>, query: web::Query<CandleQuery
     }
 }
 
+/// Query for the economic calendar window.
+#[derive(Debug, Deserialize)]
+pub struct CalendarQuery {
+    /// Hours ahead to list (1-168); defaults to 24.
+    pub hours: Option<u32>,
+}
+
+#[get("/calendar")]
+/// Returns the scheduled events the entry path sees for the requested window.
+///
+/// Read-only: the provider is fetched at most once per cached window and no
+/// order path is touched. Without a configured calendar the route reports
+/// unavailable, matching the market routes.
+pub async fn calendar_events(
+    state: Data<AppState>,
+    query: web::Query<CalendarQuery>,
+) -> HttpResponse {
+    let Some(runtime) = state.calendar() else {
+        return HttpResponse::ServiceUnavailable().json(json!({ "error": "calendar_unavailable" }));
+    };
+    let hours = query.hours.unwrap_or(24);
+    if !(1..=168).contains(&hours) {
+        return HttpResponse::BadRequest()
+            .json(json!({ "error": "invalid_window", "reason": "hours must be 1-168" }));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let until = now.saturating_add(i64::from(hours) * 3_600);
+    let feed = runtime.feed();
+    match feed.events(now, until).await {
+        Ok(events) => HttpResponse::Ok().json(json!({
+            "provider": feed.provider().as_str(),
+            "from": now,
+            "until": until,
+            "events": events
+                .iter()
+                .map(|event| json!({
+                    "title": event.title(),
+                    "currency": event.currency(),
+                    "impact": event.impact().as_str(),
+                    "time": event.time()
+                }))
+                .collect::<Vec<_>>()
+        })),
+        Err(error) => HttpResponse::BadGateway()
+            .json(json!({ "error": "calendar_failed", "reason": error.to_string() })),
+    }
+}
+
 /// Query for the instrument contract.
 #[derive(Debug, Deserialize)]
 pub struct SpecQuery {
@@ -929,6 +980,9 @@ mod tests {
     use crate::broker::{
         AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName, SymbolSpecRequest,
     };
+    use crate::calendar::{
+        CalendarError, CalendarEvent, CalendarProvider, CalendarRuntime, EventCalendar, Impact,
+    };
     use crate::config::{ConfigError, ServiceConfig};
     use crate::market::{Candle, CandleSeries, MarketError, MarketFeed, MarketProvider};
     use crate::risk::{RiskGate, RiskPolicy};
@@ -991,6 +1045,34 @@ mod tests {
                 swap_type: 0,
                 trade_allowed: true,
             })
+        }
+    }
+
+    /// Calendar stub answering from a fixed event list or failing outright.
+    #[derive(Debug)]
+    struct StubCalendar {
+        events: Vec<CalendarEvent>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl EventCalendar for StubCalendar {
+        fn provider(&self) -> CalendarProvider {
+            CalendarProvider::Forexfactory
+        }
+
+        async fn events(&self, from: i64, until: i64) -> Result<Vec<CalendarEvent>, CalendarError> {
+            if self.fail {
+                return Err(CalendarError::Transport {
+                    reason: "feed down".to_owned(),
+                });
+            }
+            Ok(self
+                .events
+                .iter()
+                .filter(|event| event.time() >= from && event.time() < until)
+                .cloned()
+                .collect())
         }
     }
 
@@ -1409,6 +1491,73 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), 503);
+    }
+
+    #[actix_web::test]
+    async fn calendar_route_lists_events_and_reports_failures() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+
+        // No calendar configured: unavailable, like the market routes.
+        let app = test::init_service(create_app(build_state(None, true))).await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/calendar").to_request()).await;
+        assert_eq!(response.status(), 503);
+
+        // A configured calendar lists the scheduled window oldest first.
+        let mut state = build_state(None, true);
+        state = state.with_calendar(Some(CalendarRuntime::from_feed(Arc::new(StubCalendar {
+            events: vec![
+                CalendarEvent::new(
+                    "Non-Farm Employment Change",
+                    "USD",
+                    Impact::High,
+                    now + 1_800,
+                )
+                .expect("event"),
+                CalendarEvent::new("ECB Rate Decision", "EUR", Impact::High, now + 7_200)
+                    .expect("event"),
+            ],
+            fail: false,
+        }))));
+        let app = test::init_service(create_app(state.clone())).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/calendar?hours=1")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["provider"], "forexfactory");
+        let events = body["events"].as_array().expect("events");
+        assert_eq!(events.len(), 1, "the 1-hour window excludes the ECB print");
+        assert_eq!(events[0]["title"], "Non-Farm Employment Change");
+        assert_eq!(events[0]["impact"], "high");
+        assert_eq!(events[0]["time"], now + 1_800);
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/calendar?hours=0")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+
+        // A provider that cannot answer is a gateway failure.
+        let mut failing = build_state(None, true);
+        failing = failing.with_calendar(Some(CalendarRuntime::from_feed(Arc::new(StubCalendar {
+            events: Vec::new(),
+            fail: true,
+        }))));
+        let app = test::init_service(create_app(failing)).await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/calendar").to_request()).await;
+        assert_eq!(response.status(), 502);
     }
 
     #[actix_web::test]

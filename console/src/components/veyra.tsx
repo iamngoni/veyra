@@ -340,6 +340,7 @@ type PolicyDraft = {
   maxDailyLossPercent: string
   maxPeakDrawdownPercent: string
   maxNetFactorLots: string
+  calendarBlackoutMinutes: string
 }
 
 const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer: boolean }> = [
@@ -351,6 +352,7 @@ const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer
   { key: 'maxDailyLossPercent', label: 'Daily brake (%)', integer: false },
   { key: 'maxPeakDrawdownPercent', label: 'Peak brake (%)', integer: false },
   { key: 'maxNetFactorLots', label: 'Net USD cap (lots)', integer: false },
+  { key: 'calendarBlackoutMinutes', label: 'News blackout (minutes)', integer: true },
 ]
 
 type NumericDraftKey =
@@ -362,6 +364,7 @@ type NumericDraftKey =
   | 'maxDailyLossPercent'
   | 'maxPeakDrawdownPercent'
   | 'maxNetFactorLots'
+  | 'calendarBlackoutMinutes'
 
 function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
   return {
@@ -376,6 +379,7 @@ function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
     maxDailyLossPercent: String(policy.maxDailyLossPercent),
     maxPeakDrawdownPercent: String(policy.maxPeakDrawdownPercent),
     maxNetFactorLots: String(policy.maxNetFactorLots),
+    calendarBlackoutMinutes: String(policy.calendarBlackoutMinutes),
   }
 }
 
@@ -581,6 +585,16 @@ export function RiskPanel({
           label="Net USD"
           value={policy ? (policy.maxNetFactorLots > 0 ? `${policy.maxNetFactorLots} lots` : 'off') : '—'}
         />
+        <Field
+          label="News"
+          value={
+            policy
+              ? policy.calendarBlackoutMinutes > 0
+                ? `${policy.calendarBlackoutMinutes}m blackout`
+                : 'off'
+              : '—'
+          }
+        />
         <Field label="Session UTC" value={policy?.sessionUtc ?? 'always open'} />
         <Field
           label="Execution"
@@ -596,7 +610,7 @@ export function RiskPanel({
       <div className="border-t border-slate-800/80 px-3 py-2 text-[11px] leading-relaxed text-slate-500">
         Every intent passes the gate in order: kill switch, allowlist, entry window, session, per-order cap,
         account facts, permission, drawdown brakes, one-per-asset, order cap, exposure, per-trade risk, net
-        exposure, duplicates.
+        exposure, duplicates. Approved entries then pass the venue contract check and the news blackout.
       </div>
     </Panel>
   )

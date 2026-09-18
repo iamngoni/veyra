@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use veyra_service::audit::{AuditEvent, AuditKind, AuditRuntime};
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
+use veyra_service::calendar::{CalendarRuntime, CalendarSettings};
 use veyra_service::jev::{JevRuntime, JevSettings};
 use veyra_service::logs::{self, LogBuffer};
 use veyra_service::market::{MarketRuntime, MarketSettings};
@@ -44,6 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // The economic calendar is optional: absent configuration leaves the
+    // blackout inert and the model without news context.
+    let calendar = match CalendarSettings::from_env()? {
+        Some(settings) => Some(CalendarRuntime::from_settings(settings)?),
+        None => None,
+    };
+
     let autopilot = AutopilotSettings::from_env()?;
 
     let companion = match &broker {
@@ -70,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = server::bind(&config)?;
     let state = AppState::new(config, broker, model, risk)
         .with_market(market)
+        .with_calendar(calendar)
         .with_autopilot(autopilot)
         .with_jev(jev)
         .with_logs(logs)

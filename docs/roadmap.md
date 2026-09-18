@@ -103,6 +103,13 @@
       lot grid, margin above free margin, and stops inside the spread or the
       broker's minimum distance — proven live against IFC Markets for the
       whole menu (EURUSD/USDJPY/GBPUSD/XAUUSD).
+- [x] Economic calendar: a provider-neutral `EventCalendar` trait with the
+      keyless ForexFactory weekly export as the first implementation (cached),
+      `GET /calendar` for operators, per-asset `upcoming_events` in the entry
+      model input, and a deterministic high-impact blackout window that is
+      console-editable through the risk policy (`calendarBlackoutMinutes`,
+      default 30, 0 disables). A configured feed that cannot answer fails the
+      entry sweep closed.
 - [x] `close_order` for Veyra-owned positions: only tickets from the latest
       completed `account_snapshot` that carry the Veyra magic number are
       accepted, and the terminal re-validates before a dry run or close —

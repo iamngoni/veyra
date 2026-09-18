@@ -37,6 +37,7 @@ use crate::AppState;
 use crate::audit::{AuditEvent, AuditKind};
 use crate::broker::Symbol;
 use crate::broker::{ORDER_MAGIC, PositionPayload, SymbolSpecPayload};
+use crate::calendar::{self, CalendarEvent};
 use crate::config::ConfigError;
 use crate::control::{
     StagedClose, StagedExecution, StagedModify, queue_staged_close, queue_staged_modify,
@@ -70,6 +71,12 @@ const MIN_BARS: u16 = 10;
 const RECENT_CANDLES: usize = 12;
 /// True-range window used for the ATR context handed to the model.
 const ATR_PERIOD: usize = 14;
+/// How far ahead the model sees scheduled events, in seconds.
+const CALENDAR_HORIZON_SECS: i64 = 86_400;
+/// How far back events are fetched so a late tick still sees a recent print.
+const CALENDAR_LOOKBACK_SECS: i64 = 86_400;
+/// Largest number of scheduled events listed per asset.
+const MAX_LISTED_EVENTS: usize = 6;
 /// Default minimum position age before an autonomous close is allowed.
 const DEFAULT_MIN_HOLD_SECS: u64 = 300;
 /// Largest minimum-hold window the parser accepts.
@@ -582,7 +589,17 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         // gets spread, stop-level, lot-band, and margin facts to size its
         // decision, and the pre-queue contract check reuses the same data.
         let specs = symbol_specs(state, &markets).await;
-        let input = proposal_input(&markets, &judgements, &account, &managed, &specs);
+        // Scheduled news: a configured calendar that cannot answer aborts the
+        // entry sweep; trading blind through a data outage is exactly what the
+        // blackout exists to prevent.
+        let events = match calendar_events(state).await {
+            Ok(events) => events,
+            Err(reason) => {
+                record(state, "unavailable", None, None, Some(&reason)).await;
+                return TickOutcome::Unavailable { reason };
+            }
+        };
+        let input = proposal_input(&markets, &judgements, &account, &managed, &specs, &events);
         let instructions = proposal_instructions(state, &markets, &account);
         let engine = model.engine();
         let session = AgentSession {
@@ -678,6 +695,35 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                             .await;
                             return TickOutcome::Rejected {
                                 code: "missing_stops",
+                            };
+                        }
+                        // Scheduled news decides before the venue contract:
+                        // an entry inside a high-impact window is refused for
+                        // the instrument's own currencies.
+                        if let Some(event) = calendar::blackout(
+                            &events,
+                            symbol.as_str(),
+                            unix_secs(SystemTime::now()),
+                            policy.calendar_blackout_minutes(),
+                        ) {
+                            tracing::debug!(
+                                symbol = symbol.as_str(),
+                                event = event.title(),
+                                "entry refused inside the news blackout"
+                            );
+                            record_event_context(
+                                state,
+                                "rejected",
+                                Some(&symbol),
+                                Some(draft),
+                                Some("news_blackout"),
+                                None,
+                                None,
+                                context,
+                            )
+                            .await;
+                            return TickOutcome::Rejected {
+                                code: "news_blackout",
                             };
                         }
                         // The venue contract decides last: volume on the lot
@@ -918,6 +964,27 @@ async fn symbol_specs(
         }
     }
     specs
+}
+
+/// Fetches the scheduled events covering the decision horizon. Without a
+/// configured calendar the list is empty and both news behaviours are inert.
+async fn calendar_events(state: &AppState) -> Result<Vec<CalendarEvent>, String> {
+    let Some(calendar) = state.calendar() else {
+        return Ok(Vec::new());
+    };
+    let now = unix_secs(SystemTime::now());
+    calendar
+        .feed()
+        .events(now - CALENDAR_LOOKBACK_SECS, now + CALENDAR_HORIZON_SECS)
+        .await
+        .map_err(|error| format!("calendar unavailable: {error}"))
+}
+
+/// Seconds since the Unix epoch, or zero for clock values before it.
+fn unix_secs(now: SystemTime) -> i64 {
+    now.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Contract for one symbol from this tick's fetched specs.
@@ -1902,7 +1969,9 @@ fn proposal_input(
     account: &AccountFacts,
     managed: &[ManagedPosition],
     specs: &[(Symbol, SymbolSpecPayload)],
+    events: &[CalendarEvent],
 ) -> String {
+    let now = unix_secs(SystemTime::now());
     let assets: Vec<Value> = markets
         .iter()
         .map(|(symbol, series)| {
@@ -1951,6 +2020,21 @@ fn proposal_input(
                     "swap_short": spec.swap_short,
                     "trade_allowed": spec.trade_allowed
                 });
+            }
+            let upcoming = calendar::upcoming(events, symbol.as_str(), now, CALENDAR_HORIZON_SECS);
+            if !upcoming.is_empty() {
+                asset["upcoming_events"] = json!(
+                    upcoming
+                        .iter()
+                        .take(MAX_LISTED_EVENTS)
+                        .map(|event| json!({
+                            "title": event.title(),
+                            "currency": event.currency(),
+                            "impact": event.impact().as_str(),
+                            "in_minutes": (event.time() - now) / 60
+                        }))
+                        .collect::<Vec<_>>()
+                );
             }
             if let Some(summary) = judgement_for_symbol(judgements, symbol.as_str()) {
                 asset["judgements"] = summary.clone();
@@ -2007,7 +2091,7 @@ fn proposal_instructions(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles and optional calibrated judgements; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors. Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: get_judgements(symbol) for calibrated probabilities, get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
+        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles and optional calibrated judgements; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors. Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. High-impact events blackout entries for their currencies around the release; the `upcoming_events` list shows what is scheduled, so avoid fighting a print. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: get_judgements(symbol) for calibrated probabilities, get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
         menu = menu,
         timeframe = markets
             .first()
@@ -2086,6 +2170,9 @@ mod tests {
     use crate::audit::{AuditRuntime, MemoryTrail};
     use crate::broker::{AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName};
     use crate::broker::{AccountSnapshotPayload, CommandKind};
+    use crate::calendar::{
+        CalendarError, CalendarProvider, CalendarRuntime, EventCalendar, Impact,
+    };
     use crate::config::ServiceConfig;
     use crate::jev::{
         JevError, JevProvider, JevRequest as JudgeRequest, JevResponse, SemanticJudge,
@@ -2219,6 +2306,34 @@ mod tests {
                 .spec
                 .clone()
                 .unwrap_or_else(|| canned_spec(symbol.as_str())))
+        }
+    }
+
+    /// Calendar stub answering from a fixed event list or failing outright.
+    #[derive(Debug)]
+    struct StubCalendar {
+        events: Vec<CalendarEvent>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl EventCalendar for StubCalendar {
+        fn provider(&self) -> CalendarProvider {
+            CalendarProvider::Forexfactory
+        }
+
+        async fn events(&self, from: i64, until: i64) -> Result<Vec<CalendarEvent>, CalendarError> {
+            if self.fail {
+                return Err(CalendarError::Transport {
+                    reason: "feed down".to_owned(),
+                });
+            }
+            Ok(self
+                .events
+                .iter()
+                .filter(|event| event.time() >= from && event.time() < until)
+                .cloned()
+                .collect())
         }
     }
 
@@ -2984,6 +3099,130 @@ mod tests {
                 code: "spec_unavailable"
             }
         );
+    }
+
+    #[actix_web::test]
+    async fn tick_rejects_entries_inside_a_news_blackout() {
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let mut harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let now = unix_secs(SystemTime::now());
+        let event =
+            CalendarEvent::new("Non-Farm Employment Change", "USD", Impact::High, now + 600)
+                .expect("event");
+        harness.state = harness
+            .state
+            .clone()
+            .with_calendar(Some(CalendarRuntime::from_feed(Arc::new(StubCalendar {
+                events: vec![event],
+                fail: false,
+            }))));
+        let policy = harness.state.risk().policy().with_calendar_blackout(30);
+        harness.state.risk().update_policy(policy);
+
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "news_blackout"
+            }
+        );
+        let link = harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link");
+        assert!(
+            !link.has_pending(CommandKind::OpenOrder),
+            "an entry inside the news window is never queued"
+        );
+
+        let input: Value =
+            serde_json::from_str(&engine.requests()[0].input).expect("input is JSON");
+        assert_eq!(
+            input["assets"][0]["upcoming_events"][0]["title"], "Non-Farm Employment Change",
+            "the model sees what is scheduled"
+        );
+        assert_eq!(input["assets"][0]["upcoming_events"][0]["impact"], "high");
+        assert_eq!(input["assets"][0]["upcoming_events"][0]["in_minutes"], 10);
+    }
+
+    #[actix_web::test]
+    async fn tick_allows_entries_outside_the_news_window() {
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let mut harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let now = unix_secs(SystemTime::now());
+        let event = CalendarEvent::new("ECB Press Conference", "EUR", Impact::High, now + 7_200)
+            .expect("event");
+        harness.state = harness
+            .state
+            .clone()
+            .with_calendar(Some(CalendarRuntime::from_feed(Arc::new(StubCalendar {
+                events: vec![event],
+                fail: false,
+            }))));
+        let policy = harness.state.risk().policy().with_calendar_blackout(30);
+        harness.state.risk().update_policy(policy);
+
+        assert!(matches!(
+            tick(&harness.state).await,
+            TickOutcome::Queued { .. }
+        ));
+    }
+
+    #[actix_web::test]
+    async fn tick_fails_closed_when_the_configured_calendar_fails() {
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let mut harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness.state = harness
+            .state
+            .clone()
+            .with_calendar(Some(CalendarRuntime::from_feed(Arc::new(StubCalendar {
+                events: Vec::new(),
+                fail: true,
+            }))));
+
+        match tick(&harness.state).await {
+            TickOutcome::Unavailable { reason } => {
+                assert!(reason.contains("calendar unavailable"), "{reason}");
+            }
+            other => panic!("expected unavailable, got {other:?}"),
+        }
     }
 
     #[actix_web::test]

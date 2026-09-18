@@ -45,6 +45,10 @@ const DEFAULT_MAX_DAILY_LOSS_PERCENT: f64 = 10.0;
 const DEFAULT_MAX_PEAK_DRAWDOWN_PERCENT: f64 = 25.0;
 /// Default cap on net USD-directional exposure in lots (0 disables).
 const DEFAULT_MAX_NET_FACTOR_LOTS: f64 = 0.01;
+/// Default news blackout either side of a high-impact event, in minutes.
+const DEFAULT_CALENDAR_BLACKOUT_MINUTES: u64 = 30;
+/// Absolute ceiling for the news blackout window (24 hours either side).
+const MAX_CALENDAR_BLACKOUT_MINUTES: u64 = 1_440;
 
 const SYMBOLS_RULE: &str = "must list 1-64 comma-separated instrument symbols";
 const VOLUME_RULE: &str = "must be a finite number greater than 0 and at most 100";
@@ -52,6 +56,8 @@ const OPEN_ORDERS_RULE: &str = "must be an integer from 0 through 1000";
 const DUPLICATE_WINDOW_RULE: &str = "must be an integer number of seconds from 0 through 86400";
 const PERCENT_RULE: &str = "must be a number from 0 through 100 (0 disables the check)";
 const FACTOR_LOTS_RULE: &str = "must be a number from 0 through 100 lots (0 disables the check)";
+const CALENDAR_BLACKOUT_RULE: &str =
+    "must be an integer number of minutes from 0 through 1440 (0 disables the check)";
 const SESSION_RULE: &str = "must be `HH-HH` with UTC hours 0-23 and different bounds";
 const KILL_SWITCH_RULE: &str = "must be `true` or `false`";
 
@@ -93,6 +99,9 @@ pub struct RiskPolicyPatch {
     pub max_peak_drawdown_percent: Option<f64>,
     /// Net USD-direction cap in lots (0 disables).
     pub max_net_factor_lots: Option<f64>,
+    /// News blackout either side of a high-impact event, in minutes
+    /// (0 disables the check).
+    pub calendar_blackout_minutes: Option<u64>,
 }
 
 /// Validates one symbol list from the control surface.
@@ -193,6 +202,7 @@ pub struct RiskPolicy {
     max_daily_loss_percent: f64,
     max_peak_drawdown_percent: f64,
     max_net_factor_lots: f64,
+    calendar_blackout_minutes: u64,
 }
 
 impl RiskPolicy {
@@ -221,6 +231,7 @@ impl RiskPolicy {
             max_daily_loss_percent: 0.0,
             max_peak_drawdown_percent: 0.0,
             max_net_factor_lots: 0.0,
+            calendar_blackout_minutes: 0,
         }
     }
 
@@ -238,6 +249,14 @@ impl RiskPolicy {
         self.max_daily_loss_percent = max_daily_loss_percent;
         self.max_peak_drawdown_percent = max_peak_drawdown_percent;
         self.max_net_factor_lots = max_net_factor_lots;
+        self
+    }
+
+    /// Sets the news blackout window in minutes either side of a high-impact
+    /// event. Zero disables the check; the calendar must also be configured
+    /// for it to apply.
+    pub fn with_calendar_blackout(mut self, minutes: u64) -> Self {
+        self.calendar_blackout_minutes = minutes;
         self
     }
 
@@ -372,6 +391,24 @@ impl RiskPolicy {
             }
         };
 
+        let calendar_blackout_minutes =
+            match trimmed(&mut source, "VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES") {
+                None => DEFAULT_CALENDAR_BLACKOUT_MINUTES,
+                Some(raw) => {
+                    let minutes = raw.parse::<u64>().map_err(|_| RiskError {
+                        name: "VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES",
+                        reason: CALENDAR_BLACKOUT_RULE,
+                    })?;
+                    if minutes > MAX_CALENDAR_BLACKOUT_MINUTES {
+                        return Err(RiskError {
+                            name: "VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES",
+                            reason: CALENDAR_BLACKOUT_RULE,
+                        });
+                    }
+                    minutes
+                }
+            };
+
         Ok(Self::new(
             kill_switch,
             symbols,
@@ -386,7 +423,8 @@ impl RiskPolicy {
             max_daily_loss_percent,
             max_peak_drawdown_percent,
             max_net_factor_lots,
-        ))
+        )
+        .with_calendar_blackout(calendar_blackout_minutes))
     }
 
     /// Applies a partial update from the control surface, keeping every field
@@ -468,6 +506,16 @@ impl RiskPolicy {
                 });
             }
         };
+        let calendar_blackout_minutes = match patch.calendar_blackout_minutes {
+            None => self.calendar_blackout_minutes,
+            Some(minutes) if minutes <= MAX_CALENDAR_BLACKOUT_MINUTES => minutes,
+            Some(_) => {
+                return Err(RiskError {
+                    name: "calendarBlackoutMinutes",
+                    reason: CALENDAR_BLACKOUT_RULE,
+                });
+            }
+        };
 
         Ok(Self::new(
             kill_switch,
@@ -483,7 +531,8 @@ impl RiskPolicy {
             max_daily_loss_percent,
             max_peak_drawdown_percent,
             max_net_factor_lots,
-        ))
+        )
+        .with_calendar_blackout(calendar_blackout_minutes))
     }
 
     /// Whether the kill switch is engaged; engaged means every intent fails.
@@ -541,6 +590,12 @@ impl RiskPolicy {
         self.max_net_factor_lots
     }
 
+    /// News blackout either side of a high-impact event, in minutes; zero
+    /// disables the check.
+    pub fn calendar_blackout_minutes(&self) -> u64 {
+        self.calendar_blackout_minutes
+    }
+
     /// Bounded, non-sensitive snapshot of the effective policy.
     ///
     /// Recorded with the audit trail at startup so a decision can always be
@@ -563,7 +618,8 @@ impl RiskPolicy {
             "maxRiskPercent": self.max_risk_percent,
             "maxDailyLossPercent": self.max_daily_loss_percent,
             "maxPeakDrawdownPercent": self.max_peak_drawdown_percent,
-            "maxNetFactorLots": self.max_net_factor_lots
+            "maxNetFactorLots": self.max_net_factor_lots,
+            "calendarBlackoutMinutes": self.calendar_blackout_minutes
         })
     }
 
@@ -594,6 +650,7 @@ impl Default for RiskPolicy {
             DEFAULT_MAX_PEAK_DRAWDOWN_PERCENT,
             DEFAULT_MAX_NET_FACTOR_LOTS,
         )
+        .with_calendar_blackout(DEFAULT_CALENDAR_BLACKOUT_MINUTES)
     }
 }
 
@@ -676,6 +733,10 @@ mod tests {
         assert_eq!(summary["maxOpenOrders"], 1);
         assert_eq!(summary["duplicateWindowSecs"], 60);
         assert_eq!(summary["sessionUtc"], "7-21");
+        assert_eq!(
+            summary["calendarBlackoutMinutes"], 0,
+            "the embedding baseline disables the news blackout"
+        );
 
         let default = RiskPolicy::default().summary();
         assert_eq!(
@@ -684,6 +745,10 @@ mod tests {
             "default denies all"
         );
         assert_eq!(default["sessionUtc"], serde_json::Value::Null);
+        assert_eq!(
+            default["calendarBlackoutMinutes"],
+            DEFAULT_CALENDAR_BLACKOUT_MINUTES
+        );
     }
 
     fn source<'a>(
@@ -717,6 +782,10 @@ mod tests {
             DEFAULT_MAX_PEAK_DRAWDOWN_PERCENT
         );
         assert_eq!(policy.max_net_factor_lots(), DEFAULT_MAX_NET_FACTOR_LOTS);
+        assert_eq!(
+            policy.calendar_blackout_minutes(),
+            DEFAULT_CALENDAR_BLACKOUT_MINUTES
+        );
         assert!(!policy.allows_symbol(&parse_instrument("EURUSD").expect("symbol")));
         assert_eq!(RiskPolicy::default(), policy);
     }
@@ -759,6 +828,7 @@ mod tests {
                 max_daily_loss_percent: Some(0.0),
                 max_peak_drawdown_percent: Some(40.0),
                 max_net_factor_lots: Some(0.05),
+                calendar_blackout_minutes: Some(15),
                 ..Default::default()
             })
             .expect("patch applies");
@@ -774,6 +844,7 @@ mod tests {
         assert_eq!(full.max_daily_loss_percent(), 0.0);
         assert_eq!(full.max_peak_drawdown_percent(), 40.0);
         assert_eq!(full.max_net_factor_lots(), 0.05);
+        assert_eq!(full.calendar_blackout_minutes(), 15);
 
         let cleared = full
             .apply_patch(&RiskPolicyPatch {
@@ -784,7 +855,7 @@ mod tests {
         assert_eq!(cleared.session(), None);
 
         // Rejections name the control-surface field.
-        let cases: [(RiskPolicyPatch, &str); 8] = [
+        let cases: [(RiskPolicyPatch, &str); 9] = [
             (
                 RiskPolicyPatch {
                     symbols: Some(Vec::new()),
@@ -841,6 +912,13 @@ mod tests {
                 },
                 "sessionUtc",
             ),
+            (
+                RiskPolicyPatch {
+                    calendar_blackout_minutes: Some(1_441),
+                    ..Default::default()
+                },
+                "calendarBlackoutMinutes",
+            ),
         ];
         for (patch, field) in cases {
             let error = base.apply_patch(&patch).expect_err(field);
@@ -862,6 +940,7 @@ mod tests {
             ("VEYRA_RISK_MAX_DAILY_LOSS_PERCENT", "0"),
             ("VEYRA_RISK_MAX_PEAK_DRAWDOWN_PERCENT", "40"),
             ("VEYRA_RISK_MAX_NET_FACTOR_LOTS", "0.05"),
+            ("VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES", "45"),
         ]))
         .expect("valid settings");
 
@@ -880,11 +959,12 @@ mod tests {
         assert_eq!(policy.max_daily_loss_percent(), 0.0, "zero disables");
         assert_eq!(policy.max_peak_drawdown_percent(), 40.0);
         assert_eq!(policy.max_net_factor_lots(), 0.05);
+        assert_eq!(policy.calendar_blackout_minutes(), 45);
     }
 
     #[test]
     fn malformed_settings_are_rejected_by_name() {
-        let cases: [(&'static str, &'static str); 14] = [
+        let cases: [(&'static str, &'static str); 16] = [
             ("VEYRA_RISK_KILL_SWITCH", "yes"),
             ("VEYRA_RISK_SYMBOLS", "not a symbol!,EURUSD"),
             ("VEYRA_RISK_MAX_VOLUME_PER_ORDER", "0"),
@@ -899,6 +979,8 @@ mod tests {
             ("VEYRA_RISK_MAX_DAILY_LOSS_PERCENT", "soon"),
             ("VEYRA_RISK_MAX_PEAK_DRAWDOWN_PERCENT", "-1"),
             ("VEYRA_RISK_MAX_NET_FACTOR_LOTS", "lots"),
+            ("VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES", "1441"),
+            ("VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES", "soon"),
         ];
         for (name, value) in cases {
             let error =

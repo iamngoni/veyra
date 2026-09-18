@@ -8,6 +8,7 @@
 pub mod app;
 pub mod audit;
 pub mod broker;
+pub mod calendar;
 pub mod config;
 pub mod control;
 pub mod jev;
@@ -27,6 +28,7 @@ use std::sync::atomic::AtomicUsize;
 
 use audit::AuditRuntime;
 use broker::BrokerRuntime;
+use calendar::CalendarRuntime;
 use config::ServiceConfig;
 use jev::JevRuntime;
 use logs::LogBuffer;
@@ -42,6 +44,7 @@ pub struct AppState {
     config: ServiceConfig,
     broker: Option<BrokerRuntime>,
     market: Option<MarketRuntime>,
+    calendar: Option<CalendarRuntime>,
     autopilot: Option<AutopilotSettings>,
     model: Option<ModelRuntime>,
     jev: Option<JevRuntime>,
@@ -65,6 +68,7 @@ impl AppState {
             config,
             broker,
             market: None,
+            calendar: None,
             autopilot: None,
             model,
             jev: None,
@@ -80,6 +84,12 @@ impl AppState {
     /// Attaches the configured market-data integration, if any.
     pub fn with_market(mut self, market: Option<MarketRuntime>) -> Self {
         self.market = market;
+        self
+    }
+
+    /// Attaches the configured calendar integration, if any.
+    pub fn with_calendar(mut self, calendar: Option<CalendarRuntime>) -> Self {
+        self.calendar = calendar;
         self
     }
 
@@ -120,6 +130,11 @@ impl AppState {
     /// Returns the active market-data integration, if one is configured.
     pub fn market(&self) -> Option<&MarketRuntime> {
         self.market.as_ref()
+    }
+
+    /// Returns the active calendar integration, if one is configured.
+    pub fn calendar(&self) -> Option<&CalendarRuntime> {
+        self.calendar.as_ref()
     }
 
     /// Returns the autonomous loop settings, if any were configured.

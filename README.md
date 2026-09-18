@@ -25,10 +25,15 @@ This repository contains the first tested, safe service slice:
   plus broker-side order validation (`order_check`) that never sends an order —
   proven live (retcode 0 for a valid request, 129 for a wrong-side limit).
 - Autonomous operation: an **autopilot** loop gathers closed candles, optional
-  Jev judgements, one structured model proposal, the deterministic gate, and
-  the same staged execution as the control surface — live-proven with the
-  first autonomous order (EURUSD 0.01 sell, ticket 10650805, executed with
-  retcode 0 after explicit owner approval of both switches).
+  Jev judgements, the venue's instrument contracts, ATR and scheduled news,
+  one structured model proposal, the deterministic gate, and the same staged
+  execution as the control surface — live-proven with the first autonomous
+  order (EURUSD 0.01 sell, ticket 10650805, executed with retcode 0 after
+  explicit owner approval of both switches).
+- **Scheduled-news awareness**: a provider-neutral economic calendar
+  (ForexFactory weekly export, no key, cached) feeds per-asset
+  `upcoming_events` to the model and blackouts high-impact entries through a
+  console-editable window; `GET /calendar` lists what the bot sees.
 - An **operations console** (TanStack Start) on `http://127.0.0.1:3000`:
   account and positions with their stops, a streaming activity feed, recent
   commands, and the current market window.

@@ -43,6 +43,8 @@ struct StatusResponse {
     model_provider: Option<&'static str>,
     jev_provider: Option<&'static str>,
     persistence: Option<&'static str>,
+    /// Active economic-calendar provider, when one is configured.
+    calendar_provider: Option<&'static str>,
     broker_connected: bool,
     trading_enabled: bool,
     ea_live_orders: bool,
@@ -178,6 +180,9 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         })
     });
     let persistence = state.audit().map(|runtime| runtime.provider().as_str());
+    let calendar_provider = state
+        .calendar()
+        .map(|runtime| runtime.feed().provider().as_str());
 
     HttpResponse::Ok().json(StatusResponse {
         service: "veyra",
@@ -188,6 +193,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         model_provider,
         jev_provider,
         persistence,
+        calendar_provider,
         broker_connected,
         trading_enabled: state.config().trading_enabled(),
         ea_live_orders,

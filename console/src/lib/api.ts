@@ -59,6 +59,8 @@ export type RiskPolicy = {
   maxPeakDrawdownPercent: number
   /** Cap on net USD-directional exposure in lots (0 disables). */
   maxNetFactorLots: number
+  /** News blackout either side of a high-impact event, in minutes (0 disables). */
+  calendarBlackoutMinutes: number
 }
 
 export type Metrics = {
@@ -143,6 +145,7 @@ export type RiskPolicyPatch = {
   maxDailyLossPercent?: number
   maxPeakDrawdownPercent?: number
   maxNetFactorLots?: number
+  calendarBlackoutMinutes?: number
 }
 
 export type CommandRecord = {
