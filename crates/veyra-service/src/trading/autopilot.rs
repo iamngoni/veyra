@@ -507,8 +507,12 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     let account = with_reference_prices(account, &markets);
 
     // Calibrated judgements per candidate. They are advisory inputs, but a
-    // configured judge that fails still aborts the tick: no model call runs on
-    // partial inputs.
+    // configured judge that fails normally aborts the tick: no model call runs
+    // on partial inputs. The owner can override that from the console, which
+    // trades on the model alone rather than pausing through a judge outage.
+    // The override drops the whole set instead of keeping the symbols that did
+    // answer, so the model never compares a judged instrument against an
+    // unjudged one and reads the silence as an absence of evidence.
     let mut judgements: Vec<(Symbol, Value)> = Vec::new();
     if settings.jev() != JevPreference::Off
         && let Some(jev) = state.jev()
@@ -518,8 +522,18 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                 Ok(summary) => judgements.push((symbol.clone(), summary)),
                 Err(error) => {
                     let reason = format!("judgement unavailable: {error}");
-                    record(state, "unavailable", Some(symbol), None, Some(&reason)).await;
-                    return TickOutcome::Unavailable { reason };
+                    if !state.risk().policy().allow_trading_without_jev() {
+                        record(state, "unavailable", Some(symbol), None, Some(&reason)).await;
+                        return TickOutcome::Unavailable { reason };
+                    }
+                    tracing::warn!(
+                        symbol = symbol.as_str(),
+                        %error,
+                        "judge unavailable; continuing without judgements by owner override"
+                    );
+                    record(state, "jev_degraded", Some(symbol), None, Some(&reason)).await;
+                    judgements.clear();
+                    break;
                 }
             }
         }
@@ -3401,6 +3415,45 @@ mod tests {
             "a failed judgement must not reach the model"
         );
         assert_eq!(outcomes(&harness.trail), vec!["unavailable".to_owned()]);
+    }
+
+    #[actix_web::test]
+    async fn tick_continues_without_judgements_when_the_owner_allows_it() {
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            Some(StubJudge::failing()),
+            true,
+            true,
+        );
+        let allowed = harness.state.risk().policy().with_trading_without_jev(true);
+        harness.state.risk().update_policy(allowed);
+
+        // The same judge failure now degrades instead of stopping: the model is
+        // asked, and it is asked with no judgements at all rather than a
+        // partial set.
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        let requests = engine.requests();
+        let input: Value =
+            serde_json::from_str(&requests.first().expect("the model is consulted").input)
+                .expect("input is JSON");
+        assert_eq!(input["assets"][0]["symbol"], "EURUSD");
+        assert!(
+            input["assets"][0].get("judgements").is_none(),
+            "no judgement set should reach the model: {input}"
+        );
+        assert_eq!(
+            outcomes(&harness.trail),
+            vec!["jev_degraded".to_owned(), "no_trade".to_owned()],
+            "the degraded tick is visible in the trail"
+        );
     }
 
     #[actix_web::test]

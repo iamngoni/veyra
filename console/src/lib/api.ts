@@ -63,6 +63,11 @@ export type RiskPolicy = {
   calendarBlackoutMinutes: number
   /** Minimum stop distance as a fraction of ATR(14) (0 disables). */
   minStopAtrFraction: number
+  /**
+   * Whether a tick may continue when the semantic judge is unavailable.
+   * False — the default — pauses new decisions until the judge answers again.
+   */
+  allowTradingWithoutJev: boolean
 }
 
 export type Metrics = {
@@ -203,6 +208,7 @@ export type RiskPolicyPatch = {
   maxNetFactorLots?: number
   calendarBlackoutMinutes?: number
   minStopAtrFraction?: number
+  allowTradingWithoutJev?: boolean
 }
 
 export type CommandRecord = {

@@ -33,8 +33,11 @@ import {
   PerformancePanel,
   Pill,
   PositionsPanel,
+  PostureBanner,
   RiskPanel,
+  SafetyControls,
   StatusPills,
+  systemPosture,
 } from './veyra'
 
 afterEach(cleanup)
@@ -69,6 +72,7 @@ const status: Status = {
   jev_usage: { calls: 12, failures: 0, inputTokens: 4800, outputTokens: 720 },
   risk_policy: {
     killSwitch: false,
+    allowTradingWithoutJev: false,
     symbols: ['EURUSD'],
     maxVolumePerOrder: 0.01,
     maxTotalLots: 0.01,
@@ -403,6 +407,66 @@ describe('RiskPanel', () => {
   })
 })
 
+describe('systemPosture', () => {
+  it('reports the most restrictive true statement first', () => {
+    expect(systemPosture(undefined).label).toBe('CONNECTING')
+    // A halted gate outranks everything else that looks healthy.
+    expect(systemPosture({ ...status, risk_policy: { ...status.risk_policy, killSwitch: true } }).label).toBe(
+      'HALTED',
+    )
+    expect(systemPosture({ ...status, broker_connected: false }).label).toBe('NO LINK')
+    expect(systemPosture({ ...status, trading_enabled: false }).label).toBe('STANDBY')
+    // Service armed but the terminal still validating only.
+    expect(systemPosture({ ...status, ea_live_orders: false }).label).toBe('DRY RUN')
+    expect(systemPosture(status).label).toBe('LIVE')
+  })
+
+  it('renders the verdict and its explanation', () => {
+    render(<PostureBanner status={status} />)
+    expect(screen.getByText('LIVE')).toBeTruthy()
+    expect(screen.getByText('orders reach the market')).toBeTruthy()
+  })
+})
+
+describe('SafetyControls', () => {
+  it('requires a confirmation before changing either switch', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    render(<SafetyControls policy={status.risk_policy} onApply={onApply} />)
+
+    // Tripping the switch only asks the question; nothing is sent yet.
+    fireEvent.click(screen.getByRole('switch', { name: 'Kill switch' }))
+    expect(onApply).not.toHaveBeenCalled()
+    expect(screen.getByText('Halt all new intents?')).toBeTruthy()
+
+    fireEvent.click(screen.getByText('Confirm'))
+    await screen.findByRole('switch', { name: 'Kill switch' })
+    expect(onApply).toHaveBeenCalledWith({ killSwitch: true })
+  })
+
+  it('sends the judge override and reports a refusal', async () => {
+    const onApply = vi.fn().mockResolvedValue('invalid_policy')
+    render(<SafetyControls policy={status.risk_policy} onApply={onApply} />)
+
+    fireEvent.click(screen.getByRole('switch', { name: 'Trade without the judge' }))
+    fireEvent.click(screen.getByText('Confirm'))
+    expect(await screen.findByText('invalid_policy')).toBeTruthy()
+    expect(onApply).toHaveBeenCalledWith({ allowTradingWithoutJev: true })
+  })
+
+  it('warns while the judge is failing, differently for each setting', () => {
+    const { rerender } = render(<SafetyControls policy={status.risk_policy} jevHealthy={false} />)
+    expect(screen.getByText(/new decisions are paused right now/)).toBeTruthy()
+
+    rerender(
+      <SafetyControls
+        policy={{ ...status.risk_policy, allowTradingWithoutJev: true }}
+        jevHealthy={false}
+      />,
+    )
+    expect(screen.getByText(/the model is deciding alone/)).toBeTruthy()
+  })
+})
+
 describe('RiskPanel editing', () => {
   it('applies a patched policy and leaves edit mode', async () => {
     const onApply = vi.fn().mockResolvedValue(undefined)
@@ -606,7 +670,7 @@ describe('ActivityFeed', () => {
   it('colours held reviews as healthy and shows streaming state', () => {
     render(<Harness />)
     const summary = screen.getByText('held · #10650805')
-    expect(summary.className).toContain('text-sky-300')
+    expect(summary.className).toContain('text-[var(--color-info)]')
     expect(screen.getByText('streaming')).toBeTruthy()
   })
 })
@@ -738,7 +802,7 @@ describe('ActivityFeed unknown shapes', () => {
     )
     expect(screen.getByText('strategy_note')).toBeTruthy()
     const summary = screen.getByText('{"outcome":"mystery"}')
-    expect(summary.className).toContain('text-slate-300')
+    expect(summary.className).toContain('text-[var(--color-ink)]')
   })
 
   it('renders an event without a payload', () => {

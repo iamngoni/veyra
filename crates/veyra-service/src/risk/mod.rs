@@ -66,6 +66,7 @@ const ATR_FRACTION_RULE: &str =
     "must be a number from 0 through 2 (fraction of ATR; 0 disables the check)";
 const SESSION_RULE: &str = "must be `HH-HH` with UTC hours 0-23 and different bounds";
 const KILL_SWITCH_RULE: &str = "must be `true` or `false`";
+const WITHOUT_JEV_RULE: &str = "must be `true` or `false`";
 
 /// Errors raised while parsing risk policy settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -110,6 +111,9 @@ pub struct RiskPolicyPatch {
     pub calendar_blackout_minutes: Option<u64>,
     /// Minimum stop distance as a fraction of ATR(14) (0 disables).
     pub min_stop_atr_fraction: Option<f64>,
+    /// Whether a tick may continue when the semantic judge is unavailable.
+    /// False — the default — stops trading until the judge answers again.
+    pub allow_trading_without_jev: Option<bool>,
 }
 
 /// Validates one symbol list from the control surface.
@@ -212,6 +216,7 @@ pub struct RiskPolicy {
     max_net_factor_lots: f64,
     calendar_blackout_minutes: u64,
     min_stop_atr_fraction: f64,
+    allow_trading_without_jev: bool,
 }
 
 impl RiskPolicy {
@@ -242,7 +247,20 @@ impl RiskPolicy {
             max_net_factor_lots: 0.0,
             calendar_blackout_minutes: 0,
             min_stop_atr_fraction: 0.0,
+            // Degraded inputs stop trading unless the owner says otherwise.
+            allow_trading_without_jev: false,
         }
+    }
+
+    /// Sets whether a tick may continue after the semantic judge fails.
+    ///
+    /// False — the default — abandons the tick, so no order is ever proposed
+    /// from inputs the judge never saw. True is a deliberate owner override
+    /// for keeping the book working through a judge outage.
+    #[must_use]
+    pub fn with_trading_without_jev(mut self, allowed: bool) -> Self {
+        self.allow_trading_without_jev = allowed;
+        self
     }
 
     /// Sets the valuation and breaker limits:
@@ -444,6 +462,19 @@ impl RiskPolicy {
             }
         };
 
+        let allow_trading_without_jev =
+            match trimmed(&mut source, "VEYRA_RISK_ALLOW_TRADING_WITHOUT_JEV").as_deref() {
+                None => false,
+                Some("true") => true,
+                Some("false") => false,
+                Some(_) => {
+                    return Err(RiskError {
+                        name: "VEYRA_RISK_ALLOW_TRADING_WITHOUT_JEV",
+                        reason: WITHOUT_JEV_RULE,
+                    });
+                }
+            };
+
         Ok(Self::new(
             kill_switch,
             symbols,
@@ -460,7 +491,8 @@ impl RiskPolicy {
             max_net_factor_lots,
         )
         .with_calendar_blackout(calendar_blackout_minutes)
-        .with_min_stop_atr_fraction(min_stop_atr_fraction))
+        .with_min_stop_atr_fraction(min_stop_atr_fraction)
+        .with_trading_without_jev(allow_trading_without_jev))
     }
 
     /// Applies a partial update from the control surface, keeping every field
@@ -566,6 +598,9 @@ impl RiskPolicy {
                 });
             }
         };
+        let allow_trading_without_jev = patch
+            .allow_trading_without_jev
+            .unwrap_or(self.allow_trading_without_jev);
 
         Ok(Self::new(
             kill_switch,
@@ -583,7 +618,8 @@ impl RiskPolicy {
             max_net_factor_lots,
         )
         .with_calendar_blackout(calendar_blackout_minutes)
-        .with_min_stop_atr_fraction(min_stop_atr_fraction))
+        .with_min_stop_atr_fraction(min_stop_atr_fraction)
+        .with_trading_without_jev(allow_trading_without_jev))
     }
 
     /// Whether the kill switch is engaged; engaged means every intent fails.
@@ -664,7 +700,17 @@ impl RiskPolicy {
             max_net_factor_lots: Some(self.max_net_factor_lots),
             calendar_blackout_minutes: Some(self.calendar_blackout_minutes),
             min_stop_atr_fraction: Some(self.min_stop_atr_fraction),
+            allow_trading_without_jev: Some(self.allow_trading_without_jev),
         }
+    }
+
+    /// Whether a tick may continue when the semantic judge is unavailable.
+    ///
+    /// False is the safe default: the judge's answers are an input the model's
+    /// proposal was meant to weigh, so losing them abandons the tick rather
+    /// than quietly trading on less evidence than the design assumes.
+    pub fn allow_trading_without_jev(&self) -> bool {
+        self.allow_trading_without_jev
     }
 
     /// News blackout either side of a high-impact event, in minutes; zero
@@ -703,7 +749,8 @@ impl RiskPolicy {
             "maxPeakDrawdownPercent": self.max_peak_drawdown_percent,
             "maxNetFactorLots": self.max_net_factor_lots,
             "calendarBlackoutMinutes": self.calendar_blackout_minutes,
-            "minStopAtrFraction": self.min_stop_atr_fraction
+            "minStopAtrFraction": self.min_stop_atr_fraction,
+            "allowTradingWithoutJev": self.allow_trading_without_jev
         })
     }
 
@@ -1136,6 +1183,56 @@ mod tests {
             .apply_patch(&patch)
             .expect("snapshot applies");
         assert_eq!(rebuilt.summary(), policy.summary());
+    }
+
+    #[test]
+    fn trading_without_the_judge_is_refused_until_the_owner_allows_it() {
+        // Losing the judge must not quietly widen what the bot will do, so the
+        // baseline and an unset environment both refuse.
+        assert!(!RiskPolicy::default().allow_trading_without_jev());
+        let unset = RiskPolicy::from_source(source(&[])).expect("valid settings");
+        assert!(!unset.allow_trading_without_jev());
+
+        let allowed =
+            RiskPolicy::from_source(source(&[("VEYRA_RISK_ALLOW_TRADING_WITHOUT_JEV", "true")]))
+                .expect("valid settings");
+        assert!(allowed.allow_trading_without_jev());
+        assert_eq!(allowed.summary()["allowTradingWithoutJev"], true);
+
+        // A console edit turns it on and off again, and survives a restart
+        // through the persisted snapshot.
+        let toggled = unset
+            .apply_patch(&RiskPolicyPatch {
+                allow_trading_without_jev: Some(true),
+                ..Default::default()
+            })
+            .expect("patch applies");
+        assert!(toggled.allow_trading_without_jev());
+        let value = serde_json::to_value(toggled.snapshot_patch()).expect("snapshot serializes");
+        let patch: RiskPolicyPatch = serde_json::from_value(value).expect("snapshot deserializes");
+        assert!(
+            RiskPolicy::default()
+                .apply_patch(&patch)
+                .expect("snapshot applies")
+                .allow_trading_without_jev()
+        );
+        assert!(
+            !toggled
+                .apply_patch(&RiskPolicyPatch {
+                    allow_trading_without_jev: Some(false),
+                    ..Default::default()
+                })
+                .expect("patch applies")
+                .allow_trading_without_jev()
+        );
+    }
+
+    #[test]
+    fn a_malformed_without_jev_value_fails_closed() {
+        let error =
+            RiskPolicy::from_source(source(&[("VEYRA_RISK_ALLOW_TRADING_WITHOUT_JEV", "yes")]))
+                .expect_err("only true or false parse");
+        assert_eq!(error.name, "VEYRA_RISK_ALLOW_TRADING_WITHOUT_JEV");
     }
 
     #[test]

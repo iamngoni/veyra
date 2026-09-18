@@ -1,7 +1,76 @@
 @import "tailwindcss";
 
+/* Design tokens.
+ *
+ * A trading console is read under stress, often at a glance. The palette stays
+ * low-chroma with layered surfaces, the accent is reserved for state rather
+ * than decoration, and every number is tabular so columns hold still while
+ * values tick.
+ *
+ * Both themes define the same names, so components never branch on theme: the
+ * dark values live on :root and the light ones override them under
+ * [data-theme='light']. Semantic hues are not simply reused across themes —
+ * a green that reads well on near-black is too light on paper, so each theme
+ * carries its own contrast-checked pair.
+ */
+@theme {
+  --color-surface-0: #06080c;
+  --color-surface-1: #0b0e14;
+  --color-surface-2: #11151d;
+  --color-surface-3: #171c26;
+  --color-line: #1e2430;
+  --color-line-strong: #2b333f;
+
+  --color-ink: #e8edf5;
+  --color-ink-muted: #9aa6b8;
+  --color-ink-faint: #6b7688;
+
+  --color-ok: #34d399;
+  --color-ok-dim: #0d3b2e;
+  --color-warn: #fbbf24;
+  --color-warn-dim: #3d2f06;
+  --color-bad: #fb7185;
+  --color-bad-dim: #40151f;
+  --color-info: #60a5fa;
+  --color-info-dim: #12243f;
+
+  --font-sans:
+    "Inter var", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    sans-serif;
+  --font-mono:
+    "JetBrains Mono", "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 :root {
   color-scheme: dark;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* Paper rather than pure white: long sessions on a bright panel are tiring,
+     and a slight warmth keeps the surfaces distinguishable without borders
+     doing all the work. */
+  --color-surface-0: #eef0f4;
+  --color-surface-1: #ffffff;
+  --color-surface-2: #f5f7fa;
+  --color-surface-3: #e9edf3;
+  --color-line: #d8dee8;
+  --color-line-strong: #b9c2d0;
+
+  --color-ink: #10151d;
+  --color-ink-muted: #46505f;
+  --color-ink-faint: #6b7686;
+
+  /* Darkened so state colour still carries on a light surface. */
+  --color-ok: #047857;
+  --color-ok-dim: #d3f0e4;
+  --color-warn: #a4620a;
+  --color-warn-dim: #fbeed2;
+  --color-bad: #be123c;
+  --color-bad-dim: #fbdde4;
+  --color-info: #1d4ed8;
+  --color-info-dim: #dbe6fd;
 }
 
 * {
@@ -16,20 +85,75 @@ body,
 
 body {
   margin: 0;
-  background: #07090d;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--color-surface-0);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  /* Numbers must not reflow as they tick. */
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* A quiet label voice used for every panel header and field caption. */
+.label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--color-ink-faint);
+}
+
+/* Live values: monospace and tabular so a changing digit never shifts layout. */
+.readout {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Placeholder shown while a poll has not answered yet. Motion is slow on
+   purpose: a fast shimmer on a trading surface reads as activity. */
+@keyframes veyra-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+.skeleton {
+  background: var(--color-surface-3);
+  border-radius: 4px;
+  animation: veyra-pulse 2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton,
+  .live-dot {
+    animation: none;
+  }
+}
+
+.live-dot {
+  animation: veyra-pulse 2.4s ease-in-out infinite;
 }
 
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 9px;
+  height: 9px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #1e293b;
-  border-radius: 4px;
+  background: var(--color-line-strong);
+  border-radius: 5px;
 }
 
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* Keyboard users must be able to see the control they are about to trip. */
+:focus-visible {
+  outline: 2px solid var(--color-info);
+  outline-offset: 2px;
+  border-radius: 3px;
 }

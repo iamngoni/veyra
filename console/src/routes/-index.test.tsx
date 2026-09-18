@@ -137,25 +137,46 @@ beforeEach(() => {
 })
 
 describe('Dashboard', () => {
-  it('renders every operational panel', async () => {
+  /** Moves to a tab by its control, mirroring what an operator clicks. */
+  const openTab = (label: string) => fireEvent.click(screen.getByRole('tab', { name: label }))
+
+  it('pins posture, money and the safety switches above the tabs', async () => {
     render(<Dashboard />)
 
     expect(await screen.findByText('VEYRA')).toBeTruthy()
-    expect(await screen.findByText('Balance')).toBeTruthy()
-    expect(screen.getByText('Market')).toBeTruthy()
-    expect(screen.getByText('Autopilot')).toBeTruthy()
-    expect(screen.getByText('Activity')).toBeTruthy()
+    // Always visible, whichever tab is selected.
+    expect(await screen.findByText('Equity')).toBeTruthy()
+    expect(screen.getByText('Open P/L')).toBeTruthy()
+    expect(screen.getByRole('switch', { name: 'Kill switch' })).toBeTruthy()
+    expect(screen.getByRole('switch', { name: 'Trade without the judge' })).toBeTruthy()
+    expect(screen.getByText(/v0.1.0/)).toBeTruthy()
+  })
+
+  it('reaches every operational panel through its tab', async () => {
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+
+    // Overview is the landing tab.
     expect(screen.getByText('Positions')).toBeTruthy()
+    expect(screen.getByText('Autopilot')).toBeTruthy()
+    expect(screen.getByText('Market')).toBeTruthy()
+
+    openTab('Activity')
     expect(screen.getByText('Commands')).toBeTruthy()
-    expect(screen.getByText('Risk')).toBeTruthy()
+
+    openTab('Risk')
+    expect(await screen.findByText('Balance')).toBeTruthy()
+
+    openTab('Diagnostics')
     expect(screen.getByText('Metrics')).toBeTruthy()
     expect(screen.getByText('Agent log')).toBeTruthy()
-    expect(screen.getByText(/v0.1.0/)).toBeTruthy()
   })
 
   it('applies policy edits through the control surface', async () => {
     mocks.updatePolicy.mockResolvedValue({})
     render(<Dashboard />)
+    await screen.findByText('Equity')
+    openTab('Risk')
     await screen.findByText('Balance')
 
     fireEvent.click(screen.getByText('edit'))
@@ -170,6 +191,8 @@ describe('Dashboard', () => {
   it('surfaces control-surface rejections in the editor', async () => {
     mocks.updatePolicy.mockRejectedValue(new Error('maxOpenOrders: too large'))
     render(<Dashboard />)
+    await screen.findByText('Equity')
+    openTab('Risk')
     await screen.findByText('Balance')
 
     fireEvent.click(screen.getByText('edit'))
@@ -177,5 +200,17 @@ describe('Dashboard', () => {
 
     await screen.findByText('maxOpenOrders: too large')
     expect(screen.getByText('save')).toBeTruthy()
+  })
+
+  it('sends a confirmed kill switch from the pinned controls', async () => {
+    mocks.updatePolicy.mockResolvedValue({})
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+
+    fireEvent.click(screen.getByRole('switch', { name: 'Kill switch' }))
+    fireEvent.click(screen.getByText('Confirm'))
+
+    await screen.findByText('Equity')
+    expect(mocks.updatePolicy).toHaveBeenCalledWith({ killSwitch: true })
   })
 })

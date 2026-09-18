@@ -26,34 +26,34 @@ import {
   outcomeTone,
   payloadSummary,
 } from '../lib/format'
-import { clockTime, money, relativeTime } from '../lib/hooks'
+import { clockTime, money, relativeTime, usePaged } from '../lib/hooks'
 
 /* ---------- primitives ---------- */
 
 type Tone = 'ok' | 'warn' | 'bad' | 'off' | 'info'
 
 const toneText: Record<Tone, string> = {
-  ok: 'text-emerald-400',
-  warn: 'text-amber-400',
-  bad: 'text-rose-400',
-  off: 'text-slate-500',
-  info: 'text-sky-400',
+  ok: 'text-[var(--color-ok)]',
+  warn: 'text-[var(--color-warn)]',
+  bad: 'text-[var(--color-bad)]',
+  off: 'text-[var(--color-ink-faint)]',
+  info: 'text-[var(--color-info)]',
 }
 
 const toneDot: Record<Tone, string> = {
-  ok: 'bg-emerald-400',
-  warn: 'bg-amber-400',
-  bad: 'bg-rose-400',
-  off: 'bg-slate-600',
-  info: 'bg-sky-400',
+  ok: 'bg-[var(--color-ok)]',
+  warn: 'bg-[var(--color-warn)]',
+  bad: 'bg-[var(--color-bad)]',
+  off: 'bg-[var(--color-line-strong)]',
+  info: 'bg-[var(--color-info)]',
 }
 
 export function Pill({ tone, label, value }: { tone: Tone; label: string; value?: string }) {
   return (
-    <div className="flex items-center gap-2 rounded-md border border-slate-800 bg-slate-900/70 px-2.5 py-1.5">
-      <span className={`size-1.5 rounded-full ${toneDot[tone]} ${tone === 'ok' ? 'animate-pulse' : ''}`} />
-      <span className="text-[11px] uppercase tracking-wider text-slate-500">{label}</span>
-      {value ? <span className={`text-xs font-medium ${toneText[tone]}`}>{value}</span> : null}
+    <div className="flex items-center gap-2 rounded-md border border-[var(--color-line)] bg-[var(--color-surface-2)] px-2.5 py-1.5">
+      <span className={`size-1.5 shrink-0 rounded-full ${toneDot[tone]} ${tone === 'ok' ? 'live-dot' : ''}`} />
+      <span className="label">{label}</span>
+      {value ? <span className={`readout text-xs font-medium ${toneText[tone]}`}>{value}</span> : null}
     </div>
   )
 }
@@ -71,11 +71,11 @@ export function Panel({
 }) {
   return (
     <section
-      className={`flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-slate-800 bg-[#0c1017] ${className}`}
+      className={`flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-[var(--color-line)] bg-[var(--color-surface-1)] ${className}`}
     >
-      <header className="flex items-center justify-between border-b border-slate-800/80 px-3 py-2">
-        <h2 className="text-[11px] font-semibold uppercase tracking-widest text-slate-400">{title}</h2>
-        {detail ? <div className="text-[11px] text-slate-500">{detail}</div> : null}
+      <header className="flex items-center justify-between gap-3 border-b border-[var(--color-line)] bg-[var(--color-surface-2)]/40 px-3.5 py-2.5">
+        <h2 className="label text-[var(--color-ink-muted)]">{title}</h2>
+        {detail ? <div className="text-[11px] text-[var(--color-ink-faint)]">{detail}</div> : null}
       </header>
       <div className="min-h-0 flex-1 overflow-auto">{children}</div>
     </section>
@@ -84,9 +84,389 @@ export function Panel({
 
 function Field({ label, value, tone }: { label: string; value: ReactNode; tone?: string }) {
   return (
-    <div>
-      <div className="text-[10px] uppercase tracking-wider text-slate-500">{label}</div>
-      <div className={`font-mono text-sm tabular-nums ${tone ?? 'text-slate-200'}`}>{value}</div>
+    <div className="min-w-0">
+      <div className="label">{label}</div>
+      <div className={`readout mt-0.5 truncate text-[13px] ${tone ?? 'text-[var(--color-ink)]'}`}>{value}</div>
+    </div>
+  )
+}
+
+/** Placeholder with the same footprint as the value it stands in for. */
+export function Skeleton({ className = 'h-4 w-16' }: { className?: string }) {
+  return <div className={`skeleton ${className}`} aria-hidden="true" />
+}
+
+/**
+ * Page control for the long lists. It states the visible range rather than
+ * only the page number, because "showing 26–50 of 312" answers the question an
+ * operator actually has when scanning a feed.
+ */
+export function Pager({
+  page,
+  pages,
+  start,
+  count,
+  total,
+  onPrevious,
+  onNext,
+}: {
+  page: number
+  pages: number
+  start: number
+  count: number
+  total: number
+  onPrevious: () => void
+  onNext: () => void
+}) {
+  if (total === 0) return null
+  const button =
+    'rounded border border-[var(--color-line-strong)] px-2 py-0.5 text-[11px] text-[var(--color-ink-muted)] enabled:hover:border-[var(--color-ink-faint)] disabled:opacity-35'
+  return (
+    <div className="flex items-center justify-between gap-3 border-t border-[var(--color-line)] px-3 py-1.5">
+      <span className="readout text-[11px] text-[var(--color-ink-faint)]">
+        {start + 1}–{start + count} of {total}
+      </span>
+      <span className="flex items-center gap-1.5">
+        <button type="button" className={button} onClick={onPrevious} disabled={page === 0} aria-label="Previous page">
+          ←
+        </button>
+        <span className="readout text-[11px] text-[var(--color-ink-faint)]">
+          {page + 1}/{pages}
+        </span>
+        <button
+          type="button"
+          className={button}
+          onClick={onNext}
+          disabled={page >= pages - 1}
+          aria-label="Next page"
+        >
+          →
+        </button>
+      </span>
+    </div>
+  )
+}
+
+/** Sections the dashboard so each view is scannable without scrolling past it. */
+export function Tabs({
+  tabs,
+  active,
+  onSelect,
+}: {
+  tabs: ReadonlyArray<{ id: string; label: string; badge?: number }>
+  active: string
+  onSelect: (id: string) => void
+}) {
+  return (
+    <div role="tablist" className="flex flex-wrap gap-1 rounded-lg border border-[var(--color-line)] bg-[var(--color-surface-1)] p-1">
+      {tabs.map((tab) => {
+        const selected = tab.id === active
+        return (
+          <button
+            key={tab.id}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            onClick={() => onSelect(tab.id)}
+            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12px] font-medium transition-colors ${
+              selected
+                ? 'bg-[var(--color-surface-3)] text-[var(--color-ink)]'
+                : 'text-[var(--color-ink-faint)] hover:text-[var(--color-ink-muted)]'
+            }`}
+          >
+            {tab.label}
+            {tab.badge ? (
+              <span className="readout rounded bg-[var(--color-surface-2)] px-1 text-[10px] text-[var(--color-ink-faint)]">
+                {tab.badge}
+              </span>
+            ) : null}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+export function ThemeToggle({ theme, onToggle }: { theme: 'dark' | 'light'; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+      title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+      className="rounded-md border border-[var(--color-line)] bg-[var(--color-surface-2)] px-2 py-1.5 text-[12px] text-[var(--color-ink-muted)] hover:border-[var(--color-line-strong)] hover:text-[var(--color-ink)]"
+    >
+      {theme === 'dark' ? '☾' : '☀'}
+    </button>
+  )
+}
+
+/* ---------- posture ---------- */
+
+/** The single verdict an operator looks for first: can this thing trade? */
+export function systemPosture(status?: Status): {
+  label: string
+  detail: string
+  tone: Tone
+} {
+  if (!status) {
+    return { label: 'CONNECTING', detail: 'reaching the service', tone: 'off' }
+  }
+  if (status.risk_policy?.killSwitch) {
+    return { label: 'HALTED', detail: 'kill switch engaged — every intent refused', tone: 'bad' }
+  }
+  if (!status.broker_connected) {
+    return { label: 'NO LINK', detail: 'terminal is not reporting', tone: 'bad' }
+  }
+  if (!status.trading_enabled) {
+    return { label: 'STANDBY', detail: 'deciding only — nothing will execute', tone: 'off' }
+  }
+  if (!status.ea_live_orders) {
+    return { label: 'DRY RUN', detail: 'service armed, terminal still validating only', tone: 'warn' }
+  }
+  return { label: 'LIVE', detail: 'orders reach the market', tone: 'ok' }
+}
+
+const postureFrame: Record<Tone, string> = {
+  ok: 'border-[var(--color-ok)]/40 bg-[var(--color-ok-dim)]',
+  warn: 'border-[var(--color-warn)]/40 bg-[var(--color-warn-dim)]',
+  bad: 'border-[var(--color-bad)]/50 bg-[var(--color-bad-dim)]',
+  off: 'border-[var(--color-line-strong)] bg-[var(--color-surface-2)]',
+  info: 'border-[var(--color-info)]/40 bg-[var(--color-info-dim)]',
+}
+
+export function PostureBanner({ status }: { status?: Status }) {
+  const posture = systemPosture(status)
+  return (
+    <div
+      className={`flex items-center gap-3.5 rounded-xl border px-4 py-3 ${postureFrame[posture.tone]}`}
+      role="status"
+    >
+      <span className={`size-2.5 shrink-0 rounded-full ${toneDot[posture.tone]} ${posture.tone === 'ok' ? 'live-dot' : ''}`} />
+      <div className="min-w-0">
+        <div className={`text-base font-semibold leading-none tracking-tight ${toneText[posture.tone]}`}>
+          {posture.label}
+        </div>
+        <div className="mt-1 truncate text-[11px] text-[var(--color-ink-muted)]">{posture.detail}</div>
+      </div>
+    </div>
+  )
+}
+
+/* ---------- headline numbers ---------- */
+
+/** The four figures that decide whether anything else needs attention. */
+export function HeroMetrics({ account, error }: { account?: Account; error?: string }) {
+  const positions = account?.positions ?? []
+  const open = positions.reduce((sum, position) => sum + (position.profit ?? 0), 0)
+  const openTone = open > 0 ? 'text-[var(--color-ok)]' : open < 0 ? 'text-[var(--color-bad)]' : 'text-[var(--color-ink)]'
+  const cells: Array<{ label: string; value: ReactNode; tone?: string; hint?: string }> = [
+    { label: 'Equity', value: account ? money(account.equity) : null, hint: account ? `balance ${money(account.balance)}` : undefined },
+    {
+      label: 'Open P/L',
+      value: account ? (positions.length > 0 ? `${open >= 0 ? '+' : ''}${open.toFixed(2)}` : '—') : null,
+      tone: openTone,
+      hint: `${positions.length} position${positions.length === 1 ? '' : 's'}`,
+    },
+    {
+      label: 'Exposure',
+      value: account ? `${account.lots} lots` : null,
+      hint: account ? `${account.orders} order${account.orders === 1 ? '' : 's'}` : undefined,
+    },
+    {
+      label: 'Free margin',
+      value: account ? money(account.freeMargin) : null,
+      hint: account?.marginLevel != null ? `level ${account.marginLevel.toFixed(0)}%` : undefined,
+    },
+  ]
+  return (
+    <div className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-[var(--color-line)] bg-[var(--color-line)] lg:grid-cols-4">
+      {cells.map((cell) => (
+        <div key={cell.label} className="bg-[var(--color-surface-1)] px-4 py-3">
+          <div className="label">{cell.label}</div>
+          <div className={`readout mt-1.5 text-xl leading-none font-medium ${cell.tone ?? 'text-[var(--color-ink)]'}`}>
+            {cell.value ?? (error ? <span className="text-sm text-[var(--color-bad)]">unavailable</span> : <Skeleton className="h-5 w-24" />)}
+          </div>
+          <div className="mt-1.5 h-3 text-[11px] text-[var(--color-ink-faint)]">{cell.value ? (cell.hint ?? '') : ''}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/* ---------- safety controls ---------- */
+
+/**
+ * The two switches an operator reaches for in a hurry, promoted out of the
+ * policy editor. Both are one click plus a confirm, because a mis-click on
+ * either one changes what the bot is allowed to do with real money.
+ */
+export function SafetyControls({
+  policy,
+  jevHealthy,
+  onApply,
+}: {
+  policy?: RiskPolicy
+  /** Whether the judge answered recently; drives the degraded warning. */
+  jevHealthy?: boolean
+  onApply?: (patch: RiskPolicyPatch) => Promise<string | undefined>
+}) {
+  const [pending, setPending] = useState<keyof RiskPolicyPatch>()
+  const [error, setError] = useState<string>()
+  const [confirming, setConfirming] = useState<keyof RiskPolicyPatch>()
+
+  const submit = async (key: 'killSwitch' | 'allowTradingWithoutJev', next: boolean) => {
+    if (!onApply) return
+    setPending(key)
+    setError(undefined)
+    const failure = await onApply({ [key]: next })
+    setPending(undefined)
+    setConfirming(undefined)
+    if (failure) setError(failure)
+  }
+
+  const halted = policy?.killSwitch ?? false
+  const withoutJev = policy?.allowTradingWithoutJev ?? false
+  const degraded = jevHealthy === false
+
+  return (
+    <Panel
+      title="Controls"
+      detail={error ? <span className="text-[var(--color-bad)]">{error}</span> : undefined}
+    >
+      <div className="flex flex-col gap-px bg-[var(--color-line)]">
+        <Switch
+          label="Kill switch"
+          description={
+            halted
+              ? 'Engaged. Every new intent is refused; open positions are untouched.'
+              : 'Refuse every new intent immediately. Open positions are left alone.'
+          }
+          checked={halted}
+          tone="bad"
+          busy={pending === 'killSwitch'}
+          disabled={!policy || !onApply}
+          confirming={confirming === 'killSwitch'}
+          onRequest={() => setConfirming(confirming === 'killSwitch' ? undefined : 'killSwitch')}
+          onConfirm={() => void submit('killSwitch', !halted)}
+          confirmLabel={halted ? 'Release the kill switch' : 'Halt all new intents'}
+        />
+        <Switch
+          label="Trade without the judge"
+          description={
+            withoutJev
+              ? 'Override active. A judge outage no longer pauses new decisions — the model decides alone.'
+              : 'Default: if the judge cannot answer, the tick is abandoned and nothing is proposed.'
+          }
+          checked={withoutJev}
+          tone="warn"
+          busy={pending === 'allowTradingWithoutJev'}
+          disabled={!policy || !onApply}
+          confirming={confirming === 'allowTradingWithoutJev'}
+          onRequest={() =>
+            setConfirming(confirming === 'allowTradingWithoutJev' ? undefined : 'allowTradingWithoutJev')
+          }
+          onConfirm={() => void submit('allowTradingWithoutJev', !withoutJev)}
+          confirmLabel={withoutJev ? 'Require the judge again' : 'Allow trading without the judge'}
+          warning={
+            degraded && !withoutJev
+              ? 'The judge is not answering — new decisions are paused right now.'
+              : degraded && withoutJev
+                ? 'The judge is not answering and the override is on: the model is deciding alone.'
+                : undefined
+          }
+        />
+      </div>
+    </Panel>
+  )
+}
+
+function Switch({
+  label,
+  description,
+  checked,
+  tone,
+  busy,
+  disabled,
+  confirming,
+  onRequest,
+  onConfirm,
+  confirmLabel,
+  warning,
+}: {
+  label: string
+  description: string
+  checked: boolean
+  tone: Tone
+  busy: boolean
+  disabled: boolean
+  confirming: boolean
+  onRequest: () => void
+  onConfirm: () => void
+  confirmLabel: string
+  warning?: string
+}) {
+  return (
+    <div className="bg-[var(--color-surface-1)] px-3.5 py-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-[13px] font-medium text-[var(--color-ink)]">{label}</span>
+            {checked ? (
+              <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${toneText[tone]} bg-[var(--color-surface-3)]`}>
+                on
+              </span>
+            ) : null}
+          </div>
+          <p className="mt-1 text-[11px] leading-relaxed text-[var(--color-ink-faint)]">{description}</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={checked}
+          aria-label={label}
+          disabled={disabled || busy}
+          onClick={onRequest}
+          className={`relative mt-0.5 h-5 w-9 shrink-0 rounded-full border transition-colors disabled:opacity-40 ${
+            checked
+              ? `${toneDot[tone]} border-transparent`
+              : 'border-[var(--color-line-strong)] bg-[var(--color-surface-3)]'
+          }`}
+        >
+          <span
+            className={`absolute top-0.5 size-3.5 rounded-full bg-[var(--color-surface-0)] transition-all ${
+              checked ? 'left-[1.15rem]' : 'left-0.5'
+            }`}
+          />
+        </button>
+      </div>
+      {warning ? (
+        <p className="mt-2 rounded border border-[var(--color-warn)]/30 bg-[var(--color-warn-dim)] px-2 py-1.5 text-[11px] text-[var(--color-warn)]">
+          {warning}
+        </p>
+      ) : null}
+      {confirming ? (
+        <div className="mt-2 flex items-center justify-between gap-2 rounded border border-[var(--color-line-strong)] bg-[var(--color-surface-2)] px-2 py-1.5">
+          <span className="text-[11px] text-[var(--color-ink-muted)]">{confirmLabel}?</span>
+          <span className="flex gap-1.5">
+            <button
+              type="button"
+              onClick={onRequest}
+              className="rounded border border-[var(--color-line-strong)] px-2 py-0.5 text-[11px] text-[var(--color-ink-muted)] hover:border-[var(--color-ink-faint)]"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={onConfirm}
+              disabled={busy}
+              className={`rounded px-2 py-0.5 text-[11px] font-medium text-[var(--color-surface-0)] disabled:opacity-50 ${toneDot[tone]}`}
+            >
+              {busy ? 'Applying…' : 'Confirm'}
+            </button>
+          </span>
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -125,7 +505,7 @@ export function AccountPanel({ account, error }: { account?: Account; error?: st
         account
           ? `updated ${relativeTime(Date.now() - account.ageSecs * 1000)}`
           : error
-            ? <span className="text-rose-400">{error}</span>
+            ? <span className="text-[var(--color-bad)]">{error}</span>
             : 'waiting…'
       }
     >
@@ -143,10 +523,10 @@ export function AccountPanel({ account, error }: { account?: Account; error?: st
         <Field
           label="Open P/L"
           value={positions.length > 0 ? `${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(2)}` : '—'}
-          tone={totalProfit >= 0 ? 'text-emerald-400' : 'text-rose-400'}
+          tone={totalProfit >= 0 ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}
         />
       </div>
-      <div className="border-t border-slate-800/80 px-3 py-2 text-[11px] text-slate-500">
+      <div className="border-t border-[var(--color-line)]/80 px-3 py-2 text-[11px] text-[var(--color-ink-faint)]">
         {account?.server ? `${account.server} · #${account.login} · ` : ''}
         {account?.symbol ?? ''}
       </div>
@@ -159,15 +539,15 @@ export function PositionsPanel({ account }: { account?: Account }) {
   return (
     <Panel
       title="Positions"
-      detail={account?.positionsTruncated ? <span className="text-amber-400">truncated</span> : `${positions.length}`}
+      detail={account?.positionsTruncated ? <span className="text-[var(--color-warn)]">truncated</span> : `${positions.length}`}
     >
       {positions.length === 0 ? (
-        <div className="p-3 text-xs text-slate-500">Flat — no open orders.</div>
+        <div className="p-3 text-xs text-[var(--color-ink-faint)]">Flat — no open orders.</div>
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
-            <thead className="text-[10px] uppercase tracking-wider text-slate-500">
-              <tr className="border-b border-slate-800/80">
+            <thead className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">
+              <tr className="border-b border-[var(--color-line)]/80">
                 <th className="px-3 py-1.5 font-medium">Ticket</th>
                 <th className="px-2 py-1.5 font-medium">Symbol</th>
                 <th className="px-2 py-1.5 font-medium">Side</th>
@@ -182,22 +562,22 @@ export function PositionsPanel({ account }: { account?: Account }) {
             </thead>
             <tbody className="font-mono tabular-nums">
               {positions.map((position: Position) => (
-                <tr key={position.ticket} className="border-b border-slate-800/40">
-                  <td className="px-3 py-1.5 text-slate-300">{position.ticket}</td>
-                  <td className="px-2 py-1.5 font-semibold text-slate-200">{position.symbol}</td>
-                  <td className={`px-2 py-1.5 ${position.kind === 'buy' ? 'text-emerald-400' : 'text-rose-400'}`}>
+                <tr key={position.ticket} className="border-b border-[var(--color-line)]/40">
+                  <td className="px-3 py-1.5 text-[var(--color-ink)]">{position.ticket}</td>
+                  <td className="px-2 py-1.5 font-semibold text-[var(--color-ink)]">{position.symbol}</td>
+                  <td className={`px-2 py-1.5 ${position.kind === 'buy' ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}`}>
                     {position.kind}
                   </td>
-                  <td className="px-2 py-1.5 text-slate-300">{position.lots}</td>
-                  <td className="px-2 py-1.5 text-slate-300">{position.price}</td>
-                  <td className="px-2 py-1.5 text-rose-300/80">{position.sl > 0 ? position.sl : '—'}</td>
-                  <td className="px-2 py-1.5 text-emerald-300/80">{position.tp > 0 ? position.tp : '—'}</td>
-                  <td className={`px-2 py-1.5 ${position.swap != null && position.swap < 0 ? 'text-rose-300/80' : 'text-emerald-300/80'}`}>
+                  <td className="px-2 py-1.5 text-[var(--color-ink)]">{position.lots}</td>
+                  <td className="px-2 py-1.5 text-[var(--color-ink)]">{position.price}</td>
+                  <td className="px-2 py-1.5 text-[var(--color-bad)]/80">{position.sl > 0 ? position.sl : '—'}</td>
+                  <td className="px-2 py-1.5 text-[var(--color-ok)]/80">{position.tp > 0 ? position.tp : '—'}</td>
+                  <td className={`px-2 py-1.5 ${position.swap != null && position.swap < 0 ? 'text-[var(--color-bad)]/80' : 'text-[var(--color-ok)]/80'}`}>
                     {position.swap == null
                       ? '—'
                       : `${position.swap >= 0 ? '+' : ''}${position.swap.toFixed(2)}`}
                   </td>
-                  <td className={`px-2 py-1.5 ${position.profit >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  <td className={`px-2 py-1.5 ${position.profit >= 0 ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}`}>
                     {position.profit >= 0 ? '+' : ''}
                     {position.profit.toFixed(2)}
                   </td>
@@ -205,7 +585,7 @@ export function PositionsPanel({ account }: { account?: Account }) {
                     {position.magic === VEYRA_MAGIC ? (
                       <span className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-300">veyra</span>
                     ) : (
-                      <span className="rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] text-slate-400">manual</span>
+                      <span className="rounded bg-[var(--color-surface-3)]/40 px-1.5 py-0.5 text-[10px] text-[var(--color-ink-muted)]">manual</span>
                     )}
                   </td>
                 </tr>
@@ -237,7 +617,7 @@ export function PerformancePanel({
         performance
           ? `last ${performance.days}d · ${performance.total} closed${performance.truncated ? ' · truncated' : ''}`
           : error
-            ? <span className="text-rose-400">{error}</span>
+            ? <span className="text-[var(--color-bad)]">{error}</span>
             : 'waiting…'
       }
     >
@@ -247,7 +627,7 @@ export function PerformancePanel({
           value={report && report.trades > 0 ? `${report.win_rate_percent.toFixed(1)}%` : '—'}
           tone={
             report && report.trades > 0 && report.win_rate_percent >= 50
-              ? 'text-emerald-400'
+              ? 'text-[var(--color-ok)]'
               : undefined
           }
         />
@@ -262,7 +642,7 @@ export function PerformancePanel({
         <Field
           label="Net P/L"
           value={performance ? money(report?.net_profit) : '—'}
-          tone={report && report.net_profit >= 0 ? 'text-emerald-400' : report ? 'text-rose-400' : undefined}
+          tone={report && report.net_profit >= 0 ? 'text-[var(--color-ok)]' : report ? 'text-[var(--color-bad)]' : undefined}
         />
         <Field
           label="Profit factor"
@@ -275,11 +655,11 @@ export function PerformancePanel({
         />
       </div>
       {report && report.by_symbol.length > 0 ? (
-        <div className="flex flex-wrap gap-x-4 gap-y-1 border-t border-slate-800/80 px-3 py-2 font-mono text-[11px] text-slate-400">
+        <div className="flex flex-wrap gap-x-4 gap-y-1 border-t border-[var(--color-line)]/80 px-3 py-2 font-mono text-[11px] text-[var(--color-ink-muted)]">
           {report.by_symbol.map((entry) => (
             <span key={entry.symbol}>
               {entry.symbol} {entry.wins}/{entry.trades}{' '}
-              <span className={entry.net_profit >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+              <span className={entry.net_profit >= 0 ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}>
                 {money(entry.net_profit)}
               </span>
             </span>
@@ -324,7 +704,7 @@ export function MarketPanel({ series, error }: { series?: CandleSeries; error?: 
   return (
     <Panel
       title="Market"
-      detail={series ? `${series.symbol} ${series.timeframe}` : error ? <span className="text-rose-400">{error}</span> : '…'}
+      detail={series ? `${series.symbol} ${series.timeframe}` : error ? <span className="text-[var(--color-bad)]">{error}</span> : '…'}
     >
       <div className="p-3">
         {series ? <Sparkline candles={series.candles} /> : <div className="h-16" />}
@@ -333,7 +713,7 @@ export function MarketPanel({ series, error }: { series?: CandleSeries; error?: 
           <Field
             label={`Change ${series?.candles.length ?? 0}b`}
             value={change === undefined ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`}
-            tone={change !== undefined && change >= 0 ? 'text-emerald-400' : 'text-rose-400'}
+            tone={change !== undefined && change >= 0 ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}
           />
           <Field label="H / L" value={last ? `${last.high.toFixed(5)} / ${last.low.toFixed(5)}` : '—'} />
         </div>
@@ -400,7 +780,7 @@ export function AutopilotPanel({
           }
         />
       </div>
-      <div className="border-t border-slate-800/80 px-3 py-2 text-[11px] leading-relaxed text-slate-500">
+      <div className="border-t border-[var(--color-line)]/80 px-3 py-2 text-[11px] leading-relaxed text-[var(--color-ink-faint)]">
         Every entry carries both stops, passes the deterministic risk gate, and still needs both armed switches
         before the terminal can place it.
       </div>
@@ -413,6 +793,7 @@ export function AutopilotPanel({
 /** Editable mirror of the live policy; numbers stay strings until save. */
 type PolicyDraft = {
   killSwitch: boolean
+  allowTradingWithoutJev: boolean
   symbols: string
   maxVolumePerOrder: string
   maxTotalLots: string
@@ -455,6 +836,7 @@ type NumericDraftKey =
 function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
   return {
     killSwitch: policy.killSwitch,
+    allowTradingWithoutJev: policy.allowTradingWithoutJev,
     symbols: policy.symbols.join(', '),
     maxVolumePerOrder: String(policy.maxVolumePerOrder),
     maxTotalLots: String(policy.maxTotalLots),
@@ -474,6 +856,7 @@ function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
 function patchFromDraft(draft: PolicyDraft): { patch?: RiskPolicyPatch; error?: string } {
   const patch: RiskPolicyPatch = {
     killSwitch: draft.killSwitch,
+    allowTradingWithoutJev: draft.allowTradingWithoutJev,
     symbols: draft.symbols
       .split(',')
       .map((symbol) => symbol.trim())
@@ -545,11 +928,11 @@ export function RiskPanel({
 
   const detail = editing ? (
     <span className="flex items-center gap-2">
-      {error ? <span className="text-rose-400">{error}</span> : null}
+      {error ? <span className="text-[var(--color-bad)]">{error}</span> : null}
       <button
         type="button"
         onClick={cancelEditing}
-        className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-slate-400 hover:border-slate-500"
+        className="rounded border border-[var(--color-line-strong)] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-[var(--color-ink-muted)] hover:border-[var(--color-ink-faint)]"
       >
         cancel
       </button>
@@ -557,19 +940,19 @@ export function RiskPanel({
         type="button"
         onClick={() => void save()}
         disabled={saving}
-        className="rounded border border-emerald-600/60 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300 hover:border-emerald-400 disabled:opacity-50"
+        className="rounded border border-[var(--color-ok)]/60 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-[var(--color-ok)] hover:border-[var(--color-ok)] disabled:opacity-50"
       >
         {saving ? 'saving…' : 'save'}
       </button>
     </span>
   ) : (
     <span className="flex items-center gap-2">
-      {policy?.killSwitch ? <span className="text-rose-400">kill switch on</span> : 'gate active'}
+      {policy?.killSwitch ? <span className="text-[var(--color-bad)]">kill switch on</span> : 'gate active'}
       {onApply && policy ? (
         <button
           type="button"
           onClick={() => startEditing(policy)}
-          className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-slate-400 hover:border-slate-500"
+          className="rounded border border-[var(--color-line-strong)] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-[var(--color-ink-muted)] hover:border-[var(--color-ink-faint)]"
         >
           edit
         </button>
@@ -579,7 +962,7 @@ export function RiskPanel({
 
   if (editing && draft) {
     const inputClass =
-      'w-full rounded border border-slate-700 bg-slate-900 px-1.5 py-1 font-mono text-[11px] text-slate-200'
+      'w-full rounded border border-[var(--color-line-strong)] bg-[var(--color-surface-2)] px-1.5 py-1 font-mono text-[11px] text-[var(--color-ink)]'
     const labelClass = 'flex flex-col gap-1'
     return (
       <Panel
@@ -589,7 +972,7 @@ export function RiskPanel({
       >
         <div className="grid grid-cols-1 gap-x-4 gap-y-3 p-3 sm:grid-cols-2">
           <label className={labelClass}>
-            <span className="text-[10px] uppercase tracking-wider text-slate-500">Symbols (comma separated)</span>
+            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">Symbols (comma separated)</span>
             <input
               className={inputClass}
               data-field="symbols"
@@ -598,7 +981,7 @@ export function RiskPanel({
             />
           </label>
           <label className={labelClass}>
-            <span className="text-[10px] uppercase tracking-wider text-slate-500">Session UTC (8-17, empty = always open)</span>
+            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">Session UTC (8-17, empty = always open)</span>
             <input
               className={inputClass}
               data-field="sessionUtc"
@@ -608,7 +991,7 @@ export function RiskPanel({
           </label>
           {POLICY_NUMBER_FIELDS.map((field) => (
             <label key={field.key} className={labelClass}>
-              <span className="text-[10px] uppercase tracking-wider text-slate-500">{field.label}</span>
+              <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">{field.label}</span>
               <input
                 className={inputClass}
                 data-field={field.key}
@@ -624,12 +1007,23 @@ export function RiskPanel({
               checked={draft.killSwitch}
               onChange={handleField}
             />
-            <span className="text-[10px] uppercase tracking-wider text-slate-400">
+            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-muted)]">
               Kill switch (refuses every new intent)
             </span>
           </label>
+          <label className="flex items-center gap-2 pt-1">
+            <input
+              type="checkbox"
+              data-field="allowTradingWithoutJev"
+              checked={draft.allowTradingWithoutJev}
+              onChange={handleField}
+            />
+            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-muted)]">
+              Trade without the judge (otherwise a judge outage pauses decisions)
+            </span>
+          </label>
         </div>
-        <div className="border-t border-slate-800/80 px-3 py-2 text-[11px] leading-relaxed text-slate-500">
+        <div className="border-t border-[var(--color-line)]/80 px-3 py-2 text-[11px] leading-relaxed text-[var(--color-ink-faint)]">
           Changes apply to the live gate immediately and are journaled with the resulting policy. Restarting the
           service restores the environment defaults.
         </div>
@@ -694,17 +1088,22 @@ export function RiskPanel({
         />
         <Field label="Session UTC" value={policy?.sessionUtc ?? 'always open'} />
         <Field
+          label="Judge outage"
+          value={policy ? (policy.allowTradingWithoutJev ? 'keeps trading' : 'pauses decisions') : '—'}
+          tone={policy?.allowTradingWithoutJev ? 'text-[var(--color-warn)]' : undefined}
+        />
+        <Field
           label="Execution"
           value={status?.trading_enabled ? 'switch on' : 'switch off'}
-          tone={status?.trading_enabled ? 'text-amber-300' : undefined}
+          tone={status?.trading_enabled ? 'text-[var(--color-warn)]' : undefined}
         />
         <Field
           label="Terminal"
           value={status?.ea_live_orders ? 'armed' : 'disarmed'}
-          tone={status?.ea_live_orders ? 'text-emerald-300' : undefined}
+          tone={status?.ea_live_orders ? 'text-[var(--color-ok)]' : undefined}
         />
       </div>
-      <div className="border-t border-slate-800/80 px-3 py-2 text-[11px] leading-relaxed text-slate-500">
+      <div className="border-t border-[var(--color-line)]/80 px-3 py-2 text-[11px] leading-relaxed text-[var(--color-ink-faint)]">
         Every intent passes the gate in order: kill switch, allowlist, entry window, session, per-order cap,
         account facts, permission, drawdown brakes, one-per-asset, order cap, exposure, per-trade risk, net
         exposure, duplicates. Approved entries then pass the venue contract check and the news blackout.
@@ -724,18 +1123,18 @@ export function MetricsPanel({ metrics, error }: { metrics?: Metrics; error?: st
   return (
     <Panel
       title="Metrics"
-      detail={metrics ? `feed #${metrics.feedLatest}` : error ? <span className="text-rose-400">{error}</span> : '…'}
+      detail={metrics ? `feed #${metrics.feedLatest}` : error ? <span className="text-[var(--color-bad)]">{error}</span> : '…'}
     >
       {counters.length === 0 ? (
-        <div className="p-3 text-xs text-slate-500">No counters yet.</div>
+        <div className="p-3 text-xs text-[var(--color-ink-faint)]">No counters yet.</div>
       ) : (
-        <ul className="divide-y divide-slate-800/40">
+        <ul className="divide-y divide-[var(--color-line)]/40">
           {counters.map(([key, value]) => (
             <li key={key} className="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
-              <span className="truncate font-mono text-[10px] text-slate-400" title={key}>
+              <span className="truncate font-mono text-[10px] text-[var(--color-ink-muted)]" title={key}>
                 {key}
               </span>
-              <span className="shrink-0 font-mono tabular-nums text-slate-200">{value}</span>
+              <span className="shrink-0 font-mono tabular-nums text-[var(--color-ink)]">{value}</span>
             </li>
           ))}
         </ul>
@@ -748,13 +1147,14 @@ export function MetricsPanel({ metrics, error }: { metrics?: Metrics; error?: st
 
 export function CommandsPanel({ commands }: { commands?: CommandRecord[] }) {
   const [expandedId, setExpandedId] = useState<string | undefined>(undefined)
+  const paged = usePaged(commands ?? [], 8)
   return (
     <Panel title="Commands" detail={`${commands?.length ?? 0} recent`}>
       {!commands || commands.length === 0 ? (
-        <div className="p-3 text-xs text-slate-500">No commands yet.</div>
+        <div className="p-3 text-xs text-[var(--color-ink-faint)]">No commands yet.</div>
       ) : (
-        <ul className="divide-y divide-slate-800/60">
-          {commands.map((command) => {
+        <ul className="divide-y divide-[var(--color-line)]">
+          {paged.items.map((command) => {
             const expanded = command.id === expandedId
             return (
               <li key={command.id}>
@@ -763,29 +1163,29 @@ export function CommandsPanel({ commands }: { commands?: CommandRecord[] }) {
                   onClick={() => setExpandedId(expanded ? undefined : command.id)}
                   aria-expanded={expanded}
                   className={`flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-xs transition-colors ${
-                    expanded ? 'bg-slate-800/50' : 'hover:bg-slate-800/20'
+                    expanded ? 'bg-[var(--color-surface-3)]/50' : 'hover:bg-[var(--color-surface-3)]/20'
                   }`}
                 >
                   <span className="flex min-w-0 items-center gap-2">
-                    <span className="rounded bg-slate-800/80 px-1.5 py-0.5 font-mono text-[10px] text-slate-300">
+                    <span className="rounded bg-[var(--color-surface-3)]/80 px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-ink)]">
                       {command.kind}
                     </span>
-                    <span className="truncate font-mono text-[10px] text-slate-500">{command.id.slice(0, 8)}</span>
+                    <span className="truncate font-mono text-[10px] text-[var(--color-ink-faint)]">{command.id.slice(0, 8)}</span>
                     {command.summary ? (
-                      <span className="truncate font-mono text-[10px] text-slate-400">
+                      <span className="truncate font-mono text-[10px] text-[var(--color-ink-muted)]">
                         {JSON.stringify(command.summary)}
                       </span>
                     ) : null}
-                    {command.reason ? <span className="truncate text-[10px] text-rose-300">{command.reason}</span> : null}
+                    {command.reason ? <span className="truncate text-[10px] text-[var(--color-bad)]">{command.reason}</span> : null}
                   </span>
                   <span className={`shrink-0 text-[10px] uppercase tracking-wider ${commandTone[command.status]}`}>
                     {command.status}
                   </span>
                 </button>
                 {expanded ? (
-                  <div className="space-y-1 border-t border-slate-800/60 bg-slate-900/50 px-3 py-2">
-                    <div className="font-mono text-[10px] text-slate-500">id {command.id}</div>
-                    <pre className="max-h-40 overflow-auto rounded bg-black/30 p-2 font-mono text-[10px] leading-relaxed text-slate-400">
+                  <div className="space-y-1 border-t border-[var(--color-line)]/60 bg-[var(--color-surface-2)]/50 px-3 py-2">
+                    <div className="font-mono text-[10px] text-[var(--color-ink-faint)]">id {command.id}</div>
+                    <pre className="max-h-40 overflow-auto rounded bg-[var(--color-surface-0)] p-2 font-mono text-[10px] leading-relaxed text-[var(--color-ink-muted)]">
                       {JSON.stringify({ summary: command.summary ?? null, reason: command.reason ?? null }, null, 2)}
                     </pre>
                   </div>
@@ -795,6 +1195,15 @@ export function CommandsPanel({ commands }: { commands?: CommandRecord[] }) {
           })}
         </ul>
       )}
+      <Pager
+        page={paged.page}
+        pages={paged.pages}
+        start={paged.start}
+        count={paged.items.length}
+        total={paged.total}
+        onPrevious={paged.previous}
+        onNext={paged.next}
+      />
     </Panel>
   )
 }
@@ -814,6 +1223,7 @@ export function ActivityFeed({
 }) {
   const [selectedSeq, setSelectedSeq] = useState<number | undefined>(undefined)
   const visible = focus ? events.filter((event) => !isRoutine(event)) : events
+  const paged = usePaged(visible, 14)
 
   return (
     <Panel
@@ -821,7 +1231,7 @@ export function ActivityFeed({
       className="min-h-[320px]"
       detail={
         <span className="flex items-center gap-3">
-          <span className="hidden text-[10px] uppercase tracking-wider text-slate-600 sm:inline">
+          <span className="hidden text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)] sm:inline">
             click a row for detail
           </span>
           <button
@@ -829,27 +1239,27 @@ export function ActivityFeed({
             onClick={() => onFocusChange(!focus)}
             className={`rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wider transition-colors ${
               focus
-                ? 'border-slate-700 text-slate-300 hover:border-slate-500'
-                : 'border-amber-500/40 text-amber-300'
+                ? 'border-[var(--color-line-strong)] text-[var(--color-ink)] hover:border-[var(--color-ink-faint)]'
+                : 'border-[var(--color-warn)]/40 text-[var(--color-warn)]'
             }`}
             title={focus ? 'Show routine snapshots and reads' : 'Hide routine snapshots and reads'}
           >
             {focus ? 'focus' : 'all'}
           </button>
           <span className="flex items-center gap-1.5">
-            <span className={`size-1.5 rounded-full ${connected ? 'animate-pulse bg-emerald-400' : 'bg-rose-400'}`} />
+            <span className={`size-1.5 rounded-full ${connected ? 'animate-pulse bg-[var(--color-ok)]' : 'bg-[var(--color-bad)]'}`} />
             {connected ? 'streaming' : 'reconnecting…'}
           </span>
         </span>
       }
     >
       {visible.length === 0 ? (
-        <div className="p-3 text-xs text-slate-500">
+        <div className="p-3 text-xs text-[var(--color-ink-faint)]">
           {events.length === 0 ? 'Waiting for events…' : 'No decisions yet — routine activity hidden.'}
         </div>
       ) : (
-        <ul className="divide-y divide-slate-800/40">
-          {visible.map((event) => {
+        <ul className="divide-y divide-[var(--color-line)]">
+          {paged.items.map((event) => {
             const outcome = typeof event.payload?.outcome === 'string' ? event.payload.outcome : undefined
             const expanded = event.seq === selectedSeq
             return (
@@ -860,30 +1270,30 @@ export function ActivityFeed({
                   aria-expanded={expanded}
                   title={JSON.stringify(event.payload)}
                   className={`flex w-full items-start gap-2 px-3 py-1.5 text-left text-xs transition-colors ${
-                    expanded ? 'bg-slate-800/50' : 'hover:bg-slate-800/20'
+                    expanded ? 'bg-[var(--color-surface-3)]/50' : 'hover:bg-[var(--color-surface-3)]/20'
                   }`}
                 >
-                  <span className="w-14 shrink-0 pt-0.5 font-mono text-[10px] text-slate-500">
+                  <span className="w-14 shrink-0 pt-0.5 font-mono text-[10px] text-[var(--color-ink-faint)]">
                     {clockTime(event.at_ms)}
                   </span>
                   <span
                     className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] ${
-                      kindTone[event.kind] ?? 'bg-slate-700/30 text-slate-300'
+                      kindTone[event.kind] ?? 'bg-[var(--color-surface-3)]/30 text-[var(--color-ink)]'
                     }`}
                   >
                     {event.kind}
                   </span>
                   <span
                     className={`min-w-0 flex-1 truncate font-mono text-[11px] ${
-                      outcome ? (outcomeTone[outcome] ?? 'text-slate-300') : 'text-slate-300'
+                      outcome ? (outcomeTone[outcome] ?? 'text-[var(--color-ink)]') : 'text-[var(--color-ink)]'
                     }`}
                   >
                     {payloadSummary(event)}
                   </span>
                 </button>
                 {expanded ? (
-                  <div className="space-y-1.5 border-t border-slate-800/60 bg-slate-900/50 px-3 py-2">
-                    <div className="flex items-center justify-between font-mono text-[10px] text-slate-500">
+                  <div className="space-y-1.5 border-t border-[var(--color-line)]/60 bg-[var(--color-surface-2)]/50 px-3 py-2">
+                    <div className="flex items-center justify-between font-mono text-[10px] text-[var(--color-ink-faint)]">
                       <span>
                         #{event.seq} · {new Date(event.at_ms).toISOString()}
                       </span>
@@ -892,14 +1302,14 @@ export function ActivityFeed({
                     <div className="space-y-1">
                       {detailRows(event.payload ?? {}).map((row) => (
                         <div key={row.label} className="grid grid-cols-[8rem_1fr] gap-x-3">
-                          <span className="font-mono text-[10px] uppercase tracking-wider text-slate-500">
+                          <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">
                             {row.label}
                           </span>
-                          <span className="min-w-0 break-words font-mono text-[11px] text-slate-300">{row.value}</span>
+                          <span className="min-w-0 break-words font-mono text-[11px] text-[var(--color-ink)]">{row.value}</span>
                         </div>
                       ))}
                     </div>
-                    <pre className="max-h-40 overflow-auto rounded bg-black/30 p-2 font-mono text-[10px] leading-relaxed text-slate-400">
+                    <pre className="max-h-40 overflow-auto rounded bg-[var(--color-surface-0)] p-2 font-mono text-[10px] leading-relaxed text-[var(--color-ink-muted)]">
                       {JSON.stringify(event.payload ?? {}, null, 2)}
                     </pre>
                   </div>
@@ -909,6 +1319,15 @@ export function ActivityFeed({
           })}
         </ul>
       )}
+      <Pager
+        page={paged.page}
+        pages={paged.pages}
+        start={paged.start}
+        count={paged.items.length}
+        total={paged.total}
+        onPrevious={paged.previous}
+        onNext={paged.next}
+      />
     </Panel>
   )
 }
@@ -916,11 +1335,11 @@ export function ActivityFeed({
 /* ---------- agent log ---------- */
 
 const logLevelTone: Record<string, string> = {
-  error: 'text-rose-300 bg-rose-500/15',
-  warn: 'text-amber-300 bg-amber-500/15',
-  info: 'text-sky-300 bg-sky-500/10',
-  debug: 'text-slate-400 bg-slate-700/30',
-  trace: 'text-slate-500 bg-slate-700/20',
+  error: 'text-[var(--color-bad)] bg-[var(--color-bad)]/15',
+  warn: 'text-[var(--color-warn)] bg-[var(--color-warn)]/15',
+  info: 'text-[var(--color-info)] bg-[var(--color-info)]/10',
+  debug: 'text-[var(--color-ink-muted)] bg-[var(--color-surface-3)]/30',
+  trace: 'text-[var(--color-ink-faint)] bg-[var(--color-surface-3)]/20',
 }
 
 export function LogsPanel({
@@ -935,6 +1354,7 @@ export function LogsPanel({
   onLevelChange: (level: LogLevel) => void
 }) {
   const ordered = [...logs].reverse()
+  const paged = usePaged(ordered, 20)
   return (
     <Panel
       title="Agent log"
@@ -948,8 +1368,8 @@ export function LogsPanel({
               onClick={() => onLevelChange(candidate)}
               className={`rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wider transition-colors ${
                 candidate === level
-                  ? 'border-slate-500 text-slate-200'
-                  : 'border-slate-800 text-slate-500 hover:border-slate-600'
+                  ? 'border-[var(--color-ink-faint)] text-[var(--color-ink)]'
+                  : 'border-[var(--color-line)] text-[var(--color-ink-faint)] hover:border-[var(--color-line-strong)]'
               }`}
             >
               {candidate}
@@ -958,34 +1378,45 @@ export function LogsPanel({
         </span>
       }
     >
-      {error ? <div className="px-3 py-2 text-[11px] text-rose-400">{error}</div> : null}
+      {error ? <div className="px-3 py-2 text-[11px] text-[var(--color-bad)]">{error}</div> : null}
       {ordered.length === 0 ? (
-        <div className="p-3 text-xs text-slate-500">{error ? 'Log tail unavailable.' : 'No log records yet.'}</div>
+        <div className="p-3 text-xs text-[var(--color-ink-faint)]">
+          {error ? 'Log tail unavailable.' : 'No log records yet.'}
+        </div>
       ) : (
-        <ul className="divide-y divide-slate-800/40">
-          {ordered.map((record) => (
+        <ul className="divide-y divide-[var(--color-line)]">
+          {paged.items.map((record) => (
             <li key={record.seq} className="flex items-start gap-2 px-3 py-1 text-xs">
-              <span className="w-14 shrink-0 pt-0.5 font-mono text-[10px] text-slate-500">
+              <span className="w-14 shrink-0 pt-0.5 font-mono text-[10px] text-[var(--color-ink-faint)]">
                 {clockTime(record.atMs)}
               </span>
               <span
                 className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] uppercase ${
-                  logLevelTone[record.level] ?? 'bg-slate-700/30 text-slate-300'
+                  logLevelTone[record.level] ?? 'bg-[var(--color-surface-3)]/30 text-[var(--color-ink)]'
                 }`}
               >
                 {record.level}
               </span>
-              <span className="min-w-0 flex-1 font-mono text-[11px] leading-relaxed text-slate-300">
-                <span className="text-slate-500">{record.target}</span>{' '}
+              <span className="min-w-0 flex-1 font-mono text-[11px] leading-relaxed text-[var(--color-ink)]">
+                <span className="text-[var(--color-ink-faint)]">{record.target}</span>{' '}
                 <span>{record.message}</span>
                 {Object.keys(record.fields).length > 0 ? (
-                  <span className="text-slate-500"> {JSON.stringify(record.fields)}</span>
+                  <span className="text-[var(--color-ink-faint)]"> {JSON.stringify(record.fields)}</span>
                 ) : null}
               </span>
             </li>
           ))}
         </ul>
       )}
+      <Pager
+        page={paged.page}
+        pages={paged.pages}
+        start={paged.start}
+        count={paged.items.length}
+        total={paged.total}
+        onPrevious={paged.previous}
+        onNext={paged.next}
+      />
     </Panel>
   )
 }

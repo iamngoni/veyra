@@ -121,8 +121,8 @@ describe('detailRows', () => {
 
 describe('commandTone', () => {
   it('maps every lifecycle status to a colour', () => {
-    expect(commandTone.pending).toBe('text-sky-400')
-    expect(commandTone.completed).toBe('text-emerald-400')
-    expect(commandTone.failed).toBe('text-rose-400')
+    expect(commandTone.pending).toBe('text-[var(--color-info)]')
+    expect(commandTone.completed).toBe('text-[var(--color-ok)]')
+    expect(commandTone.failed).toBe('text-[var(--color-bad)]')
   })
 })

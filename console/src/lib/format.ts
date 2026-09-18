@@ -12,34 +12,34 @@ import type { CommandRecord, FeedEvent } from './api'
 export const kindTone: Record<string, string> = {
   proposal_evaluated: 'text-violet-300 bg-violet-500/10',
   agent_tool_called: 'text-fuchsia-300 bg-fuchsia-500/10',
-  command_queued: 'text-sky-300 bg-sky-500/10',
-  command_completed: 'text-emerald-300 bg-emerald-500/10',
-  command_failed: 'text-rose-300 bg-rose-500/10',
-  broker_snapshot: 'text-slate-400 bg-slate-700/30',
+  command_queued: 'text-[var(--color-info)] bg-[var(--color-info)]/10',
+  command_completed: 'text-[var(--color-ok)] bg-[var(--color-ok)]/10',
+  command_failed: 'text-[var(--color-bad)] bg-[var(--color-bad)]/10',
+  broker_snapshot: 'text-[var(--color-ink-muted)] bg-[var(--color-surface-3)]/30',
   position_closed: 'text-cyan-300 bg-cyan-500/10',
-  service_started: 'text-amber-300 bg-amber-500/10',
-  reconciliation_drift: 'text-rose-300 bg-rose-500/15',
+  service_started: 'text-[var(--color-warn)] bg-[var(--color-warn)]/10',
+  reconciliation_drift: 'text-[var(--color-bad)] bg-[var(--color-bad)]/15',
 }
 
 /** Proposal/review outcome → text colour. Unknown outcomes keep the default. */
 export const outcomeTone: Record<string, string> = {
-  queued: 'text-emerald-300',
+  queued: 'text-[var(--color-ok)]',
   approved_dry_run: 'text-cyan-300',
-  no_trade: 'text-slate-400',
-  held: 'text-sky-300',
-  break_even: 'text-emerald-300',
-  break_even_rejected: 'text-rose-300',
-  close_queued: 'text-amber-300',
-  close_rejected: 'text-rose-300',
-  rejected: 'text-amber-300',
-  unavailable: 'text-rose-300',
+  no_trade: 'text-[var(--color-ink-muted)]',
+  held: 'text-[var(--color-info)]',
+  break_even: 'text-[var(--color-ok)]',
+  break_even_rejected: 'text-[var(--color-bad)]',
+  close_queued: 'text-[var(--color-warn)]',
+  close_rejected: 'text-[var(--color-bad)]',
+  rejected: 'text-[var(--color-warn)]',
+  unavailable: 'text-[var(--color-bad)]',
 }
 
 /** Command lifecycle status → text colour. */
 export const commandTone: Record<CommandRecord['status'], string> = {
-  pending: 'text-sky-400',
-  completed: 'text-emerald-400',
-  failed: 'text-rose-400',
+  pending: 'text-[var(--color-info)]',
+  completed: 'text-[var(--color-ok)]',
+  failed: 'text-[var(--color-bad)]',
 }
 
 /** One-line summary of an event payload for the activity list. */
