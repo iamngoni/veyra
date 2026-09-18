@@ -34,6 +34,11 @@ This repository contains the first tested, safe service slice:
   (ForexFactory weekly export, no key, cached) feeds per-asset
   `upcoming_events` to the model and blackouts high-impact entries through a
   console-editable window; `GET /calendar` lists what the bot sees.
+- **Pre-queue venue checks**: after gate approval, a draft's volume must land
+  on the venue's lot band and step, its estimated margin must fit reported
+  free margin, and its stop must clear the current spread, the broker's
+  minimum stop level, and a console-editable ATR(14) noise floor
+  (`minStopAtrFraction`, default 0.25) — otherwise nothing is queued.
 - An **operations console** (TanStack Start) on `http://127.0.0.1:3000`:
   account and positions with their stops, a streaming activity feed, recent
   commands, and the current market window.

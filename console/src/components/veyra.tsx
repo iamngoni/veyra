@@ -341,6 +341,7 @@ type PolicyDraft = {
   maxPeakDrawdownPercent: string
   maxNetFactorLots: string
   calendarBlackoutMinutes: string
+  minStopAtrFraction: string
 }
 
 const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer: boolean }> = [
@@ -353,6 +354,7 @@ const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer
   { key: 'maxPeakDrawdownPercent', label: 'Peak brake (%)', integer: false },
   { key: 'maxNetFactorLots', label: 'Net USD cap (lots)', integer: false },
   { key: 'calendarBlackoutMinutes', label: 'News blackout (minutes)', integer: true },
+  { key: 'minStopAtrFraction', label: 'Min stop (× ATR)', integer: false },
 ]
 
 type NumericDraftKey =
@@ -365,6 +367,7 @@ type NumericDraftKey =
   | 'maxPeakDrawdownPercent'
   | 'maxNetFactorLots'
   | 'calendarBlackoutMinutes'
+  | 'minStopAtrFraction'
 
 function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
   return {
@@ -380,6 +383,7 @@ function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
     maxPeakDrawdownPercent: String(policy.maxPeakDrawdownPercent),
     maxNetFactorLots: String(policy.maxNetFactorLots),
     calendarBlackoutMinutes: String(policy.calendarBlackoutMinutes),
+    minStopAtrFraction: String(policy.minStopAtrFraction),
   }
 }
 
@@ -591,6 +595,16 @@ export function RiskPanel({
             policy
               ? policy.calendarBlackoutMinutes > 0
                 ? `${policy.calendarBlackoutMinutes}m blackout`
+                : 'off'
+              : '—'
+          }
+        />
+        <Field
+          label="Stop floor"
+          value={
+            policy
+              ? policy.minStopAtrFraction > 0
+                ? `${policy.minStopAtrFraction}\u00d7 ATR`
                 : 'off'
               : '—'
           }

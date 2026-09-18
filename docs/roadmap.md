@@ -100,9 +100,10 @@
       per lot, swap rates, and trade permission; `GET /market/spec` exposes it
       and the autopilot feeds it (with ATR(14) and account free margin) into
       both model inputs. A pre-queue contract check rejects volumes off the
-      lot grid, margin above free margin, and stops inside the spread or the
-      broker's minimum distance — proven live against IFC Markets for the
-      whole menu (EURUSD/USDJPY/GBPUSD/XAUUSD).
+      lot grid, margin above free margin, and stops inside the spread, the
+      broker's minimum distance, or a console-editable ATR(14) noise floor
+      (`minStopAtrFraction`, default 0.25) — proven live against IFC Markets
+      for the whole menu (EURUSD/USDJPY/GBPUSD/XAUUSD).
 - [x] Economic calendar: a provider-neutral `EventCalendar` trait with the
       keyless ForexFactory weekly export as the first implementation (cached),
       `GET /calendar` for operators, per-asset `upcoming_events` in the entry

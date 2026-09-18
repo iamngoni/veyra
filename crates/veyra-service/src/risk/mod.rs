@@ -49,6 +49,10 @@ const DEFAULT_MAX_NET_FACTOR_LOTS: f64 = 0.01;
 const DEFAULT_CALENDAR_BLACKOUT_MINUTES: u64 = 30;
 /// Absolute ceiling for the news blackout window (24 hours either side).
 const MAX_CALENDAR_BLACKOUT_MINUTES: u64 = 1_440;
+/// Default minimum stop distance as a fraction of ATR(14) (0 disables).
+const DEFAULT_MIN_STOP_ATR_FRACTION: f64 = 0.25;
+/// Absolute ceiling for the ATR stop floor.
+const MAX_MIN_STOP_ATR_FRACTION: f64 = 2.0;
 
 const SYMBOLS_RULE: &str = "must list 1-64 comma-separated instrument symbols";
 const VOLUME_RULE: &str = "must be a finite number greater than 0 and at most 100";
@@ -58,6 +62,8 @@ const PERCENT_RULE: &str = "must be a number from 0 through 100 (0 disables the 
 const FACTOR_LOTS_RULE: &str = "must be a number from 0 through 100 lots (0 disables the check)";
 const CALENDAR_BLACKOUT_RULE: &str =
     "must be an integer number of minutes from 0 through 1440 (0 disables the check)";
+const ATR_FRACTION_RULE: &str =
+    "must be a number from 0 through 2 (fraction of ATR; 0 disables the check)";
 const SESSION_RULE: &str = "must be `HH-HH` with UTC hours 0-23 and different bounds";
 const KILL_SWITCH_RULE: &str = "must be `true` or `false`";
 
@@ -102,6 +108,8 @@ pub struct RiskPolicyPatch {
     /// News blackout either side of a high-impact event, in minutes
     /// (0 disables the check).
     pub calendar_blackout_minutes: Option<u64>,
+    /// Minimum stop distance as a fraction of ATR(14) (0 disables).
+    pub min_stop_atr_fraction: Option<f64>,
 }
 
 /// Validates one symbol list from the control surface.
@@ -203,6 +211,7 @@ pub struct RiskPolicy {
     max_peak_drawdown_percent: f64,
     max_net_factor_lots: f64,
     calendar_blackout_minutes: u64,
+    min_stop_atr_fraction: f64,
 }
 
 impl RiskPolicy {
@@ -232,6 +241,7 @@ impl RiskPolicy {
             max_peak_drawdown_percent: 0.0,
             max_net_factor_lots: 0.0,
             calendar_blackout_minutes: 0,
+            min_stop_atr_fraction: 0.0,
         }
     }
 
@@ -257,6 +267,14 @@ impl RiskPolicy {
     /// for it to apply.
     pub fn with_calendar_blackout(mut self, minutes: u64) -> Self {
         self.calendar_blackout_minutes = minutes;
+        self
+    }
+
+    /// Sets the minimum stop distance as a fraction of ATR(14). Zero
+    /// disables the floor; the ATR window comes from the candles the tick
+    /// already fetched.
+    pub fn with_min_stop_atr_fraction(mut self, fraction: f64) -> Self {
+        self.min_stop_atr_fraction = fraction;
         self
     }
 
@@ -409,6 +427,23 @@ impl RiskPolicy {
                 }
             };
 
+        let min_stop_atr_fraction = match trimmed(&mut source, "VEYRA_RISK_MIN_STOP_ATR_FRACTION") {
+            None => DEFAULT_MIN_STOP_ATR_FRACTION,
+            Some(raw) => {
+                let value = raw.parse::<f64>().map_err(|_| RiskError {
+                    name: "VEYRA_RISK_MIN_STOP_ATR_FRACTION",
+                    reason: ATR_FRACTION_RULE,
+                })?;
+                if !value.is_finite() || !(0.0..=MAX_MIN_STOP_ATR_FRACTION).contains(&value) {
+                    return Err(RiskError {
+                        name: "VEYRA_RISK_MIN_STOP_ATR_FRACTION",
+                        reason: ATR_FRACTION_RULE,
+                    });
+                }
+                value
+            }
+        };
+
         Ok(Self::new(
             kill_switch,
             symbols,
@@ -424,7 +459,8 @@ impl RiskPolicy {
             max_peak_drawdown_percent,
             max_net_factor_lots,
         )
-        .with_calendar_blackout(calendar_blackout_minutes))
+        .with_calendar_blackout(calendar_blackout_minutes)
+        .with_min_stop_atr_fraction(min_stop_atr_fraction))
     }
 
     /// Applies a partial update from the control surface, keeping every field
@@ -516,6 +552,20 @@ impl RiskPolicy {
                 });
             }
         };
+        let min_stop_atr_fraction = match patch.min_stop_atr_fraction {
+            None => self.min_stop_atr_fraction,
+            Some(value)
+                if value.is_finite() && (0.0..=MAX_MIN_STOP_ATR_FRACTION).contains(&value) =>
+            {
+                value
+            }
+            Some(_) => {
+                return Err(RiskError {
+                    name: "minStopAtrFraction",
+                    reason: ATR_FRACTION_RULE,
+                });
+            }
+        };
 
         Ok(Self::new(
             kill_switch,
@@ -532,7 +582,8 @@ impl RiskPolicy {
             max_peak_drawdown_percent,
             max_net_factor_lots,
         )
-        .with_calendar_blackout(calendar_blackout_minutes))
+        .with_calendar_blackout(calendar_blackout_minutes)
+        .with_min_stop_atr_fraction(min_stop_atr_fraction))
     }
 
     /// Whether the kill switch is engaged; engaged means every intent fails.
@@ -596,6 +647,12 @@ impl RiskPolicy {
         self.calendar_blackout_minutes
     }
 
+    /// Minimum stop distance as a fraction of ATR(14); zero disables the
+    /// floor.
+    pub fn min_stop_atr_fraction(&self) -> f64 {
+        self.min_stop_atr_fraction
+    }
+
     /// Bounded, non-sensitive snapshot of the effective policy.
     ///
     /// Recorded with the audit trail at startup so a decision can always be
@@ -619,7 +676,8 @@ impl RiskPolicy {
             "maxDailyLossPercent": self.max_daily_loss_percent,
             "maxPeakDrawdownPercent": self.max_peak_drawdown_percent,
             "maxNetFactorLots": self.max_net_factor_lots,
-            "calendarBlackoutMinutes": self.calendar_blackout_minutes
+            "calendarBlackoutMinutes": self.calendar_blackout_minutes,
+            "minStopAtrFraction": self.min_stop_atr_fraction
         })
     }
 
@@ -651,6 +709,7 @@ impl Default for RiskPolicy {
             DEFAULT_MAX_NET_FACTOR_LOTS,
         )
         .with_calendar_blackout(DEFAULT_CALENDAR_BLACKOUT_MINUTES)
+        .with_min_stop_atr_fraction(DEFAULT_MIN_STOP_ATR_FRACTION)
     }
 }
 
@@ -737,6 +796,10 @@ mod tests {
             summary["calendarBlackoutMinutes"], 0,
             "the embedding baseline disables the news blackout"
         );
+        assert_eq!(
+            summary["minStopAtrFraction"], 0.0,
+            "the embedding baseline disables the ATR floor"
+        );
 
         let default = RiskPolicy::default().summary();
         assert_eq!(
@@ -749,6 +812,7 @@ mod tests {
             default["calendarBlackoutMinutes"],
             DEFAULT_CALENDAR_BLACKOUT_MINUTES
         );
+        assert_eq!(default["minStopAtrFraction"], DEFAULT_MIN_STOP_ATR_FRACTION);
     }
 
     fn source<'a>(
@@ -785,6 +849,10 @@ mod tests {
         assert_eq!(
             policy.calendar_blackout_minutes(),
             DEFAULT_CALENDAR_BLACKOUT_MINUTES
+        );
+        assert_eq!(
+            policy.min_stop_atr_fraction(),
+            DEFAULT_MIN_STOP_ATR_FRACTION
         );
         assert!(!policy.allows_symbol(&parse_instrument("EURUSD").expect("symbol")));
         assert_eq!(RiskPolicy::default(), policy);
@@ -829,6 +897,7 @@ mod tests {
                 max_peak_drawdown_percent: Some(40.0),
                 max_net_factor_lots: Some(0.05),
                 calendar_blackout_minutes: Some(15),
+                min_stop_atr_fraction: Some(0.5),
                 ..Default::default()
             })
             .expect("patch applies");
@@ -845,6 +914,7 @@ mod tests {
         assert_eq!(full.max_peak_drawdown_percent(), 40.0);
         assert_eq!(full.max_net_factor_lots(), 0.05);
         assert_eq!(full.calendar_blackout_minutes(), 15);
+        assert_eq!(full.min_stop_atr_fraction(), 0.5);
 
         let cleared = full
             .apply_patch(&RiskPolicyPatch {
@@ -855,7 +925,7 @@ mod tests {
         assert_eq!(cleared.session(), None);
 
         // Rejections name the control-surface field.
-        let cases: [(RiskPolicyPatch, &str); 9] = [
+        let cases: [(RiskPolicyPatch, &str); 10] = [
             (
                 RiskPolicyPatch {
                     symbols: Some(Vec::new()),
@@ -919,6 +989,13 @@ mod tests {
                 },
                 "calendarBlackoutMinutes",
             ),
+            (
+                RiskPolicyPatch {
+                    min_stop_atr_fraction: Some(2.5),
+                    ..Default::default()
+                },
+                "minStopAtrFraction",
+            ),
         ];
         for (patch, field) in cases {
             let error = base.apply_patch(&patch).expect_err(field);
@@ -941,6 +1018,7 @@ mod tests {
             ("VEYRA_RISK_MAX_PEAK_DRAWDOWN_PERCENT", "40"),
             ("VEYRA_RISK_MAX_NET_FACTOR_LOTS", "0.05"),
             ("VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES", "45"),
+            ("VEYRA_RISK_MIN_STOP_ATR_FRACTION", "0.75"),
         ]))
         .expect("valid settings");
 
@@ -960,11 +1038,12 @@ mod tests {
         assert_eq!(policy.max_peak_drawdown_percent(), 40.0);
         assert_eq!(policy.max_net_factor_lots(), 0.05);
         assert_eq!(policy.calendar_blackout_minutes(), 45);
+        assert_eq!(policy.min_stop_atr_fraction(), 0.75);
     }
 
     #[test]
     fn malformed_settings_are_rejected_by_name() {
-        let cases: [(&'static str, &'static str); 16] = [
+        let cases: [(&'static str, &'static str); 18] = [
             ("VEYRA_RISK_KILL_SWITCH", "yes"),
             ("VEYRA_RISK_SYMBOLS", "not a symbol!,EURUSD"),
             ("VEYRA_RISK_MAX_VOLUME_PER_ORDER", "0"),
@@ -981,6 +1060,8 @@ mod tests {
             ("VEYRA_RISK_MAX_NET_FACTOR_LOTS", "lots"),
             ("VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES", "1441"),
             ("VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES", "soon"),
+            ("VEYRA_RISK_MIN_STOP_ATR_FRACTION", "2.5"),
+            ("VEYRA_RISK_MIN_STOP_ATR_FRACTION", "tight"),
         ];
         for (name, value) in cases {
             let error =

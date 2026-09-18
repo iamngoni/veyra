@@ -61,6 +61,8 @@ export type RiskPolicy = {
   maxNetFactorLots: number
   /** News blackout either side of a high-impact event, in minutes (0 disables). */
   calendarBlackoutMinutes: number
+  /** Minimum stop distance as a fraction of ATR(14) (0 disables). */
+  minStopAtrFraction: number
 }
 
 export type Metrics = {
@@ -146,6 +148,7 @@ export type RiskPolicyPatch = {
   maxPeakDrawdownPercent?: number
   maxNetFactorLots?: number
   calendarBlackoutMinutes?: number
+  minStopAtrFraction?: number
 }
 
 export type CommandRecord = {

@@ -71,6 +71,7 @@ const status: Status = {
     maxPeakDrawdownPercent: 25,
     maxNetFactorLots: 0.01,
     calendarBlackoutMinutes: 30,
+    minStopAtrFraction: 0.25,
   },
 }
 
@@ -288,6 +289,7 @@ describe('RiskPanel', () => {
     expect(screen.getByText('armed')).toBeTruthy()
     expect(screen.getByText('always open')).toBeTruthy()
     expect(screen.getByText('30m blackout')).toBeTruthy()
+    expect(screen.getByText('0.25× ATR')).toBeTruthy()
   })
 
   it('shows disabled valuation limits explicitly', () => {
@@ -300,6 +302,7 @@ describe('RiskPanel', () => {
           maxPeakDrawdownPercent: 0,
           maxNetFactorLots: 0,
           calendarBlackoutMinutes: 0,
+          minStopAtrFraction: 0,
         }}
         status={status}
       />,
@@ -324,6 +327,7 @@ describe('RiskPanel editing', () => {
     fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: '7' } })
     fireEvent.change(screen.getByLabelText('Net USD cap (lots)'), { target: { value: '0.02' } })
     fireEvent.change(screen.getByLabelText('News blackout (minutes)'), { target: { value: '45' } })
+    fireEvent.change(screen.getByLabelText('Min stop (× ATR)'), { target: { value: '0.75' } })
     fireEvent.click(screen.getByText('save'))
 
     await screen.findByText('gate active')
@@ -332,6 +336,7 @@ describe('RiskPanel editing', () => {
     expect(patch.maxOpenOrders).toBe(7)
     expect(patch.maxNetFactorLots).toBe(0.02)
     expect(patch.calendarBlackoutMinutes).toBe(45)
+    expect(patch.minStopAtrFraction).toBe(0.75)
     expect(patch.symbols).toEqual(['EURUSD'])
     expect(patch.killSwitch).toBe(false)
   })

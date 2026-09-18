@@ -736,6 +736,9 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                             series_for_symbol(&markets, symbol.as_str())
                                 .and_then(|series| series.last())
                                 .map(|candle| candle.close()),
+                            series_for_symbol(&markets, symbol.as_str())
+                                .and_then(|series| average_true_range(series, ATR_PERIOD)),
+                            policy.min_stop_atr_fraction(),
                         ) {
                             record_event_context(
                                 state,
@@ -3073,6 +3076,39 @@ mod tests {
             tick(&harness.state).await,
             TickOutcome::Rejected {
                 code: "volume_below_min"
+            }
+        );
+    }
+
+    #[actix_web::test]
+    async fn tick_rejects_entries_inside_the_atr_floor() {
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        // The canned series carries a 0.02 ATR, so a 0.5 floor demands a
+        // 0.01 stop distance; the draft carries 0.0069.
+        let policy = harness
+            .state
+            .risk()
+            .policy()
+            .with_min_stop_atr_fraction(0.5);
+        harness.state.risk().update_policy(policy);
+
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "stop_inside_noise"
             }
         );
     }
