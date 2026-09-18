@@ -33,6 +33,7 @@ use logs::LogBuffer;
 use market::MarketRuntime;
 use model::ModelRuntime;
 use risk::RiskGate;
+use risk::guard::EquityGuard;
 use trading::autopilot::{AutopilotSettings, StopBasis};
 
 /// Immutable runtime state shared by HTTP handlers.
@@ -49,6 +50,7 @@ pub struct AppState {
     risk: RiskGate,
     stop_basis: Arc<StopBasis>,
     rotation: Arc<AtomicUsize>,
+    equity_guard: Arc<EquityGuard>,
 }
 
 impl AppState {
@@ -71,6 +73,7 @@ impl AppState {
             risk,
             stop_basis: Arc::new(StopBasis::default()),
             rotation: Arc::new(AtomicUsize::new(0)),
+            equity_guard: Arc::new(EquityGuard::new()),
         }
     }
 
@@ -159,5 +162,10 @@ impl AppState {
     /// configured instrument gets its turn.
     pub fn rotation(&self) -> &Arc<AtomicUsize> {
         &self.rotation
+    }
+
+    /// Equity baseline tracker feeding the daily and peak drawdown breakers.
+    pub fn equity_guard(&self) -> &Arc<EquityGuard> {
+        &self.equity_guard
     }
 }

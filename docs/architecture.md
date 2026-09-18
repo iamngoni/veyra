@@ -178,13 +178,16 @@ Four independent controls, each of which can only reduce activity:
 | Risk gate (deterministic code) | Mint the only executable `TradeIntent` | Be influenced by model confidence; it never fetches state itself |
 | Arming switches (`VEYRA_TRADING_ENABLED`, EA `InAllowLiveOrders`) | Authorise real money | Trade alone: with either off, the command is refused or dry-runs |
 
-The gate evaluates one draft in a fixed order: **kill switch → instrument allowlist → UTC session window → per-order volume cap → account facts available and connected → trading permission → open-order cap → total-exposure cap → duplicate suppression**. Rejections carry stable codes (`kill_switch`, `symbol_not_allowed`, `session_closed`, `volume_above_limit`, `account_state_unavailable`, `trading_not_allowed`, `order_limit_reached`, `exposure_above_limit`, `duplicate_intent`).
+The gate evaluates one draft in a fixed order: **kill switch → instrument allowlist → built-in entry window (rollover/weekend) → configured session window → per-order volume cap → account facts available and connected → trading permission → daily-loss breaker → peak-drawdown breaker → one position per asset → open-order cap → total-exposure cap → per-trade risk cap → net directional exposure cap → duplicate suppression**. Rejections carry stable codes (`kill_switch`, `symbol_not_allowed`, `market_window_closed`, `session_closed`, `volume_above_limit`, `account_state_unavailable`, `trading_not_allowed`, `daily_loss_limit`, `peak_drawdown_limit`, `symbol_already_open`, `order_limit_reached`, `exposure_above_limit`, `risk_above_limit`, `risk_unverifiable`, `factor_exposure_above_limit`, `duplicate_intent`).
 
 The surrounding guards:
 
 - **Kill switch** — `VEYRA_RISK_KILL_SWITCH=true` rejects every intent.
 - **Symbol allowlist** — `VEYRA_RISK_SYMBOLS`; the default is empty, which approves nothing, so a missing setting cannot widen behaviour.
 - **One position per asset.** The gate rejects an open intent for any symbol that already appears in the latest validated snapshot's position list (manual or Veyra-owned), so the book cannot stack two positions on one instrument.
+- **Per-trade risk cap** — `VEYRA_RISK_MAX_RISK_PERCENT` (default 12): a draft's stop distance is converted to money through pip value and the caller's reference prices, and anything risking more than that share of equity is rejected (`risk_above_limit`). When a price is known but the instrument cannot be valued (a cross or metal), the gate fails closed (`risk_unverifiable`); without any price the check cannot run and the exposure caps stay binding.
+- **Drawdown breakers** — `VEYRA_RISK_MAX_DAILY_LOSS_PERCENT` (default 10, below the UTC day's opening equity) and `VEYRA_RISK_MAX_PEAK_DRAWDOWN_PERCENT` (default 25, below the highest equity since startup). Both refuse *new* risk (`daily_loss_limit`, `peak_drawdown_limit`) while stops and reviews keep running. Baselines live in memory, so a restart re-baselines.
+- **Net directional cap** — `VEYRA_RISK_MAX_NET_FACTOR_LOTS` (default 0.01): the gate sums signed USD exposure across open positions and the draft, so long EURUSD plus long USDJPY is one bet, not two (`factor_exposure_above_limit`). Opposing directions offset.
 - **Bounded model budget** — `BudgetedEngine` wraps whatever engine a provider builds; `VEYRA_MODEL_MAX_CALLS_PER_HOUR` / `_PER_DAY` (0 = unlimited, the default) refuse calls past a fixed window, and `/status` reports usage against the caps.
 - **Duplicate window** — `VEYRA_RISK_DUPLICATE_WINDOW_SECS` (default 60) suppresses an identical approved draft.
 - **Missing or stale state rejects.** No fresh link report or no connected terminal means `account_state_unavailable`, not an assumption.
@@ -230,7 +233,7 @@ The surrounding guards:
 | New symbols | `VEYRA_RISK_SYMBOLS` + `VEYRA_AUTOPILOT_SYMBOLS` (up to 8, comma-separated; `VEYRA_AUTOPILOT_SYMBOL` remains the single-symbol form); no code change |
 | New timeframe | `VEYRA_AUTOPILOT_TIMEFRAME`; update the console's fixed H4 call in `console/src/lib/api.ts` if the UI should follow |
 | More positions | `VEYRA_RISK_MAX_OPEN_ORDERS` and `VEYRA_RISK_MAX_TOTAL_LOTS`, plus the candidate menu in `VEYRA_AUTOPILOT_SYMBOLS`/`VEYRA_RISK_SYMBOLS`; the AI chooses at most one instrument per tick and skips unsuitable ones, one position per asset is enforced by the gate |
-| New risk limit | `risk/mod.rs` (policy parse + `summary`) and `risk/gate.rs` (fixed check order), plus the gate tests |
+| New risk limit | `risk/mod.rs` (policy parse + `summary`) and `risk/gate.rs` (fixed check order), plus gate tests; valuation maths lives in `risk/valuation.rs` and the equity baselines in `risk/guard.rs` |
 | New terminal command | `broker/command.rs` (`CommandKind`, request/payload types, validation), `broker/ea.rs` (wire mapping + ack handling), `ea/VeyraProbe.mq4`, and the caller in `control.rs`/`autopilot.rs` |
 | Console behaviour | `console/src/components/veyra.tsx`, typed client `console/src/lib/api.ts`, feed hooks `console/src/lib/hooks.ts`, formatting rules `console/src/lib/format.ts` |
 | Log capture and tail | Buffer and level parsing in `logs.rs`, tracing tee in `observability.rs`, route contract in `routes.rs` (`GET /logs`), console panel in `console/src/components/veyra.tsx` |

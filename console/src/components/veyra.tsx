@@ -318,6 +318,27 @@ export function RiskPanel({ policy, status }: { policy?: RiskPolicy; status?: St
         <Field label="Max total" value={policy ? `${policy.maxTotalLots} lots` : '—'} />
         <Field label="Max open" value={policy?.maxOpenOrders ?? '—'} />
         <Field label="Duplicates" value={policy ? `${policy.duplicateWindowSecs}s window` : '—'} />
+        <Field
+          label="Max risk"
+          value={policy ? (policy.maxRiskPercent > 0 ? `${policy.maxRiskPercent}% / trade` : 'off') : '—'}
+        />
+        <Field
+          label="Brakes"
+          value={
+            policy
+              ? [
+                  policy.maxDailyLossPercent > 0 ? `day ${policy.maxDailyLossPercent}%` : null,
+                  policy.maxPeakDrawdownPercent > 0 ? `peak ${policy.maxPeakDrawdownPercent}%` : null,
+                ]
+                  .filter(Boolean)
+                  .join(' · ') || 'off'
+              : '—'
+          }
+        />
+        <Field
+          label="Net USD"
+          value={policy ? (policy.maxNetFactorLots > 0 ? `${policy.maxNetFactorLots} lots` : 'off') : '—'}
+        />
         <Field label="Session UTC" value={policy?.sessionUtc ?? 'always open'} />
         <Field
           label="Execution"

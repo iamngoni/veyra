@@ -14,7 +14,6 @@ use serde_json::json;
 use tracing::Level;
 
 use crate::AppState;
-use crate::broker::BrokerRuntime;
 use crate::logs::parse_level;
 use crate::risk::{AccountFacts, RiskDecision};
 use crate::trading::TradeIntentDraft;
@@ -254,7 +253,7 @@ pub async fn evaluate_intent(
     state: Data<AppState>,
     draft: web::Json<TradeIntentDraft>,
 ) -> HttpResponse {
-    let account = account_facts(state.broker()).await;
+    let account = account_facts(state.as_ref()).await;
     let decision: RiskDecision =
         state
             .risk()
@@ -266,8 +265,8 @@ pub async fn evaluate_intent(
 /// closed, so a stale heartbeat, a broken link, or a snapshot that has not
 /// landed yet cannot widen behavior. The open-symbol list comes from the
 /// latest validated account snapshot and enforces one position per asset.
-pub(crate) async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<AccountFacts> {
-    let runtime = broker?;
+pub(crate) async fn account_facts(state: &AppState) -> Option<AccountFacts> {
+    let runtime = state.broker()?;
     let report = runtime.link().report().await;
     if !report.fresh {
         return None;
@@ -277,28 +276,77 @@ pub(crate) async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<Acco
         return None;
     }
     let open_orders = snapshot.open_orders();
-    // The symbol list is only needed to enforce one position per asset. With
-    // no orders it is provably empty; with orders, the validated snapshot must
-    // be present and complete or the gate fails closed.
-    let (open_symbols, equity) = match runtime.link().last_account() {
+    // The position list is only needed to enforce one position per asset.
+    // With no orders it is provably empty; with orders, the validated snapshot
+    // must be present and complete or the gate fails closed.
+    let (open_symbols, open_positions, prices, equity) = match runtime.link().last_account() {
         Some(account) if account.positions_truncated => return None,
-        Some(account) => (
-            account
+        Some(account) => {
+            let positions: Vec<crate::risk::valuation::PositionFact> = account
                 .positions
                 .iter()
-                .filter_map(|position| crate::broker::Symbol::parse(&position.symbol).ok())
-                .collect(),
-            Some(account.equity),
-        ),
-        None if open_orders == 0 => (Vec::new(), None),
+                .filter_map(|position| {
+                    let symbol = crate::broker::Symbol::parse(&position.symbol).ok()?;
+                    let side = match position.kind {
+                        crate::broker::PositionKind::Buy
+                        | crate::broker::PositionKind::BuyLimit
+                        | crate::broker::PositionKind::BuyStop
+                        | crate::broker::PositionKind::BuyStopLimit => {
+                            crate::trading::intent::Side::Buy
+                        }
+                        crate::broker::PositionKind::Sell
+                        | crate::broker::PositionKind::SellLimit
+                        | crate::broker::PositionKind::SellStop
+                        | crate::broker::PositionKind::SellStopLimit => {
+                            crate::trading::intent::Side::Sell
+                        }
+                    };
+                    Some(crate::risk::valuation::PositionFact {
+                        symbol,
+                        side,
+                        lots: position.lots,
+                    })
+                })
+                .collect();
+            let open_symbols = positions
+                .iter()
+                .map(|position| position.symbol.clone())
+                .collect();
+            let prices = account
+                .positions
+                .iter()
+                .filter(|position| position.current > 0.0)
+                .filter_map(|position| {
+                    Some((
+                        crate::broker::Symbol::parse(&position.symbol).ok()?,
+                        position.current,
+                    ))
+                })
+                .collect();
+            (open_symbols, positions, prices, Some(account.equity))
+        }
+        None if open_orders == 0 => (Vec::new(), Vec::new(), Vec::new(), None),
         None => return None,
+    };
+    let (day_drawdown_percent, peak_drawdown_percent) = match equity {
+        Some(equity) => {
+            let drawdowns = state
+                .equity_guard()
+                .observe(equity, std::time::SystemTime::now());
+            (Some(drawdowns.day_percent), Some(drawdowns.peak_percent))
+        }
+        None => (None, None),
     };
     Some(AccountFacts {
         trade_allowed: snapshot.trade_allowed(),
         open_orders,
         open_lots: snapshot.open_lots(),
         open_symbols,
+        open_positions,
+        prices,
         equity,
+        day_drawdown_percent,
+        peak_drawdown_percent,
     })
 }
 

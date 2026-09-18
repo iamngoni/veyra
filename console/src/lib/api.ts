@@ -49,6 +49,14 @@ export type RiskPolicy = {
   maxOpenOrders: number
   duplicateWindowSecs: number
   sessionUtc: string | null
+  /** Per-trade risk cap as a percentage of equity (0 disables). */
+  maxRiskPercent: number
+  /** Daily-loss breaker, percent below the day's opening equity. */
+  maxDailyLossPercent: number
+  /** Peak-drawdown breaker, percent below the lifetime peak. */
+  maxPeakDrawdownPercent: number
+  /** Cap on net USD-directional exposure in lots (0 disables). */
+  maxNetFactorLots: number
 }
 
 export type Metrics = {

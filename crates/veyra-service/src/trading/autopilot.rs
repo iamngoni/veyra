@@ -450,7 +450,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         .join(",");
     tracing::Span::current().record("symbols", menu.as_str());
 
-    let Some(account) = crate::routes::account_facts(Some(broker)).await else {
+    let Some(account) = crate::routes::account_facts(state).await else {
         return TickOutcome::Skipped {
             reason: "account_unavailable",
         };
@@ -492,6 +492,9 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         record(state, "unavailable", None, None, Some(&reason)).await;
         return TickOutcome::Unavailable { reason };
     }
+    // The tick's own last closes value stop distances for candidates that have
+    // no open position to quote from.
+    let account = with_reference_prices(account, &markets);
 
     // Calibrated judgements per candidate. They are advisory inputs, but a
     // configured judge that fails still aborts the tick: no model call runs on
@@ -824,6 +827,24 @@ fn candidate_symbols(configured: &[Symbol], managed: &[ManagedPosition]) -> Vec<
         }
     }
     symbols
+}
+
+/// Adds the tick's last closes to the facts so the gate can value drafts for
+/// instruments without an open position.
+fn with_reference_prices(
+    mut account: AccountFacts,
+    markets: &[(Symbol, CandleSeries)],
+) -> AccountFacts {
+    for (symbol, series) in markets {
+        let Some(last) = series.last() else {
+            continue;
+        };
+        match account.prices.iter_mut().find(|(known, _)| known == symbol) {
+            Some((_, price)) => *price = last.close(),
+            None => account.prices.push((symbol.clone(), last.close())),
+        }
+    }
+    account
 }
 
 /// Series for one symbol from this tick's fetched markets.

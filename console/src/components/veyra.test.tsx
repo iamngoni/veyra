@@ -65,6 +65,10 @@ const status: Status = {
     maxOpenOrders: 1,
     duplicateWindowSecs: 60,
     sessionUtc: null,
+    maxRiskPercent: 12,
+    maxDailyLossPercent: 10,
+    maxPeakDrawdownPercent: 25,
+    maxNetFactorLots: 0.01,
   },
 }
 
@@ -274,6 +278,22 @@ describe('RiskPanel', () => {
     expect(screen.getByText('switch on')).toBeTruthy()
     expect(screen.getByText('armed')).toBeTruthy()
     expect(screen.getByText('always open')).toBeTruthy()
+  })
+
+  it('shows disabled valuation limits explicitly', () => {
+    render(
+      <RiskPanel
+        policy={{
+          ...status.risk_policy,
+          maxRiskPercent: 0,
+          maxDailyLossPercent: 0,
+          maxPeakDrawdownPercent: 0,
+          maxNetFactorLots: 0,
+        }}
+        status={status}
+      />,
+    )
+    expect(screen.getAllByText('off').length).toBeGreaterThanOrEqual(3)
   })
 
   it('renders the kill switch and missing policy', () => {

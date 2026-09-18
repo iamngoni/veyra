@@ -10,6 +10,8 @@
 //! is configured.
 
 pub mod gate;
+pub mod guard;
+pub mod valuation;
 pub mod window;
 
 pub use gate::{AccountFacts, RiskCode, RiskDecision, RiskGate, RiskRejection};
@@ -31,11 +33,23 @@ const MAX_OPEN_ORDERS_CEILING: u32 = 1_000;
 const MAX_DUPLICATE_WINDOW_SECS: u64 = 86_400;
 /// Largest representable UTC hour.
 const MAX_SESSION_HOUR: u8 = 23;
+/// Default per-trade risk cap as a percentage of equity (0 disables).
+const DEFAULT_MAX_RISK_PERCENT: f64 = 12.0;
+/// Default daily-loss breaker as a percentage below the UTC day's opening
+/// equity (0 disables).
+const DEFAULT_MAX_DAILY_LOSS_PERCENT: f64 = 10.0;
+/// Default peak-drawdown breaker as a percentage below the highest equity
+/// since startup (0 disables).
+const DEFAULT_MAX_PEAK_DRAWDOWN_PERCENT: f64 = 25.0;
+/// Default cap on net USD-directional exposure in lots (0 disables).
+const DEFAULT_MAX_NET_FACTOR_LOTS: f64 = 0.01;
 
 const SYMBOLS_RULE: &str = "must list 1-64 comma-separated instrument symbols";
 const VOLUME_RULE: &str = "must be a finite number greater than 0 and at most 100";
 const OPEN_ORDERS_RULE: &str = "must be an integer from 0 through 1000";
 const DUPLICATE_WINDOW_RULE: &str = "must be an integer number of seconds from 0 through 86400";
+const PERCENT_RULE: &str = "must be a number from 0 through 100 (0 disables the check)";
+const FACTOR_LOTS_RULE: &str = "must be a number from 0 through 100 lots (0 disables the check)";
 const SESSION_RULE: &str = "must be `HH-HH` with UTC hours 0-23 and different bounds";
 const KILL_SWITCH_RULE: &str = "must be `true` or `false`";
 
@@ -109,6 +123,10 @@ pub struct RiskPolicy {
     max_open_orders: u32,
     duplicate_window: Duration,
     session: Option<SessionWindow>,
+    max_risk_percent: f64,
+    max_daily_loss_percent: f64,
+    max_peak_drawdown_percent: f64,
+    max_net_factor_lots: f64,
 }
 
 impl RiskPolicy {
@@ -130,7 +148,31 @@ impl RiskPolicy {
             max_open_orders,
             duplicate_window,
             session,
+            // The constructor is the test and embedding baseline: valuation
+            // rules are opt-in. Production configuration (`from_source`)
+            // applies the operational defaults below.
+            max_risk_percent: 0.0,
+            max_daily_loss_percent: 0.0,
+            max_peak_drawdown_percent: 0.0,
+            max_net_factor_lots: 0.0,
         }
+    }
+
+    /// Sets the valuation and breaker limits:
+    /// per-trade risk percent, daily-loss percent, peak-drawdown percent, and
+    /// the net USD-directional lot cap. Zero disables each check.
+    pub fn with_limits(
+        mut self,
+        max_risk_percent: f64,
+        max_daily_loss_percent: f64,
+        max_peak_drawdown_percent: f64,
+        max_net_factor_lots: f64,
+    ) -> Self {
+        self.max_risk_percent = max_risk_percent;
+        self.max_daily_loss_percent = max_daily_loss_percent;
+        self.max_peak_drawdown_percent = max_peak_drawdown_percent;
+        self.max_net_factor_lots = max_net_factor_lots;
+        self
     }
 
     /// Reads optional `VEYRA_RISK_*` variables, applying restrictive defaults.
@@ -232,6 +274,38 @@ impl RiskPolicy {
             Some(raw) => Some(SessionWindow::parse(&raw)?),
         };
 
+        let max_risk_percent = percent(
+            &mut source,
+            "VEYRA_RISK_MAX_RISK_PERCENT",
+            DEFAULT_MAX_RISK_PERCENT,
+        )?;
+        let max_daily_loss_percent = percent(
+            &mut source,
+            "VEYRA_RISK_MAX_DAILY_LOSS_PERCENT",
+            DEFAULT_MAX_DAILY_LOSS_PERCENT,
+        )?;
+        let max_peak_drawdown_percent = percent(
+            &mut source,
+            "VEYRA_RISK_MAX_PEAK_DRAWDOWN_PERCENT",
+            DEFAULT_MAX_PEAK_DRAWDOWN_PERCENT,
+        )?;
+        let max_net_factor_lots = match trimmed(&mut source, "VEYRA_RISK_MAX_NET_FACTOR_LOTS") {
+            None => DEFAULT_MAX_NET_FACTOR_LOTS,
+            Some(raw) => {
+                let value = raw.parse::<f64>().map_err(|_| RiskError {
+                    name: "VEYRA_RISK_MAX_NET_FACTOR_LOTS",
+                    reason: FACTOR_LOTS_RULE,
+                })?;
+                if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                    return Err(RiskError {
+                        name: "VEYRA_RISK_MAX_NET_FACTOR_LOTS",
+                        reason: FACTOR_LOTS_RULE,
+                    });
+                }
+                value
+            }
+        };
+
         Ok(Self::new(
             kill_switch,
             symbols,
@@ -240,6 +314,12 @@ impl RiskPolicy {
             max_open_orders,
             duplicate_window,
             session,
+        )
+        .with_limits(
+            max_risk_percent,
+            max_daily_loss_percent,
+            max_peak_drawdown_percent,
+            max_net_factor_lots,
         ))
     }
 
@@ -278,6 +358,26 @@ impl RiskPolicy {
         self.session
     }
 
+    /// Per-trade risk cap as a percentage of equity; zero disables.
+    pub fn max_risk_percent(&self) -> f64 {
+        self.max_risk_percent
+    }
+
+    /// Daily-loss breaker as a percentage below the day's opening equity.
+    pub fn max_daily_loss_percent(&self) -> f64 {
+        self.max_daily_loss_percent
+    }
+
+    /// Peak-drawdown breaker as a percentage below the lifetime peak.
+    pub fn max_peak_drawdown_percent(&self) -> f64 {
+        self.max_peak_drawdown_percent
+    }
+
+    /// Cap on net USD-directional exposure in lots; zero disables.
+    pub fn max_net_factor_lots(&self) -> f64 {
+        self.max_net_factor_lots
+    }
+
     /// Bounded, non-sensitive snapshot of the effective policy.
     ///
     /// Recorded with the audit trail at startup so a decision can always be
@@ -296,7 +396,11 @@ impl RiskPolicy {
             "duplicateWindowSecs": self.duplicate_window.as_secs(),
             "sessionUtc": self
                 .session
-                .map(|session| format!("{}-{}", session.start_hour(), session.end_hour()))
+                .map(|session| format!("{}-{}", session.start_hour(), session.end_hour())),
+            "maxRiskPercent": self.max_risk_percent,
+            "maxDailyLossPercent": self.max_daily_loss_percent,
+            "maxPeakDrawdownPercent": self.max_peak_drawdown_percent,
+            "maxNetFactorLots": self.max_net_factor_lots
         })
     }
 
@@ -308,7 +412,9 @@ impl RiskPolicy {
 
 impl Default for RiskPolicy {
     /// The restrictive baseline: no instrument allowed, smallest volume, one
-    /// open order, duplicate suppression on, no session restriction.
+    /// open order, duplicate suppression on, no session restriction, and the
+    /// operational valuation limits (per-trade risk 12%, daily loss 10%, peak
+    /// drawdown 25%, 0.01-lot net USD-direction cap).
     fn default() -> Self {
         Self::new(
             false,
@@ -319,6 +425,36 @@ impl Default for RiskPolicy {
             Duration::from_secs(DEFAULT_DUPLICATE_WINDOW_SECS),
             None,
         )
+        .with_limits(
+            DEFAULT_MAX_RISK_PERCENT,
+            DEFAULT_MAX_DAILY_LOSS_PERCENT,
+            DEFAULT_MAX_PEAK_DRAWDOWN_PERCENT,
+            DEFAULT_MAX_NET_FACTOR_LOTS,
+        )
+    }
+}
+
+/// Parses an optional percentage with a default; malformed values fail.
+fn percent(
+    source: &mut impl FnMut(&'static str) -> Option<String>,
+    name: &'static str,
+    default: f64,
+) -> Result<f64, RiskError> {
+    match trimmed(source, name) {
+        None => Ok(default),
+        Some(raw) => {
+            let value = raw.parse::<f64>().map_err(|_| RiskError {
+                name,
+                reason: PERCENT_RULE,
+            })?;
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                return Err(RiskError {
+                    name,
+                    reason: PERCENT_RULE,
+                });
+            }
+            Ok(value)
+        }
     }
 }
 
@@ -408,6 +544,16 @@ mod tests {
         assert_eq!(policy.max_open_orders(), 1);
         assert_eq!(policy.duplicate_window(), Duration::from_secs(60));
         assert_eq!(policy.session(), None);
+        assert_eq!(policy.max_risk_percent(), DEFAULT_MAX_RISK_PERCENT);
+        assert_eq!(
+            policy.max_daily_loss_percent(),
+            DEFAULT_MAX_DAILY_LOSS_PERCENT
+        );
+        assert_eq!(
+            policy.max_peak_drawdown_percent(),
+            DEFAULT_MAX_PEAK_DRAWDOWN_PERCENT
+        );
+        assert_eq!(policy.max_net_factor_lots(), DEFAULT_MAX_NET_FACTOR_LOTS);
         assert!(!policy.allows_symbol(&parse_instrument("EURUSD").expect("symbol")));
         assert_eq!(RiskPolicy::default(), policy);
     }
@@ -422,6 +568,10 @@ mod tests {
             ("VEYRA_RISK_MAX_OPEN_ORDERS", "7"),
             ("VEYRA_RISK_DUPLICATE_WINDOW_SECS", "5"),
             ("VEYRA_RISK_SESSION_HOURS_UTC", "8-17"),
+            ("VEYRA_RISK_MAX_RISK_PERCENT", "3.5"),
+            ("VEYRA_RISK_MAX_DAILY_LOSS_PERCENT", "0"),
+            ("VEYRA_RISK_MAX_PEAK_DRAWDOWN_PERCENT", "40"),
+            ("VEYRA_RISK_MAX_NET_FACTOR_LOTS", "0.05"),
         ]))
         .expect("valid settings");
 
@@ -436,11 +586,15 @@ mod tests {
             policy.session(),
             Some(SessionWindow::parse("8-17").expect("window"))
         );
+        assert_eq!(policy.max_risk_percent(), 3.5);
+        assert_eq!(policy.max_daily_loss_percent(), 0.0, "zero disables");
+        assert_eq!(policy.max_peak_drawdown_percent(), 40.0);
+        assert_eq!(policy.max_net_factor_lots(), 0.05);
     }
 
     #[test]
     fn malformed_settings_are_rejected_by_name() {
-        let cases: [(&'static str, &'static str); 10] = [
+        let cases: [(&'static str, &'static str); 14] = [
             ("VEYRA_RISK_KILL_SWITCH", "yes"),
             ("VEYRA_RISK_SYMBOLS", "not a symbol!,EURUSD"),
             ("VEYRA_RISK_MAX_VOLUME_PER_ORDER", "0"),
@@ -451,6 +605,10 @@ mod tests {
             ("VEYRA_RISK_MAX_OPEN_ORDERS", "1001"),
             ("VEYRA_RISK_DUPLICATE_WINDOW_SECS", "86401"),
             ("VEYRA_RISK_SESSION_HOURS_UTC", "24-3"),
+            ("VEYRA_RISK_MAX_RISK_PERCENT", "101"),
+            ("VEYRA_RISK_MAX_DAILY_LOSS_PERCENT", "soon"),
+            ("VEYRA_RISK_MAX_PEAK_DRAWDOWN_PERCENT", "-1"),
+            ("VEYRA_RISK_MAX_NET_FACTOR_LOTS", "lots"),
         ];
         for (name, value) in cases {
             let error =

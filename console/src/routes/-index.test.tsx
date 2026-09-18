@@ -69,6 +69,10 @@ beforeEach(() => {
       maxOpenOrders: 1,
       duplicateWindowSecs: 60,
       sessionUtc: null,
+      maxRiskPercent: 12,
+      maxDailyLossPercent: 10,
+      maxPeakDrawdownPercent: 25,
+      maxNetFactorLots: 0.01,
     },
   })
   mocks.account.mockResolvedValue({

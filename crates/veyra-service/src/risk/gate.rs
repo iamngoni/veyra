@@ -16,6 +16,7 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
 use super::RiskPolicy;
+use super::valuation::{self, PositionFact};
 use crate::broker::Symbol;
 use crate::trading::intent::{TradeIntent, TradeIntentDraft};
 
@@ -38,8 +39,17 @@ pub struct AccountFacts {
     /// Symbols carrying an open venue order (any magic), from the latest
     /// validated snapshot. Used to enforce one position per asset.
     pub open_symbols: Vec<Symbol>,
+    /// Open positions with side and volume, for net-exposure checks.
+    pub open_positions: Vec<PositionFact>,
+    /// Reference prices the caller can vouch for (venue snapshot `current`
+    /// values plus any market data it holds), used to value draft risk.
+    pub prices: Vec<(Symbol, f64)>,
     /// Account equity reported by the latest validated snapshot, when known.
     pub equity: Option<f64>,
+    /// Percentage below the current UTC day's opening equity, when tracked.
+    pub day_drawdown_percent: Option<f64>,
+    /// Percentage below the highest equity since startup, when tracked.
+    pub peak_drawdown_percent: Option<f64>,
 }
 
 /// Stable rejection codes; additions are backwards-compatible for consumers
@@ -69,6 +79,16 @@ pub enum RiskCode {
     SymbolAlreadyOpen,
     /// The built-in entry window (rollover blackout or weekend guard) is closed.
     MarketWindowClosed,
+    /// The draft's stop risk exceeds the configured per-trade cap.
+    RiskAboveLimit,
+    /// A draft price is known but the risk cannot be valued (unknown pair).
+    RiskUnverifiable,
+    /// Equity is below the daily-loss breaker.
+    DailyLossLimitReached,
+    /// Equity is below the peak-drawdown breaker.
+    PeakDrawdownLimitReached,
+    /// The net directional exposure would exceed the factor cap.
+    FactorExposureAboveLimit,
 }
 
 impl RiskCode {
@@ -86,6 +106,11 @@ impl RiskCode {
             Self::DuplicateIntent => "duplicate_intent",
             Self::SymbolAlreadyOpen => "symbol_already_open",
             Self::MarketWindowClosed => "market_window_closed",
+            Self::RiskAboveLimit => "risk_above_limit",
+            Self::RiskUnverifiable => "risk_unverifiable",
+            Self::DailyLossLimitReached => "daily_loss_limit",
+            Self::PeakDrawdownLimitReached => "peak_drawdown_limit",
+            Self::FactorExposureAboveLimit => "factor_exposure_above_limit",
         }
     }
 
@@ -102,6 +127,15 @@ impl RiskCode {
             }
             Self::MarketWindowClosed => {
                 "the entry window is closed (rollover blackout or weekend guard)"
+            }
+            Self::RiskAboveLimit => "the stop would risk more than the per-trade cap allows",
+            Self::RiskUnverifiable => {
+                "the draft price is known but the instrument cannot be valued"
+            }
+            Self::DailyLossLimitReached => "equity is below the daily-loss breaker",
+            Self::PeakDrawdownLimitReached => "equity is below the peak-drawdown breaker",
+            Self::FactorExposureAboveLimit => {
+                "net directional exposure would exceed the factor cap"
             }
             Self::TradingNotAllowed => "the terminal reports trading is not allowed",
             Self::OrderLimitReached => "the venue already holds the maximum tolerated orders",
@@ -254,6 +288,20 @@ impl RiskGate {
         if !account.trade_allowed {
             return Err(RiskCode::TradingNotAllowed);
         }
+        if self.policy.max_daily_loss_percent() > 0.0
+            && account
+                .day_drawdown_percent
+                .is_some_and(|value| value >= self.policy.max_daily_loss_percent())
+        {
+            return Err(RiskCode::DailyLossLimitReached);
+        }
+        if self.policy.max_peak_drawdown_percent() > 0.0
+            && account
+                .peak_drawdown_percent
+                .is_some_and(|value| value >= self.policy.max_peak_drawdown_percent())
+        {
+            return Err(RiskCode::PeakDrawdownLimitReached);
+        }
         if account
             .open_symbols
             .iter()
@@ -268,6 +316,36 @@ impl RiskGate {
             > self.policy.max_total_lots().value() + EXPOSURE_EPSILON
         {
             return Err(RiskCode::ExposureAboveLimit);
+        }
+        if self.policy.max_risk_percent() > 0.0 && draft.stop_loss().is_some() {
+            let reference = draft
+                .order()
+                .price()
+                .map(|price| price.value())
+                .or_else(|| {
+                    account
+                        .prices
+                        .iter()
+                        .find(|(symbol, _)| symbol == draft.symbol())
+                        .map(|(_, price)| *price)
+                });
+            if let Some(reference) = reference
+                && let Some(equity) = account.equity
+            {
+                match valuation::risk_percent(draft, Some(reference), equity) {
+                    Some(risk) if risk > self.policy.max_risk_percent() + EXPOSURE_EPSILON => {
+                        return Err(RiskCode::RiskAboveLimit);
+                    }
+                    Some(_) => {}
+                    None => return Err(RiskCode::RiskUnverifiable),
+                }
+            }
+        }
+        if self.policy.max_net_factor_lots() > 0.0 {
+            let net = valuation::net_usd_lots(&account.open_positions, draft);
+            if net.abs() > self.policy.max_net_factor_lots() + EXPOSURE_EPSILON {
+                return Err(RiskCode::FactorExposureAboveLimit);
+            }
         }
         Ok(())
     }
@@ -366,6 +444,10 @@ mod tests {
             open_lots,
             open_symbols: Vec::new(),
             equity: Some(1_000.0),
+            open_positions: Vec::new(),
+            prices: Vec::new(),
+            day_drawdown_percent: None,
+            peak_drawdown_percent: None,
         })
     }
 
@@ -407,6 +489,83 @@ mod tests {
             gate.evaluate(&draft(0.1), facts_holding("GBPUSD"), now),
             RiskDecision::Approved(_)
         ));
+    }
+
+    /// Draft with a stop and an explicit side, for valuation tests.
+    fn draft_sided(symbol_name: &str, side: Side, volume: f64, stop: f64) -> TradeIntentDraft {
+        TradeIntentDraft::new(
+            Symbol::parse(symbol_name).expect("symbol"),
+            side,
+            OrderKind::Market,
+            Volume::parse(volume).expect("volume"),
+            Some(Price::parse(stop).expect("stop")),
+            None,
+            None,
+        )
+    }
+
+    /// Buy draft with a stop.
+    fn draft_with_stop(symbol: &str, volume: f64, stop: f64) -> TradeIntentDraft {
+        draft_sided(symbol, Side::Buy, volume, stop)
+    }
+
+    /// Baseline facts with a reference price table and equity.
+    fn facts_priced(prices: &[(&str, f64)]) -> AccountFacts {
+        let mut facts = facts_test(0);
+        facts.prices = prices
+            .iter()
+            .map(|(name, price)| (Symbol::parse(name).expect("symbol"), *price))
+            .collect();
+        facts.equity = Some(1_000.0);
+        facts
+    }
+
+    /// Baseline facts with an open position on the book.
+    fn facts_positioned(symbol_name: &str, side: Side, lots: f64) -> AccountFacts {
+        let mut facts = facts_test(1);
+        let symbol = Symbol::parse(symbol_name).expect("symbol");
+        facts.open_symbols = vec![symbol.clone()];
+        facts.open_positions = vec![PositionFact { symbol, side, lots }];
+        facts.open_lots = lots;
+        facts
+    }
+
+    fn facts_test(open_orders: u32) -> AccountFacts {
+        AccountFacts {
+            trade_allowed: true,
+            open_orders,
+            open_lots: 0.0,
+            open_symbols: Vec::new(),
+            open_positions: Vec::new(),
+            prices: Vec::new(),
+            equity: Some(1_000.0),
+            day_drawdown_percent: None,
+            peak_drawdown_percent: None,
+        }
+    }
+
+    /// Policy with focused limits so one rule can be tested at a time.
+    fn rule_policy(risk: f64, daily: f64, peak: f64, factor: f64) -> RiskGate {
+        RiskGate::new(policy().with_limits(risk, daily, peak, factor))
+    }
+
+    /// Rebuilds a policy with a different allowlist, keeping every limit.
+    fn policy_with_symbols(policy: RiskPolicy, symbols: Vec<Symbol>) -> RiskPolicy {
+        RiskPolicy::new(
+            policy.kill_switch(),
+            symbols,
+            policy.max_volume_per_order(),
+            policy.max_total_lots(),
+            policy.max_open_orders(),
+            policy.duplicate_window(),
+            policy.session(),
+        )
+        .with_limits(
+            policy.max_risk_percent(),
+            policy.max_daily_loss_percent(),
+            policy.max_peak_drawdown_percent(),
+            policy.max_net_factor_lots(),
+        )
     }
 
     /// Facts that already hold an order on `symbol`.
@@ -571,6 +730,10 @@ mod tests {
             open_lots: 0.0,
             open_symbols: Vec::new(),
             equity: Some(1_000.0),
+            open_positions: Vec::new(),
+            prices: Vec::new(),
+            day_drawdown_percent: None,
+            peak_drawdown_percent: None,
         });
         assert_eq!(
             expect_rejection(gate.evaluate(&draft(0.1), closed_account, now)).code(),
@@ -652,6 +815,118 @@ mod tests {
 
         assert!(matches!(
             gate.evaluate(&draft(0.1), facts(0), at(10)),
+            RiskDecision::Approved(_)
+        ));
+    }
+
+    #[test]
+    fn per_trade_risk_rule_rejects_oversized_stops() {
+        let gate = rule_policy(5.0, 0.0, 0.0, 0.0);
+        let priced = facts_priced(&[("EURUSD", 1.12)]);
+        let now = at(10);
+
+        // 0.1 lots, 200-pip stop: $200 on $1,000 = 20% > 5%.
+        let big = draft_with_stop("EURUSD", 0.1, 1.10);
+        assert_eq!(
+            expect_rejection(gate.evaluate(&big, Some(priced.clone()), now)).code(),
+            RiskCode::RiskAboveLimit
+        );
+
+        // 0.01 lots, 20-pip stop: $2 on $1,000 = 0.2% passes.
+        let small = draft_with_stop("EURUSD", 0.01, 1.118);
+        assert!(matches!(
+            gate.evaluate(&small, Some(priced), now),
+            RiskDecision::Approved(_)
+        ));
+
+        // A known price on an unpriceable instrument fails closed.
+        let mut unpriceable_policy = policy().with_limits(5.0, 0.0, 0.0, 0.0);
+        let mut symbols = unpriceable_policy.symbols().to_vec();
+        symbols.push(Symbol::parse("XAUUSD").expect("symbol"));
+        unpriceable_policy = policy_with_symbols(unpriceable_policy, symbols);
+        let unpriceable_gate = RiskGate::new(unpriceable_policy);
+        let gold = draft_with_stop("XAUUSD", 0.1, 1_990.0);
+        assert_eq!(
+            expect_rejection(unpriceable_gate.evaluate(
+                &gold,
+                Some(facts_priced(&[("XAUUSD", 2_000.0)])),
+                now
+            ))
+            .code(),
+            RiskCode::RiskUnverifiable
+        );
+
+        // Without any price the rule cannot run and is skipped; the caps stay
+        // the binding controls.
+        assert!(matches!(
+            gate.evaluate(&big, Some(facts_test(0)), now),
+            RiskDecision::Approved(_)
+        ));
+    }
+
+    #[test]
+    fn drawdown_breakers_reject_new_risk() {
+        let gate = rule_policy(0.0, 10.0, 25.0, 0.0);
+        let now = at(10);
+        let mut facts = facts_test(0);
+
+        facts.day_drawdown_percent = Some(12.0);
+        assert_eq!(
+            expect_rejection(gate.evaluate(&draft(0.1), Some(facts.clone()), now)).code(),
+            RiskCode::DailyLossLimitReached
+        );
+
+        facts.day_drawdown_percent = Some(4.0);
+        facts.peak_drawdown_percent = Some(30.0);
+        assert_eq!(
+            expect_rejection(gate.evaluate(&draft(0.1), Some(facts.clone()), now)).code(),
+            RiskCode::PeakDrawdownLimitReached
+        );
+
+        facts.peak_drawdown_percent = Some(6.0);
+        assert!(matches!(
+            gate.evaluate(&draft(0.1), Some(facts), now),
+            RiskDecision::Approved(_)
+        ));
+    }
+
+    #[test]
+    fn net_factor_cap_blocks_doubling_one_bet() {
+        let now = at(10);
+
+        // Short EURUSD is long USD; a long USDJPY would double the bet.
+        let facts = facts_positioned("EURUSD", Side::Sell, 0.01);
+        let mut both_policy = policy().with_limits(0.0, 0.0, 0.0, 0.01);
+        let mut symbols = both_policy.symbols().to_vec();
+        symbols.push(Symbol::parse("USDJPY").expect("symbol"));
+        both_policy = policy_with_symbols(both_policy, symbols);
+        let both_gate = RiskGate::new(both_policy);
+
+        let jpy = draft_with_stop("USDJPY", 0.01, 155.90);
+        assert_eq!(
+            expect_rejection(both_gate.evaluate(&jpy, Some(facts.clone()), now)).code(),
+            RiskCode::FactorExposureAboveLimit
+        );
+
+        // Selling the JPY pair cancels the USD exposure and passes.
+        let offset = draft_sided("USDJPY", Side::Sell, 0.01, 156.10);
+        assert!(matches!(
+            both_gate.evaluate(&offset, Some(facts), now),
+            RiskDecision::Approved(_)
+        ));
+
+        // A disabled factor cap approves the same doubling draft.
+        let mut disabled_policy = policy().with_limits(0.0, 0.0, 0.0, 0.0);
+        let mut symbols = disabled_policy.symbols().to_vec();
+        symbols.push(Symbol::parse("USDJPY").expect("symbol"));
+        disabled_policy = policy_with_symbols(disabled_policy, symbols);
+        let disabled = RiskGate::new(disabled_policy);
+        assert!(matches!(
+            disabled.evaluate(
+                &jpy,
+                Some(facts_positioned("EURUSD", Side::Sell, 0.01)),
+                now
+            ),
             RiskDecision::Approved(_)
         ));
     }

@@ -773,6 +773,10 @@ mod tests {
             open_lots: 0.0,
             open_symbols: Vec::new(),
             equity: Some(1_000.0),
+            open_positions: Vec::new(),
+            prices: Vec::new(),
+            day_drawdown_percent: None,
+            peak_drawdown_percent: None,
         }
     }
 
