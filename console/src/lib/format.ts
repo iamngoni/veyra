@@ -11,6 +11,7 @@ import type { CommandRecord, FeedEvent } from './api'
 /** Kind → badge classes for the activity feed. Unknown kinds fall back to slate. */
 export const kindTone: Record<string, string> = {
   proposal_evaluated: 'text-violet-300 bg-violet-500/10',
+  agent_tool_called: 'text-fuchsia-300 bg-fuchsia-500/10',
   command_queued: 'text-sky-300 bg-sky-500/10',
   command_completed: 'text-emerald-300 bg-emerald-500/10',
   command_failed: 'text-rose-300 bg-rose-500/10',
@@ -54,6 +55,15 @@ export function payloadSummary(event: FeedEvent): string {
     ].filter(Boolean)
     return parts.join(' · ')
   }
+  if (event.kind === 'agent_tool_called') {
+    const tool = String(payload.tool ?? 'tool')
+    const result = payload.result as Record<string, unknown> | undefined
+    const error = result?.error
+    const decision = result?.decision
+    if (typeof error === 'string') return `${tool} · ${error}`
+    if (typeof decision === 'string') return `${tool} · ${decision}`
+    return tool
+  }
   if (event.kind === 'broker_snapshot') {
     return `orders=${payload.orders} lots=${payload.lots}`
   }
@@ -81,6 +91,10 @@ const FIELD_ORDER = [
   'outcome',
   'rationale',
   'judgements',
+  'tool',
+  'result',
+  'step',
+  'agent_tools',
   'reason',
   'origin',
   'status',

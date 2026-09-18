@@ -38,6 +38,8 @@ pub struct AccountFacts {
     /// Symbols carrying an open venue order (any magic), from the latest
     /// validated snapshot. Used to enforce one position per asset.
     pub open_symbols: Vec<Symbol>,
+    /// Account equity reported by the latest validated snapshot, when known.
+    pub equity: Option<f64>,
 }
 
 /// Stable rejection codes; additions are backwards-compatible for consumers
@@ -65,6 +67,8 @@ pub enum RiskCode {
     DuplicateIntent,
     /// A position is already open on the requested instrument.
     SymbolAlreadyOpen,
+    /// The built-in entry window (rollover blackout or weekend guard) is closed.
+    MarketWindowClosed,
 }
 
 impl RiskCode {
@@ -81,6 +85,7 @@ impl RiskCode {
             Self::ExposureAboveLimit => "exposure_above_limit",
             Self::DuplicateIntent => "duplicate_intent",
             Self::SymbolAlreadyOpen => "symbol_already_open",
+            Self::MarketWindowClosed => "market_window_closed",
         }
     }
 
@@ -94,6 +99,9 @@ impl RiskCode {
             Self::AccountStateUnavailable => "no fresh account state is available",
             Self::SymbolAlreadyOpen => {
                 "a position is already open on this instrument (one position per asset)"
+            }
+            Self::MarketWindowClosed => {
+                "the entry window is closed (rollover blackout or weekend guard)"
             }
             Self::TradingNotAllowed => "the terminal reports trading is not allowed",
             Self::OrderLimitReached => "the venue already holds the maximum tolerated orders",
@@ -187,45 +195,81 @@ impl RiskGate {
         account: Option<AccountFacts>,
         now: SystemTime,
     ) -> RiskDecision {
+        match self.check(draft, account, now) {
+            Err(code) => Self::reject(code),
+            Ok(()) => {
+                if self.suppress_duplicate(draft, now) {
+                    return Self::reject(RiskCode::DuplicateIntent);
+                }
+                RiskDecision::Approved(TradeIntent::approve(draft.clone()))
+            }
+        }
+    }
+
+    /// Non-recording dry run for the agent loop: every deterministic rule
+    /// applies, but the duplicate memory is neither read nor written, so a
+    /// preview can never consume the single approval a draft gets.
+    pub fn preview(
+        &self,
+        draft: &TradeIntentDraft,
+        account: Option<AccountFacts>,
+        now: SystemTime,
+    ) -> RiskDecision {
+        match self.check(draft, account, now) {
+            Err(code) => Self::reject(code),
+            Ok(()) => RiskDecision::Approved(TradeIntent::approve(draft.clone())),
+        }
+    }
+
+    /// The stateless half of [`RiskGate::evaluate`]: every rule except the
+    /// duplicate window.
+    fn check(
+        &self,
+        draft: &TradeIntentDraft,
+        account: Option<AccountFacts>,
+        now: SystemTime,
+    ) -> Result<(), RiskCode> {
         if self.policy.kill_switch() {
-            return Self::reject(RiskCode::KillSwitch);
+            return Err(RiskCode::KillSwitch);
         }
         if !self.policy.allows_symbol(draft.symbol()) {
-            return Self::reject(RiskCode::SymbolNotAllowed);
+            return Err(RiskCode::SymbolNotAllowed);
+        }
+        // Built-in calendar guards: rollover blackout and the weekend cutoff.
+        // They run for every venue and cannot be disabled by an empty session.
+        if crate::risk::window::entry_block(now, None).is_some() {
+            return Err(RiskCode::MarketWindowClosed);
         }
         if let Some(window) = self.policy.session()
             && !window.contains(utc_hour(now))
         {
-            return Self::reject(RiskCode::SessionClosed);
+            return Err(RiskCode::SessionClosed);
         }
         if draft.volume().value() > self.policy.max_volume_per_order().value() {
-            return Self::reject(RiskCode::VolumeAboveLimit);
+            return Err(RiskCode::VolumeAboveLimit);
         }
         let Some(account) = account else {
-            return Self::reject(RiskCode::AccountStateUnavailable);
+            return Err(RiskCode::AccountStateUnavailable);
         };
         if !account.trade_allowed {
-            return Self::reject(RiskCode::TradingNotAllowed);
+            return Err(RiskCode::TradingNotAllowed);
         }
         if account
             .open_symbols
             .iter()
             .any(|open| open == draft.symbol())
         {
-            return Self::reject(RiskCode::SymbolAlreadyOpen);
+            return Err(RiskCode::SymbolAlreadyOpen);
         }
         if account.open_orders >= self.policy.max_open_orders() {
-            return Self::reject(RiskCode::OrderLimitReached);
+            return Err(RiskCode::OrderLimitReached);
         }
         if account.open_lots + draft.volume().value()
             > self.policy.max_total_lots().value() + EXPOSURE_EPSILON
         {
-            return Self::reject(RiskCode::ExposureAboveLimit);
+            return Err(RiskCode::ExposureAboveLimit);
         }
-        if self.suppress_duplicate(draft, now) {
-            return Self::reject(RiskCode::DuplicateIntent);
-        }
-        RiskDecision::Approved(TradeIntent::approve(draft.clone()))
+        Ok(())
     }
 
     fn reject(code: RiskCode) -> RiskDecision {
@@ -321,7 +365,33 @@ mod tests {
             open_orders,
             open_lots,
             open_symbols: Vec::new(),
+            equity: Some(1_000.0),
         })
+    }
+
+    #[test]
+    fn rollover_and_weekend_windows_reject_entries() {
+        let gate = RiskGate::new(policy());
+        // Thursday 2026-01-08 21:00 UTC: inside the rollover blackout.
+        let rollover = UNIX_EPOCH + Duration::from_secs(1_767_906_000);
+        assert_eq!(
+            expect_rejection(gate.evaluate(&draft(0.1), facts(0), rollover)).code(),
+            RiskCode::MarketWindowClosed
+        );
+
+        // Friday 2026-01-09 20:00 UTC: past the weekend entry cutoff.
+        let friday_evening = UNIX_EPOCH + Duration::from_secs(1_767_988_800);
+        assert_eq!(
+            expect_rejection(gate.evaluate(&draft(0.1), facts(0), friday_evening)).code(),
+            RiskCode::MarketWindowClosed
+        );
+
+        // Wednesday midday remains open.
+        let wednesday = UNIX_EPOCH + Duration::from_secs(1_767_787_200);
+        assert!(matches!(
+            gate.evaluate(&draft(0.1), facts(0), wednesday),
+            RiskDecision::Approved(_)
+        ));
     }
 
     #[test]
@@ -500,6 +570,7 @@ mod tests {
             open_orders: 0,
             open_lots: 0.0,
             open_symbols: Vec::new(),
+            equity: Some(1_000.0),
         });
         assert_eq!(
             expect_rejection(gate.evaluate(&draft(0.1), closed_account, now)).code(),

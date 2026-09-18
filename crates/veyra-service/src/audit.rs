@@ -36,6 +36,8 @@ pub enum AuditKind {
     ProposalEvaluated,
     /// A Veyra-managed position disappeared from the book (closed at the venue).
     PositionClosed,
+    /// The decision loop executed one read-only tool for the model.
+    AgentToolCalled,
 }
 
 impl AuditKind {
@@ -50,6 +52,7 @@ impl AuditKind {
             Self::ReconciliationDrift => "reconciliation_drift",
             Self::ProposalEvaluated => "proposal_evaluated",
             Self::PositionClosed => "position_closed",
+            Self::AgentToolCalled => "agent_tool_called",
         }
     }
 }

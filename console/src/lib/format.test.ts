@@ -39,6 +39,21 @@ describe('payloadSummary', () => {
     )
   })
 
+  it('summarises agent tool calls with their outcome', () => {
+    expect(
+      payloadSummary(
+        event('agent_tool_called', { tool: 'get_judgements', result: { direction: 'long' } }),
+      ),
+    ).toBe('get_judgements')
+    expect(
+      payloadSummary(event('agent_tool_called', { tool: 'get_market', result: { error: 'outside allowlist' } })),
+    ).toBe('get_market · outside allowlist')
+    expect(
+      payloadSummary(event('agent_tool_called', { tool: 'check_risk', result: { decision: 'rejected' } })),
+    ).toBe('check_risk · rejected')
+    expect(payloadSummary(event('agent_tool_called', {}))).toBe('tool')
+  })
+
   it('falls back to the raw payload JSON', () => {
     expect(payloadSummary(event('service_started', { version: '0.1.0' }))).toBe('{"version":"0.1.0"}')
   })
@@ -80,14 +95,14 @@ describe('detailRows', () => {
     })
     expect(rows.map((row) => row.label)).toEqual([
       'outcome',
+      'result',
       'stop loss',
       'empty',
       'enabled',
       'note',
-      'result',
       'zeta',
     ])
-    expect(rows.map((row) => row.value)).toEqual(['held', '1.085', '—', 'true', '—', '{"lots":1}', 'last'])
+    expect(rows.map((row) => row.value)).toEqual(['held', '{"lots":1}', '1.085', '—', 'true', '—', 'last'])
   })
 
   it('shows the rationale directly after the outcome', () => {

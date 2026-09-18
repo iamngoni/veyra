@@ -6,6 +6,7 @@
 //! to the single staged execution path (which still requires both operator
 //! controls).
 
+pub mod agent;
 pub mod autopilot;
 pub mod intent;
 pub mod pipeline;

@@ -77,6 +77,12 @@ pub enum PipelineError {
         /// Non-sensitive parser explanation.
         reason: String,
     },
+    /// The decision loop hit a step or tool-call bound.
+    #[error("agent decision loop limit: {reason}")]
+    AgentLoopLimit {
+        /// Non-sensitive explanation.
+        reason: String,
+    },
 }
 
 /// Longest rationale kept in the journal; longer answers are truncated.
@@ -147,12 +153,28 @@ pub async fn evaluate_proposal(
         })
         .await?;
 
-    let mut normalized = normalize_proposal(answer.value);
+    evaluate_answer(answer.value, gate, account, now)
+}
+
+/// Evaluates one already-structured model answer: the pure half of
+/// [`evaluate_proposal`], shared with the agent decision loop.
+///
+/// # Errors
+/// Returns [`PipelineError::InvalidProposal`] when the answer violates the
+/// intent contract.
+pub fn evaluate_answer(
+    value: serde_json::Value,
+    gate: &RiskGate,
+    account: Option<AccountFacts>,
+    now: SystemTime,
+) -> Result<ProposalEvaluation, PipelineError> {
+    let mut normalized = normalize_proposal(value);
     let rationale = parse_rationale(&normalized);
-    // The rationale is journal metadata, not part of the intent contract;
-    // `TradeProposal` stays strict, so remove it before parsing.
+    // Rationale and loop-only keys are journal metadata, not part of the
+    // intent contract; `TradeProposal` stays strict, so strip them first.
     if let Some(object) = normalized.as_object_mut() {
         object.remove("rationale");
+        object.remove("tool");
     }
     let proposal: TradeProposal =
         serde_json::from_value(normalized).map_err(|error| PipelineError::InvalidProposal {
@@ -304,6 +326,7 @@ mod tests {
             open_orders: 0,
             open_lots: 0.0,
             open_symbols: Vec::new(),
+            equity: Some(1_000.0),
         })
     }
 

@@ -47,10 +47,11 @@ use crate::jev::{
     ScoreLevels, State as JevState,
 };
 use crate::market::{Candle, CandleRequest, CandleSeries, Timeframe};
-use crate::model::{AnswerFormat, ModelTier};
+use crate::model::ModelTier;
 use crate::risk::AccountFacts;
+use crate::trading::agent::{self, AgentDecision, AgentMode, AgentSession};
 use crate::trading::intent::TradeIntentDraft;
-use crate::trading::pipeline::{PipelineOutcome, evaluate_proposal};
+use crate::trading::pipeline::{PipelineError, PipelineOutcome};
 
 /// Default proposal cadence in seconds.
 const DEFAULT_INTERVAL_SECS: u64 = 300;
@@ -535,13 +536,23 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     if let Some(position) = next_review_position(&managed, state.rotation())
         && let Some(series) = series_for_symbol(&markets, &position.symbol)
     {
+        let engine = model.engine();
+        let session = AgentSession {
+            state,
+            engine: engine.as_ref(),
+            mode: AgentMode::Review,
+            markets: &markets,
+            account: &account,
+            judgements: &judgements,
+            tier: settings.tier(),
+            now: SystemTime::now(),
+        };
         let outcome = review_positions(
             state,
             settings,
-            model,
+            &session,
             series,
             std::slice::from_ref(&position),
-            judgement_for_symbol(&judgements, series.symbol().as_str()),
         )
         .await;
         if !matches!(outcome, TickOutcome::Held) {
@@ -563,23 +574,37 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     } else {
         let input = proposal_input(&markets, &judgements, &account, &managed);
         let instructions = proposal_instructions(state, &markets, &account);
-        match evaluate_proposal(
-            model.engine().as_ref(),
-            state.risk(),
-            instructions,
-            input,
-            settings.tier(),
-            Some(account.clone()),
-            SystemTime::now(),
-        )
-        .await
-        {
+        let engine = model.engine();
+        let session = AgentSession {
+            state,
+            engine: engine.as_ref(),
+            mode: AgentMode::Proposal,
+            markets: &markets,
+            account: &account,
+            judgements: &judgements,
+            tier: settings.tier(),
+            now: SystemTime::now(),
+        };
+        match agent::run(&session, &instructions, &input).await {
             Err(error) => {
-                let reason = format!("model unavailable: {error}");
+                let reason = match error {
+                    PipelineError::AgentLoopLimit { reason } => format!("agent loop: {reason}"),
+                    other => format!("model unavailable: {other}"),
+                };
                 record(state, "unavailable", None, None, Some(&reason)).await;
                 TickOutcome::Unavailable { reason }
             }
-            Ok(evaluation) => {
+            Ok(outcome) => {
+                let AgentDecision::Proposal(evaluation) = outcome.decision else {
+                    let reason = "agent returned a review for an entry decision".to_owned();
+                    record(state, "unavailable", None, None, Some(&reason)).await;
+                    return TickOutcome::Unavailable { reason };
+                };
+                let tool_names: Vec<String> = outcome
+                    .tool_calls
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect();
                 let rationale = evaluation.rationale.as_deref();
                 match evaluation.outcome {
                     PipelineOutcome::NoTrade => {
@@ -594,6 +619,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                             DecisionContext {
                                 rationale,
                                 judgements: None,
+                                tool_names: Some(&tool_names),
                             },
                         )
                         .await;
@@ -612,6 +638,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                             DecisionContext {
                                 rationale,
                                 judgements: judgement_for_symbol(&judgements, symbol.as_str()),
+                                tool_names: Some(&tool_names),
                             },
                         )
                         .await;
@@ -625,6 +652,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                         let context = DecisionContext {
                             rationale,
                             judgements: judgement_for_symbol(&judgements, symbol.as_str()),
+                            tool_names: Some(&tool_names),
                         };
                         if draft.stop_loss().is_none() || draft.take_profit().is_none() {
                             record_event_context(
@@ -1039,7 +1067,7 @@ fn position_age_secs(server_time: i64, opened_at: i64) -> Option<u64> {
 
 /// The reviewer's parsed decision.
 #[derive(Debug, Clone, PartialEq)]
-enum ReviewDecision {
+pub(crate) enum ReviewDecision {
     /// Keep the position and its bracket.
     Hold,
     /// Flatten the given ticket.
@@ -1047,7 +1075,7 @@ enum ReviewDecision {
 }
 
 /// Parses the constrained review answer.
-fn parse_review(value: &serde_json::Value) -> Result<ReviewDecision, String> {
+pub(crate) fn parse_review(value: &serde_json::Value) -> Result<ReviewDecision, String> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Answer {
@@ -1071,59 +1099,25 @@ fn parse_review(value: &serde_json::Value) -> Result<ReviewDecision, String> {
     }
 }
 
-/// Schema the reviewer answers with.
-fn review_format() -> AnswerFormat {
-    AnswerFormat {
-        name: "veyra_position_review".to_owned(),
-        schema: json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["action"],
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["hold", "close"],
-                    "description": "hold keeps the entry bracket; close flattens the ticket now"
-                },
-                "ticket": {
-                    "type": ["integer", "null"],
-                    "description": "the position to close; required when action is close"
-                },
-                "rationale": {
-                    "type": ["string", "null"],
-                    "maxLength": 280,
-                    "description": "Short operator-facing explanation of the decision. Always include it."
-                }
-            }
-        }),
-    }
-}
-
 /// Reviews the open managed position: hold, or close when the entry thesis no
 /// longer holds.
 async fn review_positions(
     state: &AppState,
     settings: &AutopilotSettings,
-    model: &crate::model::ModelRuntime,
+    session: &AgentSession<'_>,
     series: &CandleSeries,
     positions: &[ManagedPosition],
-    judgements: Option<&Value>,
 ) -> TickOutcome {
+    let judgements = judgement_for_symbol(session.judgements, series.symbol().as_str());
     let instructions = review_instructions(series, positions);
     let input = review_input(state, series, positions, judgements);
-    let answer = match model
-        .engine()
-        .answer(crate::model::DecisionRequest {
-            instructions,
-            input,
-            format: review_format(),
-            tier: settings.tier(),
-        })
-        .await
-    {
-        Ok(answer) => answer,
+    let outcome = match agent::run(session, &instructions, &input).await {
+        Ok(outcome) => outcome,
         Err(error) => {
-            let reason = format!("model unavailable: {error}");
+            let reason = match error {
+                PipelineError::AgentLoopLimit { reason } => format!("agent loop: {reason}"),
+                other => format!("model unavailable: {other}"),
+            };
             record(
                 state,
                 "unavailable",
@@ -1136,22 +1130,26 @@ async fn review_positions(
         }
     };
 
-    let rationale = crate::trading::pipeline::parse_rationale(&answer.value);
+    let tool_names: Vec<String> = outcome
+        .tool_calls
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
     let context = DecisionContext {
-        rationale: rationale.as_deref(),
+        rationale: outcome.rationale.as_deref(),
         judgements,
+        tool_names: Some(&tool_names),
     };
-
-    let decision = match parse_review(&answer.value) {
-        Ok(decision) => decision,
-        Err(reason) => {
+    let decision = match outcome.decision {
+        AgentDecision::Review(decision) => decision,
+        AgentDecision::Proposal(_) => {
             record_position_context(
                 state,
                 "close_rejected",
                 "autopilot_review",
                 series,
                 None,
-                Some(&reason),
+                Some("agent returned a proposal for a review"),
                 None,
                 context,
             )
@@ -1411,7 +1409,7 @@ fn review_instructions(series: &CandleSeries, positions: &[ManagedPosition]) -> 
         "You are the analyst for Veyra, a single-instrument trading bot. Your open {symbol}          {timeframe} position(s) (ticket(s) {tickets}) were entered by this bot with a stop loss          and take profit attached.
          Decide for the reported position: `hold` keeps the entry bracket and lets the plan play          out; `close` flattens the ticket now because the thesis that justified the entry is no          longer supported by the latest candles and judgements.
          Closing costs the spread and abandons the bracket, so hold unless the evidence has          genuinely shifted; do not close merely because the position shows a small loss — the          attached stop defines the risk.
-         Answer with the provided schema only, including the ticket when you close, and a short `rationale` (a sentence or two, at most 280 characters) explaining the decision.",
+         Answer with the provided schema only, including the ticket when you close, and a short `rationale` (a sentence or two, at most 280 characters) explaining the decision. Before answering you may call read-only tools: get_market(symbol, timeframe?, bars?), get_judgements(symbol), get_account(), get_positions(), and get_market_window(). Call a tool only when its result would change your decision.",
         symbol = series.symbol().as_str(),
         timeframe = series.timeframe().as_str(),
         tickets = tickets.join(", ")
@@ -1491,6 +1489,8 @@ fn review_input(
 struct DecisionContext<'a> {
     rationale: Option<&'a str>,
     judgements: Option<&'a Value>,
+    /// Read-only agent tools used before this decision, in call order.
+    tool_names: Option<&'a [String]>,
 }
 
 /// Records one review decision with the model's rationale and judgements.
@@ -1577,6 +1577,12 @@ async fn record_symbol_event_context(
     }
     if let Some(judgements) = context.judgements {
         payload["judgements"] = judgements.clone();
+    }
+    if let Some(names) = context.tool_names
+        && !names.is_empty()
+    {
+        payload["agent_tool_calls"] = json!(names.len());
+        payload["agent_tools"] = json!(names);
     }
     audit
         .try_record(AuditEvent::new(AuditKind::ProposalEvaluated, payload))
@@ -1665,6 +1671,12 @@ async fn record_event_context(
     if let Some(judgements) = context.judgements {
         payload["judgements"] = judgements.clone();
     }
+    if let Some(names) = context.tool_names
+        && !names.is_empty()
+    {
+        payload["agent_tool_calls"] = json!(names.len());
+        payload["agent_tools"] = json!(names);
+    }
     audit
         .try_record(AuditEvent::new(AuditKind::ProposalEvaluated, payload))
         .await;
@@ -1672,7 +1684,10 @@ async fn record_event_context(
 
 /// Asks the judgement engine for calibrated answers over the same market
 /// state, returning a compact JSON summary for the model input.
-async fn judgements_for(jev: &JevRuntime, series: &CandleSeries) -> Result<Value, String> {
+pub(crate) async fn judgements_for(
+    jev: &JevRuntime,
+    series: &CandleSeries,
+) -> Result<Value, String> {
     let state = JevState::text(&market_narrative(series)).map_err(|error| error.to_string())?;
     let instructions = |text: &str| Instructions::text(text).map_err(|error| error.to_string());
 
@@ -1869,7 +1884,7 @@ fn proposal_instructions(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles and optional calibrated judgements; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal.",
+        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles and optional calibrated judgements; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: get_judgements(symbol) for calibrated probabilities, get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
         menu = menu,
         timeframe = markets
             .first()
@@ -1883,7 +1898,7 @@ fn proposal_instructions(
 }
 
 /// Highest candle high across the window.
-fn window_high(series: &CandleSeries) -> f64 {
+pub(crate) fn window_high(series: &CandleSeries) -> f64 {
     series
         .candles()
         .iter()
@@ -1892,7 +1907,7 @@ fn window_high(series: &CandleSeries) -> f64 {
 }
 
 /// Lowest candle low across the window.
-fn window_low(series: &CandleSeries) -> f64 {
+pub(crate) fn window_low(series: &CandleSeries) -> f64 {
     series
         .candles()
         .iter()
@@ -1902,7 +1917,7 @@ fn window_low(series: &CandleSeries) -> f64 {
 
 /// Percentage change from the first to the last close, rounded to four
 /// decimals to keep the model input compact.
-fn change_pct(series: &CandleSeries) -> f64 {
+pub(crate) fn change_pct(series: &CandleSeries) -> f64 {
     match (series.candles().first(), series.last()) {
         (Some(first), Some(last)) if first.close() > 0.0 => {
             let change = (last.close() - first.close()) / first.close() * 100.0;
@@ -1980,7 +1995,9 @@ mod tests {
         }
 
         async fn answer(&self, request: DecisionRequest) -> Result<DecisionAnswer, ModelError> {
-            let is_review = request.format.name == "veyra_position_review";
+            let is_review = request.format.schema["properties"]["action"]["enum"]
+                .as_array()
+                .is_some_and(|actions| actions.iter().any(|action| action == "hold"));
             self.seen.lock().expect("lock").push(request);
             let selected = if is_review {
                 self.review.as_ref().or(self.answer.as_ref())

@@ -280,14 +280,17 @@ pub(crate) async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<Acco
     // The symbol list is only needed to enforce one position per asset. With
     // no orders it is provably empty; with orders, the validated snapshot must
     // be present and complete or the gate fails closed.
-    let open_symbols = match runtime.link().last_account() {
+    let (open_symbols, equity) = match runtime.link().last_account() {
         Some(account) if account.positions_truncated => return None,
-        Some(account) => account
-            .positions
-            .iter()
-            .filter_map(|position| crate::broker::Symbol::parse(&position.symbol).ok())
-            .collect(),
-        None if open_orders == 0 => Vec::new(),
+        Some(account) => (
+            account
+                .positions
+                .iter()
+                .filter_map(|position| crate::broker::Symbol::parse(&position.symbol).ok())
+                .collect(),
+            Some(account.equity),
+        ),
+        None if open_orders == 0 => (Vec::new(), None),
         None => return None,
     };
     Some(AccountFacts {
@@ -295,6 +298,7 @@ pub(crate) async fn account_facts(broker: Option<&BrokerRuntime>) -> Option<Acco
         open_orders,
         open_lots: snapshot.open_lots(),
         open_symbols,
+        equity,
     })
 }
 

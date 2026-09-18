@@ -10,6 +10,7 @@
 //! is configured.
 
 pub mod gate;
+pub mod window;
 
 pub use gate::{AccountFacts, RiskCode, RiskDecision, RiskGate, RiskRejection};
 
