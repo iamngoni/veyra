@@ -839,21 +839,42 @@ mod tests {
             RiskDecision::Approved(_)
         ));
 
-        // A known price on an unpriceable instrument fails closed.
+        // A known price on an unpriceable instrument fails closed: a metal
+        // quoted in a non-USD currency has no conversion path.
         let mut unpriceable_policy = policy().with_limits(5.0, 0.0, 0.0, 0.0);
         let mut symbols = unpriceable_policy.symbols().to_vec();
-        symbols.push(Symbol::parse("XAUUSD").expect("symbol"));
+        symbols.push(Symbol::parse("XAUEUR").expect("symbol"));
         unpriceable_policy = policy_with_symbols(unpriceable_policy, symbols);
         let unpriceable_gate = RiskGate::new(unpriceable_policy);
-        let gold = draft_with_stop("XAUUSD", 0.1, 1_990.0);
+        let euro_gold = draft_with_stop("XAUEUR", 0.1, 3_990.0);
         assert_eq!(
             expect_rejection(unpriceable_gate.evaluate(
-                &gold,
-                Some(facts_priced(&[("XAUUSD", 2_000.0)])),
+                &euro_gold,
+                Some(facts_priced(&[("XAUEUR", 4_000.0)])),
                 now
             ))
             .code(),
             RiskCode::RiskUnverifiable
+        );
+
+        // Gold is priceable now: it passes when the risk fits and is rejected
+        // by the cap when it does not.
+        let mut gold_policy = policy().with_limits(5.0, 0.0, 0.0, 0.0);
+        let mut symbols = gold_policy.symbols().to_vec();
+        symbols.push(Symbol::parse("XAUUSD").expect("symbol"));
+        gold_policy = policy_with_symbols(gold_policy, symbols);
+        let gold_gate = RiskGate::new(gold_policy);
+        let priced_gold = facts_priced(&[("XAUUSD", 4_341.0)]);
+        let tiny = draft_with_stop("XAUUSD", 0.01, 4_340.0);
+        assert!(matches!(
+            gold_gate.evaluate(&tiny, Some(priced_gold.clone()), now),
+            RiskDecision::Approved(_)
+        ));
+        // A $61 gold stop on 1 oz is $61 = 6.1% of $1,000, above the 5% cap.
+        let wide = draft_with_stop("XAUUSD", 0.01, 4_280.0);
+        assert_eq!(
+            expect_rejection(gold_gate.evaluate(&wide, Some(priced_gold), now)).code(),
+            RiskCode::RiskAboveLimit
         );
 
         // Without any price the rule cannot run and is skipped; the caps stay

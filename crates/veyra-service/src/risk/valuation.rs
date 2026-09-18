@@ -19,6 +19,19 @@ const CURRENCIES: [&str; 8] = ["USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", 
 /// One standard lot expressed in units of the base currency.
 const UNITS_PER_LOT: f64 = 100_000.0;
 
+/// Physical contract of one metal instrument per standard lot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MetalSpec {
+    /// Troy ounces (or equivalent units) per standard lot.
+    units_per_lot: f64,
+    /// Price increment this venue quotes as one pip.
+    pip_size: f64,
+    /// Currency the metal is quoted in.
+    quote: &'static str,
+    /// Whether the quote currency is USD.
+    quote_is_usd: bool,
+}
+
 /// One open venue position as the risk rules see it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionFact {
@@ -46,23 +59,60 @@ pub fn currency_pair(symbol: &Symbol) -> Option<(String, String)> {
     }
 }
 
-/// Pip size for a priced pair: JPY quotes quote in hundredths.
-pub fn pip_size(symbol: &Symbol) -> Option<f64> {
-    let (_, quote) = currency_pair(symbol)?;
-    Some(if quote == "JPY" { 0.01 } else { 0.0001 })
+/// Splits `XAUUSD`-style metals into their contract spec when the quote is a
+/// known currency. Other synthetic symbols return `None`.
+fn metal_spec(symbol: &Symbol) -> Option<MetalSpec> {
+    let uppercase = symbol.as_str().to_ascii_uppercase();
+    let core = uppercase.split('.').next().unwrap_or("");
+    if core.len() != 6 || !core.is_ascii() {
+        return None;
+    }
+    let (base, quote) = core.split_at(3);
+    if !CURRENCIES.contains(&quote) {
+        return None;
+    }
+    let (units_per_lot, pip_size) = match base {
+        "XAU" => (100.0, 0.01),
+        "XAG" => (5_000.0, 0.001),
+        _ => return None,
+    };
+    Some(MetalSpec {
+        units_per_lot,
+        pip_size,
+        quote: if quote == "USD" { "USD" } else { "OTHER" },
+        quote_is_usd: quote == "USD",
+    })
 }
 
-/// Value of one pip for one standard lot, in USD.
+/// Pip size for a priced instrument: JPY quotes in hundredths, metals per
+/// their contract convention.
+pub fn pip_size(symbol: &Symbol) -> Option<f64> {
+    if let Some((_, quote)) = currency_pair(symbol) {
+        return Some(if quote == "JPY" { 0.01 } else { 0.0001 });
+    }
+    metal_spec(symbol).map(|metal| metal.pip_size)
+}
+
+/// Value of one pip for one standard lot, in USD. Only USD-quoted and
+/// USD-based instruments are priced; everything else (crosses, non-USD
+/// metals) stays deliberately unpriceable.
 pub fn pip_value_per_lot(symbol: &Symbol, price: f64) -> Option<f64> {
     if !price.is_finite() || price <= 0.0 {
         return None;
     }
-    let (base, quote) = currency_pair(symbol)?;
-    let quote_per_pip = pip_size(symbol)? * UNITS_PER_LOT;
-    if quote == "USD" {
-        Some(quote_per_pip)
-    } else if base == "USD" {
-        Some(quote_per_pip / price)
+    if let Some((base, quote)) = currency_pair(symbol) {
+        let quote_per_pip = pip_size(symbol)? * UNITS_PER_LOT;
+        return if quote == "USD" {
+            Some(quote_per_pip)
+        } else if base == "USD" {
+            Some(quote_per_pip / price)
+        } else {
+            None
+        };
+    }
+    let metal = metal_spec(symbol)?;
+    if metal.quote_is_usd {
+        Some(metal.pip_size * metal.units_per_lot)
     } else {
         None
     }
@@ -98,16 +148,20 @@ pub fn risk_percent(
 }
 
 /// USD direction of one long lot of `symbol`: +1 longs USD, -1 shorts it,
-/// `None` for instruments this model does not classify.
+/// `None` for instruments this model does not classify. USD-quoted metals
+/// behave like the currency pairs: long gold is short dollars.
 fn usd_sign(symbol: &Symbol) -> Option<f64> {
-    let (base, quote) = currency_pair(symbol)?;
-    if quote == "USD" {
-        Some(-1.0)
-    } else if base == "USD" {
-        Some(1.0)
-    } else {
-        None
+    if let Some((base, quote)) = currency_pair(symbol) {
+        return if quote == "USD" {
+            Some(-1.0)
+        } else if base == "USD" {
+            Some(1.0)
+        } else {
+            None
+        };
     }
+    let metal = metal_spec(symbol)?;
+    if metal.quote_is_usd { Some(-1.0) } else { None }
 }
 
 fn side_sign(side: Side) -> f64 {
@@ -188,6 +242,21 @@ mod tests {
         // Crosses stay unpriceable rather than guessed.
         assert_eq!(pip_value_per_lot(&symbol("EURGBP"), 0.86), None);
         assert_eq!(pip_value_per_lot(&symbol("EURUSD"), 0.0), None);
+
+        // Metals use their own contract: 100 oz of gold, 5,000 of silver,
+        // quoted in dollars.
+        let gold = pip_value_per_lot(&symbol("XAUUSD"), 4_341.0).expect("gold value");
+        assert!(
+            (gold - 1.0).abs() < 1e-9,
+            "one cent on 100 oz is $1, got {gold}"
+        );
+        let silver = pip_value_per_lot(&symbol("XAGUSD"), 40.0).expect("silver value");
+        assert!(
+            (silver - 5.0).abs() < 1e-9,
+            "0.001 on 5,000 oz is $5, got {silver}"
+        );
+        assert_eq!(pip_value_per_lot(&symbol("XAUEUR"), 4_000.0), None);
+        assert_eq!(pip_value_per_lot(&symbol("XAUOIL"), 1.0), None);
     }
 
     #[test]
@@ -210,6 +279,11 @@ mod tests {
             (risk - expected).abs() < 1e-9,
             "expected {expected}%, got {risk}"
         );
+
+        // Gold: a one-dollar stop on one ounce risks one dollar.
+        let gold = draft("XAUUSD", Side::Buy, 0.01, Some(4_340.0), None);
+        let risk = risk_percent(&gold, Some(4_341.0), 100.0).expect("gold valued");
+        assert!((risk - 1.0).abs() < 1e-9, "expected 1%, got {risk}");
 
         // Unpriceable or incomplete drafts return None.
         assert_eq!(risk_percent(&small, None, 100.0), None);
@@ -252,9 +326,14 @@ mod tests {
         let net = net_usd_lots(&positions, &flatten);
         assert!(net.abs() < 1e-9, "flattens exactly, got {net}");
 
-        // Unclassified symbols contribute nothing.
+        // Long gold is short dollars, exactly like a USD-quoted pair.
         let gold = draft("XAUUSD", Side::Buy, 0.01, None, None);
         let net = net_usd_lots(&[], &gold);
+        assert!((net + 0.01).abs() < 1e-9, "long gold is -USD, got {net}");
+
+        // An unclassified synthetic contributes nothing.
+        let oil = draft("XAUOIL", Side::Buy, 0.01, None, None);
+        let net = net_usd_lots(&[], &oil);
         assert_eq!(net, 0.0);
     }
 }
