@@ -90,6 +90,15 @@ describe('detailRows', () => {
     expect(rows.map((row) => row.value)).toEqual(['held', '1.085', '—', 'true', '—', '{"lots":1}', 'last'])
   })
 
+  it('shows the rationale directly after the outcome', () => {
+    const rows = detailRows({
+      symbol: 'EURUSD',
+      rationale: 'Momentum favours the upside.',
+      outcome: 'queued',
+    })
+    expect(rows.map((row) => row.label)).toEqual(['outcome', 'rationale', 'symbol'])
+  })
+
   it('returns no rows for an empty payload', () => {
     expect(detailRows({})).toEqual([])
   })

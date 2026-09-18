@@ -579,83 +579,118 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                 record(state, "unavailable", None, None, Some(&reason)).await;
                 TickOutcome::Unavailable { reason }
             }
-            Ok(PipelineOutcome::NoTrade) => {
-                record(state, "no_trade", None, None, None).await;
-                TickOutcome::NoTrade
-            }
-            Ok(PipelineOutcome::Rejected { rejection, draft }) => {
-                record(
-                    state,
-                    "rejected",
-                    Some(draft.symbol()),
-                    Some(&draft),
-                    Some(rejection.code().as_str()),
-                )
-                .await;
-                TickOutcome::Rejected {
-                    code: rejection.code().as_str(),
-                }
-            }
-            Ok(PipelineOutcome::Approved(intent)) => {
-                let draft = intent.draft();
-                let symbol = draft.symbol().clone();
-                if draft.stop_loss().is_none() || draft.take_profit().is_none() {
-                    record(
-                        state,
-                        "rejected",
-                        Some(&symbol),
-                        Some(draft),
-                        Some("missing_stops"),
-                    )
-                    .await;
-                    return TickOutcome::Rejected {
-                        code: "missing_stops",
-                    };
-                }
-                match queue_staged_order(state, &intent).await {
-                    StagedExecution::Queued { command, intent_id } => {
-                        record_event(
+            Ok(evaluation) => {
+                let rationale = evaluation.rationale.as_deref();
+                match evaluation.outcome {
+                    PipelineOutcome::NoTrade => {
+                        record_event_context(
                             state,
-                            "queued",
-                            Some(&symbol),
-                            Some(draft),
+                            "no_trade",
                             None,
-                            Some(&intent_id),
-                            Some(&command.to_string()),
+                            None,
+                            None,
+                            None,
+                            None,
+                            DecisionContext {
+                                rationale,
+                                judgements: None,
+                            },
                         )
                         .await;
-                        TickOutcome::Queued {
-                            command: command.to_string(),
+                        TickOutcome::NoTrade
+                    }
+                    PipelineOutcome::Rejected { rejection, draft } => {
+                        let symbol = draft.symbol().clone();
+                        record_event_context(
+                            state,
+                            "rejected",
+                            Some(&symbol),
+                            Some(&draft),
+                            Some(rejection.code().as_str()),
+                            None,
+                            None,
+                            DecisionContext {
+                                rationale,
+                                judgements: judgement_for_symbol(&judgements, symbol.as_str()),
+                            },
+                        )
+                        .await;
+                        TickOutcome::Rejected {
+                            code: rejection.code().as_str(),
                         }
                     }
-                    StagedExecution::TradingDisabled => {
-                        let intent_id = intent.id().to_string();
-                        record_event(
-                            state,
-                            "approved_dry_run",
-                            Some(&symbol),
-                            Some(draft),
-                            None,
-                            Some(&intent_id),
-                            None,
-                        )
-                        .await;
-                        TickOutcome::ApprovedDryRun
-                    }
-                    StagedExecution::ChannelUnavailable => {
-                        let reason = "command channel unavailable".to_owned();
-                        let intent_id = intent.id().to_string();
-                        record_event(
-                            state,
-                            "unavailable",
-                            Some(&symbol),
-                            Some(draft),
-                            Some(&reason),
-                            Some(&intent_id),
-                            None,
-                        )
-                        .await;
-                        TickOutcome::Unavailable { reason }
+                    PipelineOutcome::Approved(intent) => {
+                        let draft = intent.draft();
+                        let symbol = draft.symbol().clone();
+                        let context = DecisionContext {
+                            rationale,
+                            judgements: judgement_for_symbol(&judgements, symbol.as_str()),
+                        };
+                        if draft.stop_loss().is_none() || draft.take_profit().is_none() {
+                            record_event_context(
+                                state,
+                                "rejected",
+                                Some(&symbol),
+                                Some(draft),
+                                Some("missing_stops"),
+                                None,
+                                None,
+                                context,
+                            )
+                            .await;
+                            return TickOutcome::Rejected {
+                                code: "missing_stops",
+                            };
+                        }
+                        match queue_staged_order(state, &intent).await {
+                            StagedExecution::Queued { command, intent_id } => {
+                                record_event_context(
+                                    state,
+                                    "queued",
+                                    Some(&symbol),
+                                    Some(draft),
+                                    None,
+                                    Some(&intent_id),
+                                    Some(&command.to_string()),
+                                    context,
+                                )
+                                .await;
+                                TickOutcome::Queued {
+                                    command: command.to_string(),
+                                }
+                            }
+                            StagedExecution::TradingDisabled => {
+                                let intent_id = intent.id().to_string();
+                                record_event_context(
+                                    state,
+                                    "approved_dry_run",
+                                    Some(&symbol),
+                                    Some(draft),
+                                    None,
+                                    Some(&intent_id),
+                                    None,
+                                    context,
+                                )
+                                .await;
+                                TickOutcome::ApprovedDryRun
+                            }
+                            StagedExecution::ChannelUnavailable => {
+                                let reason = "command channel unavailable".to_owned();
+                                let intent_id = intent.id().to_string();
+                                record_event_context(
+                                    state,
+                                    "unavailable",
+                                    Some(&symbol),
+                                    Some(draft),
+                                    Some(&reason),
+                                    Some(&intent_id),
+                                    None,
+                                    context,
+                                )
+                                .await;
+                                TickOutcome::Unavailable { reason }
+                            }
+                        }
                     }
                 }
             }
@@ -1019,6 +1054,10 @@ fn parse_review(value: &serde_json::Value) -> Result<ReviewDecision, String> {
         action: String,
         #[serde(default)]
         ticket: Option<i64>,
+        /// Journal metadata, extracted separately by `parse_rationale`.
+        #[serde(default)]
+        #[allow(dead_code)]
+        rationale: Option<String>,
     }
     let answer: Answer = serde_json::from_value(value.clone())
         .map_err(|error| format!("invalid review answer: {error}"))?;
@@ -1049,6 +1088,11 @@ fn review_format() -> AnswerFormat {
                 "ticket": {
                     "type": ["integer", "null"],
                     "description": "the position to close; required when action is close"
+                },
+                "rationale": {
+                    "type": ["string", "null"],
+                    "maxLength": 280,
+                    "description": "Short operator-facing explanation of the decision. Always include it."
                 }
             }
         }),
@@ -1092,16 +1136,24 @@ async fn review_positions(
         }
     };
 
+    let rationale = crate::trading::pipeline::parse_rationale(&answer.value);
+    let context = DecisionContext {
+        rationale: rationale.as_deref(),
+        judgements,
+    };
+
     let decision = match parse_review(&answer.value) {
         Ok(decision) => decision,
         Err(reason) => {
-            record_position(
+            record_position_context(
                 state,
                 "close_rejected",
                 "autopilot_review",
                 series,
                 None,
                 Some(&reason),
+                None,
+                context,
             )
             .await;
             return TickOutcome::Rejected {
@@ -1112,26 +1164,30 @@ async fn review_positions(
 
     match decision {
         ReviewDecision::Hold => {
-            record_position(
+            record_position_context(
                 state,
                 "held",
                 "autopilot_review",
                 series,
                 Some(positions[0].ticket),
                 None,
+                None,
+                context,
             )
             .await;
             TickOutcome::Held
         }
         ReviewDecision::Close(ticket) => {
             let Some(position) = positions.iter().find(|position| position.ticket == ticket) else {
-                record_position(
+                record_position_context(
                     state,
                     "close_rejected",
                     "autopilot_review",
                     series,
                     Some(ticket),
                     Some("unknown_ticket"),
+                    None,
+                    context,
                 )
                 .await;
                 return TickOutcome::Rejected {
@@ -1146,13 +1202,15 @@ async fn review_positions(
             match position_age_secs(snapshot_server_time, position.opened_at) {
                 Some(age) if age >= settings.min_hold().as_secs() => {}
                 Some(_) => {
-                    record_position(
+                    record_position_context(
                         state,
                         "close_rejected",
                         "autopilot_review",
                         series,
                         Some(ticket),
                         Some("position_too_young"),
+                        None,
+                        context,
                     )
                     .await;
                     return TickOutcome::Rejected {
@@ -1160,13 +1218,15 @@ async fn review_positions(
                     };
                 }
                 None => {
-                    record_position(
+                    record_position_context(
                         state,
                         "close_rejected",
                         "autopilot_review",
                         series,
                         Some(ticket),
                         Some("position_age_unknown"),
+                        None,
+                        context,
                     )
                     .await;
                     return TickOutcome::Rejected {
@@ -1177,7 +1237,7 @@ async fn review_positions(
             match queue_staged_close(state, ticket).await {
                 StagedClose::Queued { command, ticket } => {
                     let command_id = command.to_string();
-                    record_position_event(
+                    record_position_context(
                         state,
                         "close_queued",
                         "autopilot_review",
@@ -1185,6 +1245,7 @@ async fn review_positions(
                         Some(ticket),
                         None,
                         Some(&command_id),
+                        context,
                     )
                     .await;
                     TickOutcome::CloseQueued {
@@ -1192,13 +1253,15 @@ async fn review_positions(
                     }
                 }
                 StagedClose::TradingDisabled => {
-                    record_position(
+                    record_position_context(
                         state,
                         "close_rejected",
                         "autopilot_review",
                         series,
                         Some(ticket),
                         Some("trading_disabled"),
+                        None,
+                        context,
                     )
                     .await;
                     TickOutcome::Rejected {
@@ -1207,25 +1270,29 @@ async fn review_positions(
                 }
                 StagedClose::ChannelUnavailable => {
                     let reason = "command channel unavailable".to_owned();
-                    record_position(
+                    record_position_context(
                         state,
                         "unavailable",
                         "autopilot_review",
                         series,
                         Some(ticket),
                         Some(&reason),
+                        None,
+                        context,
                     )
                     .await;
                     TickOutcome::Unavailable { reason }
                 }
                 StagedClose::NoPositions | StagedClose::UnknownTicket => {
-                    record_position(
+                    record_position_context(
                         state,
                         "close_rejected",
                         "autopilot_review",
                         series,
                         Some(ticket),
                         Some("stale_position"),
+                        None,
+                        context,
                     )
                     .await;
                     TickOutcome::Rejected {
@@ -1233,13 +1300,15 @@ async fn review_positions(
                     }
                 }
                 StagedClose::NotVeyra => {
-                    record_position(
+                    record_position_context(
                         state,
                         "close_rejected",
                         "autopilot_review",
                         series,
                         Some(ticket),
                         Some("not_a_veyra_position"),
+                        None,
+                        context,
                     )
                     .await;
                     TickOutcome::Rejected {
@@ -1342,7 +1411,7 @@ fn review_instructions(series: &CandleSeries, positions: &[ManagedPosition]) -> 
         "You are the analyst for Veyra, a single-instrument trading bot. Your open {symbol}          {timeframe} position(s) (ticket(s) {tickets}) were entered by this bot with a stop loss          and take profit attached.
          Decide for the reported position: `hold` keeps the entry bracket and lets the plan play          out; `close` flattens the ticket now because the thesis that justified the entry is no          longer supported by the latest candles and judgements.
          Closing costs the spread and abandons the bracket, so hold unless the evidence has          genuinely shifted; do not close merely because the position shows a small loss — the          attached stop defines the risk.
-         Answer with the provided schema only, including the ticket when you close.",
+         Answer with the provided schema only, including the ticket when you close, and a short `rationale` (a sentence or two, at most 280 characters) explaining the decision.",
         symbol = series.symbol().as_str(),
         timeframe = series.timeframe().as_str(),
         tickets = tickets.join(", ")
@@ -1416,21 +1485,18 @@ fn review_input(
     input.to_string()
 }
 
-/// Records one review decision; best-effort and bounded in size.
-async fn record_position(
-    state: &AppState,
-    outcome: &'static str,
-    origin: &'static str,
-    series: &CandleSeries,
-    ticket: Option<i64>,
-    reason: Option<&str>,
-) {
-    record_position_event(state, outcome, origin, series, ticket, reason, None).await;
+/// Optional model context journaled alongside a proposal event: the model's
+/// short rationale and the judgements of the instrument it decided on.
+#[derive(Debug, Default, Clone, Copy)]
+struct DecisionContext<'a> {
+    rationale: Option<&'a str>,
+    judgements: Option<&'a Value>,
 }
 
-/// Records one position decision together with the command it produced, so a
-/// stop move or close can be traced from the journal to the terminal ack.
-async fn record_position_event(
+/// Records one review decision with the model's rationale and judgements.
+/// Position records always come from a review, so the context is required.
+#[allow(clippy::too_many_arguments)]
+async fn record_position_context(
     state: &AppState,
     outcome: &'static str,
     origin: &'static str,
@@ -1438,8 +1504,9 @@ async fn record_position_event(
     ticket: Option<i64>,
     reason: Option<&str>,
     command_id: Option<&str>,
+    context: DecisionContext<'_>,
 ) {
-    record_symbol_event(
+    record_symbol_event_context(
         state,
         outcome,
         origin,
@@ -1447,6 +1514,7 @@ async fn record_position_event(
         ticket,
         reason,
         command_id,
+        context,
     )
     .await;
 }
@@ -1461,6 +1529,31 @@ async fn record_symbol_event(
     ticket: Option<i64>,
     reason: Option<&str>,
     command_id: Option<&str>,
+) {
+    record_symbol_event_context(
+        state,
+        outcome,
+        origin,
+        symbol,
+        ticket,
+        reason,
+        command_id,
+        DecisionContext::default(),
+    )
+    .await;
+}
+
+/// Records one position decision with model context.
+#[allow(clippy::too_many_arguments)]
+async fn record_symbol_event_context(
+    state: &AppState,
+    outcome: &'static str,
+    origin: &'static str,
+    symbol: &str,
+    ticket: Option<i64>,
+    reason: Option<&str>,
+    command_id: Option<&str>,
+    context: DecisionContext<'_>,
 ) {
     let Some(audit) = state.audit() else {
         return;
@@ -1478,6 +1571,12 @@ async fn record_symbol_event(
     }
     if let Some(command_id) = command_id {
         payload["command_id"] = json!(command_id);
+    }
+    if let Some(rationale) = context.rationale {
+        payload["rationale"] = json!(rationale);
+    }
+    if let Some(judgements) = context.judgements {
+        payload["judgements"] = judgements.clone();
     }
     audit
         .try_record(AuditEvent::new(AuditKind::ProposalEvaluated, payload))
@@ -1508,6 +1607,31 @@ async fn record_event(
     intent_id: Option<&str>,
     command_id: Option<&str>,
 ) {
+    record_event_context(
+        state,
+        outcome,
+        symbol,
+        draft,
+        reason,
+        intent_id,
+        command_id,
+        DecisionContext::default(),
+    )
+    .await;
+}
+
+/// Records one decision attempt with the model's rationale and judgements.
+#[allow(clippy::too_many_arguments)]
+async fn record_event_context(
+    state: &AppState,
+    outcome: &'static str,
+    symbol: Option<&Symbol>,
+    draft: Option<&TradeIntentDraft>,
+    reason: Option<&str>,
+    intent_id: Option<&str>,
+    command_id: Option<&str>,
+    context: DecisionContext<'_>,
+) {
     let Some(audit) = state.audit() else {
         return;
     };
@@ -1534,6 +1658,12 @@ async fn record_event(
     }
     if let Some(command_id) = command_id {
         payload["command_id"] = json!(command_id);
+    }
+    if let Some(rationale) = context.rationale {
+        payload["rationale"] = json!(rationale);
+    }
+    if let Some(judgements) = context.judgements {
+        payload["judgements"] = judgements.clone();
     }
     audit
         .try_record(AuditEvent::new(AuditKind::ProposalEvaluated, payload))
@@ -1739,7 +1869,7 @@ fn proposal_instructions(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles and optional calibrated judgements; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors.",
+        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles and optional calibrated judgements; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal.",
         menu = menu,
         timeframe = markets
             .first()
@@ -2061,6 +2191,9 @@ mod tests {
     }
 
     fn open_proposal(with_stops: bool, symbol: &str) -> Value {
+        let mut rationale = json!({});
+        rationale["action"] = json!("open");
+        rationale["rationale"] = json!("Breakout above the window high with momentum.");
         let mut intent = json!({
             "symbol": symbol,
             "side": "buy",
@@ -2071,7 +2204,8 @@ mod tests {
             intent["stop_loss"] = json!(1.0850);
             intent["take_profit"] = json!(1.1000);
         }
-        json!({ "action": "open", "intent": intent })
+        rationale["intent"] = intent;
+        rationale
     }
 
     fn judgements_response() -> Value {
@@ -2465,7 +2599,7 @@ mod tests {
                 bars: 20,
                 fail: false,
             }),
-            None,
+            Some(StubJudge::responding(judgements_response())),
             true,
             true,
         );
@@ -2483,6 +2617,16 @@ mod tests {
             .expect("decision recorded");
         assert_eq!(decision.payload()["stop_loss"], 1.0850);
         assert_eq!(decision.payload()["take_profit"], 1.1000);
+        assert_eq!(
+            decision.payload()["rationale"],
+            "Breakout above the window high with momentum.",
+            "the model's why reaches the journal"
+        );
+        assert_eq!(
+            decision.payload()["judgements"]["direction"]["choice"],
+            "long",
+            "the judgements behind the decision travel with it"
+        );
         assert!(
             decision.payload()["intent_id"]
                 .as_str()
@@ -2767,8 +2911,10 @@ mod tests {
 
     #[actix_web::test]
     async fn review_holds_when_the_analyst_holds() {
-        let engine =
-            StubEngine::answering_review(json!({"action": "hold"}), json!({"action": "none"}));
+        let engine = StubEngine::answering_review(
+            json!({"action": "hold", "rationale": "Bracket intact; wait for break-even."}),
+            json!({"action": "none"}),
+        );
         let harness = build_harness(
             enabled_settings(),
             Some(engine.clone()),
@@ -2789,6 +2935,17 @@ mod tests {
             .retain_snapshot(managed_snapshot(10650805, 1_758_000_000, 1_758_003_600));
 
         assert_eq!(tick(&harness.state).await, TickOutcome::Held);
+        let held = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "held")
+            .expect("held decision recorded");
+        assert_eq!(
+            held.payload()["rationale"],
+            "Bracket intact; wait for break-even.",
+            "the reviewer's why reaches the journal"
+        );
         assert_eq!(
             outcomes(&harness.trail),
             vec!["held".to_owned(), "no_trade".to_owned()],

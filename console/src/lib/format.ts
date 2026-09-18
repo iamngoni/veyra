@@ -79,6 +79,8 @@ export function isRoutine(event: FeedEvent): boolean {
 /** Ordered keys shown first in the drill-down; everything else follows. */
 const FIELD_ORDER = [
   'outcome',
+  'rationale',
+  'judgements',
   'reason',
   'origin',
   'status',

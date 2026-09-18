@@ -120,7 +120,12 @@ const events: FeedEvent[] = [
     seq: 2,
     at_ms: 1_700_000_001_000,
     kind: 'proposal_evaluated',
-    payload: { outcome: 'held', symbol: 'EURUSD', ticket: 10650805 },
+    payload: {
+      outcome: 'held',
+      rationale: 'Momentum favours the upside.',
+      symbol: 'EURUSD',
+      ticket: 10650805,
+    },
   },
   {
     seq: 3,
@@ -376,6 +381,8 @@ describe('ActivityFeed', () => {
     expect(screen.getByText('outcome')).toBeTruthy()
     expect(screen.getAllByText('held').length).toBeGreaterThan(0)
     expect(screen.getByText('symbol')).toBeTruthy()
+    expect(screen.getByText('rationale')).toBeTruthy()
+    expect(screen.getByText('Momentum favours the upside.')).toBeTruthy()
     expect(screen.getByText(/"outcome": "held"/)).toBeTruthy()
 
     fireEvent.click(row)

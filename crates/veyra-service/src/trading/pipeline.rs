@@ -36,6 +36,11 @@ pub fn proposal_format() -> AnswerFormat {
             "required": ["action"],
             "properties": {
                 "action": {"type": "string", "enum": ["none", "open"]},
+                "rationale": {
+                    "type": ["string", "null"],
+                    "maxLength": 280,
+                    "description": "Short operator-facing explanation of the decision: why this instrument and direction, or why nothing qualifies. Always include it."
+                },
                 "intent": {
                     "type": "object",
                     "additionalProperties": false,
@@ -74,6 +79,35 @@ pub enum PipelineError {
     },
 }
 
+/// Longest rationale kept in the journal; longer answers are truncated.
+pub const RATIONALE_MAX_CHARS: usize = 280;
+
+/// Sanitises a model rationale: trims, drops control characters, and bounds
+/// the length. Missing, empty, or unusable text becomes `None`.
+pub fn parse_rationale(value: &serde_json::Value) -> Option<String> {
+    let text = value.get("rationale")?.as_str()?.trim();
+    let cleaned: String = text
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(RATIONALE_MAX_CHARS)
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_owned())
+    }
+}
+
+/// One evaluation result plus the model's operator-facing rationale.
+#[derive(Debug)]
+pub struct ProposalEvaluation {
+    /// Parsed outcome the caller acts on.
+    pub outcome: PipelineOutcome,
+    /// Short model-written explanation of the decision, when provided.
+    pub rationale: Option<String>,
+}
+
 /// Outcome of one proposal evaluation.
 #[derive(Debug)]
 pub enum PipelineOutcome {
@@ -103,7 +137,7 @@ pub async fn evaluate_proposal(
     tier: ModelTier,
     account: Option<AccountFacts>,
     now: SystemTime,
-) -> Result<PipelineOutcome, PipelineError> {
+) -> Result<ProposalEvaluation, PipelineError> {
     let answer = engine
         .answer(DecisionRequest {
             instructions,
@@ -113,18 +147,26 @@ pub async fn evaluate_proposal(
         })
         .await?;
 
-    let proposal: TradeProposal = serde_json::from_value(normalize_proposal(answer.value))
-        .map_err(|error| PipelineError::InvalidProposal {
+    let mut normalized = normalize_proposal(answer.value);
+    let rationale = parse_rationale(&normalized);
+    // The rationale is journal metadata, not part of the intent contract;
+    // `TradeProposal` stays strict, so remove it before parsing.
+    if let Some(object) = normalized.as_object_mut() {
+        object.remove("rationale");
+    }
+    let proposal: TradeProposal =
+        serde_json::from_value(normalized).map_err(|error| PipelineError::InvalidProposal {
             reason: error.to_string(),
         })?;
 
-    match proposal {
-        TradeProposal::None => Ok(PipelineOutcome::NoTrade),
+    let outcome = match proposal {
+        TradeProposal::None => PipelineOutcome::NoTrade,
         TradeProposal::Open(draft) => match gate.evaluate(&draft, account, now) {
-            RiskDecision::Approved(intent) => Ok(PipelineOutcome::Approved(intent)),
-            RiskDecision::Rejected(rejection) => Ok(PipelineOutcome::Rejected { draft, rejection }),
+            RiskDecision::Approved(intent) => PipelineOutcome::Approved(intent),
+            RiskDecision::Rejected(rejection) => PipelineOutcome::Rejected { draft, rejection },
         },
-    }
+    };
+    Ok(ProposalEvaluation { outcome, rationale })
 }
 
 /// Drops a reference `price` echoed on a market-order proposal.
@@ -268,6 +310,7 @@ mod tests {
     fn open_answer() -> Value {
         json!({
             "action": "open",
+            "rationale": "Momentum favours the upside.",
             "intent": {
                 "symbol": "EURUSD",
                 "side": "buy",
@@ -281,7 +324,7 @@ mod tests {
         engine: &StubEngine,
         gate: &RiskGate,
         account: Option<AccountFacts>,
-    ) -> Result<PipelineOutcome, PipelineError> {
+    ) -> Result<ProposalEvaluation, PipelineError> {
         evaluate_proposal(
             engine,
             gate,
@@ -404,40 +447,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rationales_are_sanitised_and_bounded() {
+        assert_eq!(
+            parse_rationale(&json!({"rationale": "  spaced  "})).as_deref(),
+            Some("spaced")
+        );
+        assert_eq!(
+            parse_rationale(&json!({"rationale": "ab\u{0007}cd"})).as_deref(),
+            Some("abcd"),
+            "control characters never reach the journal"
+        );
+        let long = "x".repeat(400);
+        assert_eq!(
+            parse_rationale(&json!({ "rationale": long }))
+                .expect("long rationale")
+                .chars()
+                .count(),
+            280,
+            "rationales are truncated at the schema bound"
+        );
+        assert!(parse_rationale(&json!({})).is_none());
+        assert!(parse_rationale(&json!({"rationale": "   "})).is_none());
+        assert!(parse_rationale(&json!({"rationale": 7})).is_none());
+    }
+
     #[actix_web::test]
     async fn approved_proposals_carry_identity_and_the_format_contract() {
         let gate = RiskGate::new(policy());
         let engine = StubEngine::replying(open_answer());
-        let outcome = run(&engine, &gate, facts()).await.expect("pipeline runs");
+        let evaluation = run(&engine, &gate, facts()).await.expect("pipeline runs");
 
-        let PipelineOutcome::Approved(intent) = outcome else {
-            panic!("expected approval, got {outcome:?}");
+        let PipelineOutcome::Approved(intent) = evaluation.outcome else {
+            panic!("expected approval, got {evaluation:?}");
         };
         assert_eq!(intent.draft().symbol().as_str(), "EURUSD");
+        assert_eq!(
+            evaluation.rationale.as_deref(),
+            Some("Momentum favours the upside."),
+            "the model's rationale travels with the evaluation"
+        );
 
         let request = engine.last_request();
         assert_eq!(request.format.name, PROPOSAL_SCHEMA_NAME);
         assert_eq!(request.tier, ModelTier::Balanced);
         assert_eq!(request.format.schema["required"], json!(["action"]));
+        assert_eq!(
+            request.format.schema["properties"]["rationale"]["maxLength"],
+            280
+        );
     }
 
     #[actix_web::test]
     async fn declined_proposals_never_reach_the_gate() {
         let gate = RiskGate::new(policy());
-        let engine = StubEngine::replying(json!({"action": "none"}));
-        let outcome = run(&engine, &gate, facts()).await.expect("pipeline runs");
+        let engine = StubEngine::replying(json!({
+            "action": "none",
+            "rationale": "No instrument shows a clear edge."
+        }));
+        let evaluation = run(&engine, &gate, facts()).await.expect("pipeline runs");
 
-        assert!(matches!(outcome, PipelineOutcome::NoTrade));
+        assert!(matches!(evaluation.outcome, PipelineOutcome::NoTrade));
+        assert_eq!(
+            evaluation.rationale.as_deref(),
+            Some("No instrument shows a clear edge."),
+            "a skip also carries its reason"
+        );
     }
 
     #[actix_web::test]
     async fn rejections_are_normal_outcomes_that_keep_the_draft() {
         let gate = RiskGate::new(policy());
         let engine = StubEngine::replying(open_answer());
-        let outcome = run(&engine, &gate, None).await.expect("pipeline runs");
+        let evaluation = run(&engine, &gate, None).await.expect("pipeline runs");
 
-        let PipelineOutcome::Rejected { draft, rejection } = outcome else {
-            panic!("expected rejection, got {outcome:?}");
+        let PipelineOutcome::Rejected { draft, rejection } = evaluation.outcome else {
+            panic!("expected rejection, got {evaluation:?}");
         };
         assert_eq!(draft.symbol().as_str(), "EURUSD");
         assert_eq!(rejection.code(), RiskCode::AccountStateUnavailable);
@@ -455,10 +540,10 @@ mod tests {
                 "volume": 0.01
             }
         }));
-        let outcome = run(&engine, &gate, facts()).await.expect("pipeline runs");
+        let evaluation = run(&engine, &gate, facts()).await.expect("pipeline runs");
 
-        let PipelineOutcome::Rejected { rejection, .. } = outcome else {
-            panic!("expected rejection, got {outcome:?}");
+        let PipelineOutcome::Rejected { rejection, .. } = evaluation.outcome else {
+            panic!("expected rejection, got {evaluation:?}");
         };
         assert_eq!(rejection.code(), RiskCode::SymbolNotAllowed);
     }
@@ -469,11 +554,11 @@ mod tests {
         let engine = StubEngine::replying(open_answer());
 
         assert!(matches!(
-            run(&engine, &gate, facts()).await.expect("first"),
+            run(&engine, &gate, facts()).await.expect("first").outcome,
             PipelineOutcome::Approved(_)
         ));
         let second = run(&engine, &gate, facts()).await.expect("second");
-        let PipelineOutcome::Rejected { rejection, .. } = second else {
+        let PipelineOutcome::Rejected { rejection, .. } = second.outcome else {
             panic!("expected duplicate rejection, got {second:?}");
         };
         assert_eq!(rejection.code(), RiskCode::DuplicateIntent);
