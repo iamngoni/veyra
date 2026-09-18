@@ -12,7 +12,9 @@ use async_trait::async_trait;
 
 use crate::broker::BrokerLink;
 use crate::broker::Symbol;
-use crate::broker::{CommandPayload, CommandState, RatesPayload, RatesRequest};
+use crate::broker::{
+    CommandPayload, CommandState, RatesPayload, RatesRequest, SymbolSpecPayload, SymbolSpecRequest,
+};
 use crate::market::{
     Candle, CandleRequest, CandleSeries, MarketError, MarketFeed, MarketProvider, Timeframe,
 };
@@ -52,6 +54,12 @@ impl MarketFeed for EaMarketFeed {
         let id = self.link.enqueue_rates(wire);
         series_from_state(self.link.await_command(id, self.await_timeout).await)
     }
+
+    async fn symbol_spec(&self, symbol: &Symbol) -> Result<SymbolSpecPayload, MarketError> {
+        let wire = SymbolSpecRequest::new(symbol);
+        let id = self.link.enqueue_symbol_spec(wire);
+        spec_from_state(self.link.await_command(id, self.await_timeout).await)
+    }
 }
 
 /// Maps a terminal command state to a domain series. Kept pure so every
@@ -68,6 +76,29 @@ fn series_from_state(state: CommandState) -> Result<CandleSeries, MarketError> {
         CommandState::Failed { reason } => Err(MarketError::Unavailable { reason }),
         CommandState::Pending => Err(MarketError::Unavailable {
             reason: "rates command still pending after the await window".to_owned(),
+        }),
+    }
+}
+
+/// Maps a terminal command state to a validated instrument contract. Kept
+/// pure so every outcome (including defensive ones the wire contract cannot
+/// produce) is exercised by tests.
+fn spec_from_state(state: CommandState) -> Result<SymbolSpecPayload, MarketError> {
+    match state {
+        CommandState::Completed {
+            payload: CommandPayload::SymbolSpec(payload),
+        } => {
+            payload
+                .validate()
+                .map_err(|reason| MarketError::Contract { reason })?;
+            Ok(payload)
+        }
+        CommandState::Completed { .. } => Err(MarketError::Contract {
+            reason: "symbol_spec command completed with a different payload".to_owned(),
+        }),
+        CommandState::Failed { reason } => Err(MarketError::Unavailable { reason }),
+        CommandState::Pending => Err(MarketError::Unavailable {
+            reason: "symbol_spec command still pending after the await window".to_owned(),
         }),
     }
 }
@@ -129,6 +160,65 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn valid_spec() -> SymbolSpecPayload {
+        SymbolSpecPayload {
+            symbol: "EURUSD".to_owned(),
+            digits: 5,
+            point: 0.00001,
+            spread_points: 12,
+            stop_level_points: 5,
+            freeze_level_points: 0,
+            lot_min: 0.01,
+            lot_max: 100.0,
+            lot_step: 0.01,
+            tick_value: 0.1,
+            tick_size: 0.00001,
+            margin_required: 3.29,
+            swap_long: -0.72,
+            swap_short: -0.31,
+            swap_type: 0,
+            trade_allowed: true,
+        }
+    }
+
+    #[test]
+    fn spec_payloads_convert_and_revalidate() {
+        let spec = spec_from_state(CommandState::Completed {
+            payload: CommandPayload::SymbolSpec(valid_spec()),
+        })
+        .expect("valid contract");
+        assert_eq!(spec.symbol, "EURUSD");
+        assert_eq!(spec.spread_points, 12);
+        assert!((spec.margin_for(0.02) - 0.065_8).abs() < 1e-9);
+
+        let mut broken = valid_spec();
+        broken.margin_required = 0.0;
+        let error = spec_from_state(CommandState::Completed {
+            payload: CommandPayload::SymbolSpec(broken),
+        })
+        .expect_err("a hand-built payload is re-validated");
+        assert!(error.to_string().contains("marginRequired"), "{error}");
+    }
+
+    #[test]
+    fn spec_states_map_to_domain_outcomes() {
+        let error = spec_from_state(CommandState::Completed {
+            payload: CommandPayload::Ping,
+        })
+        .expect_err("non-spec payloads are contract violations");
+        assert!(error.to_string().contains("different payload"), "{error}");
+
+        let error = spec_from_state(CommandState::Failed {
+            reason: "timeout".to_owned(),
+        })
+        .expect_err("failed commands are unavailable");
+        assert!(error.to_string().contains("timeout"), "{error}");
+
+        let error =
+            spec_from_state(CommandState::Pending).expect_err("pending commands are unavailable");
+        assert!(error.to_string().contains("pending"), "{error}");
     }
 
     #[test]
@@ -287,5 +377,92 @@ mod tests {
         assert_eq!(series.timeframe(), Timeframe::H4);
         assert_eq!(series.candles().len(), 2);
         assert_eq!(series.candles()[1].close(), 1.25);
+    }
+
+    #[actix_web::test]
+    async fn feed_round_trips_symbol_specs_through_the_poll_channel() {
+        let token = "test-token-1234567890";
+        let link = Arc::new(EaLink::new(
+            EaToken::parse(token).expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(15),
+        ));
+        let app = actix_web::test::init_service(create_ea_app(link.clone())).await;
+        let feed = EaMarketFeed::new(link, Duration::from_secs(5));
+
+        let symbol = Symbol::parse("EURUSD").expect("symbol");
+        let spec_task = actix_web::rt::spawn(async move { feed.symbol_spec(&symbol).await });
+
+        let hello = serde_json::json!({
+            "t": "hb",
+            "token": token,
+            "acct": 94168,
+            "server": "IFCMarkets-Real",
+            "symbol": "EURUSD",
+            "connected": true,
+            "tradeAllowed": true,
+            "orders": 0,
+            "lots": 0.0
+        });
+        let mut command = None;
+        for _ in 0..40 {
+            let response = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::post()
+                    .uri("/ea/poll")
+                    .set_payload(hello.to_string())
+                    .to_request(),
+            )
+            .await;
+            assert!(response.status().is_success());
+            let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+            if body["t"] == "cmd" {
+                command = Some(body);
+                break;
+            }
+            actix_web::rt::time::sleep(Duration::from_millis(25)).await;
+        }
+        let command = command.expect("symbol_spec command delivered");
+        assert_eq!(command["kind"], "symbol_spec");
+        assert_eq!(command["spec"]["symbol"], "EURUSD");
+
+        let ack = serde_json::json!({
+            "t": "ack",
+            "token": token,
+            "id": command["id"],
+            "ok": true,
+            "data": {
+                "symbol": "EURUSD",
+                "digits": 5,
+                "point": 0.00001,
+                "spreadPoints": 12,
+                "stopLevelPoints": 5,
+                "freezeLevelPoints": 0,
+                "lotMin": 0.01,
+                "lotMax": 100.0,
+                "lotStep": 0.01,
+                "tickValue": 0.1,
+                "tickSize": 0.00001,
+                "marginRequired": 3.29,
+                "swapLong": -0.72,
+                "swapShort": -0.31,
+                "swapType": 0,
+                "tradeAllowed": true
+            }
+        });
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/ea/poll")
+                .set_payload(ack.to_string())
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+
+        let spec = spec_task.await.expect("task joins").expect("spec");
+        assert_eq!(spec.symbol, "EURUSD");
+        assert_eq!(spec.lot_min, 0.01);
+        assert!(spec.trade_allowed);
     }
 }

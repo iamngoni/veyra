@@ -20,7 +20,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::broker::RatesRequest;
-use crate::broker::{BrokerRuntime, Symbol};
+use crate::broker::{BrokerRuntime, Symbol, SymbolSpecPayload};
 
 /// Supported market-data provider implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +339,13 @@ pub trait MarketFeed: Send + Sync + fmt::Debug + 'static {
     /// Returns [`MarketError::Unavailable`] when the provider cannot answer
     /// and [`MarketError::Contract`] when its response is unusable.
     async fn candles(&self, request: CandleRequest) -> Result<CandleSeries, MarketError>;
+
+    /// Fetches the venue's contract details for one instrument.
+    ///
+    /// # Errors
+    /// Returns [`MarketError::Unavailable`] when the provider cannot answer
+    /// and [`MarketError::Contract`] when its response is unusable.
+    async fn symbol_spec(&self, symbol: &Symbol) -> Result<SymbolSpecPayload, MarketError>;
 }
 
 /// Active market-data integration selected by configuration.
@@ -507,6 +514,15 @@ mod tests {
                     Timeframe::H4,
                     Vec::new(),
                 ))
+            }
+
+            async fn symbol_spec(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<SymbolSpecPayload, MarketError> {
+                Err(MarketError::Unavailable {
+                    reason: "stub has no contract data".to_owned(),
+                })
             }
         }
 

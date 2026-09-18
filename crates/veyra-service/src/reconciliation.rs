@@ -139,6 +139,7 @@ mod tests {
             take_profit: 1.105,
             opened_at: 1_758_000_000,
             current: 1.096,
+            swap: 0.0,
             magic,
         }
     }
@@ -153,6 +154,8 @@ mod tests {
             positions,
             positions_truncated: truncated,
             server_time: 1_758_000_000,
+            leverage: 100,
+            margin_level: 0.0,
         }
     }
 

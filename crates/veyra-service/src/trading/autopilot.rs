@@ -36,7 +36,7 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::audit::{AuditEvent, AuditKind};
 use crate::broker::Symbol;
-use crate::broker::{ORDER_MAGIC, PositionPayload};
+use crate::broker::{ORDER_MAGIC, PositionPayload, SymbolSpecPayload};
 use crate::config::ConfigError;
 use crate::control::{
     StagedClose, StagedExecution, StagedModify, queue_staged_close, queue_staged_modify,
@@ -50,6 +50,7 @@ use crate::market::{Candle, CandleRequest, CandleSeries, Timeframe};
 use crate::model::ModelTier;
 use crate::risk::AccountFacts;
 use crate::trading::agent::{self, AgentDecision, AgentMode, AgentSession};
+use crate::trading::contract;
 use crate::trading::intent::TradeIntentDraft;
 use crate::trading::pipeline::{PipelineError, PipelineOutcome};
 
@@ -67,6 +68,8 @@ const DEFAULT_BARS: u16 = 48;
 const MIN_BARS: u16 = 10;
 /// How many recent candles are embedded in the model input.
 const RECENT_CANDLES: usize = 12;
+/// True-range window used for the ATR context handed to the model.
+const ATR_PERIOD: usize = 14;
 /// Default minimum position age before an autonomous close is allowed.
 const DEFAULT_MIN_HOLD_SECS: u64 = 300;
 /// Largest minimum-hold window the parser accepts.
@@ -575,7 +578,11 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         record(state, "no_trade", None, None, Some("exposure_cap")).await;
         TickOutcome::NoTrade
     } else {
-        let input = proposal_input(&markets, &judgements, &account, &managed);
+        // Fetch the venue contract for every menu instrument once: the model
+        // gets spread, stop-level, lot-band, and margin facts to size its
+        // decision, and the pre-queue contract check reuses the same data.
+        let specs = symbol_specs(state, &markets).await;
+        let input = proposal_input(&markets, &judgements, &account, &managed, &specs);
         let instructions = proposal_instructions(state, &markets, &account);
         let engine = model.engine();
         let session = AgentSession {
@@ -673,6 +680,32 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                                 code: "missing_stops",
                             };
                         }
+                        // The venue contract decides last: volume on the lot
+                        // grid, margin the account can cover, and a stop far
+                        // enough out to survive the spread and stop level.
+                        if let Err(violation) = contract::validate_entry(
+                            draft,
+                            symbol_spec_for(&specs, symbol.as_str()),
+                            account.free_margin,
+                            series_for_symbol(&markets, symbol.as_str())
+                                .and_then(|series| series.last())
+                                .map(|candle| candle.close()),
+                        ) {
+                            record_event_context(
+                                state,
+                                "rejected",
+                                Some(&symbol),
+                                Some(draft),
+                                Some(violation.as_str()),
+                                None,
+                                None,
+                                context,
+                            )
+                            .await;
+                            return TickOutcome::Rejected {
+                                code: violation.as_str(),
+                            };
+                        }
                         match queue_staged_order(state, &intent).await {
                             StagedExecution::Queued { command, intent_id } => {
                                 record_event_context(
@@ -767,6 +800,7 @@ struct ManagedPosition {
     take_profit: f64,
     opened_at: i64,
     current: f64,
+    swap: f64,
 }
 
 /// Managed positions from the latest completed snapshot.
@@ -810,6 +844,7 @@ fn managed_from_payload(position: &PositionPayload) -> ManagedPosition {
         take_profit: position.take_profit,
         opened_at: position.opened_at,
         current: position.current,
+        swap: position.swap,
     }
 }
 
@@ -856,6 +891,44 @@ fn series_for_symbol<'a>(
         .iter()
         .find(|(candidate, _)| candidate.as_str() == symbol)
         .map(|(_, series)| series)
+}
+
+/// Fetches the venue contract for every menu instrument. A symbol whose
+/// contract is unavailable is left out; the contract check then treats its
+/// drafts as unverifiable and rejects them instead of queueing blind.
+async fn symbol_specs(
+    state: &AppState,
+    markets: &[(Symbol, CandleSeries)],
+) -> Vec<(Symbol, SymbolSpecPayload)> {
+    let Some(market) = state.market() else {
+        return Vec::new();
+    };
+    let feed = market.feed();
+    let mut specs = Vec::new();
+    for (symbol, _) in markets {
+        match feed.symbol_spec(symbol).await {
+            Ok(spec) => specs.push((symbol.clone(), spec)),
+            Err(error) => {
+                tracing::warn!(
+                    symbol = symbol.as_str(),
+                    %error,
+                    "symbol contract unavailable; entries for this symbol will be rejected"
+                );
+            }
+        }
+    }
+    specs
+}
+
+/// Contract for one symbol from this tick's fetched specs.
+fn symbol_spec_for<'a>(
+    specs: &'a [(Symbol, SymbolSpecPayload)],
+    symbol: &str,
+) -> Option<&'a SymbolSpecPayload> {
+    specs
+        .iter()
+        .find(|(candidate, _)| candidate.as_str() == symbol)
+        .map(|(_, spec)| spec)
 }
 
 /// Judgement summary for one symbol, when the judge produced one.
@@ -1464,9 +1537,11 @@ fn review_input(
         })
         .collect();
 
-    let server_time = state
+    let snapshot = state
         .broker()
-        .and_then(|broker| broker.link().last_account())
+        .and_then(|broker| broker.link().last_account());
+    let server_time = snapshot
+        .as_ref()
         .map(|snapshot| snapshot.server_time)
         .unwrap_or(0);
     let open_positions: Vec<Value> = positions
@@ -1478,6 +1553,7 @@ fn review_input(
                 "lots": position.lots,
                 "entry": position.entry,
                 "profit": position.profit,
+                "swap": position.swap,
                 "stop_loss": position.stop_loss,
                 "take_profit": position.take_profit,
                 "age_secs": position_age_secs(server_time, position.opened_at)
@@ -1494,12 +1570,20 @@ fn review_input(
             "window_high": window_high(series),
             "window_low": window_low(series),
             "change_pct": change_pct(series),
+            "atr14": average_true_range(series, ATR_PERIOD),
             "recent": recent
         },
         "open_positions": open_positions
     });
     if let Some(judgements) = judgements {
         input["judgements"] = judgements.clone();
+    }
+    if let Some(snapshot) = &snapshot {
+        input["account"] = json!({
+            "free_margin": snapshot.free_margin,
+            "margin_level": snapshot.margin_level,
+            "leverage": snapshot.leverage
+        });
     }
     input.to_string()
 }
@@ -1817,6 +1901,7 @@ fn proposal_input(
     judgements: &[(Symbol, Value)],
     account: &AccountFacts,
     managed: &[ManagedPosition],
+    specs: &[(Symbol, SymbolSpecPayload)],
 ) -> String {
     let assets: Vec<Value> = markets
         .iter()
@@ -1847,9 +1932,26 @@ fn proposal_input(
                     "window_high": window_high(series),
                     "window_low": window_low(series),
                     "change_pct": change_pct(series),
+                    "atr14": average_true_range(series, ATR_PERIOD),
                     "recent": recent
                 }
             });
+            if let Some(spec) = symbol_spec_for(specs, symbol.as_str()) {
+                asset["contract"] = json!({
+                    "digits": spec.digits,
+                    "point": spec.point,
+                    "spread_points": spec.spread_points,
+                    "stop_level_points": spec.stop_level_points,
+                    "lot_min": spec.lot_min,
+                    "lot_max": spec.lot_max,
+                    "lot_step": spec.lot_step,
+                    "tick_value": spec.tick_value,
+                    "margin_required": spec.margin_required,
+                    "swap_long": spec.swap_long,
+                    "swap_short": spec.swap_short,
+                    "trade_allowed": spec.trade_allowed
+                });
+            }
             if let Some(summary) = judgement_for_symbol(judgements, symbol.as_str()) {
                 asset["judgements"] = summary.clone();
             }
@@ -1880,6 +1982,7 @@ fn proposal_input(
         "account": {
             "open_orders": account.open_orders,
             "open_lots": account.open_lots,
+            "free_margin": account.free_margin,
             "trade_allowed": account.trade_allowed,
             "open_symbols": account
                 .open_symbols
@@ -1904,7 +2007,7 @@ fn proposal_instructions(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles and optional calibrated judgements; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: get_judgements(symbol) for calibrated probabilities, get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
+        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles and optional calibrated judgements; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors. Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: get_judgements(symbol) for calibrated probabilities, get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
         menu = menu,
         timeframe = markets
             .first()
@@ -1933,6 +2036,32 @@ pub(crate) fn window_low(series: &CandleSeries) -> f64 {
         .iter()
         .map(|candle| candle.low())
         .fold(f64::INFINITY, f64::min)
+}
+
+/// Simple average true range over the last `period` completed candles,
+/// rounded to five decimals to keep the model input compact. Returns `None`
+/// when the window cannot be measured: fewer than `period + 1` candles means a
+/// true range would lack its previous close.
+pub(crate) fn average_true_range(series: &CandleSeries, period: usize) -> Option<f64> {
+    if period == 0 {
+        return None;
+    }
+    let candles = series.candles();
+    if candles.len() < period + 1 {
+        return None;
+    }
+    let start = candles.len() - period;
+    let mut sum = 0.0;
+    for index in start..candles.len() {
+        let candle = &candles[index];
+        let previous_close = candles[index - 1].close();
+        let true_range = (candle.high() - candle.low())
+            .max((candle.high() - previous_close).abs())
+            .max((candle.low() - previous_close).abs());
+        sum += true_range;
+    }
+    let atr = sum / period as f64;
+    Some((atr * 100_000.0).round() / 100_000.0)
 }
 
 /// Percentage change from the first to the last close, rounded to four
@@ -2040,6 +2169,12 @@ mod tests {
     struct StubFeed {
         bars: u16,
         fail: bool,
+        /// Contract override; `None` serves the canned default that all
+        /// existing entry tests rely on.
+        spec: Option<SymbolSpecPayload>,
+        /// Forces contract requests to fail while candles still answer, so
+        /// the unavailable-contract path is reachable.
+        spec_fail: bool,
     }
 
     #[async_trait]
@@ -2072,6 +2207,41 @@ mod tests {
                 request.timeframe(),
                 candles,
             ))
+        }
+
+        async fn symbol_spec(&self, symbol: &Symbol) -> Result<SymbolSpecPayload, MarketError> {
+            if self.fail || self.spec_fail {
+                return Err(MarketError::Unavailable {
+                    reason: "terminal down".to_owned(),
+                });
+            }
+            Ok(self
+                .spec
+                .clone()
+                .unwrap_or_else(|| canned_spec(symbol.as_str())))
+        }
+    }
+
+    /// Contract every stub symbol reports unless a test overrides it: the
+    /// values IFC Markets publishes for EURUSD-class pairs.
+    fn canned_spec(symbol: &str) -> SymbolSpecPayload {
+        SymbolSpecPayload {
+            symbol: symbol.to_owned(),
+            digits: 5,
+            point: 0.00001,
+            spread_points: 12,
+            stop_level_points: 5,
+            freeze_level_points: 0,
+            lot_min: 0.01,
+            lot_max: 100.0,
+            lot_step: 0.01,
+            tick_value: 0.1,
+            tick_size: 0.00001,
+            margin_required: 3.29,
+            swap_long: -0.72,
+            swap_short: -0.31,
+            swap_type: 0,
+            trade_allowed: true,
         }
     }
 
@@ -2422,6 +2592,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -2438,6 +2610,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -2469,6 +2643,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -2487,6 +2663,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -2517,6 +2695,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -2544,6 +2724,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -2575,6 +2757,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -2604,6 +2788,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             false,
@@ -2635,6 +2821,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             Some(StubJudge::responding(judgements_response())),
             true,
@@ -2696,6 +2884,109 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn tick_rejects_entries_the_free_margin_cannot_cover() {
+        let mut spec = canned_spec("EURUSD");
+        spec.margin_required = 5_000.0;
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: Some(spec),
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let link = harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link");
+        link.retain_snapshot(cash_snapshot(20.0, 20.0));
+
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "insufficient_margin"
+            }
+        );
+        let rejection = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "rejected")
+            .expect("rejection recorded");
+        assert_eq!(rejection.payload()["reason"], "insufficient_margin");
+        assert!(
+            !link.has_pending(CommandKind::OpenOrder),
+            "an unaffordable order is never queued"
+        );
+
+        let input: Value =
+            serde_json::from_str(&engine.requests()[0].input).expect("input is JSON");
+        assert_eq!(
+            input["account"]["free_margin"], 20.0,
+            "the model sees the same free margin the check used"
+        );
+        assert_eq!(input["assets"][0]["contract"]["margin_required"], 5_000.0);
+    }
+
+    #[actix_web::test]
+    async fn tick_rejects_entries_below_the_venue_lot_minimum() {
+        let mut spec = canned_spec("EURUSD");
+        spec.lot_min = 0.02;
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: Some(spec),
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "volume_below_min"
+            }
+        );
+    }
+
+    #[actix_web::test]
+    async fn tick_rejects_entries_without_a_venue_contract() {
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: true,
+            }),
+            None,
+            true,
+            true,
+        );
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "spec_unavailable"
+            }
+        );
+    }
+
+    #[actix_web::test]
     async fn tick_feeds_judgements_into_the_model_input() {
         let engine = StubEngine::answering(json!({"action": "none"}));
         let judge = StubJudge::responding(judgements_response());
@@ -2705,6 +2996,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             Some(judge.clone()),
             true,
@@ -2726,6 +3019,16 @@ mod tests {
         );
         assert_eq!(input["assets"][0]["judgements"]["momentum"]["score"], 1.5);
         assert_eq!(input["assets"][0]["market"]["bars"], 20);
+        assert_eq!(
+            input["assets"][0]["market"]["atr14"], 0.02,
+            "the model gets the true-range context it sizes stops against"
+        );
+        assert_eq!(
+            input["assets"][0]["contract"]["spread_points"], 12,
+            "the venue contract travels with the asset"
+        );
+        assert_eq!(input["assets"][0]["contract"]["lot_min"], 0.01);
+        assert_eq!(input["assets"][0]["contract"]["stop_level_points"], 5);
     }
 
     #[actix_web::test]
@@ -2743,6 +3046,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             Some(judge.clone()),
             true,
@@ -2762,6 +3067,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             Some(StubJudge::failing()),
             true,
@@ -2789,6 +3096,8 @@ mod tests {
             Some(StubFeed {
                 bars: 0,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -2812,6 +3121,8 @@ mod tests {
         let feed = StubFeed {
             bars: 20,
             fail: false,
+            spec: None,
+            spec_fail: false,
         };
         let no_broker = AppState::new(
             config(true),
@@ -2852,6 +3163,8 @@ mod tests {
         .with_market(Some(MarketRuntime::from_feed(Arc::new(StubFeed {
             bars: 20,
             fail: false,
+            spec: None,
+            spec_fail: false,
         }))));
         assert_eq!(
             tick(&disconnected).await,
@@ -2876,6 +3189,8 @@ mod tests {
         .with_market(Some(MarketRuntime::from_feed(Arc::new(StubFeed {
             bars: 20,
             fail: false,
+            spec: None,
+            spec_fail: false,
         }))));
         assert_eq!(tick(&state).await, TickOutcome::NoTrade);
     }
@@ -2889,6 +3204,32 @@ mod tests {
         );
         assert!(market_narrative(&empty).contains("no closed candles"));
         assert_eq!(change_pct(&empty), 0.0);
+        assert_eq!(average_true_range(&empty, ATR_PERIOD), None);
+    }
+
+    #[test]
+    fn average_true_range_measures_true_ranges_or_reports_none() {
+        let three = CandleSeries::from_validated(
+            Symbol::parse("EURUSD").expect("symbol"),
+            Timeframe::H4,
+            vec![
+                Candle::from_validated(1, 1.0, 1.05, 0.95, 1.0, 1),
+                Candle::from_validated(2, 1.0, 1.5, 0.9, 1.2, 1),
+                Candle::from_validated(3, 1.2, 1.3, 1.0, 1.1, 1),
+            ],
+        );
+        // TR2 = max(0.6, |1.5-1.0|, |0.9-1.0|) = 0.6; TR3 = max(0.3, 0.1, 0.2) = 0.3.
+        assert_eq!(average_true_range(&three, 2), Some(0.45));
+        assert_eq!(
+            average_true_range(&three, 0),
+            None,
+            "a zero window is not measurable"
+        );
+        assert_eq!(
+            average_true_range(&three, 3),
+            None,
+            "each true range needs a previous close"
+        );
     }
 
     fn managed_snapshot(ticket: i64, opened_at: i64, server_time: i64) -> AccountSnapshotPayload {
@@ -2919,10 +3260,30 @@ mod tests {
                 take_profit: 1.14554,
                 opened_at,
                 current,
+                swap: -0.11,
                 magic: crate::broker::ORDER_MAGIC,
             }],
             positions_truncated: false,
             server_time,
+            leverage: 100,
+            margin_level: 357.5,
+        }
+    }
+
+    /// Snapshot of a flat account with explicit money values, used to give
+    /// the pre-queue margin check a free-margin number to compare against.
+    fn cash_snapshot(equity: f64, free_margin: f64) -> AccountSnapshotPayload {
+        AccountSnapshotPayload {
+            balance: equity,
+            equity,
+            free_margin,
+            orders: 0,
+            lots: 0.0,
+            positions: Vec::new(),
+            positions_truncated: false,
+            server_time: 1_758_003_600,
+            leverage: 100,
+            margin_level: 0.0,
         }
     }
 
@@ -2958,6 +3319,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -2997,6 +3360,16 @@ mod tests {
         assert_eq!(input["open_positions"][0]["ticket"], 10650805);
         assert_eq!(input["open_positions"][0]["age_secs"], 3600);
         assert_eq!(input["open_positions"][0]["stop_loss"], 1.1497);
+        assert_eq!(
+            input["open_positions"][0]["swap"], -0.11,
+            "the reviewer sees the carry the position is paying"
+        );
+        assert_eq!(input["account"]["margin_level"], 357.5);
+        assert_eq!(input["account"]["leverage"], 100);
+        assert_eq!(
+            input["market"]["atr14"], 0.02,
+            "the reviewer sees the same volatility context as the entry prompt"
+        );
     }
 
     #[actix_web::test]
@@ -3009,6 +3382,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -3037,6 +3412,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -3064,6 +3441,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -3093,6 +3472,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -3155,6 +3536,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             false,
@@ -3187,6 +3570,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -3214,6 +3599,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -3251,6 +3638,7 @@ mod tests {
             take_profit: 0.0,
             opened_at: 1_758_000_000,
             current,
+            swap: 0.0,
         }
     }
 
@@ -3482,6 +3870,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -3540,6 +3930,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -3583,6 +3975,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -3639,6 +4033,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             })
         };
 
@@ -3716,6 +4112,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: true,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,
@@ -3734,6 +4132,8 @@ mod tests {
             Some(StubFeed {
                 bars: 20,
                 fail: false,
+                spec: None,
+                spec_fail: false,
             }),
             None,
             true,

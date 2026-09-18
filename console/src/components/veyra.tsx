@@ -132,6 +132,11 @@ export function AccountPanel({ account, error }: { account?: Account; error?: st
         <Field label="Balance" value={money(account?.balance)} />
         <Field label="Equity" value={money(account?.equity)} />
         <Field label="Free margin" value={money(account?.freeMargin)} />
+        <Field
+          label="Margin level"
+          value={account?.marginLevel != null ? `${account.marginLevel.toFixed(1)}%` : '—'}
+        />
+        <Field label="Leverage" value={account?.leverage != null ? `1:${account.leverage}` : '—'} />
         <Field label="Open orders" value={account?.orders ?? '—'} />
         <Field label="Open lots" value={account?.lots ?? '—'} />
         <Field

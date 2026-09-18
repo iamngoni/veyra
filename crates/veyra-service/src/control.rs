@@ -256,6 +256,8 @@ pub async fn account_state(state: Data<AppState>) -> HttpResponse {
         body["balance"] = json!(account.balance);
         body["equity"] = json!(account.equity);
         body["freeMargin"] = json!(account.free_margin);
+        body["marginLevel"] = json!(account.margin_level);
+        body["leverage"] = json!(account.leverage);
         body["orders"] = json!(account.orders);
         body["lots"] = json!(account.lots);
         body["positions"] = json!(account.positions);
@@ -335,6 +337,46 @@ pub async fn market_candles(state: Data<AppState>, query: web::Query<CandleQuery
                 }))
                 .collect::<Vec<_>>()
         })),
+        Err(error) => HttpResponse::BadGateway()
+            .json(json!({ "error": "market_feed_failed", "reason": error.to_string() })),
+    }
+}
+
+/// Query for the instrument contract.
+#[derive(Debug, Deserialize)]
+pub struct SpecQuery {
+    /// Instrument; defaults to the terminal's chart symbol.
+    pub symbol: Option<String>,
+}
+
+#[get("/market/spec")]
+/// Returns the venue's contract details for one instrument.
+///
+/// Read-only: at most one `symbol_spec` command is queued on the control
+/// channel and no order path is touched. Invalid symbols are rejected before
+/// anything is queued, and a terminal that does not answer within the
+/// configured window is reported as a gateway failure.
+pub async fn market_spec(state: Data<AppState>, query: web::Query<SpecQuery>) -> HttpResponse {
+    let Some(runtime) = state.market() else {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "market_feed_unavailable" }));
+    };
+    let symbol = match query.symbol.as_deref() {
+        Some(raw) => match Symbol::parse(raw) {
+            Ok(symbol) => symbol,
+            Err(_) => {
+                return HttpResponse::BadRequest().json(json!({ "error": "invalid_symbol" }));
+            }
+        },
+        None => match default_symbol(&state).await {
+            Some(symbol) => symbol,
+            None => {
+                return HttpResponse::Conflict().json(json!({ "error": "symbol_unavailable" }));
+            }
+        },
+    };
+    match runtime.feed().symbol_spec(&symbol).await {
+        Ok(spec) => HttpResponse::Ok().json(spec),
         Err(error) => HttpResponse::BadGateway()
             .json(json!({ "error": "market_feed_failed", "reason": error.to_string() })),
     }
@@ -843,6 +885,24 @@ fn command_result(payload: CommandPayload) -> serde_json::Value {
             "timeframeMinutes": rates.timeframe_minutes,
             "candles": rates.candles
         }),
+        CommandPayload::SymbolSpec(spec) => json!({
+            "symbol": spec.symbol,
+            "digits": spec.digits,
+            "point": spec.point,
+            "spreadPoints": spec.spread_points,
+            "stopLevelPoints": spec.stop_level_points,
+            "freezeLevelPoints": spec.freeze_level_points,
+            "lotMin": spec.lot_min,
+            "lotMax": spec.lot_max,
+            "lotStep": spec.lot_step,
+            "tickValue": spec.tick_value,
+            "tickSize": spec.tick_size,
+            "marginRequired": spec.margin_required,
+            "swapLong": spec.swap_long,
+            "swapShort": spec.swap_short,
+            "swapType": spec.swap_type,
+            "tradeAllowed": spec.trade_allowed
+        }),
         CommandPayload::OpenOrder(execution)
         | CommandPayload::CloseOrder(execution)
         | CommandPayload::ModifyOrder(execution) => json!({
@@ -866,7 +926,9 @@ mod tests {
     use super::*;
     use crate::app::create_app;
     use crate::audit::MemoryTrail;
-    use crate::broker::{AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName};
+    use crate::broker::{
+        AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName, SymbolSpecRequest,
+    };
     use crate::config::{ConfigError, ServiceConfig};
     use crate::market::{Candle, CandleSeries, MarketError, MarketFeed, MarketProvider};
     use crate::risk::{RiskGate, RiskPolicy};
@@ -900,6 +962,35 @@ mod tests {
                     42,
                 )],
             ))
+        }
+
+        async fn symbol_spec(
+            &self,
+            symbol: &Symbol,
+        ) -> Result<crate::broker::SymbolSpecPayload, MarketError> {
+            if self.fail {
+                return Err(MarketError::Unavailable {
+                    reason: "terminal did not answer".to_owned(),
+                });
+            }
+            Ok(crate::broker::SymbolSpecPayload {
+                symbol: symbol.as_str().to_owned(),
+                digits: 5,
+                point: 0.00001,
+                spread_points: 12,
+                stop_level_points: 5,
+                freeze_level_points: 0,
+                lot_min: 0.01,
+                lot_max: 100.0,
+                lot_step: 0.01,
+                tick_value: 0.1,
+                tick_size: 0.00001,
+                margin_required: 3.29,
+                swap_long: -0.72,
+                swap_short: -0.31,
+                swap_type: 0,
+                trade_allowed: true,
+            })
         }
     }
 
@@ -1218,7 +1309,9 @@ mod tests {
                     "magic": 77041
                 }],
                 "positionsTruncated": false,
-                "serverTime": 1_758_000_000
+                "serverTime": 1_758_000_000,
+                "leverage": 100,
+                "marginLevel": 12.5
             }
         });
         let response = test::call_service(
@@ -1236,12 +1329,177 @@ mod tests {
         let body: Value = test::read_body_json(response).await;
         assert_eq!(body["balance"], 20.57);
         assert_eq!(body["equity"], 21.10);
+        assert_eq!(body["freeMargin"], 20.10);
+        assert_eq!(body["marginLevel"], 12.5);
+        assert_eq!(body["leverage"], 100);
         assert_eq!(body["orders"], 1);
         assert_eq!(body["lots"], 0.01);
         assert_eq!(body["positions"][0]["ticket"], 123456);
         assert_eq!(body["positions"][0]["magic"], 77041);
         assert_eq!(body["login"], 94168);
         assert_eq!(body["server"], "IFCMarkets-Real");
+    }
+
+    #[actix_web::test]
+    async fn market_spec_returns_contracts_and_reports_failures() {
+        let app = test::init_service(create_app(build_state(
+            Some(StubFeed { fail: false }),
+            true,
+        )))
+        .await;
+
+        // No symbol defaults to the terminal's chart symbol.
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/market/spec").to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["symbol"], "EURUSD");
+        assert_eq!(body["spreadPoints"], 12);
+        assert_eq!(body["stopLevelPoints"], 5);
+        assert_eq!(body["lotMin"], 0.01);
+        assert_eq!(body["marginRequired"], 3.29);
+        assert_eq!(body["tradeAllowed"], true);
+
+        // An explicit symbol is honoured.
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/market/spec?symbol=GBPUSD")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["symbol"], "GBPUSD");
+
+        // Invalid symbols never reach the feed.
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/market/spec?symbol=bad%20symbol")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "invalid_symbol");
+
+        // A terminal that does not answer is a gateway failure.
+        let failing =
+            test::init_service(create_app(build_state(Some(StubFeed { fail: true }), true))).await;
+        let response = test::call_service(
+            &failing,
+            test::TestRequest::get()
+                .uri("/market/spec?symbol=EURUSD")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 502);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "market_feed_failed");
+
+        // Without a feed the route is unavailable.
+        let unlinked = test::init_service(create_app(build_state(None, true))).await;
+        let response = test::call_service(
+            &unlinked,
+            test::TestRequest::get().uri("/market/spec").to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 503);
+    }
+
+    #[actix_web::test]
+    async fn command_status_flattens_completed_symbol_specs() {
+        let (state, _) = audited_state(Some(StubFeed { fail: false }));
+        let link = state.broker().expect("broker").ea_link().expect("ea link");
+        let id = link.enqueue_symbol_spec(SymbolSpecRequest::new(
+            &Symbol::parse("EURUSD").expect("symbol"),
+        ));
+
+        // Deliver and acknowledge the command through the real poll path.
+        let ea_app = test::init_service(crate::broker::ea::create_ea_app(link.clone())).await;
+        let hello = serde_json::json!({
+            "t": "hb",
+            "token": "test-token-1234567890",
+            "acct": 94168,
+            "server": "IFCMarkets-Real",
+            "symbol": "EURUSD",
+            "connected": true,
+            "tradeAllowed": true,
+            "orders": 0,
+            "lots": 0.0
+        });
+        let mut command = None;
+        for _ in 0..40 {
+            let response = test::call_service(
+                &ea_app,
+                test::TestRequest::post()
+                    .uri("/ea/poll")
+                    .set_payload(hello.to_string())
+                    .to_request(),
+            )
+            .await;
+            let body: Value = test::read_body_json(response).await;
+            if body["t"] == "cmd" {
+                command = Some(body);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let command = command.expect("symbol_spec command delivered");
+        assert_eq!(command["kind"], "symbol_spec");
+        let ack = serde_json::json!({
+            "t": "ack",
+            "token": "test-token-1234567890",
+            "id": command["id"],
+            "ok": true,
+            "data": {
+                "symbol": "EURUSD",
+                "digits": 5,
+                "point": 0.00001,
+                "spreadPoints": 12,
+                "stopLevelPoints": 5,
+                "freezeLevelPoints": 0,
+                "lotMin": 0.01,
+                "lotMax": 100.0,
+                "lotStep": 0.01,
+                "tickValue": 0.1,
+                "tickSize": 0.00001,
+                "marginRequired": 3.29,
+                "swapLong": -0.72,
+                "swapShort": -0.31,
+                "swapType": 0,
+                "tradeAllowed": true
+            }
+        });
+        let response = test::call_service(
+            &ea_app,
+            test::TestRequest::post()
+                .uri("/ea/poll")
+                .set_payload(ack.to_string())
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+
+        let app = test::init_service(create_app(state.clone())).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/commands/{id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["kind"], "symbol_spec");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["result"]["symbol"], "EURUSD");
+        assert_eq!(body["result"]["spreadPoints"], 12);
+        assert_eq!(body["result"]["marginRequired"], 3.29);
     }
 
     #[actix_web::test]

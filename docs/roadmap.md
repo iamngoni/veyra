@@ -95,6 +95,14 @@
       behind the best price; the most protective candidate wins, stops never
       move backwards, and an entry-risk memory supplies the basis after a move
       (off by default; both enabled at 1R in the live environment).
+- [x] Venue contract reporting: a read-only `symbol_spec` command returns the
+      instrument's spread and stop level (points), lot band and step, margin
+      per lot, swap rates, and trade permission; `GET /market/spec` exposes it
+      and the autopilot feeds it (with ATR(14) and account free margin) into
+      both model inputs. A pre-queue contract check rejects volumes off the
+      lot grid, margin above free margin, and stops inside the spread or the
+      broker's minimum distance — proven live against IFC Markets for the
+      whole menu (EURUSD/USDJPY/GBPUSD/XAUUSD).
 - [x] `close_order` for Veyra-owned positions: only tickets from the latest
       completed `account_snapshot` that carry the Veyra magic number are
       accepted, and the terminal re-validates before a dry run or close —

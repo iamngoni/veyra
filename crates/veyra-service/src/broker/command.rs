@@ -65,6 +65,9 @@ pub enum CommandKind {
     ModifyOrder,
     /// Report recent closed candles for one symbol and timeframe.
     Rates,
+    /// Report the venue's contract details for one instrument (spread, stop
+    /// level, lot band, margin requirement, swap rates).
+    SymbolSpec,
 }
 
 impl CommandKind {
@@ -78,6 +81,7 @@ impl CommandKind {
             Self::CloseOrder => "close_order",
             Self::ModifyOrder => "modify_order",
             Self::Rates => "rates",
+            Self::SymbolSpec => "symbol_spec",
         }
     }
 }
@@ -127,6 +131,10 @@ pub struct PositionPayload {
     /// not report it. The break-even policy is skipped without it.
     #[serde(default)]
     pub current: f64,
+    /// Swap charged or credited on the position so far, in account currency.
+    /// Absent on older terminals that do not report it.
+    #[serde(default)]
+    pub swap: f64,
 }
 
 /// Order kinds the terminal can report.
@@ -173,6 +181,14 @@ pub struct AccountSnapshotPayload {
     /// Terminal server time.
     #[serde(rename = "serverTime")]
     pub server_time: i64,
+    /// Account leverage (for example 100 for 1:100), or zero when the
+    /// terminal does not report it.
+    #[serde(default)]
+    pub leverage: u32,
+    /// Margin level percentage (equity / used margin x 100), or zero when no
+    /// margin is used or the terminal does not report it.
+    #[serde(rename = "marginLevel", default)]
+    pub margin_level: f64,
 }
 
 impl AccountSnapshotPayload {
@@ -183,6 +199,7 @@ impl AccountSnapshotPayload {
             ("balance", self.balance),
             ("equity", self.equity),
             ("freeMargin", self.free_margin),
+            ("marginLevel", self.margin_level),
         ] {
             if !value.is_finite() {
                 return Err(format!("{name} must be a finite number"));
@@ -190,6 +207,9 @@ impl AccountSnapshotPayload {
         }
         if !self.lots.is_finite() || self.lots < 0.0 {
             return Err("lots must be a finite, non-negative number".to_owned());
+        }
+        if self.margin_level < 0.0 {
+            return Err("marginLevel must be non-negative".to_owned());
         }
         if self.positions.len() > MAX_POSITIONS {
             return Err(format!(
@@ -223,6 +243,9 @@ impl AccountSnapshotPayload {
             }
             if !position.current.is_finite() || position.current < 0.0 {
                 return Err("position current must be a finite, non-negative price".to_owned());
+            }
+            if !position.swap.is_finite() {
+                return Err("position swap must be a finite number".to_owned());
             }
         }
         Ok(())
@@ -508,6 +531,135 @@ impl RatesPayload {
     }
 }
 
+/// Symbol-spec request sent to the EA: the venue contract for one instrument.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SymbolSpecRequest {
+    symbol: String,
+}
+
+impl SymbolSpecRequest {
+    /// Builds a request for an already validated instrument.
+    pub fn new(symbol: &Symbol) -> Self {
+        Self {
+            symbol: symbol.as_str().to_owned(),
+        }
+    }
+
+    /// Instrument the contract is requested for.
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+}
+
+/// Venue contract details for one instrument as the terminal reports them.
+///
+/// These values price risk locally: the spread and minimum stop distance
+/// decide whether a stop can survive execution, the lot band gates volume, and
+/// the margin requirement pre-checks affordability before an order is queued.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SymbolSpecPayload {
+    /// Instrument the contract belongs to.
+    pub symbol: String,
+    /// Price digits.
+    pub digits: u32,
+    /// Smallest price increment.
+    pub point: f64,
+    /// Current spread in points.
+    #[serde(rename = "spreadPoints")]
+    pub spread_points: u32,
+    /// Broker minimum distance between the market price and a stop, in points.
+    #[serde(rename = "stopLevelPoints")]
+    pub stop_level_points: u32,
+    /// Distance inside which the terminal freezes an open position, in points.
+    #[serde(rename = "freezeLevelPoints")]
+    pub freeze_level_points: u32,
+    /// Minimum order volume, in lots.
+    #[serde(rename = "lotMin")]
+    pub lot_min: f64,
+    /// Maximum order volume, in lots.
+    #[serde(rename = "lotMax")]
+    pub lot_max: f64,
+    /// Volume increment, in lots.
+    #[serde(rename = "lotStep")]
+    pub lot_step: f64,
+    /// Value of one tick for one lot, in account currency.
+    #[serde(rename = "tickValue")]
+    pub tick_value: f64,
+    /// Size of one tick in price terms.
+    #[serde(rename = "tickSize")]
+    pub tick_size: f64,
+    /// Margin required to open one lot, in account currency.
+    #[serde(rename = "marginRequired")]
+    pub margin_required: f64,
+    /// Swap charged or credited for a long position, per lot.
+    #[serde(rename = "swapLong")]
+    pub swap_long: f64,
+    /// Swap charged or credited for a short position, per lot.
+    #[serde(rename = "swapShort")]
+    pub swap_short: f64,
+    /// MT4 swap accounting mode (0 points, 1 base currency, 2 interest,
+    /// 3 margin currency).
+    #[serde(rename = "swapType")]
+    pub swap_type: u32,
+    /// Whether the broker currently allows trading this instrument.
+    #[serde(rename = "tradeAllowed")]
+    pub trade_allowed: bool,
+}
+
+impl SymbolSpecPayload {
+    /// Largest accepted price-digit count; anything above is a parse error
+    /// rather than a contract decision.
+    const MAX_DIGITS: u32 = 10;
+
+    /// Margin the venue would require to open `lots`, in account currency.
+    /// Pure arithmetic so callers gate on the same number the terminal uses.
+    pub fn margin_for(&self, lots: f64) -> f64 {
+        self.margin_required * lots
+    }
+
+    /// Rejects unusable contract data before it reaches decision code.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        Symbol::parse(&self.symbol)
+            .map_err(|error| format!("symbol spec symbol is invalid: {error}"))?;
+        if self.digits > Self::MAX_DIGITS {
+            return Err(format!("digits must be at most {}", Self::MAX_DIGITS));
+        }
+        for (name, value) in [("point", self.point), ("tickSize", self.tick_size)] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!("{name} must be a finite, positive number"));
+            }
+        }
+        for (name, value) in [
+            ("lotMin", self.lot_min),
+            ("lotMax", self.lot_max),
+            ("lotStep", self.lot_step),
+            ("marginRequired", self.margin_required),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!("{name} must be a finite, positive number"));
+            }
+        }
+        if self.lot_min > self.lot_max {
+            return Err("lotMin must not exceed lotMax".to_owned());
+        }
+        if self.lot_step > self.lot_max {
+            return Err("lotStep must not exceed lotMax".to_owned());
+        }
+        if !self.tick_value.is_finite() || self.tick_value < 0.0 {
+            return Err("tickValue must be a finite, non-negative number".to_owned());
+        }
+        for (name, value) in [("swapLong", self.swap_long), ("swapShort", self.swap_short)] {
+            if !value.is_finite() {
+                return Err(format!("{name} must be a finite number"));
+            }
+        }
+        if self.swap_type > 3 {
+            return Err("swapType must be 0, 1, 2, or 3".to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// Order request sent to the EA for validation or execution, derived only from
 /// an approved intent. Fields mirror the intent wire contract so the EA can
 /// read them without a nested parser.
@@ -563,6 +715,8 @@ pub enum CommandPayload {
     ModifyOrder(OrderExecutionPayload),
     /// Result of `rates`; the requested window of closed candles.
     Rates(RatesPayload),
+    /// Result of `symbol_spec`; the venue contract for one instrument.
+    SymbolSpec(SymbolSpecPayload),
 }
 
 /// Lifecycle state of one command.

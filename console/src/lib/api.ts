@@ -94,6 +94,10 @@ export type Account = {
   balance?: number
   equity?: number
   freeMargin?: number
+  /** Margin level percentage (equity / used margin x 100); 0 when unused. */
+  marginLevel?: number
+  /** Account leverage (for example 100 for 1:100); 0 when unreported. */
+  leverage?: number
   orders?: number
   lots?: number
   positions?: Position[]

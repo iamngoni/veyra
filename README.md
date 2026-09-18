@@ -151,7 +151,8 @@ One-time terminal setup:
    externally rebuilt `.ex4` files.
 
 Commands: the service delivers typed commands (`ping`, `account_snapshot`,
-`order_check`) on a poll; the EA executes and acknowledges by id. Delivery is
+`rates`, `symbol_spec`, `order_check`, `open_order`, `close_order`,
+`modify_order`) on a poll; the EA executes and acknowledges by id. Delivery is
 at-least-once, a command fails after a 15 s timeout, and acknowledgements are
 validated against the command's typed payload before they are recorded.
 `order_check` only validates a gate-approved request through the terminal's

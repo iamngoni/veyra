@@ -46,6 +46,10 @@ pub struct AccountFacts {
     pub prices: Vec<(Symbol, f64)>,
     /// Account equity reported by the latest validated snapshot, when known.
     pub equity: Option<f64>,
+    /// Free margin reported by the latest validated snapshot, when known.
+    /// The pre-queue margin check skips when it is unknown; the terminal
+    /// still re-validates margin when the order is sent.
+    pub free_margin: Option<f64>,
     /// Percentage below the current UTC day's opening equity, when tracked.
     pub day_drawdown_percent: Option<f64>,
     /// Percentage below the highest equity since startup, when tracked.
@@ -470,6 +474,7 @@ mod tests {
             open_lots,
             open_symbols: Vec::new(),
             equity: Some(1_000.0),
+            free_margin: Some(1_000.0),
             open_positions: Vec::new(),
             prices: Vec::new(),
             day_drawdown_percent: None,
@@ -565,6 +570,7 @@ mod tests {
             open_positions: Vec::new(),
             prices: Vec::new(),
             equity: Some(1_000.0),
+            free_margin: Some(1_000.0),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
         }
@@ -756,6 +762,7 @@ mod tests {
             open_lots: 0.0,
             open_symbols: Vec::new(),
             equity: Some(1_000.0),
+            free_margin: Some(1_000.0),
             open_positions: Vec::new(),
             prices: Vec::new(),
             day_drawdown_percent: None,

@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod autopilot;
+pub mod contract;
 pub mod intent;
 pub mod pipeline;
 

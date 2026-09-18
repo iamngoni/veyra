@@ -742,6 +742,15 @@ mod tests {
                 )],
             ))
         }
+
+        async fn symbol_spec(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<crate::broker::SymbolSpecPayload, MarketError> {
+            Err(MarketError::Unavailable {
+                reason: "stub has no contract data".to_owned(),
+            })
+        }
     }
 
     fn config() -> ServiceConfig {
@@ -773,6 +782,7 @@ mod tests {
             open_lots: 0.0,
             open_symbols: Vec::new(),
             equity: Some(1_000.0),
+            free_margin: Some(1_000.0),
             open_positions: Vec::new(),
             prices: Vec::new(),
             day_drawdown_percent: None,
@@ -1323,9 +1333,12 @@ mod tests {
                     take_profit: 1.20,
                     opened_at: 1_700_000_000,
                     current: 1.105,
+                    swap: -0.11,
                 }],
                 positions_truncated: false,
                 server_time: 1_700_000_000,
+                leverage: 100,
+                margin_level: 0.0,
             });
         harness.state = AppState::new(config(), Some(broker), None, gate())
             .with_audit(Some(AuditRuntime::new(harness.trail.clone())));

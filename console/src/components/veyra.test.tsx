@@ -85,6 +85,8 @@ const account: Account = {
   balance: 1000,
   equity: 1005.5,
   freeMargin: 900,
+  marginLevel: 357.5,
+  leverage: 100,
   orders: 1,
   lots: 0.01,
   positions: [
@@ -178,6 +180,8 @@ describe('AccountPanel', () => {
     expect(screen.getByText('1000.00')).toBeTruthy()
     expect(screen.getByText('1005.50')).toBeTruthy()
     expect(screen.getByText('900.00')).toBeTruthy()
+    expect(screen.getByText('357.5%')).toBeTruthy()
+    expect(screen.getByText('1:100')).toBeTruthy()
     expect(screen.getByText('0.01')).toBeTruthy()
     expect(screen.getByText('-0.32')).toBeTruthy()
     expect(screen.getByText(/ICMarketsSC-MT4 · #123456/)).toBeTruthy()

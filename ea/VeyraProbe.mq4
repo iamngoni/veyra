@@ -6,7 +6,7 @@
 // Requires the endpoint to be listed in
 // Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.22"
+#property version   "1.24"
 #property description "Veyra control channel: heartbeat, account/position snapshots, market rates, order validation, gated live execution, and Veyra-owned closes and stop changes."
 
 input string InUrl         = "__VEYRA_URL__";            // Veyra endpoint (loopback or tunnel)
@@ -333,8 +333,15 @@ void HandleOpenOrder(string response, string id)
       else              cmd = 5;
      }
 
+   // Bound slippage against the live market: twice the current spread with a
+   // 10-point floor for tight books and a 30-point ceiling so a spread
+   // blowout can never turn into a blank cheque.
+   int deviation = (int)MarketInfo(symbol, MODE_SPREAD) * 2;
+   if(deviation < 10) deviation = 10;
+   if(deviation > 30) deviation = 30;
+
    ResetLastError();
-   int ticket = OrderSend(symbol, cmd, volume, entry, 10, sl, tp, "Veyra", magic, 0, CLR_NONE);
+   int ticket = OrderSend(symbol, cmd, volume, entry, deviation, sl, tp, "Veyra", magic, 0, CLR_NONE);
    int sendError = GetLastError();
    if(ticket <= 0)
      {
@@ -405,6 +412,7 @@ string PositionsJson(int maxEntries)
             + ",\"sl\":" + DoubleToString(OrderStopLoss(), digits)
             + ",\"tp\":" + DoubleToString(OrderTakeProfit(), digits)
             + ",\"current\":" + DoubleToString(OrderClosePrice(), digits)
+            + ",\"swap\":" + DoubleToString(OrderSwap(), 2)
             + ",\"openedAt\":" + (string)(long)OrderOpenTime() + "}";
       included++;
      }
@@ -621,6 +629,53 @@ void HandleRates(string response, string id)
    SendAck(id, json);
   }
 
+// Reports the market contract details for one symbol: what the service needs
+// to price risk, check margin before queueing a draft, and avoid trading into
+// a spread blowout. Values come straight from MarketInfo, in the deposit
+// currency where MarketInfo reports money.
+void HandleSymbolSpec(string response, string id)
+  {
+   string symbol = JsonString(response, "symbol");
+   if(StringLen(symbol) == 0) symbol = Symbol();
+
+   double point = MarketInfo(symbol, MODE_POINT);
+   double tickSize = MarketInfo(symbol, MODE_TICKSIZE);
+   double tickValue = MarketInfo(symbol, MODE_TICKVALUE);
+   double minLot = MarketInfo(symbol, MODE_MINLOT);
+   double maxLot = MarketInfo(symbol, MODE_MAXLOT);
+   double lotStep = MarketInfo(symbol, MODE_LOTSTEP);
+   double marginRequired = MarketInfo(symbol, MODE_MARGINREQUIRED);
+   if(point <= 0.0 || tickSize <= 0.0 || minLot <= 0.0 || maxLot <= 0.0 || lotStep <= 0.0)
+     {
+      SendAckError(id, "symbol spec unavailable");
+      return;
+     }
+   if(marginRequired <= 0.0)
+     {
+      SendAckError(id, "symbol spec unavailable: no margin requirement reported");
+      return;
+     }
+
+   string json = "{\"symbol\":\"" + EscapeJson(symbol) + "\""
+                 + ",\"digits\":" + (string)(int)MarketInfo(symbol, MODE_DIGITS)
+                 + ",\"point\":" + DoubleToString(point, 8)
+                 + ",\"spreadPoints\":" + (string)(int)MarketInfo(symbol, MODE_SPREAD)
+                 + ",\"stopLevelPoints\":" + (string)(int)MarketInfo(symbol, MODE_STOPLEVEL)
+                 + ",\"freezeLevelPoints\":" + (string)(int)MarketInfo(symbol, MODE_FREEZELEVEL)
+                 + ",\"lotMin\":" + DoubleToString(minLot, 2)
+                 + ",\"lotMax\":" + DoubleToString(maxLot, 2)
+                 + ",\"lotStep\":" + DoubleToString(lotStep, 2)
+                 + ",\"tickValue\":" + DoubleToString(tickValue, 5)
+                 + ",\"tickSize\":" + DoubleToString(tickSize, 8)
+                 + ",\"marginRequired\":" + DoubleToString(marginRequired, 2)
+                 + ",\"swapLong\":" + DoubleToString(MarketInfo(symbol, MODE_SWAPLONG), 4)
+                 + ",\"swapShort\":" + DoubleToString(MarketInfo(symbol, MODE_SWAPSHORT), 4)
+                 + ",\"swapType\":" + (string)(int)MarketInfo(symbol, MODE_SWAPTYPE)
+                 + ",\"tradeAllowed\":" + (MarketInfo(symbol, MODE_TRADEALLOWED) == 1.0 ? "true" : "false")
+                 + "}";
+   SendAck(id, json);
+  }
+
 // Executes one command delivered by the service and acknowledges it by id.
 void HandleCommand(string response)
   {
@@ -658,6 +713,12 @@ void HandleCommand(string response)
       return;
      }
 
+   if(kind == "symbol_spec")
+     {
+      HandleSymbolSpec(response, id);
+      return;
+     }
+
    string data = "";
    if(kind == "ping")
      {
@@ -672,6 +733,8 @@ void HandleCommand(string response)
              + ",\"lots\":" + DoubleToString(OpenLots(), 2)
              + ",\"positions\":" + PositionsJson(32)
              + ",\"positionsTruncated\":" + (OrdersTotal() > 32 ? "true" : "false")
+             + ",\"leverage\":" + (string)(int)AccountLeverage()
+             + ",\"marginLevel\":" + DoubleToString(AccountMargin() > 0.0 ? AccountEquity() / AccountMargin() * 100.0 : 0.0, 2)
              + ",\"serverTime\":" + (string)(long)TimeLocal() + "}";
      }
    else

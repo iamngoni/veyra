@@ -16,7 +16,7 @@ pub use command::{
     AccountSnapshotPayload, CandlePayload, CloseOrderRequest, CommandId, CommandKind,
     CommandPayload, CommandRecord, CommandState, ListedCommand, ModifyOrderRequest, ORDER_MAGIC,
     OrderCheckPayload, OrderExecutionPayload, OrderRequest, PositionKind, PositionPayload,
-    RatesPayload, RatesRequest, SUPPORTED_TIMEFRAME_MINUTES,
+    RatesPayload, RatesRequest, SUPPORTED_TIMEFRAME_MINUTES, SymbolSpecPayload, SymbolSpecRequest,
 };
 /// EA-specific transport surface, used by the EA server and its contract tests.
 pub use ea::{EaErrorBody, EaLink, EaPoll, EaReply, build_server, create_ea_app};
@@ -293,6 +293,9 @@ pub trait BrokerLink: Send + Sync + fmt::Debug + 'static {
     /// Queues a read-only market-rates request.
     fn enqueue_rates(&self, request: RatesRequest) -> CommandId;
 
+    /// Queues a read-only instrument-contract request.
+    fn enqueue_symbol_spec(&self, request: SymbolSpecRequest) -> CommandId;
+
     /// Whether a command of `kind` is still awaiting acknowledgement.
     fn has_pending(&self, kind: CommandKind) -> bool;
 
@@ -419,6 +422,10 @@ mod tests {
         }
 
         fn enqueue_rates(&self, _request: RatesRequest) -> CommandId {
+            CommandId::new()
+        }
+
+        fn enqueue_symbol_spec(&self, _request: SymbolSpecRequest) -> CommandId {
             CommandId::new()
         }
 

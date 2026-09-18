@@ -30,6 +30,7 @@ use crate::broker::command::{
     AccountSnapshotPayload, CloseOrderRequest, CommandId, CommandKind, CommandPayload,
     CommandRecord, CommandState, ListedCommand, ModifyOrderRequest, OrderCheckPayload,
     OrderExecutionPayload, OrderRequest, PositionPayload, RatesPayload, RatesRequest,
+    SymbolSpecPayload, SymbolSpecRequest,
 };
 use crate::broker::settings::EaToken;
 use crate::broker::{
@@ -194,6 +195,9 @@ pub enum EaReply {
         /// Present for market-rates commands.
         #[serde(skip_serializing_if = "Option::is_none")]
         rates: Option<Box<RatesRequest>>,
+        /// Present for instrument-contract commands.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spec: Option<Box<SymbolSpecRequest>>,
     },
 }
 
@@ -236,6 +240,8 @@ enum CommandRequest {
     Modify(ModifyOrderRequest),
     /// Market-rates request for one symbol and timeframe.
     Rates(RatesRequest),
+    /// Instrument-contract request for one symbol.
+    SymbolSpec(SymbolSpecRequest),
 }
 
 /// Retained account snapshot plus the instant it was validated.
@@ -323,6 +329,14 @@ impl EaLink {
     /// Queues a read-only market-rates request.
     pub fn enqueue_rates(&self, request: RatesRequest) -> CommandId {
         self.enqueue_with(CommandKind::Rates, Some(CommandRequest::Rates(request)))
+    }
+
+    /// Queues a read-only instrument-contract request.
+    pub fn enqueue_symbol_spec(&self, request: SymbolSpecRequest) -> CommandId {
+        self.enqueue_with(
+            CommandKind::SymbolSpec,
+            Some(CommandRequest::SymbolSpec(request)),
+        )
     }
 
     fn enqueue_with(&self, kind: CommandKind, request: Option<CommandRequest>) -> CommandId {
@@ -469,7 +483,8 @@ impl EaLink {
                         | CommandPayload::OpenOrder(_)
                         | CommandPayload::CloseOrder(_)
                         | CommandPayload::ModifyOrder(_)
-                        | CommandPayload::Rates(_) => None,
+                        | CommandPayload::Rates(_)
+                        | CommandPayload::SymbolSpec(_) => None,
                     };
                     command.state = CommandState::Completed { payload };
                     retained
@@ -752,6 +767,10 @@ impl BrokerLink for EaLink {
         EaLink::enqueue_rates(self, request)
     }
 
+    fn enqueue_symbol_spec(&self, request: SymbolSpecRequest) -> CommandId {
+        EaLink::enqueue_symbol_spec(self, request)
+    }
+
     fn has_pending(&self, kind: CommandKind) -> bool {
         EaLink::has_pending(self, kind)
     }
@@ -834,20 +853,23 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
                 link.record(snapshot);
                 let reply = match link.deliverable() {
                     Some((id, kind, request)) => {
-                        let (order, close, modify, rates) = match request {
+                        let (order, close, modify, rates, spec) = match request {
                             Some(CommandRequest::Order(order)) => {
-                                (Some(Box::new(order)), None, None, None)
+                                (Some(Box::new(order)), None, None, None, None)
                             }
                             Some(CommandRequest::Close(close)) => {
-                                (None, Some(Box::new(close)), None, None)
+                                (None, Some(Box::new(close)), None, None, None)
                             }
                             Some(CommandRequest::Modify(modify)) => {
-                                (None, None, Some(Box::new(modify)), None)
+                                (None, None, Some(Box::new(modify)), None, None)
                             }
                             Some(CommandRequest::Rates(rates)) => {
-                                (None, None, None, Some(Box::new(rates)))
+                                (None, None, None, Some(Box::new(rates)), None)
                             }
-                            None => (None, None, None, None),
+                            Some(CommandRequest::SymbolSpec(spec)) => {
+                                (None, None, None, None, Some(Box::new(spec)))
+                            }
+                            None => (None, None, None, None, None),
                         };
                         EaReply::Command {
                             id,
@@ -856,6 +878,7 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
                             close,
                             modify,
                             rates,
+                            spec,
                         }
                     }
                     // Ask for a pong on hello and until one has been seen for
@@ -922,6 +945,13 @@ fn payload_for(kind: CommandKind, data: Option<Value>) -> Result<CommandPayload,
             payload.validate()?;
             Ok(CommandPayload::Rates(payload))
         }
+        CommandKind::SymbolSpec => {
+            let value = data.ok_or_else(|| "symbol_spec ack is missing data".to_owned())?;
+            let payload: SymbolSpecPayload = serde_json::from_value(value)
+                .map_err(|error| format!("invalid symbol_spec payload: {error}"))?;
+            payload.validate()?;
+            Ok(CommandPayload::SymbolSpec(payload))
+        }
     }
 }
 
@@ -975,6 +1005,12 @@ fn completed_summary(payload: &CommandPayload) -> Value {
             "symbol": rates.symbol,
             "timeframeMinutes": rates.timeframe_minutes,
             "candles": rates.candles.len()
+        }),
+        CommandPayload::SymbolSpec(spec) => serde_json::json!({
+            "symbol": spec.symbol,
+            "spreadPoints": spec.spread_points,
+            "stopLevelPoints": spec.stop_level_points,
+            "marginRequired": spec.margin_required
         }),
     }
 }
@@ -1033,7 +1069,7 @@ mod tests {
     use crate::broker::Symbol as BrokerSymbol;
     use crate::broker::{
         AccountSnapshotPayload, CandlePayload, CommandId, CommandKind, CommandPayload,
-        CommandState, PositionKind, PositionPayload,
+        CommandState, PositionKind, PositionPayload, SymbolSpecRequest,
     };
     use crate::trading::intent::{
         OrderKind, Price, Side, TradeIntent, TradeIntentDraft, Volume, parse_instrument,
@@ -1062,6 +1098,7 @@ mod tests {
         assert_eq!(CommandKind::CloseOrder.as_str(), "close_order");
         assert_eq!(CommandKind::ModifyOrder.as_str(), "modify_order");
         assert_eq!(CommandKind::Rates.as_str(), "rates");
+        assert_eq!(CommandKind::SymbolSpec.as_str(), "symbol_spec");
     }
 
     fn candle(time: i64) -> CandlePayload {
@@ -1172,6 +1209,7 @@ mod tests {
             close: None,
             modify: None,
             rates: Some(Box::new(request)),
+            spec: None,
         };
         let wire = serde_json::to_value(&reply).expect("serializes");
         assert_eq!(wire["t"], "cmd");
@@ -1323,6 +1361,7 @@ mod tests {
             take_profit: 1.105,
             opened_at: 1_758_000_000,
             current: 1.096,
+            swap: -0.11,
             magic,
         }
     }
@@ -1337,6 +1376,8 @@ mod tests {
             positions,
             positions_truncated: truncated,
             server_time: 0,
+            leverage: 100,
+            margin_level: 0.0,
         }
     }
 
@@ -1519,6 +1560,8 @@ mod tests {
             positions: Vec::new(),
             positions_truncated: false,
             server_time: 0,
+            leverage: 100,
+            margin_level: 0.0,
         };
         let error = payload.validate().expect_err("NaN must be rejected");
         assert!(error.contains("balance"), "unexpected error: {error}");
@@ -1911,6 +1954,90 @@ mod tests {
             .is_err(),
             "an executed modify must report its ticket"
         );
+    }
+
+    fn spec_json() -> serde_json::Value {
+        serde_json::json!({
+            "symbol": "EURUSD",
+            "digits": 5,
+            "point": 0.00001,
+            "spreadPoints": 12,
+            "stopLevelPoints": 5,
+            "freezeLevelPoints": 0,
+            "lotMin": 0.01,
+            "lotMax": 100.0,
+            "lotStep": 0.01,
+            "tickValue": 0.1,
+            "tickSize": 0.00001,
+            "marginRequired": 3.29,
+            "swapLong": -0.72,
+            "swapShort": -0.31,
+            "swapType": 0,
+            "tradeAllowed": true
+        })
+    }
+
+    #[test]
+    fn symbol_specs_deliver_validate_and_summarize() {
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        let symbol = BrokerSymbol::parse("EURUSD").expect("symbol");
+        let request = SymbolSpecRequest::new(&symbol);
+        let id = link.enqueue_symbol_spec(request.clone());
+
+        let (delivered, kind, payload) = link.deliverable().expect("pending command");
+        assert_eq!(delivered, id);
+        assert_eq!(kind, CommandKind::SymbolSpec);
+        assert_eq!(payload, Some(CommandRequest::SymbolSpec(request.clone())));
+
+        let reply = EaReply::Command {
+            id,
+            kind,
+            order: None,
+            close: None,
+            modify: None,
+            rates: None,
+            spec: Some(Box::new(request)),
+        };
+        let wire = serde_json::to_value(&reply).expect("serializes");
+        assert_eq!(wire["kind"], "symbol_spec");
+        assert_eq!(wire["spec"]["symbol"], "EURUSD");
+        assert!(wire.get("rates").is_none(), "absent requests are omitted");
+
+        link.apply_ack(&EaAck {
+            id,
+            ok: true,
+            data: Some(spec_json()),
+            error: None,
+        });
+        let record = link.command(id).expect("record");
+        let CommandState::Completed {
+            payload: CommandPayload::SymbolSpec(spec),
+        } = record.state
+        else {
+            panic!("expected a completed symbol spec");
+        };
+        assert_eq!(spec.symbol, "EURUSD");
+        let listed = link.recent_commands(1);
+        let summary = listed[0].summary.as_ref().expect("summary");
+        assert_eq!(summary["spreadPoints"], 12);
+        assert_eq!(summary["marginRequired"], 3.29);
+
+        // A malformed acknowledgement fails the command instead of storing junk.
+        let bad = link.enqueue_symbol_spec(SymbolSpecRequest::new(&symbol));
+        link.apply_ack(&EaAck {
+            id: bad,
+            ok: true,
+            data: Some(serde_json::json!({"symbol": "EURUSD"})),
+            error: None,
+        });
+        assert!(matches!(
+            link.command(bad).expect("record").state,
+            CommandState::Failed { .. }
+        ));
     }
 
     #[actix_web::test]
