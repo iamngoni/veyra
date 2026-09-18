@@ -604,13 +604,23 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         .and_then(|broker| broker.link().last_account())
         .map(|snapshot| snapshot.server_time)
         .unwrap_or(0);
+    state
+        .review_watch()
+        .retain(&managed.iter().map(|p| p.ticket).collect::<Vec<_>>());
     if let Some(position) = next_review_position(&managed, state.rotation())
         && matches!(
             position_age_secs(server_time, position.opened_at),
             Some(age) if age >= settings.min_hold().as_secs()
         )
         && let Some(series) = series_for_symbol(&markets, &position.symbol)
+        && let candle_time = series.last().map(|candle| candle.time()).unwrap_or(0)
+        && state
+            .review_watch()
+            .should_review(position.ticket, candle_time)
     {
+        // Marked before the verdict, so an error on the way to one cannot make
+        // the same question repeat every tick for the rest of the candle.
+        state.review_watch().record(position.ticket, candle_time);
         let engine = model.engine();
         let session = AgentSession {
             state,
@@ -1227,6 +1237,48 @@ pub struct EntryObservation<'a> {
 #[derive(Debug, Default)]
 pub struct EntryWatch {
     seen: std::sync::Mutex<std::collections::HashMap<String, EntrySeen>>,
+}
+
+/// The candle each open position was last reviewed on.
+///
+/// A review asks whether the reason for holding still stands, and that reason
+/// is formed from closed candles. Asking again inside the same candle re-runs
+/// an identical question, and a model asked repeatedly will eventually answer
+/// differently for no new reason — which cuts winners short.
+///
+/// Stop moves are deliberately not gated by this. A position running toward its
+/// stop cannot wait for a bar to close, so that path stays on every tick.
+#[derive(Debug, Default)]
+pub struct ReviewWatch {
+    seen: std::sync::Mutex<std::collections::HashMap<i64, i64>>,
+}
+
+impl ReviewWatch {
+    /// Whether this position has yet to be reviewed on this candle.
+    pub fn should_review(&self, ticket: i64, candle_time: i64) -> bool {
+        let Ok(seen) = self.seen.lock() else {
+            // A poisoned lock must not strand an open position unreviewed.
+            return true;
+        };
+        seen.get(&ticket).is_none_or(|last| candle_time > *last)
+    }
+
+    /// Marks this position as reviewed on this candle.
+    pub fn record(&self, ticket: i64, candle_time: i64) {
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        seen.insert(ticket, candle_time);
+    }
+
+    /// Forgets tickets that are no longer open, so the map tracks the book
+    /// rather than every position the process has ever seen.
+    pub fn retain(&self, open: &[i64]) {
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        seen.retain(|ticket, _| open.contains(ticket));
+    }
 }
 
 /// Judge answers, keyed to the candle they were formed on.
@@ -3609,6 +3661,69 @@ mod tests {
             "a failed judgement must not reach the model"
         );
         assert_eq!(outcomes(&harness.trail), vec!["unavailable".to_owned()]);
+    }
+
+    #[test]
+    fn a_position_is_reviewed_once_per_candle() {
+        let watch = ReviewWatch::default();
+        // Never reviewed: the first look on any candle is always allowed.
+        assert!(watch.should_review(10650805, 1_700_000_000));
+        watch.record(10650805, 1_700_000_000);
+
+        assert!(
+            !watch.should_review(10650805, 1_700_000_000),
+            "the same candle is the same question"
+        );
+        assert!(
+            watch.should_review(10650805, 1_700_014_400),
+            "a newly closed candle is a new question"
+        );
+        assert!(
+            watch.should_review(7, 1_700_000_000),
+            "reviews are tracked per position"
+        );
+
+        // A closed position stops being tracked, so a recycled ticket number
+        // cannot inherit a review it never had.
+        watch.retain(&[7]);
+        assert!(watch.should_review(10650805, 1_700_000_000));
+    }
+
+    #[actix_web::test]
+    async fn an_open_position_is_not_re_reviewed_inside_its_candle() {
+        let engine = StubEngine::answering(json!({"action": "hold"}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            // Opened long enough ago that the minimum hold no longer applies.
+            .retain_snapshot(managed_snapshot(10650805, 1_757_900_000, 1_758_003_600));
+
+        tick(&harness.state).await;
+        let after_first = engine.requests().len();
+        assert!(after_first >= 1, "the first tick reviews the position");
+
+        tick(&harness.state).await;
+        assert_eq!(
+            engine.requests().len(),
+            after_first,
+            "an unchanged candle must not re-review an open position"
+        );
     }
 
     #[actix_web::test]
