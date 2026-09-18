@@ -83,6 +83,8 @@ export type Position = {
   sl: number
   /** Take profit as an absolute price, zero when the position carries none. */
   tp: number
+  /** Swap charged or credited so far, in account currency (absent on older terminals). */
+  swap?: number
   magic: number
 }
 

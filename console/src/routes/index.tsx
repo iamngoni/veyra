@@ -56,7 +56,7 @@ export function Dashboard() {
         </div>
       </div>
 
-      <div className="grid flex-1 items-start gap-3 lg:grid-cols-[3fr_2fr]">
+      <div className="grid flex-1 items-start gap-3 lg:grid-cols-2">
         <div className="min-w-0">
           <ActivityFeed events={events} connected={connected} focus={focus} onFocusChange={setFocus} />
         </div>

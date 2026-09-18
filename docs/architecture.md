@@ -224,14 +224,14 @@ Environment variables are **startup defaults and secrets** (bind addresses, toke
 | Panel | Shows |
 | --- | --- |
 | Status pills | Terminal live/stale, EA armed/disarmed, trading enabled/disabled, autopilot cadence, audit provider, environment |
-| Account | Balance, equity, free margin, open orders, open lots, open P/L, server/login/symbol, freshness |
+| Account | Balance, equity, free margin, margin level, leverage, open orders, open lots, open P/L, server/login/symbol, freshness |
 | Market | 48 closed H4 candles via `/market/candles`: sparkline, last close, window change, last high/low |
 | Autopilot | Enabled, cadence, timeframe, window, model tier, Jev mode, symbol menu, stop policies, model-budget usage, and the service's own Jev call/token counters |
 | Activity | `/events` cursor feed (streaming indicator); "focus" mode hides routine snapshots and read-only commands |
-| Positions | Ticket, side, lots, entry, SL, TP, P/L, and owner (Veyra by magic 77041 vs manual); truncation flag |
+| Positions | Ticket, symbol, side, lots, entry, SL, TP, swap, P/L, and owner (Veyra by magic 77041 vs manual); truncation flag |
 | Commands | Recent command lifecycle (`pending`/`completed`/`failed`) with bounded summaries |
 | Risk | The effective gate policy plus both switch states |
-| Risk | Effective gate policy: symbols, caps, risk/drawdown brakes, net-exposure cap, execution/terminal state — with an inline editor for live changes |
+| Risk | Effective gate policy: symbols, caps, risk/drawdown brakes, net-exposure cap, news blackout minutes, ATR stop floor, execution/terminal state — with an inline editor for live changes |
 | Metrics | Top counters from `/metrics` and the feed sequence |
 | Agent log | `/logs` tail with a level filter (`error`…`trace`), polled every 2 s; shows the tracing target, message, and structured fields |
 

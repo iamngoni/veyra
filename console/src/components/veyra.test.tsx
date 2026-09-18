@@ -101,6 +101,7 @@ const account: Account = {
       profit: -0.32,
       sl: 1.1497,
       tp: 1.14554,
+      swap: -0.11,
       magic: VEYRA_MAGIC,
     },
   ],
@@ -221,14 +222,21 @@ describe('PositionsPanel', () => {
               tp: 0,
               magic: 0,
             },
-            { ticket: 42, symbol: 'EURUSD', kind: 'buy', lots: 0.1, price: 1.15, profit: 4, sl: 0, tp: 0, magic: 0 },
+            { ticket: 42, symbol: 'USDJPY', kind: 'buy', lots: 0.1, price: 156.2, profit: 4, sl: 155.9, tp: 156.4, magic: 0 },
+            { ticket: 43, symbol: 'XAUUSD', kind: 'buy', lots: 0.01, price: 2_400, profit: 0.5, sl: 2_390, tp: 2_420, swap: 0.02, magic: 0 },
           ],
         }}
       />,
     )
     expect(screen.getByText('10650805')).toBeTruthy()
+    expect(screen.getByText('EURUSD')).toBeTruthy()
+    expect(screen.getByText('USDJPY')).toBeTruthy()
+    expect(screen.getByText('XAUUSD')).toBeTruthy()
+    expect(screen.getByText('-0.11')).toBeTruthy()
+    expect(screen.getByText('+0.02')).toBeTruthy()
+    expect(screen.getAllByText('—').length).toBe(1)
     expect(screen.getByText('veyra')).toBeTruthy()
-    expect(screen.getByText('manual')).toBeTruthy()
+    expect(screen.getAllByText('manual').length).toBe(2)
     expect(screen.getByText('truncated')).toBeTruthy()
     expect(screen.getByText('+4.00')).toBeTruthy()
   })

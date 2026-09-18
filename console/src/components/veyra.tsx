@@ -163,45 +163,55 @@ export function PositionsPanel({ account }: { account?: Account }) {
       {positions.length === 0 ? (
         <div className="p-3 text-xs text-slate-500">Flat — no open orders.</div>
       ) : (
-        <table className="w-full text-left text-xs">
-          <thead className="text-[10px] uppercase tracking-wider text-slate-500">
-            <tr className="border-b border-slate-800/80">
-              <th className="px-3 py-1.5 font-medium">Ticket</th>
-              <th className="px-2 py-1.5 font-medium">Side</th>
-              <th className="px-2 py-1.5 font-medium">Lots</th>
-              <th className="px-2 py-1.5 font-medium">Entry</th>
-              <th className="px-2 py-1.5 font-medium">SL</th>
-              <th className="px-2 py-1.5 font-medium">TP</th>
-              <th className="px-2 py-1.5 font-medium">P/L</th>
-              <th className="px-3 py-1.5 font-medium">Owner</th>
-            </tr>
-          </thead>
-          <tbody className="font-mono tabular-nums">
-            {positions.map((position: Position) => (
-              <tr key={position.ticket} className="border-b border-slate-800/40">
-                <td className="px-3 py-1.5 text-slate-300">{position.ticket}</td>
-                <td className={`px-2 py-1.5 ${position.kind === 'buy' ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {position.kind}
-                </td>
-                <td className="px-2 py-1.5 text-slate-300">{position.lots}</td>
-                <td className="px-2 py-1.5 text-slate-300">{position.price}</td>
-                <td className="px-2 py-1.5 text-rose-300/80">{position.sl > 0 ? position.sl : '—'}</td>
-                <td className="px-2 py-1.5 text-emerald-300/80">{position.tp > 0 ? position.tp : '—'}</td>
-                <td className={`px-2 py-1.5 ${position.profit >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {position.profit >= 0 ? '+' : ''}
-                  {position.profit.toFixed(2)}
-                </td>
-                <td className="px-3 py-1.5">
-                  {position.magic === VEYRA_MAGIC ? (
-                    <span className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-300">veyra</span>
-                  ) : (
-                    <span className="rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] text-slate-400">manual</span>
-                  )}
-                </td>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs">
+            <thead className="text-[10px] uppercase tracking-wider text-slate-500">
+              <tr className="border-b border-slate-800/80">
+                <th className="px-3 py-1.5 font-medium">Ticket</th>
+                <th className="px-2 py-1.5 font-medium">Symbol</th>
+                <th className="px-2 py-1.5 font-medium">Side</th>
+                <th className="px-2 py-1.5 font-medium">Lots</th>
+                <th className="px-2 py-1.5 font-medium">Entry</th>
+                <th className="px-2 py-1.5 font-medium">SL</th>
+                <th className="px-2 py-1.5 font-medium">TP</th>
+                <th className="px-2 py-1.5 font-medium">Swap</th>
+                <th className="px-2 py-1.5 font-medium">P/L</th>
+                <th className="px-3 py-1.5 font-medium">Owner</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody className="font-mono tabular-nums">
+              {positions.map((position: Position) => (
+                <tr key={position.ticket} className="border-b border-slate-800/40">
+                  <td className="px-3 py-1.5 text-slate-300">{position.ticket}</td>
+                  <td className="px-2 py-1.5 font-semibold text-slate-200">{position.symbol}</td>
+                  <td className={`px-2 py-1.5 ${position.kind === 'buy' ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {position.kind}
+                  </td>
+                  <td className="px-2 py-1.5 text-slate-300">{position.lots}</td>
+                  <td className="px-2 py-1.5 text-slate-300">{position.price}</td>
+                  <td className="px-2 py-1.5 text-rose-300/80">{position.sl > 0 ? position.sl : '—'}</td>
+                  <td className="px-2 py-1.5 text-emerald-300/80">{position.tp > 0 ? position.tp : '—'}</td>
+                  <td className={`px-2 py-1.5 ${position.swap != null && position.swap < 0 ? 'text-rose-300/80' : 'text-emerald-300/80'}`}>
+                    {position.swap == null
+                      ? '—'
+                      : `${position.swap >= 0 ? '+' : ''}${position.swap.toFixed(2)}`}
+                  </td>
+                  <td className={`px-2 py-1.5 ${position.profit >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {position.profit >= 0 ? '+' : ''}
+                    {position.profit.toFixed(2)}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    {position.magic === VEYRA_MAGIC ? (
+                      <span className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-300">veyra</span>
+                    ) : (
+                      <span className="rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] text-slate-400">manual</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </Panel>
   )
