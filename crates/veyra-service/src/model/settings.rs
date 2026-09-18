@@ -86,6 +86,7 @@ pub struct ModelSettings {
     http_referer: Option<String>,
     app_title: Option<String>,
     app_hidden: bool,
+    compel_structured_answer: bool,
     budget: crate::model::BudgetPolicy,
 }
 
@@ -120,6 +121,7 @@ impl ModelSettings {
         let referer_raw = optional(&mut source, "VEYRA_MODEL_HTTP_REFERER");
         let title_raw = optional(&mut source, "VEYRA_MODEL_APP_TITLE");
         let hidden_raw = optional(&mut source, "VEYRA_MODEL_APP_HIDDEN");
+        let compel_raw = optional(&mut source, "VEYRA_MODEL_COMPEL_STRUCTURED");
         let hourly_cap_raw = optional(&mut source, "VEYRA_MODEL_MAX_CALLS_PER_HOUR");
         let daily_cap_raw = optional(&mut source, "VEYRA_MODEL_MAX_CALLS_PER_DAY");
 
@@ -221,6 +223,20 @@ impl ModelSettings {
             }
         };
 
+        // Compelling the answer is the stronger guarantee and the right default
+        // wherever a model accepts it. Reasoning models do not: they refuse the
+        // request outright, so the whole loop fails rather than degrading.
+        let compel_structured_answer = match compel_raw.as_str() {
+            "" | "true" => true,
+            "false" => false,
+            _ => {
+                return Err(ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_MODEL_COMPEL_STRUCTURED",
+                    reason: "must be `true` or `false`",
+                });
+            }
+        };
+
         Ok(Some(Self {
             provider,
             api_key,
@@ -229,6 +245,7 @@ impl ModelSettings {
             http_referer,
             app_title,
             app_hidden,
+            compel_structured_answer,
             budget,
         }))
     }
@@ -266,6 +283,15 @@ impl ModelSettings {
     /// Whether the attributed app asks to stay out of public rankings.
     pub fn app_hidden(&self) -> bool {
         self.app_hidden
+    }
+
+    /// Whether the provider is told it must return the schema, rather than
+    /// being offered it as the obvious channel.
+    ///
+    /// True is stronger and is the default. Reasoning ("thinking") models
+    /// reject a compelled choice with a 400, so they need this false.
+    pub fn compel_structured_answer(&self) -> bool {
+        self.compel_structured_answer
     }
 
     /// Call budget applied to the active engine.

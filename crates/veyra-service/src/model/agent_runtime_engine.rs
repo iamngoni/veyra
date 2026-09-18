@@ -88,6 +88,14 @@ impl AgentRuntimeEngine {
                 settings.tiers().resolve(ModelTier::Reasoning),
             ))
             .retry(RetryPolicy::with_retries(2))
+            // A reasoning model refuses a compelled tool choice outright, so
+            // this is the difference between the loop working and every
+            // request failing — not a preference about answer strictness.
+            .structured_strategy(if settings.compel_structured_answer() {
+                agent_runtime::StructuredStrategy::ForcedTool
+            } else {
+                agent_runtime::StructuredStrategy::AutoTool
+            })
             .verbose(false);
 
         // Attribution is keyed on the URL: the provider creates no app entry
@@ -150,6 +158,8 @@ impl DecisionEngine for AgentRuntimeEngine {
 
 #[cfg(test)]
 mod tests {
+    // Asserts the wire shape rather than the helper, because the whole point
+    // of the switch is what the provider receives.
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -223,6 +233,30 @@ mod tests {
         .expect("model configured")
     }
 
+    /// Settings with the compel switch set explicitly.
+    fn settings_compelling(compel: bool) -> ModelSettings {
+        ModelSettings::from_source(move |name| {
+            Ok(match name {
+                "VEYRA_MODEL_PROVIDER" => "openrouter",
+                "VEYRA_MODEL_API_KEY" => "test-key-12345678",
+                "VEYRA_MODEL_FAST" => "vendor/fast",
+                "VEYRA_MODEL_BALANCED" => "vendor/balanced",
+                "VEYRA_MODEL_REASONING" => "vendor/reasoning",
+                "VEYRA_MODEL_COMPEL_STRUCTURED" => {
+                    if compel {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                }
+                _ => return Err(ConfigError::MissingEnvironmentVariable { name }),
+            }
+            .to_owned())
+        })
+        .expect("settings parse")
+        .expect("model configured")
+    }
+
     fn request(tier: ModelTier) -> DecisionRequest {
         DecisionRequest {
             instructions: "Classify the bias.".to_owned(),
@@ -288,6 +322,53 @@ mod tests {
         assert!(
             sent.contains("vendor/fast"),
             "requested tier's model must be sent: {sent}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_compel_switch_decides_the_tool_choice_on_the_wire() {
+        // Compelled: the provider is told it must answer through the channel.
+        let mock = Arc::new(QueueClient::default());
+        mock.push(200, structured_response("bias", "{\"bias\":\"bullish\"}"));
+        let engine = AgentRuntimeEngine::build_with_client(
+            &settings_compelling(true),
+            Some(mock.clone() as SharedHttpClient),
+        )
+        .expect("engine builds");
+        engine
+            .answer(request(ModelTier::Fast))
+            .await
+            .expect("answer");
+        // Parsed, not matched as text: the body serialises keys alphabetically
+        // so a substring assertion would pin field order rather than meaning.
+        let sent: serde_json::Value =
+            serde_json::from_str(&mock.last_body()).expect("request body is JSON");
+        assert_eq!(
+            sent["tool_choice"],
+            json!({ "type": "function", "function": { "name": "bias" } }),
+            "a compelled choice must name the function"
+        );
+
+        // Not compelled: reasoning models reject the compelled form outright.
+        let mock = Arc::new(QueueClient::default());
+        mock.push(200, structured_response("bias", "{\"bias\":\"bearish\"}"));
+        let engine = AgentRuntimeEngine::build_with_client(
+            &settings_compelling(false),
+            Some(mock.clone() as SharedHttpClient),
+        )
+        .expect("engine builds");
+        let answer = engine
+            .answer(request(ModelTier::Fast))
+            .await
+            .expect("answer");
+        assert_eq!(answer.value["bias"], "bearish");
+        let sent: serde_json::Value =
+            serde_json::from_str(&mock.last_body()).expect("request body is JSON");
+        assert_eq!(sent["tool_choice"], json!("auto"));
+        // The schema still travels, so the answer shape is still requested.
+        assert_eq!(
+            sent["tools"][0]["function"]["parameters"]["properties"]["bias"]["enum"],
+            json!(["bullish", "bearish"])
         );
     }
 
