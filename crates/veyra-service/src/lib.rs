@@ -16,6 +16,7 @@ pub mod logs;
 pub mod market;
 pub mod model;
 pub mod observability;
+pub mod performance;
 pub mod reconciliation;
 pub mod risk;
 pub mod routes;

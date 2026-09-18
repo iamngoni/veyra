@@ -120,6 +120,58 @@ export type FeedEvent = {
 
 export type Feed = { events: FeedEvent[]; latest: number; next: number }
 
+/** Per-symbol slice of the realized-performance window. */
+export type SymbolPerformance = {
+  symbol: string
+  trades: number
+  wins: number
+  net_profit: number
+}
+
+/** Aggregated realized performance over closed Veyra trades. */
+export type PerformanceReport = {
+  trades: number
+  wins: number
+  losses: number
+  breakeven: number
+  win_rate_percent: number
+  net_profit: number
+  gross_profit: number
+  gross_loss: number
+  profit_factor: number | null
+  average_win: number | null
+  average_loss: number | null
+  expectancy: number | null
+  best_trade: number | null
+  worst_trade: number | null
+  by_symbol: SymbolPerformance[]
+}
+
+/** One closed order from the venue's account history. */
+export type ClosedTrade = {
+  ticket: number
+  symbol: string
+  kind: 'buy' | 'sell'
+  lots: number
+  openPrice: number
+  closePrice: number
+  openTime: number
+  closeTime: number
+  profit: number
+  swap: number
+  commission: number
+  magic: number
+}
+
+/** Realized performance response for one lookback window. */
+export type Performance = {
+  days: number
+  report: PerformanceReport
+  trades: ClosedTrade[]
+  total: number
+  truncated: boolean
+}
+
 /** Levels the service log tail accepts, most severe first. */
 export type LogLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace'
 
@@ -221,6 +273,7 @@ export const api = {
   metrics: () => get<Metrics>('/metrics'),
   commands: (limit = 25) => get<{ commands: CommandRecord[] }>(`/commands?limit=${limit}`),
   candles: (bars = 48) => get<CandleSeries>(`/market/candles?timeframe=H4&bars=${bars}`),
+  performance: (days = 30) => get<Performance>(`/performance?days=${days}`),
   events: (after: number | undefined, waitMs = 15000) =>
     get<Feed>(after === undefined ? '/events' : `/events?after=${after}&wait_ms=${waitMs}`),
   logs: (after: number | undefined, level: LogLevel, limit = 300) =>

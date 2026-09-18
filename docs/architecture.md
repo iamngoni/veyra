@@ -30,7 +30,7 @@ Status at a glance (see `README.md` and `docs/roadmap.md` for evidence):
 | Piece | Role | Where |
 | --- | --- | --- |
 | Service (`veyra-service`) | configuration, risk gate, command queue, autopilot, HTTP surface | Rust 2024 + Actix Web + Tokio, `crates/veyra-service` |
-| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/market/candles`, `/market/spec`, `/calendar`, `/reconciliation` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
+| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/market/candles`, `/market/spec`, `/calendar`, `/performance`, `/reconciliation` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
 | EA channel listener | token-authenticated `POST /ea/poll` carrying heartbeats and the command queue | `127.0.0.1:7801` (`VEYRA_EA_BIND_*`); non-loopback binds are rejected at startup |
 | MT4 terminal + `VeyraProbe` EA | holds the broker session, polls the channel, executes acknowledged commands, reports dry runs while disarmed | `ea/VeyraProbe.mq4` inside MetaTrader 4 (Wine) |
 | Cloudflare tunnel | `veyra.antonlabs.cc` → `127.0.0.1:7801` — the EA channel only | launchd agent, `KeepAlive` |
@@ -229,11 +229,14 @@ Environment variables are **startup defaults and secrets** (bind addresses, toke
 | Autopilot | Enabled, cadence, timeframe, window, model tier, Jev mode, symbol menu, stop policies, model-budget usage, and the service's own Jev call/token counters |
 | Activity | `/events` cursor feed (streaming indicator); "focus" mode hides routine snapshots and read-only commands |
 | Positions | Ticket, symbol, side, lots, entry, SL, TP, swap, P/L, and owner (Veyra by magic 77041 vs manual); truncation flag |
+| Performance | Realized wins/losses/win rate, net P/L, profit factor, average win/loss, and per-symbol totals over the closed Veyra orders in the window |
 | Commands | Recent command lifecycle (`pending`/`completed`/`failed`) with bounded summaries |
 | Risk | The effective gate policy plus both switch states |
 | Risk | Effective gate policy: symbols, caps, risk/drawdown brakes, net-exposure cap, news blackout minutes, ATR stop floor, execution/terminal state — with an inline editor for live changes |
 | Metrics | Top counters from `/metrics` and the feed sequence |
 | Agent log | `/logs` tail with a level filter (`error`…`trace`), polled every 2 s; shows the tracing target, message, and structured fields |
+
+**Realized performance.** `GET /performance?days=1-365` queues one read-only `order_history` command; the EA walks the terminal's account history for the Veyra magic number and returns closed fills (open/close price and time, profit, swap, commission). The route aggregates them into wins / losses / win rate, net P/L, profit factor, average win/loss, and per-symbol totals, and the console renders that as the Performance panel. This is the honest source for success rate: the reconciler's `position_closed` event records the position's *last-seen floating* profit, which can differ from the fill that actually happened (the USDJPY take-profit closed between snapshots and read +0.47 when it really booked +1.36).
 
 **Decision/command drill-down.** Clicking an activity row expands priority-ordered detail rows starting with the model's `rationale` and `judgements`, then `outcome`, `reason`, `origin`, `symbol`, `side`, `volume`, `ticket`, `intent_id`, `command_id`, stops, … plus the raw JSON payload, so a decision can be followed into the command and on to its ack (`GET /commands/{id}`). Agent tool calls appear as their own `agent_tool_called` rows carrying the arguments and result. Clicking a command row expands its result summary or failure reason. Expanding a position's story therefore runs: proposal outcome → queued command → terminal ack/result → later stop, close, or `position_closed` events.
 

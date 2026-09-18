@@ -104,6 +104,11 @@
       broker's minimum distance, or a console-editable ATR(14) noise floor
       (`minStopAtrFraction`, default 0.25) — proven live against IFC Markets
       for the whole menu (EURUSD/USDJPY/GBPUSD/XAUUSD).
+- [x] Realized performance: a read-only `order_history` command returns the
+      terminal's closed fills (profit + swap + commission), `GET /performance`
+      aggregates wins/losses/win rate, net P/L, profit factor, and per-symbol
+      totals, and the console shows it as the Performance panel — proven live
+      (the USDJPY take-profit: open 156.198, close 156.410, net +1.36, 1W/0L).
 - [x] Economic calendar: a provider-neutral `EventCalendar` trait with the
       keyless ForexFactory weekly export as the first implementation (cached),
       `GET /calendar` for operators, per-asset `upcoming_events` in the entry

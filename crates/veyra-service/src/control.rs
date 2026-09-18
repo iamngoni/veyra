@@ -24,7 +24,7 @@ use crate::broker::BrokerLink;
 use crate::broker::Symbol;
 use crate::broker::{
     CloseOrderRequest, CommandId, CommandPayload, CommandState, ModifyOrderRequest, ORDER_MAGIC,
-    OrderRequest,
+    OrderHistoryRequest, OrderRequest,
 };
 use crate::market::{CandleRequest, Timeframe};
 use crate::risk::RiskDecision;
@@ -339,6 +339,64 @@ pub async fn market_candles(state: Data<AppState>, query: web::Query<CandleQuery
         })),
         Err(error) => HttpResponse::BadGateway()
             .json(json!({ "error": "market_feed_failed", "reason": error.to_string() })),
+    }
+}
+
+/// Query for the realized-performance window.
+#[derive(Debug, Deserialize)]
+pub struct PerformanceQuery {
+    /// Days of account history to include (1-365); defaults to 30.
+    pub days: Option<u32>,
+}
+
+#[get("/performance")]
+/// Returns realized performance from the venue's closed orders.
+///
+/// Read-only: one `order_history` command is queued for the Veyra magic
+/// number and awaited, so the numbers come from actual fills (profit + swap +
+/// commission) rather than floating snapshots. Invalid windows are rejected
+/// before anything is queued, and a terminal that does not answer within the
+/// configured window is reported as a gateway failure.
+pub async fn performance(
+    state: Data<AppState>,
+    query: web::Query<PerformanceQuery>,
+) -> HttpResponse {
+    let Some(link) = command_link(&state) else {
+        return HttpResponse::ServiceUnavailable().json(json!({ "error": "broker_unavailable" }));
+    };
+    let days = query.days.unwrap_or(OrderHistoryRequest::DEFAULT_DAYS);
+    let request = match OrderHistoryRequest::new(days, ORDER_MAGIC) {
+        Ok(request) => request,
+        Err(error) => {
+            return HttpResponse::BadRequest()
+                .json(json!({ "error": "invalid_window", "reason": error.to_string() }));
+        }
+    };
+    let id = link.enqueue_order_history(request);
+    match link.await_command(id, Duration::from_secs(20)).await {
+        CommandState::Completed {
+            payload: CommandPayload::OrderHistory(history),
+        } => {
+            let report = crate::performance::summarize(&history.orders);
+            HttpResponse::Ok().json(json!({
+                "days": days,
+                "report": report,
+                "trades": history.orders,
+                "total": history.total,
+                "truncated": history.truncated
+            }))
+        }
+        CommandState::Completed { .. } => HttpResponse::BadGateway().json(json!({
+            "error": "history_failed",
+            "reason": "history command completed with a different payload"
+        })),
+        CommandState::Failed { reason } => {
+            HttpResponse::BadGateway().json(json!({ "error": "history_failed", "reason": reason }))
+        }
+        CommandState::Pending => HttpResponse::BadGateway().json(json!({
+            "error": "history_failed",
+            "reason": "history command still pending after the await window"
+        })),
     }
 }
 
@@ -954,6 +1012,11 @@ fn command_result(payload: CommandPayload) -> serde_json::Value {
             "swapType": spec.swap_type,
             "tradeAllowed": spec.trade_allowed
         }),
+        CommandPayload::OrderHistory(history) => json!({
+            "orders": history.orders,
+            "total": history.total,
+            "truncated": history.truncated
+        }),
         CommandPayload::OpenOrder(execution)
         | CommandPayload::CloseOrder(execution)
         | CommandPayload::ModifyOrder(execution) => json!({
@@ -1491,6 +1554,188 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), 503);
+    }
+
+    #[actix_web::test]
+    async fn performance_route_reports_realized_history() {
+        let (state, _) = audited_state(Some(StubFeed { fail: false }));
+        let link = state.broker().expect("broker").ea_link().expect("ea link");
+
+        // Unavailable without a broker; invalid windows never reach the channel.
+        let unlinked = test::init_service(create_app(build_state(None, false))).await;
+        let response = test::call_service(
+            &unlinked,
+            test::TestRequest::get().uri("/performance").to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 503);
+        let typed = test::init_service(create_app(state.clone())).await;
+        let response = test::call_service(
+            &typed,
+            test::TestRequest::get()
+                .uri("/performance?days=0")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+
+        // One history round trip: the route queues, the EA answers.
+        let ea_app = test::init_service(crate::broker::ea::create_ea_app(link.clone())).await;
+        let route_state = state.clone();
+        let task = actix_web::rt::spawn(async move {
+            let app = test::init_service(create_app(route_state)).await;
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/performance?days=7")
+                    .to_request(),
+            )
+            .await
+        });
+        let hello = serde_json::json!({
+            "t": "hb",
+            "token": "test-token-1234567890",
+            "acct": 94168,
+            "server": "IFCMarkets-Real",
+            "symbol": "EURUSD",
+            "connected": true,
+            "tradeAllowed": true,
+            "orders": 0,
+            "lots": 0.0
+        });
+        let mut command = None;
+        for _ in 0..40 {
+            let response = test::call_service(
+                &ea_app,
+                test::TestRequest::post()
+                    .uri("/ea/poll")
+                    .set_payload(hello.to_string())
+                    .to_request(),
+            )
+            .await;
+            let body: Value = test::read_body_json(response).await;
+            if body["t"] == "cmd" {
+                command = Some(body);
+                break;
+            }
+            actix_web::rt::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let command = command.expect("history command delivered");
+        assert_eq!(command["kind"], "order_history");
+        assert_eq!(command["history"]["days"], 7);
+        assert_eq!(command["history"]["magic"], 77041);
+
+        let ack = serde_json::json!({
+            "t": "ack",
+            "token": "test-token-1234567890",
+            "id": command["id"],
+            "ok": true,
+            "data": {
+                "orders": [{
+                    "ticket": 10650830,
+                    "symbol": "USDJPY",
+                    "kind": "buy",
+                    "lots": 0.01,
+                    "openPrice": 156.198,
+                    "closePrice": 156.41,
+                    "openTime": 1_789_699_082_i64,
+                    "closeTime": 1_789_707_257_i64,
+                    "profit": 1.36,
+                    "swap": 0.0,
+                    "commission": 0.0,
+                    "magic": 77041
+                }],
+                "total": 1,
+                "truncated": false
+            }
+        });
+        let response = test::call_service(
+            &ea_app,
+            test::TestRequest::post()
+                .uri("/ea/poll")
+                .set_payload(ack.to_string())
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+
+        let response = task.await.expect("task joins");
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["days"], 7);
+        assert_eq!(body["report"]["trades"], 1);
+        assert_eq!(body["report"]["wins"], 1);
+        assert_eq!(body["report"]["win_rate_percent"], 100.0);
+        assert_eq!(body["report"]["net_profit"], 1.36);
+        assert_eq!(body["report"]["profit_factor"], Value::Null);
+        assert_eq!(body["trades"][0]["symbol"], "USDJPY");
+        assert_eq!(body["trades"][0]["closePrice"], 156.41);
+
+        // The same command flattens through /commands/{id}.
+        let id = command["id"].as_str().expect("command id");
+        let app = test::init_service(create_app(state.clone())).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/commands/{id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["kind"], "order_history");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["result"]["truncated"], false);
+
+        // A terminal that fails the request is a gateway failure.
+        let route_state = state.clone();
+        let failing = actix_web::rt::spawn(async move {
+            let app = test::init_service(create_app(route_state)).await;
+            test::call_service(
+                &app,
+                test::TestRequest::get().uri("/performance").to_request(),
+            )
+            .await
+        });
+        let mut command = None;
+        for _ in 0..40 {
+            let response = test::call_service(
+                &ea_app,
+                test::TestRequest::post()
+                    .uri("/ea/poll")
+                    .set_payload(hello.to_string())
+                    .to_request(),
+            )
+            .await;
+            let body: Value = test::read_body_json(response).await;
+            if body["t"] == "cmd" {
+                command = Some(body);
+                break;
+            }
+            actix_web::rt::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let command = command.expect("history command delivered again");
+        let failure = serde_json::json!({
+            "t": "ack",
+            "token": "test-token-1234567890",
+            "id": command["id"],
+            "ok": false,
+            "error": "history unavailable"
+        });
+        let response = test::call_service(
+            &ea_app,
+            test::TestRequest::post()
+                .uri("/ea/poll")
+                .set_payload(failure.to_string())
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let response = failing.await.expect("task joins");
+        assert_eq!(response.status(), 502);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "history_failed");
+        assert_eq!(body["reason"], "history unavailable");
     }
 
     #[actix_web::test]

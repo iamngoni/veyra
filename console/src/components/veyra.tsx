@@ -11,6 +11,7 @@ import type {
   LogLevel,
   LogRecord,
   Metrics,
+  Performance,
   Position,
   RiskPolicy,
   Status,
@@ -213,6 +214,78 @@ export function PositionsPanel({ account }: { account?: Account }) {
           </table>
         </div>
       )}
+    </Panel>
+  )
+}
+
+/* ---------- performance ---------- */
+
+export function PerformancePanel({
+  performance,
+  error,
+}: {
+  performance?: Performance
+  error?: string
+}) {
+  const report = performance?.report
+  const money = (value: number | null | undefined) =>
+    value == null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(2)}`
+  return (
+    <Panel
+      title="Performance"
+      detail={
+        performance
+          ? `last ${performance.days}d · ${performance.total} closed${performance.truncated ? ' · truncated' : ''}`
+          : error
+            ? <span className="text-rose-400">{error}</span>
+            : 'waiting…'
+      }
+    >
+      <div className="grid grid-cols-2 gap-x-4 gap-y-3 p-3 sm:grid-cols-3">
+        <Field
+          label="Win rate"
+          value={report && report.trades > 0 ? `${report.win_rate_percent.toFixed(1)}%` : '—'}
+          tone={
+            report && report.trades > 0 && report.win_rate_percent >= 50
+              ? 'text-emerald-400'
+              : undefined
+          }
+        />
+        <Field
+          label="Record"
+          value={
+            report && report.trades > 0
+              ? `${report.wins}W · ${report.losses}L${report.breakeven > 0 ? ` · ${report.breakeven}F` : ''}`
+              : '—'
+          }
+        />
+        <Field
+          label="Net P/L"
+          value={performance ? money(report?.net_profit) : '—'}
+          tone={report && report.net_profit >= 0 ? 'text-emerald-400' : report ? 'text-rose-400' : undefined}
+        />
+        <Field
+          label="Profit factor"
+          value={report?.profit_factor != null ? report.profit_factor.toFixed(2) : '—'}
+        />
+        <Field label="Avg win" value={money(report?.average_win)} />
+        <Field
+          label="Avg loss"
+          value={report?.average_loss != null ? `-${report.average_loss.toFixed(2)}` : '—'}
+        />
+      </div>
+      {report && report.by_symbol.length > 0 ? (
+        <div className="flex flex-wrap gap-x-4 gap-y-1 border-t border-slate-800/80 px-3 py-2 font-mono text-[11px] text-slate-400">
+          {report.by_symbol.map((entry) => (
+            <span key={entry.symbol}>
+              {entry.symbol} {entry.wins}/{entry.trades}{' '}
+              <span className={entry.net_profit >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                {money(entry.net_profit)}
+              </span>
+            </span>
+          ))}
+        </div>
+      ) : null}
     </Panel>
   )
 }

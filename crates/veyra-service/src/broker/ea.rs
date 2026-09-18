@@ -29,8 +29,8 @@ use crate::audit::{AuditEvent, AuditKind, AuditRuntime};
 use crate::broker::command::{
     AccountSnapshotPayload, CloseOrderRequest, CommandId, CommandKind, CommandPayload,
     CommandRecord, CommandState, ListedCommand, ModifyOrderRequest, OrderCheckPayload,
-    OrderExecutionPayload, OrderRequest, PositionPayload, RatesPayload, RatesRequest,
-    SymbolSpecPayload, SymbolSpecRequest,
+    OrderExecutionPayload, OrderHistoryPayload, OrderHistoryRequest, OrderRequest, PositionPayload,
+    RatesPayload, RatesRequest, SymbolSpecPayload, SymbolSpecRequest,
 };
 use crate::broker::settings::EaToken;
 use crate::broker::{
@@ -198,6 +198,9 @@ pub enum EaReply {
         /// Present for instrument-contract commands.
         #[serde(skip_serializing_if = "Option::is_none")]
         spec: Option<Box<SymbolSpecRequest>>,
+        /// Present for account-history commands.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        history: Option<Box<OrderHistoryRequest>>,
     },
 }
 
@@ -242,6 +245,8 @@ enum CommandRequest {
     Rates(RatesRequest),
     /// Instrument-contract request for one symbol.
     SymbolSpec(SymbolSpecRequest),
+    /// Account-history request for one magic number and window.
+    OrderHistory(OrderHistoryRequest),
 }
 
 /// Retained account snapshot plus the instant it was validated.
@@ -336,6 +341,14 @@ impl EaLink {
         self.enqueue_with(
             CommandKind::SymbolSpec,
             Some(CommandRequest::SymbolSpec(request)),
+        )
+    }
+
+    /// Queues a read-only account-history request.
+    pub fn enqueue_order_history(&self, request: OrderHistoryRequest) -> CommandId {
+        self.enqueue_with(
+            CommandKind::OrderHistory,
+            Some(CommandRequest::OrderHistory(request)),
         )
     }
 
@@ -484,7 +497,8 @@ impl EaLink {
                         | CommandPayload::CloseOrder(_)
                         | CommandPayload::ModifyOrder(_)
                         | CommandPayload::Rates(_)
-                        | CommandPayload::SymbolSpec(_) => None,
+                        | CommandPayload::SymbolSpec(_)
+                        | CommandPayload::OrderHistory(_) => None,
                     };
                     command.state = CommandState::Completed { payload };
                     retained
@@ -771,6 +785,10 @@ impl BrokerLink for EaLink {
         EaLink::enqueue_symbol_spec(self, request)
     }
 
+    fn enqueue_order_history(&self, request: OrderHistoryRequest) -> CommandId {
+        EaLink::enqueue_order_history(self, request)
+    }
+
     fn has_pending(&self, kind: CommandKind) -> bool {
         EaLink::has_pending(self, kind)
     }
@@ -853,23 +871,26 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
                 link.record(snapshot);
                 let reply = match link.deliverable() {
                     Some((id, kind, request)) => {
-                        let (order, close, modify, rates, spec) = match request {
+                        let (order, close, modify, rates, spec, history) = match request {
                             Some(CommandRequest::Order(order)) => {
-                                (Some(Box::new(order)), None, None, None, None)
+                                (Some(Box::new(order)), None, None, None, None, None)
                             }
                             Some(CommandRequest::Close(close)) => {
-                                (None, Some(Box::new(close)), None, None, None)
+                                (None, Some(Box::new(close)), None, None, None, None)
                             }
                             Some(CommandRequest::Modify(modify)) => {
-                                (None, None, Some(Box::new(modify)), None, None)
+                                (None, None, Some(Box::new(modify)), None, None, None)
                             }
                             Some(CommandRequest::Rates(rates)) => {
-                                (None, None, None, Some(Box::new(rates)), None)
+                                (None, None, None, Some(Box::new(rates)), None, None)
                             }
                             Some(CommandRequest::SymbolSpec(spec)) => {
-                                (None, None, None, None, Some(Box::new(spec)))
+                                (None, None, None, None, Some(Box::new(spec)), None)
                             }
-                            None => (None, None, None, None, None),
+                            Some(CommandRequest::OrderHistory(history)) => {
+                                (None, None, None, None, None, Some(Box::new(history)))
+                            }
+                            None => (None, None, None, None, None, None),
                         };
                         EaReply::Command {
                             id,
@@ -879,6 +900,7 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
                             modify,
                             rates,
                             spec,
+                            history,
                         }
                     }
                     // Ask for a pong on hello and until one has been seen for
@@ -952,6 +974,13 @@ fn payload_for(kind: CommandKind, data: Option<Value>) -> Result<CommandPayload,
             payload.validate()?;
             Ok(CommandPayload::SymbolSpec(payload))
         }
+        CommandKind::OrderHistory => {
+            let value = data.ok_or_else(|| "order_history ack is missing data".to_owned())?;
+            let payload: OrderHistoryPayload = serde_json::from_value(value)
+                .map_err(|error| format!("invalid order_history payload: {error}"))?;
+            payload.validate()?;
+            Ok(CommandPayload::OrderHistory(payload))
+        }
     }
 }
 
@@ -1012,6 +1041,11 @@ fn completed_summary(payload: &CommandPayload) -> Value {
             "stopLevelPoints": spec.stop_level_points,
             "marginRequired": spec.margin_required
         }),
+        CommandPayload::OrderHistory(history) => serde_json::json!({
+            "orders": history.orders.len(),
+            "total": history.total,
+            "truncated": history.truncated
+        }),
     }
 }
 
@@ -1069,7 +1103,7 @@ mod tests {
     use crate::broker::Symbol as BrokerSymbol;
     use crate::broker::{
         AccountSnapshotPayload, CandlePayload, CommandId, CommandKind, CommandPayload,
-        CommandState, PositionKind, PositionPayload, SymbolSpecRequest,
+        CommandState, OrderHistoryRequest, PositionKind, PositionPayload, SymbolSpecRequest,
     };
     use crate::trading::intent::{
         OrderKind, Price, Side, TradeIntent, TradeIntentDraft, Volume, parse_instrument,
@@ -1210,6 +1244,7 @@ mod tests {
             modify: None,
             rates: Some(Box::new(request)),
             spec: None,
+            history: None,
         };
         let wire = serde_json::to_value(&reply).expect("serializes");
         assert_eq!(wire["t"], "cmd");
@@ -2001,6 +2036,7 @@ mod tests {
             modify: None,
             rates: None,
             spec: Some(Box::new(request)),
+            history: None,
         };
         let wire = serde_json::to_value(&reply).expect("serializes");
         assert_eq!(wire["kind"], "symbol_spec");
@@ -2032,6 +2068,100 @@ mod tests {
             id: bad,
             ok: true,
             data: Some(serde_json::json!({"symbol": "EURUSD"})),
+            error: None,
+        });
+        assert!(matches!(
+            link.command(bad).expect("record").state,
+            CommandState::Failed { .. }
+        ));
+    }
+
+    fn history_json() -> serde_json::Value {
+        serde_json::json!({
+            "orders": [{
+                "ticket": 10650830,
+                "symbol": "USDJPY",
+                "kind": "buy",
+                "lots": 0.01,
+                "openPrice": 156.198,
+                "closePrice": 156.41,
+                "openTime": 1_789_699_082_i64,
+                "closeTime": 1_789_707_257_i64,
+                "profit": 1.36,
+                "swap": 0.0,
+                "commission": 0.0,
+                "magic": ORDER_MAGIC
+            }],
+            "total": 1,
+            "truncated": false
+        })
+    }
+
+    #[test]
+    fn order_history_commands_deliver_validate_and_summarize() {
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        assert!(OrderHistoryRequest::new(0, ORDER_MAGIC).is_err());
+        assert!(OrderHistoryRequest::new(366, ORDER_MAGIC).is_err());
+        let request = OrderHistoryRequest::new(30, ORDER_MAGIC).expect("request");
+        assert_eq!(request.days(), 30);
+        assert_eq!(request.magic(), ORDER_MAGIC);
+        let id = link.enqueue_order_history(request.clone());
+
+        let (delivered, kind, payload) = link.deliverable().expect("pending command");
+        assert_eq!(delivered, id);
+        assert_eq!(kind, CommandKind::OrderHistory);
+        assert_eq!(payload, Some(CommandRequest::OrderHistory(request.clone())));
+
+        let reply = EaReply::Command {
+            id,
+            kind,
+            order: None,
+            close: None,
+            modify: None,
+            rates: None,
+            spec: None,
+            history: Some(Box::new(request)),
+        };
+        let wire = serde_json::to_value(&reply).expect("serializes");
+        assert_eq!(wire["kind"], "order_history");
+        assert_eq!(wire["history"]["days"], 30);
+        assert_eq!(wire["history"]["magic"], ORDER_MAGIC);
+        assert!(wire.get("spec").is_none(), "absent requests are omitted");
+
+        link.apply_ack(&EaAck {
+            id,
+            ok: true,
+            data: Some(history_json()),
+            error: None,
+        });
+        let record = link.command(id).expect("record");
+        let CommandState::Completed {
+            payload: CommandPayload::OrderHistory(history),
+        } = record.state
+        else {
+            panic!("expected a completed order history");
+        };
+        assert_eq!(history.orders.len(), 1);
+        assert_eq!(history.orders[0].net_profit(), 1.36);
+        assert!(matches!(history.orders[0].kind, PositionKind::Buy));
+        let listed = link.recent_commands(1);
+        let summary = listed[0].summary.as_ref().expect("summary");
+        assert_eq!(summary["orders"], 1);
+        assert_eq!(summary["truncated"], false);
+
+        // A malformed acknowledgement fails the command instead of storing junk.
+        let bad =
+            link.enqueue_order_history(OrderHistoryRequest::new(7, ORDER_MAGIC).expect("request"));
+        let mut broken = history_json();
+        broken["orders"][0]["closeTime"] = serde_json::json!(1);
+        link.apply_ack(&EaAck {
+            id: bad,
+            ok: true,
+            data: Some(broken),
             error: None,
         });
         assert!(matches!(

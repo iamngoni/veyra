@@ -11,7 +11,15 @@ import { useState } from 'react'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type { Account, CandleSeries, CommandRecord, FeedEvent, LogRecord, Status } from '../lib/api'
+import type {
+  Account,
+  CandleSeries,
+  CommandRecord,
+  FeedEvent,
+  LogRecord,
+  Performance,
+  Status,
+} from '../lib/api'
 import { VEYRA_MAGIC } from '../lib/api'
 import {
   AccountPanel,
@@ -22,6 +30,7 @@ import {
   MarketPanel,
   MetricsPanel,
   Panel,
+  PerformancePanel,
   Pill,
   PositionsPanel,
   RiskPanel,
@@ -239,6 +248,74 @@ describe('PositionsPanel', () => {
     expect(screen.getAllByText('manual').length).toBe(2)
     expect(screen.getByText('truncated')).toBeTruthy()
     expect(screen.getByText('+4.00')).toBeTruthy()
+  })
+})
+
+describe('PerformancePanel', () => {
+  const performance: Performance = {
+    days: 30,
+    report: {
+      trades: 2,
+      wins: 1,
+      losses: 1,
+      breakeven: 0,
+      win_rate_percent: 50,
+      net_profit: 0.55,
+      gross_profit: 1.36,
+      gross_loss: 0.81,
+      profit_factor: 1.68,
+      average_win: 1.36,
+      average_loss: 0.81,
+      expectancy: 0.28,
+      best_trade: 1.36,
+      worst_trade: -0.81,
+      by_symbol: [
+        { symbol: 'USDJPY', trades: 1, wins: 1, net_profit: 1.36 },
+        { symbol: 'EURUSD', trades: 1, wins: 0, net_profit: -0.81 },
+      ],
+    },
+    trades: [],
+    total: 2,
+    truncated: false,
+  }
+
+  it('renders realized performance and per-symbol totals', () => {
+    render(<PerformancePanel performance={performance} />)
+    expect(screen.getByText('Win rate')).toBeTruthy()
+    expect(screen.getByText('50.0%')).toBeTruthy()
+    expect(screen.getByText('1W · 1L')).toBeTruthy()
+    expect(screen.getByText('+0.55')).toBeTruthy()
+    expect(screen.getByText('1.68')).toBeTruthy()
+    expect(screen.getAllByText('+1.36').length).toBe(2)
+    expect(screen.getAllByText('-0.81').length).toBe(2)
+    expect(screen.getByText(/last 30d · 2 closed/)).toBeTruthy()
+  })
+
+  it('shows waiting, error, and empty states', () => {
+    const { rerender } = render(<PerformancePanel />)
+    expect(screen.getByText('waiting…')).toBeTruthy()
+    rerender(<PerformancePanel error="performance down" />)
+    expect(screen.getByText('performance down')).toBeTruthy()
+
+    rerender(
+      <PerformancePanel
+        performance={{
+          ...performance,
+          report: {
+            ...performance.report,
+            trades: 0,
+            wins: 0,
+            losses: 0,
+            net_profit: 0,
+            profit_factor: null,
+            average_win: null,
+            average_loss: null,
+            by_symbol: [],
+          },
+        }}
+      />,
+    )
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(4)
   })
 })
 

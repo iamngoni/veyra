@@ -13,10 +13,11 @@ pub mod settings;
 
 /// Provider-neutral command and report types every venue integration speaks.
 pub use command::{
-    AccountSnapshotPayload, CandlePayload, CloseOrderRequest, CommandId, CommandKind,
-    CommandPayload, CommandRecord, CommandState, ListedCommand, ModifyOrderRequest, ORDER_MAGIC,
-    OrderCheckPayload, OrderExecutionPayload, OrderRequest, PositionKind, PositionPayload,
-    RatesPayload, RatesRequest, SUPPORTED_TIMEFRAME_MINUTES, SymbolSpecPayload, SymbolSpecRequest,
+    AccountSnapshotPayload, CandlePayload, CloseOrderRequest, ClosedTradePayload, CommandId,
+    CommandKind, CommandPayload, CommandRecord, CommandState, ListedCommand, ModifyOrderRequest,
+    ORDER_MAGIC, OrderCheckPayload, OrderExecutionPayload, OrderHistoryPayload,
+    OrderHistoryRequest, OrderRequest, PositionKind, PositionPayload, RatesPayload, RatesRequest,
+    SUPPORTED_TIMEFRAME_MINUTES, SymbolSpecPayload, SymbolSpecRequest,
 };
 /// EA-specific transport surface, used by the EA server and its contract tests.
 pub use ea::{EaErrorBody, EaLink, EaPoll, EaReply, build_server, create_ea_app};
@@ -296,6 +297,9 @@ pub trait BrokerLink: Send + Sync + fmt::Debug + 'static {
     /// Queues a read-only instrument-contract request.
     fn enqueue_symbol_spec(&self, request: SymbolSpecRequest) -> CommandId;
 
+    /// Queues a read-only account-history request.
+    fn enqueue_order_history(&self, request: OrderHistoryRequest) -> CommandId;
+
     /// Whether a command of `kind` is still awaiting acknowledgement.
     fn has_pending(&self, kind: CommandKind) -> bool;
 
@@ -426,6 +430,10 @@ mod tests {
         }
 
         fn enqueue_symbol_spec(&self, _request: SymbolSpecRequest) -> CommandId {
+            CommandId::new()
+        }
+
+        fn enqueue_order_history(&self, _request: OrderHistoryRequest) -> CommandId {
             CommandId::new()
         }
 

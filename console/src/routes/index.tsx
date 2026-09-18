@@ -10,6 +10,7 @@ import {
   LogsPanel,
   MarketPanel,
   MetricsPanel,
+  PerformancePanel,
   PositionsPanel,
   RiskPanel,
   StatusPills,
@@ -23,6 +24,7 @@ export function Dashboard() {
   const { data: status } = usePoll(api.status, 5000)
   const { data: account, error: accountError } = usePoll(api.account, 5000)
   const { data: commands } = usePoll(() => api.commands(25), 10000)
+  const { data: performance, error: performanceError } = usePoll(api.performance, 30000)
   const { data: series, error: marketError } = usePoll(() => api.candles(48), 60000)
   const { data: metrics, error: metricsError } = usePoll(api.metrics, 10000)
   const { events, connected } = useEventFeed(80)
@@ -62,6 +64,7 @@ export function Dashboard() {
         </div>
         <div className="flex min-w-0 flex-col gap-3">
           <PositionsPanel account={account} />
+          <PerformancePanel performance={performance} error={performanceError} />
           <CommandsPanel commands={commands?.commands} />
         </div>
       </div>

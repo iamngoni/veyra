@@ -68,6 +68,8 @@ pub enum CommandKind {
     /// Report the venue's contract details for one instrument (spread, stop
     /// level, lot band, margin requirement, swap rates).
     SymbolSpec,
+    /// Report closed orders from the terminal's account history.
+    OrderHistory,
 }
 
 impl CommandKind {
@@ -82,6 +84,7 @@ impl CommandKind {
             Self::ModifyOrder => "modify_order",
             Self::Rates => "rates",
             Self::SymbolSpec => "symbol_spec",
+            Self::OrderHistory => "order_history",
         }
     }
 }
@@ -660,6 +663,157 @@ impl SymbolSpecPayload {
     }
 }
 
+/// Orders-history request sent to the EA: closed orders from the account
+/// history, newest first. Realized fills are the only honest source for
+/// success rate — floating snapshots miss the exit.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OrderHistoryRequest {
+    days: u32,
+    magic: u32,
+}
+
+impl OrderHistoryRequest {
+    /// Default lookback window.
+    pub const DEFAULT_DAYS: u32 = 30;
+    /// Largest lookback window accepted.
+    pub const MAX_DAYS: u32 = 365;
+
+    /// Builds a validated request for `days` of history for one magic number.
+    ///
+    /// # Errors
+    /// Returns [`BrokerError::InvalidPayload`] when the window is zero or
+    /// larger than [`Self::MAX_DAYS`].
+    pub fn new(days: u32, magic: u32) -> Result<Self, BrokerError> {
+        if days == 0 || days > Self::MAX_DAYS {
+            return Err(BrokerError::InvalidPayload {
+                field: "days",
+                reason: "must be from 1 through 365",
+            });
+        }
+        Ok(Self { days, magic })
+    }
+
+    /// Lookback window in days.
+    pub fn days(&self) -> u32 {
+        self.days
+    }
+
+    /// Magic number the terminal filters by.
+    pub fn magic(&self) -> u32 {
+        self.magic
+    }
+}
+
+/// One closed order as the terminal's account history reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClosedTradePayload {
+    /// Venue ticket.
+    pub ticket: i64,
+    /// Instrument.
+    pub symbol: String,
+    /// Executed side.
+    pub kind: PositionKind,
+    /// Volume in lots.
+    pub lots: f64,
+    /// Entry fill.
+    #[serde(rename = "openPrice")]
+    pub open_price: f64,
+    /// Exit fill.
+    #[serde(rename = "closePrice")]
+    pub close_price: f64,
+    /// Entry time (broker server seconds).
+    #[serde(rename = "openTime")]
+    pub open_time: i64,
+    /// Exit time (broker server seconds).
+    #[serde(rename = "closeTime")]
+    pub close_time: i64,
+    /// Realized gross profit in account currency.
+    pub profit: f64,
+    /// Swap charged or credited over the hold.
+    pub swap: f64,
+    /// Commission charged on the round trip.
+    pub commission: f64,
+    /// Magic number stamped on the order.
+    pub magic: u32,
+}
+
+impl ClosedTradePayload {
+    /// Realized profit after swap and commission, in account currency.
+    pub fn net_profit(&self) -> f64 {
+        self.profit + self.swap + self.commission
+    }
+
+    /// Rejects unusable fills before they reach performance math.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.ticket <= 0 {
+            return Err("closed trade ticket must be positive".to_owned());
+        }
+        Symbol::parse(&self.symbol)
+            .map_err(|error| format!("closed trade symbol is invalid: {error}"))?;
+        if !matches!(self.kind, PositionKind::Buy | PositionKind::Sell) {
+            return Err("closed trade kind must be buy or sell".to_owned());
+        }
+        if !self.lots.is_finite() || self.lots <= 0.0 {
+            return Err("closed trade lots must be a finite, positive number".to_owned());
+        }
+        for (name, value) in [
+            ("openPrice", self.open_price),
+            ("closePrice", self.close_price),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!("{name} must be a finite, positive price"));
+            }
+        }
+        if self.open_time <= 0 || self.close_time < self.open_time {
+            return Err("closed trade times must satisfy 0 < openTime <= closeTime".to_owned());
+        }
+        for (name, value) in [
+            ("profit", self.profit),
+            ("swap", self.swap),
+            ("commission", self.commission),
+        ] {
+            if !value.is_finite() {
+                return Err(format!("{name} must be a finite number"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Result of an `order_history` command: the closed orders that matched the
+/// request, newest first, with the terminal's own truncation report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderHistoryPayload {
+    /// Closed orders, newest first.
+    pub orders: Vec<ClosedTradePayload>,
+    /// Matching orders the terminal held before its response cap.
+    pub total: u32,
+    /// Whether the terminal omitted orders beyond its cap.
+    pub truncated: bool,
+}
+
+impl OrderHistoryPayload {
+    /// Largest order list the payload accepts.
+    pub const MAX_ORDERS: usize = 256;
+
+    /// Rejects unusable history before it reaches performance math.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.orders.len() > Self::MAX_ORDERS {
+            return Err(format!(
+                "orders must contain at most {} entries",
+                Self::MAX_ORDERS
+            ));
+        }
+        if (self.total as usize) < self.orders.len() {
+            return Err("total must not be below the returned order count".to_owned());
+        }
+        for order in &self.orders {
+            order.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// Order request sent to the EA for validation or execution, derived only from
 /// an approved intent. Fields mirror the intent wire contract so the EA can
 /// read them without a nested parser.
@@ -717,6 +871,8 @@ pub enum CommandPayload {
     Rates(RatesPayload),
     /// Result of `symbol_spec`; the venue contract for one instrument.
     SymbolSpec(SymbolSpecPayload),
+    /// Result of `order_history`; realized fills from the account history.
+    OrderHistory(OrderHistoryPayload),
 }
 
 /// Lifecycle state of one command.

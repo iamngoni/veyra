@@ -6,7 +6,7 @@
 // Requires the endpoint to be listed in
 // Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.24"
+#property version   "1.25"
 #property description "Veyra control channel: heartbeat, account/position snapshots, market rates, order validation, gated live execution, and Veyra-owned closes and stop changes."
 
 input string InUrl         = "__VEYRA_URL__";            // Veyra endpoint (loopback or tunnel)
@@ -676,6 +676,58 @@ void HandleSymbolSpec(string response, string id)
    SendAck(id, json);
   }
 
+// Reports closed orders from the account history, newest first: realized
+// fills with profit, swap, and commission, so the service computes
+// performance from what actually happened instead of floating snapshots.
+void HandleOrderHistory(string response, string id)
+  {
+   int days = (int)JsonNumber(response, "days");
+   if(days <= 0) days = 30;
+   if(days > 365) days = 365;
+   int magic = (int)JsonNumber(response, "magic");
+   datetime cutoff = TimeCurrent() - days * 86400;
+
+   int total = OrdersHistoryTotal();
+   string orders = "";
+   int included = 0;
+   int matched = 0;
+   for(int i = total - 1; i >= 0; i--)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(OrderMagicNumber() != magic) continue;
+      if(OrderCloseTime() < cutoff) continue;
+      matched++;
+      if(included >= 200) continue;
+
+      string symbol = OrderSymbol();
+      int digits = (int)MarketInfo(symbol, MODE_DIGITS);
+      if(digits <= 0) digits = 5;
+      string kind = (OrderType() == OP_SELL) ? "sell" : "buy";
+      string entry = "{\"ticket\":" + (string)(long)OrderTicket()
+                     + ",\"symbol\":\"" + EscapeJson(symbol) + "\""
+                     + ",\"kind\":\"" + kind + "\""
+                     + ",\"lots\":" + DoubleToString(OrderLots(), 2)
+                     + ",\"openPrice\":" + DoubleToString(OrderOpenPrice(), digits)
+                     + ",\"closePrice\":" + DoubleToString(OrderClosePrice(), digits)
+                     + ",\"openTime\":" + (string)(long)OrderOpenTime()
+                     + ",\"closeTime\":" + (string)(long)OrderCloseTime()
+                     + ",\"profit\":" + DoubleToString(OrderProfit(), 2)
+                     + ",\"swap\":" + DoubleToString(OrderSwap(), 2)
+                     + ",\"commission\":" + DoubleToString(OrderCommission(), 2)
+                     + ",\"magic\":" + (string)OrderMagicNumber()
+                     + "}";
+      if(StringLen(orders) > 0) orders = orders + ",";
+      orders = orders + entry;
+      included++;
+     }
+
+   string json = "{\"orders\":[" + orders + "],\"total\":" + (string)matched
+                 + ",\"truncated\":" + (matched > included ? "true" : "false") + "}";
+   Print("VeyraProbe order_history days=", (string)days, " matched=", (string)matched,
+         " included=", (string)included);
+   SendAck(id, json);
+  }
+
 // Executes one command delivered by the service and acknowledges it by id.
 void HandleCommand(string response)
   {
@@ -716,6 +768,12 @@ void HandleCommand(string response)
    if(kind == "symbol_spec")
      {
       HandleSymbolSpec(response, id);
+      return;
+     }
+
+   if(kind == "order_history")
+     {
+      HandleOrderHistory(response, id);
       return;
      }
 
