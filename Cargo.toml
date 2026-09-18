@@ -11,7 +11,7 @@ repository = "https://github.com/iamngoni/veyra"
 
 [workspace.dependencies]
 actix-web = "4"
-agent-runtime = { git = "https://github.com/iamngoni/agent-runtime", rev = "1207aa7a1c65f9f88cf8420a1f19cdd2b57a47ab" }
+agent-runtime = { git = "https://github.com/iamngoni/agent-runtime", rev = "83e708dc854eed024c70e83cb8eeff266b849c3f" }
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "macros", "migrate", "json"] }
@@ -32,8 +32,3 @@ codegen-units = 1
 # dylibs ("mis-aligned LINKEDIT string pool" when sqlx_macros loads). Keep
 # symbols unstripped so `cargo build --release` produces loadable artifacts.
 strip = "none"
-
-# Temporary: verifies the local structured-strategy change before it is pushed
-# and the rev above is bumped. Remove once the pin points at the new commit.
-[patch."https://github.com/iamngoni/agent-runtime"]
-agent-runtime = { path = "../agent-runtime" }

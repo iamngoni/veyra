@@ -192,7 +192,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-runtime"
 version = "0.5.0"
-source = "git+https://github.com/iamngoni/agent-runtime?rev=1207aa7a1c65f9f88cf8420a1f19cdd2b57a47ab#1207aa7a1c65f9f88cf8420a1f19cdd2b57a47ab"
+source = "git+https://github.com/iamngoni/agent-runtime?rev=83e708dc854eed024c70e83cb8eeff266b849c3f#83e708dc854eed024c70e83cb8eeff266b849c3f"
 dependencies = [
  "anyhow",
  "async-trait",
