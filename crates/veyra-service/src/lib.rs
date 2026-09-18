@@ -56,6 +56,7 @@ pub struct AppState {
     risk: RiskGate,
     runtime_state: RuntimeState,
     stop_basis: Arc<StopBasis>,
+    entry_watch: Arc<crate::trading::autopilot::EntryWatch>,
     rotation: Arc<AtomicUsize>,
     equity_guard: Arc<EquityGuard>,
 }
@@ -81,6 +82,7 @@ impl AppState {
             risk,
             runtime_state: RuntimeState::disabled(),
             stop_basis: Arc::new(StopBasis::default()),
+            entry_watch: Arc::new(crate::trading::autopilot::EntryWatch::default()),
             rotation: Arc::new(AtomicUsize::new(0)),
             equity_guard: Arc::new(EquityGuard::new()),
         }
@@ -162,6 +164,12 @@ impl AppState {
     /// across ticks for the lifetime of the process.
     pub fn stop_basis(&self) -> &Arc<StopBasis> {
         &self.stop_basis
+    }
+
+    /// Market the entry sweep last judged each instrument on; survives across
+    /// ticks for the lifetime of the process.
+    pub fn entry_watch(&self) -> &Arc<crate::trading::autopilot::EntryWatch> {
+        &self.entry_watch
     }
 
     /// Returns the active model integration, if one is configured.

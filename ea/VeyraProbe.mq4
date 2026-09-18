@@ -656,9 +656,16 @@ void HandleSymbolSpec(string response, string id)
       return;
      }
 
+   int specDigits = (int)MarketInfo(symbol, MODE_DIGITS);
+   if(specDigits <= 0) specDigits = 5;
    string json = "{\"symbol\":\"" + EscapeJson(symbol) + "\""
-                 + ",\"digits\":" + (string)(int)MarketInfo(symbol, MODE_DIGITS)
+                 + ",\"digits\":" + (string)specDigits
                  + ",\"point\":" + DoubleToString(point, 8)
+                 // The live quote. For an instrument holding no position this
+                 // is the only current price the service can see; without it
+                 // the newest price it has is the last closed candle.
+                 + ",\"bid\":" + DoubleToString(MarketInfo(symbol, MODE_BID), specDigits)
+                 + ",\"ask\":" + DoubleToString(MarketInfo(symbol, MODE_ASK), specDigits)
                  + ",\"spreadPoints\":" + (string)(int)MarketInfo(symbol, MODE_SPREAD)
                  + ",\"stopLevelPoints\":" + (string)(int)MarketInfo(symbol, MODE_STOPLEVEL)
                  + ",\"freezeLevelPoints\":" + (string)(int)MarketInfo(symbol, MODE_FREEZELEVEL)

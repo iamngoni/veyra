@@ -168,6 +168,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     TickOutcome::Skipped { reason } => {
                         tracing::debug!(reason, "autopilot tick skipped");
                     }
+                    // The quiet majority once the entry gate is doing its job:
+                    // logging it at info would bury the ticks that decided
+                    // something under one line a minute saying nothing did.
+                    TickOutcome::Unchanged => {
+                        tracing::debug!("autopilot tick found nothing changed");
+                    }
                     outcome => tracing::info!(?outcome, "autopilot tick"),
                 }
             }

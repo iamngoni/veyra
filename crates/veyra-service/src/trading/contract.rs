@@ -144,6 +144,8 @@ mod tests {
             symbol: "EURUSD".to_owned(),
             digits: 5,
             point: 0.00001,
+            bid: 1.1,
+            ask: 1.10012,
             spread_points: 12,
             stop_level_points: 5,
             freeze_level_points: 0,

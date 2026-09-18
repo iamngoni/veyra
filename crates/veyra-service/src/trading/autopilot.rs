@@ -79,6 +79,8 @@ const CALENDAR_LOOKBACK_SECS: i64 = 86_400;
 const MAX_LISTED_EVENTS: usize = 6;
 /// Default minimum position age before an autonomous close is allowed.
 const DEFAULT_MIN_HOLD_SECS: u64 = 300;
+/// Default mid-candle trigger: a quarter of the instrument's own ATR.
+const DEFAULT_ENTRY_MOVE_ATR_FRACTION: f64 = 0.25;
 /// Largest minimum-hold window the parser accepts.
 const MAX_MIN_HOLD_SECS: u64 = 86_400;
 
@@ -123,6 +125,7 @@ pub struct AutopilotSettings {
     min_hold: Duration,
     breakeven_r: f64,
     trail_r: f64,
+    entry_move_atr_fraction: f64,
 }
 
 impl AutopilotSettings {
@@ -155,6 +158,7 @@ impl AutopilotSettings {
         let min_hold_raw = optional(&mut source, "VEYRA_AUTOPILOT_MIN_HOLD_SECS");
         let breakeven_raw = optional(&mut source, "VEYRA_AUTOPILOT_BREAKEVEN_R");
         let trail_raw = optional(&mut source, "VEYRA_AUTOPILOT_TRAIL_R");
+        let entry_move_raw = optional(&mut source, "VEYRA_AUTOPILOT_ENTRY_MOVE_ATR");
 
         if enabled_raw.is_empty()
             && symbol_raw.is_empty()
@@ -283,6 +287,13 @@ impl AutopilotSettings {
         };
         let breakeven_r = multiple("VEYRA_AUTOPILOT_BREAKEVEN_R", &breakeven_raw)?;
         let trail_r = multiple("VEYRA_AUTOPILOT_TRAIL_R", &trail_raw)?;
+        // Unset keeps the same floor the stop checks already use, so a
+        // mid-candle move has to be meaningful by the instrument's own measure
+        // before it buys another opinion.
+        let entry_move_atr_fraction = match entry_move_raw.as_str() {
+            "" => DEFAULT_ENTRY_MOVE_ATR_FRACTION,
+            other => multiple("VEYRA_AUTOPILOT_ENTRY_MOVE_ATR", other)?,
+        };
 
         Ok(Some(Self {
             enabled,
@@ -295,6 +306,7 @@ impl AutopilotSettings {
             min_hold,
             breakeven_r,
             trail_r,
+            entry_move_atr_fraction,
         }))
     }
 
@@ -347,6 +359,12 @@ impl AutopilotSettings {
         self.breakeven_r
     }
 
+    /// Fraction of ATR a candidate must move inside a candle before the entry
+    /// sweep asks the model again; zero leaves new candles as the only trigger.
+    pub fn entry_move_atr_fraction(&self) -> f64 {
+        self.entry_move_atr_fraction
+    }
+
     /// Distance kept behind the best favourable price once trailing starts,
     /// as a multiple of the entry risk; zero disables the policy.
     pub fn trail_r(&self) -> f64 {
@@ -379,6 +397,9 @@ pub enum TickOutcome {
     },
     /// The model proposed no trade.
     NoTrade,
+    /// No candidate moved since the last proposal, so none was requested.
+    /// Stops and reviews still ran; only the entry question was skipped.
+    Unchanged,
     /// The reviewer chose to keep the open position and its bracket.
     Held,
     /// The reviewer asked to close; the close command was queued.
@@ -592,13 +613,40 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     // possible; only then is the model asked to pick from the menu, and it may
     // still answer `none` when no instrument is suitable.
     let policy = state.risk().policy();
+    // What the model would be shown, as the gate reads it. A candidate's live
+    // price is only known when the venue reports one for it; without that the
+    // gate falls back to new closed candles alone.
+    let observations: Vec<EntryObservation<'_>> = markets
+        .iter()
+        .map(|(symbol, series)| EntryObservation {
+            symbol: symbol.as_str(),
+            candle_time: series.last().map(|candle| candle.time()).unwrap_or(0),
+            price: account
+                .prices
+                .iter()
+                .find(|(known, _)| known == symbol)
+                .map(|(_, price)| *price),
+            atr: average_true_range(series, ATR_PERIOD),
+        })
+        .collect();
     let entry_outcome = if account.open_orders >= policy.max_open_orders() {
         record(state, "no_trade", None, None, Some("open_order_cap")).await;
         TickOutcome::NoTrade
     } else if policy.max_total_lots().value() - account.open_lots <= 0.0 {
         record(state, "no_trade", None, None, Some("exposure_cap")).await;
         TickOutcome::NoTrade
+    } else if !state
+        .entry_watch()
+        .should_evaluate(&observations, settings.entry_move_atr_fraction())
+    {
+        // Nothing moved since the last proposal, so the model would be asked
+        // an identical question. Stops and reviews already ran above.
+        TickOutcome::Unchanged
     } else {
+        // Marked before the proposal, not after: whatever this sweep decides,
+        // the question has now been asked about this market, and an error on
+        // the way to the answer must not leave it asking again every tick.
+        state.entry_watch().record(&observations);
         // Fetch the venue contract for every menu instrument once: the model
         // gets spread, stop-level, lot-band, and margin facts to size its
         // decision, and the pre-queue contract check reuses the same data.
@@ -1115,6 +1163,89 @@ const STOP_MIN_STEP_RATIO: f64 = 0.1;
 #[derive(Debug, Default)]
 pub struct StopBasis {
     risks: std::sync::Mutex<std::collections::HashMap<i64, f64>>,
+}
+
+/// One instrument's market as the entry sweep last saw it.
+#[derive(Debug, Clone, Copy)]
+struct EntrySeen {
+    /// Open time of the newest closed candle that was evaluated.
+    candle_time: i64,
+    /// Price at evaluation, when one was known.
+    price: Option<f64>,
+}
+
+/// One instrument's current market, as the sweep gate reads it.
+#[derive(Debug, Clone, Copy)]
+pub struct EntryObservation<'a> {
+    /// Instrument being observed.
+    pub symbol: &'a str,
+    /// Open time of its newest closed candle.
+    pub candle_time: i64,
+    /// Live price, when the venue reported one for this instrument.
+    pub price: Option<f64>,
+    /// ATR over the same window, scaling the mid-candle threshold to the
+    /// instrument's own volatility.
+    pub atr: Option<f64>,
+}
+
+/// What the entry sweep last formed an opinion about, per instrument.
+///
+/// A proposal costs a model call, and asking the same question of an unchanged
+/// chart returns the same answer. This remembers the market each instrument was
+/// last judged on, so the sweep runs when something actually moved: a new closed
+/// candle, or a mid-candle move past a fraction of the instrument's own ATR.
+///
+/// Position reviews and stop moves never consult this. They must keep running
+/// every tick because they react to live price on money already at risk.
+#[derive(Debug, Default)]
+pub struct EntryWatch {
+    seen: std::sync::Mutex<std::collections::HashMap<String, EntrySeen>>,
+}
+
+impl EntryWatch {
+    /// Whether any instrument changed enough to be worth a fresh proposal.
+    ///
+    /// An instrument never seen before always qualifies, so a restart or a
+    /// newly configured symbol gets one look before the gate starts applying.
+    pub fn should_evaluate(&self, observations: &[EntryObservation<'_>], fraction: f64) -> bool {
+        let Ok(seen) = self.seen.lock() else {
+            // A poisoned lock must not silently stop trading; ask instead.
+            return true;
+        };
+        observations.iter().any(|observation| {
+            let Some(previous) = seen.get(observation.symbol) else {
+                return true;
+            };
+            if observation.candle_time > previous.candle_time {
+                return true;
+            }
+            let (Some(now), Some(before), Some(atr)) =
+                (observation.price, previous.price, observation.atr)
+            else {
+                return false;
+            };
+            fraction > 0.0 && atr > 0.0 && (now - before).abs() >= atr * fraction
+        })
+    }
+
+    /// Records the market each instrument was judged on.
+    ///
+    /// Only called once a sweep actually runs, so the threshold measures
+    /// movement since the last real look rather than since the last tick.
+    pub fn record(&self, observations: &[EntryObservation<'_>]) {
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        for observation in observations {
+            seen.insert(
+                observation.symbol.to_owned(),
+                EntrySeen {
+                    candle_time: observation.candle_time,
+                    price: observation.price,
+                },
+            );
+        }
+    }
 }
 
 impl StopBasis {
@@ -2404,6 +2535,8 @@ mod tests {
             symbol: symbol.to_owned(),
             digits: 5,
             point: 0.00001,
+            bid: 1.1,
+            ask: 1.10012,
             spread_points: 12,
             stop_level_points: 5,
             freeze_level_points: 0,
@@ -3417,6 +3550,103 @@ mod tests {
             "a failed judgement must not reach the model"
         );
         assert_eq!(outcomes(&harness.trail), vec!["unavailable".to_owned()]);
+    }
+
+    #[actix_web::test]
+    async fn an_unchanged_market_is_not_proposed_on_twice() {
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+
+        // First look: nothing has been judged yet, so the model is asked.
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        assert_eq!(engine.requests().len(), 1);
+
+        // Same candles, same price: the question would be identical.
+        assert_eq!(tick(&harness.state).await, TickOutcome::Unchanged);
+        assert_eq!(
+            engine.requests().len(),
+            1,
+            "an unchanged chart must not buy a second opinion"
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_new_candle_reopens_the_entry_question() {
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+
+        // A later candle is new information, so the gate opens again.
+        let observation = EntryObservation {
+            symbol: "EURUSD",
+            candle_time: i64::MAX,
+            price: None,
+            atr: None,
+        };
+        assert!(
+            harness
+                .state
+                .entry_watch()
+                .should_evaluate(&[observation], 0.25),
+            "a newer closed candle must reopen the entry question"
+        );
+    }
+
+    #[test]
+    fn a_mid_candle_move_reopens_the_question_only_past_the_threshold() {
+        let watch = EntryWatch::default();
+        let seen = |price: f64| EntryObservation {
+            symbol: "EURUSD",
+            candle_time: 1_700_000_000,
+            price: Some(price),
+            atr: Some(0.0040),
+        };
+        // Never seen before: always worth one look.
+        assert!(watch.should_evaluate(&[seen(1.1000)], 0.25));
+        watch.record(&[seen(1.1000)]);
+
+        // A quarter of ATR is 0.0010, so drift below it stays quiet. The exact
+        // boundary is deliberately not asserted: at these magnitudes it lands
+        // inside float error, and no decision should hinge on which side of a
+        // rounding step a price fell.
+        assert!(!watch.should_evaluate(&[seen(1.1005)], 0.25));
+        // Clearly past it, in either direction.
+        assert!(watch.should_evaluate(&[seen(1.1012)], 0.25));
+        assert!(watch.should_evaluate(&[seen(1.0988)], 0.25));
+        // Zero disables the mid-candle trigger entirely.
+        assert!(!watch.should_evaluate(&[seen(1.5000)], 0.0));
+        // Without a live price there is nothing to compare, so candles rule.
+        let unpriced = EntryObservation {
+            symbol: "EURUSD",
+            candle_time: 1_700_000_000,
+            price: None,
+            atr: Some(0.0040),
+        };
+        assert!(!watch.should_evaluate(&[unpriced], 0.25));
     }
 
     #[actix_web::test]

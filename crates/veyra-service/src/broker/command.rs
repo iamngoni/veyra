@@ -567,6 +567,14 @@ pub struct SymbolSpecPayload {
     pub digits: u32,
     /// Smallest price increment.
     pub point: f64,
+    /// Live bid, or zero when the terminal does not report one. An EA built
+    /// before quotes were added omits it, so zero means "no quote" and never
+    /// a price.
+    #[serde(default)]
+    pub bid: f64,
+    /// Live ask, under the same absence rule as [`SymbolSpecPayload::bid`].
+    #[serde(default)]
+    pub ask: f64,
     /// Current spread in points.
     #[serde(rename = "spreadPoints")]
     pub spread_points: u32,
@@ -618,6 +626,22 @@ impl SymbolSpecPayload {
     /// Pure arithmetic so callers gate on the same number the terminal uses.
     pub fn margin_for(&self, lots: f64) -> f64 {
         self.margin_required * lots
+    }
+
+    /// Mid price from the live quote, or `None` when the terminal reported
+    /// none.
+    ///
+    /// An EA built before quotes were added sends neither side, and a crossed
+    /// or non-finite book is not a price either. Callers get an absence they
+    /// must handle rather than a zero that would read as a real move.
+    pub fn quote_mid(&self) -> Option<f64> {
+        if !self.bid.is_finite() || !self.ask.is_finite() {
+            return None;
+        }
+        if self.bid <= 0.0 || self.ask < self.bid {
+            return None;
+        }
+        Some((self.bid + self.ask) / 2.0)
     }
 
     /// Rejects unusable contract data before it reaches decision code.
