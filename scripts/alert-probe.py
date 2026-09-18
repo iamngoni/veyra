@@ -150,20 +150,40 @@ def close_message(close: dict, trade: dict | None) -> str:
     )
 
 
-def realized_trades() -> dict:
-    """Closed fills by ticket, from the venue history; empty on failure."""
+def realized_performance() -> tuple[dict, dict | None]:
+    """Closed fills by ticket plus the window report, from the venue
+    history; empty on failure."""
     try:
         payload = http_json("/performance?days=7")
     except (OSError, ValueError):
-        return {}
+        return {}, None
     trades = payload.get("trades")
     if not isinstance(trades, list):
-        return {}
-    return {
+        return {}, None
+    fills = {
         trade.get("ticket"): trade
         for trade in trades
         if isinstance(trade, dict) and trade.get("ticket") is not None
     }
+    report = payload.get("report")
+    return fills, report if isinstance(report, dict) else None
+
+
+def record_line(report: dict | None) -> str | None:
+    """Running closed-trade record for the alert footer, when available."""
+    if not report:
+        return None
+    trades = int(report.get("trades") or 0)
+    if trades <= 0:
+        return None
+    wins = int(report.get("wins") or 0)
+    losses = int(report.get("losses") or 0)
+    net = float(report.get("net_profit") or 0.0)
+    win_rate = float(report.get("win_rate_percent") or 0.0)
+    return (
+        f"Record ({trades} closed): {wins}W/{losses}L, "
+        f"win rate {win_rate:.0f}%, net {net:+.2f}"
+    )
 
 
 def main() -> int:
@@ -269,8 +289,11 @@ def main() -> int:
         errors.append(f"event feed failed: {error}")
 
     if closes:
-        fills = realized_trades()
+        fills, report = realized_performance()
         findings.extend(close_message(close, fills.get(close.get("ticket"))) for close in closes)
+        summary = record_line(report)
+        if summary:
+            findings.append(summary)
 
     if findings:
         push(findings, webhook, severity)
