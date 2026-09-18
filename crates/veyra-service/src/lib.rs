@@ -57,6 +57,7 @@ pub struct AppState {
     runtime_state: RuntimeState,
     stop_basis: Arc<StopBasis>,
     entry_watch: Arc<crate::trading::autopilot::EntryWatch>,
+    judgements: Arc<crate::trading::autopilot::JudgementCache>,
     rotation: Arc<AtomicUsize>,
     equity_guard: Arc<EquityGuard>,
 }
@@ -83,6 +84,7 @@ impl AppState {
             runtime_state: RuntimeState::disabled(),
             stop_basis: Arc::new(StopBasis::default()),
             entry_watch: Arc::new(crate::trading::autopilot::EntryWatch::default()),
+            judgements: Arc::new(crate::trading::autopilot::JudgementCache::default()),
             rotation: Arc::new(AtomicUsize::new(0)),
             equity_guard: Arc::new(EquityGuard::new()),
         }
@@ -170,6 +172,11 @@ impl AppState {
     /// ticks for the lifetime of the process.
     pub fn entry_watch(&self) -> &Arc<crate::trading::autopilot::EntryWatch> {
         &self.entry_watch
+    }
+
+    /// Judge answers held against the candle that produced them.
+    pub fn judgements(&self) -> &Arc<crate::trading::autopilot::JudgementCache> {
+        &self.judgements
     }
 
     /// Returns the active model integration, if one is configured.

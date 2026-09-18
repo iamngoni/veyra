@@ -539,8 +539,20 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         && let Some(jev) = state.jev()
     {
         for (symbol, series) in &markets {
+            let candle_time = series.last().map(|candle| candle.time()).unwrap_or(0);
+            // The judge sees only this candle series, so an answer already held
+            // for the same newest candle is the answer it would give again.
+            if let Some(held) = state.judgements().get(symbol.as_str(), candle_time) {
+                judgements.push((symbol.clone(), held));
+                continue;
+            }
             match judgements_for(jev, series).await {
-                Ok(summary) => judgements.push((symbol.clone(), summary)),
+                Ok(summary) => {
+                    state
+                        .judgements()
+                        .put(symbol.as_str(), candle_time, summary.clone());
+                    judgements.push((symbol.clone(), summary));
+                }
                 Err(error) => {
                     let reason = format!("judgement unavailable: {error}");
                     if !state.risk().policy().allow_trading_without_jev() {
@@ -1200,6 +1212,38 @@ pub struct EntryObservation<'a> {
 #[derive(Debug, Default)]
 pub struct EntryWatch {
     seen: std::sync::Mutex<std::collections::HashMap<String, EntrySeen>>,
+}
+
+/// Judge answers, keyed to the candle they were formed on.
+///
+/// The judge is shown nothing but the market narrative, and that narrative is
+/// derived entirely from the closed candles. The same candles therefore produce
+/// the same answer, so an answer already held for an instrument's newest candle
+/// is reused rather than bought again. Nothing else the tick knows — price,
+/// equity, open positions — reaches the judge, which is what makes the candle
+/// alone a sound key.
+#[derive(Debug, Default)]
+pub struct JudgementCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, (i64, Value)>>,
+}
+
+impl JudgementCache {
+    /// The answer already held for this instrument's candle, if any.
+    pub fn get(&self, symbol: &str, candle_time: i64) -> Option<Value> {
+        let entries = self.entries.lock().ok()?;
+        entries
+            .get(symbol)
+            .filter(|(seen, _)| *seen == candle_time)
+            .map(|(_, value)| value.clone())
+    }
+
+    /// Holds one answer, replacing any older candle's answer for the symbol.
+    pub fn put(&self, symbol: &str, candle_time: i64, value: Value) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        entries.insert(symbol.to_owned(), (candle_time, value));
+    }
 }
 
 impl EntryWatch {
@@ -3550,6 +3594,63 @@ mod tests {
             "a failed judgement must not reach the model"
         );
         assert_eq!(outcomes(&harness.trail), vec!["unavailable".to_owned()]);
+    }
+
+    #[actix_web::test]
+    async fn the_judge_is_asked_once_per_candle() {
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let judge = StubJudge::responding(judgements_response());
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            Some(judge.clone()),
+            true,
+            true,
+        );
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        assert_eq!(judge.requests().len(), 1);
+
+        // Same candles: the judge would be shown an identical narrative, so the
+        // held answer stands in for it.
+        assert_eq!(tick(&harness.state).await, TickOutcome::Unchanged);
+        assert_eq!(
+            judge.requests().len(),
+            1,
+            "an unchanged candle must not be judged twice"
+        );
+    }
+
+    #[test]
+    fn held_judgements_belong_to_one_candle_only() {
+        let cache = JudgementCache::default();
+        cache.put("EURUSD", 100, json!({"direction": "long"}));
+
+        assert_eq!(
+            cache.get("EURUSD", 100),
+            Some(json!({"direction": "long"})),
+            "the answer stands for the candle that produced it"
+        );
+        assert_eq!(
+            cache.get("EURUSD", 101),
+            None,
+            "a newer candle is a different question"
+        );
+        assert_eq!(cache.get("GBPUSD", 100), None, "answers are per instrument");
+
+        // A newer candle replaces the older answer rather than accumulating.
+        cache.put("EURUSD", 101, json!({"direction": "short"}));
+        assert_eq!(cache.get("EURUSD", 100), None);
+        assert_eq!(
+            cache.get("EURUSD", 101),
+            Some(json!({"direction": "short"}))
+        );
     }
 
     #[actix_web::test]
