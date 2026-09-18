@@ -44,9 +44,13 @@ This repository contains the first tested, safe service slice:
   commands, and the current market window.
 - **Alerting** without a vendor: a supervised probe watches readiness, the
   two execution controls, repeated autopilot failures, reconciliation drift,
-  executed opens, and closed positions (with last P/L), and pushes one JSON
-  POST per finding to `VEYRA_ALERT_WEBHOOK` — Slack, Discord, or ntfy all
-  accept the payload. Without a webhook it logs to `~/Library/Logs/veyra`.
+  executed opens, and closed positions — enriched with the realized fill from
+  the venue history, so a close reports what it actually banked (`Trade
+  closed — win: USDJPY … net +1.36`). Findings are pushed to
+  `VEYRA_ALERT_WEBHOOK`: Slack and Discord webhooks get the shared JSON
+  shape, an ntfy topic URL gets a titled notification (warnings arrive
+  high-priority with a warning tag). Without a webhook it logs to
+  `~/Library/Logs/veyra`.
 - 24/7 supervision: launchd agents for the terminal, tunnel, service, console,
   alert probe, hourly log rotation, and daily verified audit backups (kept
   locally and uploaded off-machine to R2) with crash restart on the service,

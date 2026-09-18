@@ -14,9 +14,11 @@ per run listing any findings:
   fill from `/performance`, so a close reports what it actually banked
   rather than the reconciler's last floating snapshot)
 
-`VEYRA_ALERT_WEBHOOK` (sourced from `.env`) receives a JSON POST with both
-`text` and `content` keys, which Slack, Discord, and ntfy all accept. With no
-webhook configured, findings are printed for the supervised log instead.
+`VEYRA_ALERT_WEBHOOK` (sourced from `.env`) receives the findings. Slack and
+Discord webhooks get the shared JSON shape (`text` + `content`); an ntfy
+topic URL gets the text body directly with an `X-Title` and warning priority,
+so the push reads as a notification rather than a JSON blob. With no webhook
+configured, findings are printed for the supervised log instead.
 
 Exit status is zero even when alerts fail: a notification problem must never
 make launchd treat the probe itself as broken.
@@ -28,6 +30,7 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -78,12 +81,23 @@ def save_state(state: dict) -> None:
 
 
 def post_webhook(url: str, text: str, severity: str) -> None:
-    body = json.dumps(
-        {"text": text, "content": text, "source": "veyra", "severity": severity}
-    ).encode()
-    request = urllib.request.Request(
-        url, data=body, headers={"content-type": "application/json"}
-    )
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if "ntfy" in host:
+        # ntfy publishes the raw body as the message; a JSON payload would
+        # arrive as an unreadable blob, so send text with a title and let
+        # warnings ring louder than routine findings.
+        headers = {"content-type": "text/plain; charset=utf-8", "X-Title": "Veyra"}
+        if severity == "warn":
+            headers["X-Priority"] = "4"
+            headers["X-Tags"] = "warning"
+        request = urllib.request.Request(url, data=text.encode("utf-8"), headers=headers)
+    else:
+        body = json.dumps(
+            {"text": text, "content": text, "source": "veyra", "severity": severity}
+        ).encode()
+        request = urllib.request.Request(
+            url, data=body, headers={"content-type": "application/json"}
+        )
     with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
         response.read()
 
