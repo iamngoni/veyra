@@ -17,6 +17,7 @@ import {
   RiskPanel,
   SafetyControls,
   StatusPills,
+  TracePanel,
   Tabs,
   ThemeToggle,
 } from '../components/veyra'
@@ -34,6 +35,7 @@ const TABS = [
   { id: 'overview', label: 'Overview' },
   { id: 'activity', label: 'Activity' },
   { id: 'risk', label: 'Risk' },
+  { id: 'trace', label: 'Trace' },
   { id: 'diagnostics', label: 'Diagnostics' },
 ] as const
 
@@ -50,6 +52,8 @@ export function Dashboard() {
   const [focus, setFocus] = useState(true)
   const [logLevel, setLogLevel] = useState<LogLevel>('info')
   const { logs, error: logsError } = useLogFeed(logLevel)
+  const { data: audit, error: auditError } = usePoll(() => api.audit(200), 15000)
+  const [traceKind, setTraceKind] = useState('all')
   const { theme, toggle } = useTheme()
   const [tab, setTab] = useState<TabId>('overview')
 
@@ -141,6 +145,15 @@ export function Dashboard() {
           <RiskPanel policy={status?.risk_policy} status={status} onApply={applyPatch} />
           <AccountPanel account={account} error={accountError} />
         </div>
+      ) : null}
+
+      {tab === 'trace' ? (
+        <TracePanel
+          page={audit}
+          error={auditError}
+          kind={traceKind}
+          onKindChange={setTraceKind}
+        />
       ) : null}
 
       {tab === 'diagnostics' ? (

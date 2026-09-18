@@ -90,6 +90,11 @@ export type Position = {
   tp: number
   /** Swap charged or credited so far, in account currency (absent on older terminals). */
   swap?: number
+  /**
+   * Price the position would close at now. Zero or absent when the terminal
+   * does not report it, which is also when the break-even policy is skipped.
+   */
+  current?: number
   magic: number
 }
 
@@ -193,6 +198,23 @@ export type LogRecord = {
 
 export type LogTail = { logs: LogRecord[]; latest: number }
 
+/** One durable audit row, as the trail stored it. */
+export type AuditRecord = {
+  /** Row identity, a UUID rather than a sequence number. */
+  id: string
+  /** Postgres timestamp text, for example `2026-09-18 17:47:46.844116+00`. */
+  at: string
+  kind: string
+  payload: Record<string, unknown> | null
+}
+
+export type AuditPage = {
+  status: 'ok' | 'disabled' | 'unavailable'
+  provider?: string
+  events: AuditRecord[]
+  error?: string
+}
+
 /** Partial update to the live risk policy; omitted fields keep their value. */
 export type RiskPolicyPatch = {
   killSwitch?: boolean
@@ -284,6 +306,8 @@ export const api = {
     get<Feed>(after === undefined ? '/events' : `/events?after=${after}&wait_ms=${waitMs}`),
   logs: (after: number | undefined, level: LogLevel, limit = 300) =>
     get<LogTail>(`/logs?limit=${limit}&level=${level}${after === undefined ? '' : `&after=${after}`}`),
+  /** Durable trail, newest first. Survives restarts, unlike the log ring. */
+  audit: (limit = 200) => get<AuditPage>(`/audit?limit=${limit}`),
   updatePolicy: (patch: RiskPolicyPatch) => post<RiskPolicy>('/risk/policy', patch),
 }
 

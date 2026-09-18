@@ -106,6 +106,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Counters and baselines resume before the first tick can move them.
     restore_runtime_state(&state, &runtime_state).await;
 
+    // A panic in a spawned task kills that task quietly: the autopilot can stop
+    // deciding while the process still answers /health. The hook records the
+    // panic durably first, so the failure outlives both the task and the
+    // in-memory log ring a restart would clear.
+    if let Some(runtime) = audit.clone() {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = serde_json::json!({
+                "outcome": "panic",
+                "origin": "process",
+                "detail": info.to_string(),
+                "location": info.location().map(|at| at.to_string()),
+                "thread": std::thread::current().name().unwrap_or("unnamed"),
+            });
+            let runtime = runtime.clone();
+            // The hook is synchronous and runs on the panicking thread, which
+            // may have no reactor of its own, so the write gets a dedicated
+            // one rather than assuming the caller's is usable.
+            std::thread::spawn(move || {
+                actix_web::rt::System::new().block_on(async {
+                    runtime
+                        .try_record(AuditEvent::new(AuditKind::Failure, payload))
+                        .await;
+                });
+            })
+            .join()
+            .ok();
+            previous(info);
+        }));
+    }
+
     if let Some(runtime) = &audit {
         if let Some(broker) = state.broker() {
             broker.link().attach_audit(runtime.clone());

@@ -12,6 +12,8 @@ import type { CommandRecord, FeedEvent } from './api'
 export const kindTone: Record<string, string> = {
   proposal_evaluated: 'text-violet-300 bg-violet-500/10',
   agent_tool_called: 'text-fuchsia-300 bg-fuchsia-500/10',
+  agent_turn: 'text-[var(--color-info)] bg-[var(--color-info-dim)]',
+  failure: 'text-[var(--color-bad)] bg-[var(--color-bad-dim)]',
   command_queued: 'text-[var(--color-info)] bg-[var(--color-info)]/10',
   command_completed: 'text-[var(--color-ok)] bg-[var(--color-ok)]/10',
   command_failed: 'text-[var(--color-bad)] bg-[var(--color-bad)]/10',

@@ -8,7 +8,7 @@
 
 import { useState } from 'react'
 
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type {
@@ -21,6 +21,7 @@ import type {
   Status,
 } from '../lib/api'
 import { VEYRA_MAGIC } from '../lib/api'
+import { auditTimeMs } from '../lib/hooks'
 import {
   AccountPanel,
   ActivityFeed,
@@ -38,6 +39,7 @@ import {
   SafetyControls,
   StatusPills,
   systemPosture,
+  TracePanel,
 } from './veyra'
 
 afterEach(cleanup)
@@ -247,11 +249,48 @@ describe('PositionsPanel', () => {
     expect(screen.getByText('XAUUSD')).toBeTruthy()
     expect(screen.getByText('-0.11')).toBeTruthy()
     expect(screen.getByText('+0.02')).toBeTruthy()
-    expect(screen.getAllByText('—').length).toBe(1)
+    // One missing swap, plus a current price none of these fixtures carry.
+    expect(screen.getAllByText('—').length).toBe(4)
     expect(screen.getByText('veyra')).toBeTruthy()
     expect(screen.getAllByText('manual').length).toBe(2)
     expect(screen.getByText('truncated')).toBeTruthy()
     expect(screen.getByText('+4.00')).toBeTruthy()
+  })
+
+  it('reports the live price and signs the move against the side', () => {
+    render(
+      <PositionsPanel
+        account={{
+          ...account,
+          positions: [
+            // A sell in profit: price fell below the entry.
+            { ticket: 1, symbol: 'EURUSD', kind: 'sell', lots: 0.01, price: 1.14757, current: 1.14585, profit: 1.72, sl: 1.1497, tp: 1.14554, magic: VEYRA_MAGIC },
+            // A buy against it: price fell below the entry too.
+            { ticket: 2, symbol: 'GBPUSD', kind: 'buy', lots: 0.01, price: 1.3, current: 1.295, profit: -5, sl: 1.29, tp: 1.31, magic: 0 },
+          ],
+        }}
+      />,
+    )
+    expect(screen.getByText('1.14585')).toBeTruthy()
+    // The same downward move is favourable for the sell and adverse for the buy.
+    expect(screen.getByText('+0.00172')).toBeTruthy()
+    expect(screen.getByText('-0.005')).toBeTruthy()
+  })
+
+  it('states a missing current price rather than implying one', () => {
+    render(
+      <PositionsPanel
+        account={{
+          ...account,
+          positions: [
+            { ticket: 3, symbol: 'EURUSD', kind: 'buy', lots: 0.01, price: 1.1, current: 0, profit: 0, sl: 0, tp: 0, magic: 0 },
+          ],
+        }}
+      />,
+    )
+    // A zero from the terminal means "not reported", never a real price.
+    expect(screen.queryByText('+0.0')).toBeNull()
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(1)
   })
 })
 
@@ -404,6 +443,71 @@ describe('RiskPanel', () => {
     expect(screen.getByText('kill switch on')).toBeTruthy()
     rerender(<RiskPanel />)
     expect(screen.getAllByText('—').length).toBeGreaterThan(0)
+  })
+})
+
+describe('TracePanel', () => {
+  const page = {
+    status: 'ok' as const,
+    provider: 'postgres',
+    events: [
+      {
+        id: '35769e04-3e73-4d7d-a175-6bac7a6e6295',
+        at: '2026-09-18 17:47:46.844116+00',
+        kind: 'agent_turn',
+        payload: {
+          outcome: 'agent_turn',
+          step: 1,
+          input: 'the exact prompt the model was shown',
+          inputChars: 36,
+          answer: { action: 'none' },
+        },
+      },
+      {
+        id: 'c3eff87c-2b31-4734-b79b-87e48b7b7923',
+        at: '2026-09-18 17:47:45.100000+00',
+        kind: 'failure',
+        payload: { outcome: 'panic', detail: 'boom' },
+      },
+    ],
+  }
+
+  it('shows the whole payload of a turn rather than a summary', () => {
+    render(<TracePanel page={page} kind="all" onKindChange={() => {}} />)
+
+    // Scoped to the rows: the same kind also names a filter button above.
+    const rows = screen.getByRole('list')
+    fireEvent.click(within(rows).getByText('agent_turn'))
+    // The prompt is readable in full: that is the point of the view.
+    expect(screen.getByText('the exact prompt the model was shown')).toBeTruthy()
+    expect(screen.getByText('inputChars')).toBeTruthy()
+  })
+
+  it('filters by kind and states an empty trail plainly', () => {
+    const { rerender } = render(<TracePanel page={page} kind="failure" onKindChange={() => {}} />)
+    const rows = screen.getByRole('list')
+    expect(within(rows).getByText('panic · 2 fields')).toBeTruthy()
+    expect(within(rows).queryByText('agent_turn')).toBeNull()
+
+    rerender(<TracePanel page={{ status: 'ok', events: [] }} kind="all" onKindChange={() => {}} />)
+    expect(screen.getByText('No durable events recorded yet.')).toBeTruthy()
+  })
+
+  it('reads a Postgres timestamp rather than printing Invalid Date', () => {
+    render(<TracePanel page={page} kind="all" onKindChange={() => {}} />)
+    const rows = screen.getByRole('list')
+    expect(within(rows).queryByText(/Invalid Date/)).toBeNull()
+    // The offset form Postgres emits has to resolve to a real instant.
+    expect(Number.isNaN(auditTimeMs('2026-09-18 17:47:46.844116+00'))).toBe(false)
+    // Anything unreadable is absent, never a confident wrong time.
+    expect(Number.isNaN(auditTimeMs('not a timestamp'))).toBe(true)
+  })
+
+  it('surfaces a disabled or unreachable trail instead of looking empty', () => {
+    render(
+      <TracePanel page={{ status: 'disabled', events: [] }} kind="all" onKindChange={() => {}} />,
+    )
+    expect(screen.getByText('disabled')).toBeTruthy()
   })
 })
 

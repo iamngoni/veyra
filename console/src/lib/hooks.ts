@@ -188,6 +188,20 @@ export function relativeTime(ms: number): string {
   return `${Math.floor(seconds / 86_400)}d ago`
 }
 
+/**
+ * Milliseconds for one audit timestamp, or NaN when it cannot be read.
+ *
+ * Postgres renders `2026-09-18 17:47:46.844116+00`: a space instead of `T`
+ * and a two-digit offset, neither of which `Date` parses reliably. Callers get
+ * NaN rather than a wrong instant, so a bad value shows as absent instead of
+ * as a confident "Invalid Date".
+ */
+export function auditTimeMs(at: string): number {
+  const direct = Date.parse(at)
+  if (!Number.isNaN(direct)) return direct
+  return Date.parse(at.replace(' ', 'T').replace(/([+-]\d{2})$/, '$1:00'))
+}
+
 export function clockTime(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour12: false })
 }

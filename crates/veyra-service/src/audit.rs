@@ -38,6 +38,11 @@ pub enum AuditKind {
     PositionClosed,
     /// The decision loop executed one read-only tool for the model.
     AgentToolCalled,
+    /// One model turn: exactly what it was shown, and what it answered.
+    AgentTurn,
+    /// A failure worth surviving a restart — a panic, or an error that would
+    /// otherwise exist only in the in-memory log ring.
+    Failure,
     /// The live risk policy was replaced from the control surface.
     RiskPolicyUpdated,
 }
@@ -55,6 +60,8 @@ impl AuditKind {
             Self::ProposalEvaluated => "proposal_evaluated",
             Self::PositionClosed => "position_closed",
             Self::AgentToolCalled => "agent_tool_called",
+            Self::AgentTurn => "agent_turn",
+            Self::Failure => "failure",
             Self::RiskPolicyUpdated => "risk_policy_updated",
         }
     }

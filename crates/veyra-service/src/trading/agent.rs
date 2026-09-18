@@ -42,6 +42,13 @@ const TRANSCRIPT_RESULT_CHARS: usize = 900;
 const JOURNAL_RESULT_CHARS: usize = 2_000;
 /// Largest tool arguments kept in the audit journal.
 const JOURNAL_ARGS_CHARS: usize = 1_000;
+/// Largest prompt body kept per turn. Generous on purpose: the cadence gate
+/// bounds decisions to a handful a day, so the whole prompt normally fits and
+/// the record is the exact text rather than an impression of it. The stored
+/// character count exposes the rare case where it did not.
+const JOURNAL_PROMPT_CHARS: usize = 64_000;
+/// Largest model answer kept per turn.
+const JOURNAL_ANSWER_CHARS: usize = 2_000;
 
 /// Which final schema the loop is allowed to end on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,11 +126,12 @@ pub(crate) async fn run(
             .engine
             .answer(DecisionRequest {
                 instructions: instructions.to_owned(),
-                input: step_input,
+                input: step_input.clone(),
                 format: format_for(session.mode),
                 tier: session.tier,
             })
             .await?;
+        record_turn(session, step + 1, instructions, &step_input, &answer.value).await;
         let rationale = pipeline::parse_rationale(&answer.value);
 
         match parse_step(&answer.value, session, rationale.clone())? {
@@ -624,6 +632,53 @@ fn tool_check_risk(session: &AgentSession<'_>, arguments: &Value) -> Result<Valu
         .risk()
         .preview(&draft, Some(session.account.clone()), session.now);
     serde_json::to_value(&decision).map_err(|error| error.to_string())
+}
+
+/// Journals one model turn: what it was shown, and what it answered.
+///
+/// The prompt is stored whole up to a generous bound, so the record is the
+/// text the model actually saw rather than a summary of it. The character
+/// count is stored beside it, which is the only way a reader can tell a
+/// complete record from a clipped one.
+///
+/// No credential can reach here. The instructions and input are built from
+/// market data and account facts; the API key never enters either, and travels
+/// to the provider through the HTTP client alone.
+async fn record_turn(
+    session: &AgentSession<'_>,
+    step: usize,
+    instructions: &str,
+    input: &str,
+    answer: &Value,
+) {
+    let Some(audit) = session.state.audit() else {
+        return;
+    };
+    let clipped = |text: &str, max: usize| -> Value {
+        match text.char_indices().nth(max) {
+            None => json!(text),
+            Some((cut, _)) => json!(format!("{}…", &text[..cut])),
+        }
+    };
+    audit
+        .try_record(AuditEvent::new(
+            AuditKind::AgentTurn,
+            json!({
+                "outcome": "agent_turn",
+                "origin": "autopilot_agent",
+                "step": step,
+                "mode": match session.mode {
+                    AgentMode::Proposal => "proposal",
+                    AgentMode::Review => "review",
+                },
+                "instructions": clipped(instructions, JOURNAL_PROMPT_CHARS),
+                "instructionsChars": instructions.chars().count(),
+                "input": clipped(input, JOURNAL_PROMPT_CHARS),
+                "inputChars": input.chars().count(),
+                "answer": bounded(answer, JOURNAL_ANSWER_CHARS)
+            }),
+        ))
+        .await;
 }
 
 /// Journals one tool execution for the console and audit trail.

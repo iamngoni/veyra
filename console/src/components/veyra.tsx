@@ -4,6 +4,7 @@ import type { ReactNode } from 'react'
 
 import type {
   Account,
+  AuditPage,
   Candle,
   CandleSeries,
   CommandRecord,
@@ -26,7 +27,7 @@ import {
   outcomeTone,
   payloadSummary,
 } from '../lib/format'
-import { clockTime, money, relativeTime, usePaged } from '../lib/hooks'
+import { auditTimeMs, clockTime, money, relativeTime, usePaged } from '../lib/hooks'
 
 /* ---------- primitives ---------- */
 
@@ -261,7 +262,11 @@ export function HeroMetrics({ account, error }: { account?: Account; error?: str
   const open = positions.reduce((sum, position) => sum + (position.profit ?? 0), 0)
   const openTone = open > 0 ? 'text-[var(--color-ok)]' : open < 0 ? 'text-[var(--color-bad)]' : 'text-[var(--color-ink)]'
   const cells: Array<{ label: string; value: ReactNode; tone?: string; hint?: string }> = [
-    { label: 'Equity', value: account ? money(account.equity) : null, hint: account ? `balance ${money(account.balance)}` : undefined },
+    {
+      label: 'Equity',
+      value: account?.equity === undefined ? null : money(account.equity),
+      hint: account?.balance === undefined ? undefined : `balance ${money(account.balance)}`,
+    },
     {
       label: 'Open P/L',
       value: account ? (positions.length > 0 ? `${open >= 0 ? '+' : ''}${open.toFixed(2)}` : '—') : null,
@@ -269,13 +274,18 @@ export function HeroMetrics({ account, error }: { account?: Account; error?: str
       hint: `${positions.length} position${positions.length === 1 ? '' : 's'}`,
     },
     {
+      // A snapshot can arrive before its money fields do, so an absent value
+      // reads as pending rather than rendering the word "undefined".
       label: 'Exposure',
-      value: account ? `${account.lots} lots` : null,
-      hint: account ? `${account.orders} order${account.orders === 1 ? '' : 's'}` : undefined,
+      value: account?.lots === undefined ? null : `${account.lots} lots`,
+      hint:
+        account?.orders === undefined
+          ? undefined
+          : `${account.orders} order${account.orders === 1 ? '' : 's'}`,
     },
     {
       label: 'Free margin',
-      value: account ? money(account.freeMargin) : null,
+      value: account?.freeMargin === undefined ? null : money(account.freeMargin),
       hint: account?.marginLevel != null ? `level ${account.marginLevel.toFixed(0)}%` : undefined,
     },
   ]
@@ -534,6 +544,44 @@ export function AccountPanel({ account, error }: { account?: Account; error?: st
   )
 }
 
+/**
+ * How far price has moved in the position's favour. A sell profits as price
+ * falls, so the raw difference is signed against the side rather than reported
+ * as a bare price change that would read backwards on half the book.
+ */
+function favourableMove(position: Position): number {
+  if (!position.current) return 0
+  return position.kind === 'buy'
+    ? position.current - position.price
+    : position.price - position.current
+}
+
+/**
+ * The move as a signed price delta at the venue's own quote precision.
+ *
+ * Deliberately not pips: pip size differs per instrument class (and this book
+ * mixes FX with metals), so a converted figure would be wrong somewhere and
+ * silently so. The delta is always true.
+ *
+ * Precision is the widest seen across the row's prices, because any single one
+ * can be short a digit — an entry that happens to land on 1.3 says nothing
+ * about how finely the instrument is quoted, and rounding to it would report a
+ * real move as no move at all.
+ */
+function quotedDecimals(position: Position): number {
+  const prices = [position.price, position.current, position.sl, position.tp]
+  const widest = prices.reduce<number>((most, price) => {
+    if (!price) return most
+    return Math.max(most, (String(price).split('.')[1] ?? '').length)
+  }, 0)
+  return widest || 2
+}
+
+function formatMove(position: Position): string {
+  const move = favourableMove(position)
+  return `${move >= 0 ? '+' : ''}${move.toFixed(quotedDecimals(position))}`
+}
+
 export function PositionsPanel({ account }: { account?: Account }) {
   const positions = account?.positions ?? []
   return (
@@ -553,6 +601,7 @@ export function PositionsPanel({ account }: { account?: Account }) {
                 <th className="px-2 py-1.5 font-medium">Side</th>
                 <th className="px-2 py-1.5 font-medium">Lots</th>
                 <th className="px-2 py-1.5 font-medium">Entry</th>
+                <th className="px-2 py-1.5 font-medium">Current</th>
                 <th className="px-2 py-1.5 font-medium">SL</th>
                 <th className="px-2 py-1.5 font-medium">TP</th>
                 <th className="px-2 py-1.5 font-medium">Swap</th>
@@ -570,6 +619,26 @@ export function PositionsPanel({ account }: { account?: Account }) {
                   </td>
                   <td className="px-2 py-1.5 text-[var(--color-ink)]">{position.lots}</td>
                   <td className="px-2 py-1.5 text-[var(--color-ink)]">{position.price}</td>
+                  <td className="px-2 py-1.5 text-[var(--color-ink)]">
+                    {position.current ? (
+                      <>
+                        {position.current}
+                        {/* The move only means anything with a direction, so it
+                            is signed against the side rather than the price. */}
+                        <span
+                          className={`ml-1.5 text-[10px] ${
+                            favourableMove(position) >= 0
+                              ? 'text-[var(--color-ok)]'
+                              : 'text-[var(--color-bad)]'
+                          }`}
+                        >
+                          {formatMove(position)}
+                        </span>
+                      </>
+                    ) : (
+                      '—'
+                    )}
+                  </td>
                   <td className="px-2 py-1.5 text-[var(--color-bad)]/80">{position.sl > 0 ? position.sl : '—'}</td>
                   <td className="px-2 py-1.5 text-[var(--color-ok)]/80">{position.tp > 0 ? position.tp : '—'}</td>
                   <td className={`px-2 py-1.5 ${position.swap != null && position.swap < 0 ? 'text-[var(--color-bad)]/80' : 'text-[var(--color-ok)]/80'}`}>
@@ -1312,6 +1381,139 @@ export function ActivityFeed({
                     <pre className="max-h-40 overflow-auto rounded bg-[var(--color-surface-0)] p-2 font-mono text-[10px] leading-relaxed text-[var(--color-ink-muted)]">
                       {JSON.stringify(event.payload ?? {}, null, 2)}
                     </pre>
+                  </div>
+                ) : null}
+              </li>
+            )
+          })}
+        </ul>
+      )}
+      <Pager
+        page={paged.page}
+        pages={paged.pages}
+        start={paged.start}
+        count={paged.items.length}
+        total={paged.total}
+        onPrevious={paged.previous}
+        onNext={paged.next}
+      />
+    </Panel>
+  )
+}
+
+/* ---------- durable trace ---------- */
+
+/** Long values are shown whole on demand, not silently clipped in the row. */
+function TraceValue({ value }: { value: unknown }) {
+  const rendered = typeof value === 'string' ? value : JSON.stringify(value, null, 2)
+  return (
+    <pre className="max-h-[28rem] overflow-auto rounded bg-[var(--color-surface-0)] p-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-[var(--color-ink-muted)]">
+      {rendered}
+    </pre>
+  )
+}
+
+/**
+ * The durable trail, not the in-memory ring: what survives a restart.
+ *
+ * Every row is expandable to its whole payload — a model turn shows the exact
+ * prompt it was given and the answer it returned, a tool call shows its
+ * arguments and result. Nothing is summarised away, because the point of this
+ * view is to answer "what actually happened" without reading the database.
+ */
+export function TracePanel({
+  page,
+  error,
+  kind,
+  onKindChange,
+}: {
+  page?: AuditPage
+  error?: string
+  kind: string
+  onKindChange: (kind: string) => void
+}) {
+  const [openId, setOpenId] = useState<string | undefined>(undefined)
+  const rows = page?.events ?? []
+  const kinds = ['all', ...Array.from(new Set(rows.map((row) => row.kind))).sort()]
+  const visible = kind === 'all' ? rows : rows.filter((row) => row.kind === kind)
+  const paged = usePaged(visible, 12)
+
+  return (
+    <Panel
+      title="Trace"
+      className="min-h-[320px]"
+      detail={
+        <span className="flex flex-wrap items-center gap-1">
+          {page?.status && page.status !== 'ok' ? (
+            <span className="text-[var(--color-warn)]">{page.status}</span>
+          ) : null}
+          {kinds.slice(0, 8).map((candidate) => (
+            <button
+              key={candidate}
+              type="button"
+              onClick={() => onKindChange(candidate)}
+              className={`rounded border px-1.5 py-0.5 text-[10px] transition-colors ${
+                candidate === kind
+                  ? 'border-[var(--color-ink-faint)] text-[var(--color-ink)]'
+                  : 'border-[var(--color-line)] text-[var(--color-ink-faint)] hover:border-[var(--color-line-strong)]'
+              }`}
+            >
+              {candidate}
+            </button>
+          ))}
+        </span>
+      }
+    >
+      {error ? <div className="px-3 py-2 text-[11px] text-[var(--color-bad)]">{error}</div> : null}
+      {visible.length === 0 ? (
+        <div className="p-3 text-xs text-[var(--color-ink-faint)]">
+          {error ? 'Trail unavailable.' : 'No durable events recorded yet.'}
+        </div>
+      ) : (
+        <ul className="divide-y divide-[var(--color-line)]">
+          {paged.items.map((row) => {
+            const open = row.id === openId
+            const payload = row.payload ?? {}
+            const outcome = typeof payload.outcome === 'string' ? payload.outcome : undefined
+            return (
+              <li key={row.id}>
+                <button
+                  type="button"
+                  onClick={() => setOpenId(open ? undefined : row.id)}
+                  aria-expanded={open}
+                  className={`flex w-full items-start gap-2 px-3 py-1.5 text-left text-xs transition-colors ${
+                    open ? 'bg-[var(--color-surface-3)]/50' : 'hover:bg-[var(--color-surface-3)]/20'
+                  }`}
+                >
+                  <span className="readout w-14 shrink-0 pt-0.5 text-[10px] text-[var(--color-ink-faint)]">
+                    {Number.isNaN(auditTimeMs(row.at)) ? '—' : clockTime(auditTimeMs(row.at))}
+                  </span>
+                  <span
+                    className={`readout shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
+                      kindTone[row.kind] ?? 'bg-[var(--color-surface-3)]/30 text-[var(--color-ink)]'
+                    }`}
+                  >
+                    {row.kind}
+                  </span>
+                  <span className="readout min-w-0 flex-1 truncate text-[11px] text-[var(--color-ink-muted)]">
+                    {outcome ? `${outcome} · ` : ''}
+                    {Object.keys(payload).length} fields
+                  </span>
+                  <span
+                    className="readout shrink-0 text-[10px] text-[var(--color-ink-faint)]"
+                    title={row.id}
+                  >
+                    {row.id.slice(0, 8)}
+                  </span>
+                </button>
+                {open ? (
+                  <div className="space-y-2 border-t border-[var(--color-line)] bg-[var(--color-surface-2)]/40 px-3 py-2">
+                    {Object.entries(payload).map(([field, value]) => (
+                      <div key={field}>
+                        <div className="label mb-0.5">{field}</div>
+                        <TraceValue value={value} />
+                      </div>
+                    ))}
                   </div>
                 ) : null}
               </li>
