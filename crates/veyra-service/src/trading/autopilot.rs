@@ -49,9 +49,8 @@ use crate::jev::{
 };
 use crate::market::{Candle, CandleRequest, CandleSeries, Timeframe};
 use crate::model::ModelTier;
-use crate::risk::AccountFacts;
-use crate::risk::WeekendPositions;
 use crate::risk::window::WeekendPrep;
+use crate::risk::{AccountFacts, RiskPolicy, WeekendPositions};
 use crate::trading::agent::{self, AgentDecision, AgentMode, AgentSession};
 use crate::trading::contract;
 use crate::trading::intent::TradeIntentDraft;
@@ -60,7 +59,7 @@ use crate::trading::pipeline::{PipelineError, PipelineOutcome};
 /// Default proposal cadence in seconds.
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 /// Largest number of instruments one autopilot rotation accepts.
-const MAX_SYMBOLS: usize = 8;
+const MAX_SYMBOLS: usize = 16;
 /// Smallest accepted cadence: frequent enough to act, slow enough to be sane.
 const MIN_INTERVAL_SECS: u64 = 30;
 /// Largest accepted cadence.
@@ -527,7 +526,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     }
     // The tick's own last closes value stop distances for candidates that have
     // no open position to quote from.
-    let account = with_reference_prices(account, &markets);
+    let mut account = with_reference_prices(account, &markets);
 
     // Calibrated judgements per candidate. They are advisory inputs, but a
     // configured judge that fails normally aborts the tick: no model call runs
@@ -630,9 +629,10 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             managed
                 .iter()
                 .filter(|position| {
-                    state
-                        .weekend_watch()
-                        .should_review(position.ticket, prep.closes_at)
+                    !policy.allows_weekend_name(&position.symbol)
+                        && state
+                            .weekend_watch()
+                            .should_review(position.ticket, prep.closes_at)
                 })
                 .cloned()
                 .collect()
@@ -710,7 +710,9 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         state.review_watch().record(position.ticket, candle_time);
         // A candle review inside the weekend window carries the same context,
         // so it settles the weekend question for this close too.
-        if let Some(prep) = weekend_context {
+        let position_weekend_context =
+            weekend_context.filter(|_| !policy.allows_weekend_name(&position.symbol));
+        if let Some(prep) = position_weekend_context {
             state
                 .weekend_watch()
                 .record(position.ticket, prep.closes_at);
@@ -732,7 +734,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             &session,
             series,
             std::slice::from_ref(&position),
-            weekend_context,
+            position_weekend_context,
             "autopilot_review",
         )
         .await;
@@ -748,6 +750,12 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     // What the model would be shown, as the gate reads it. A candidate's live
     // price is only known when the venue reports one for it; without that the
     // gate falls back to new closed candles alone.
+    // Venue contracts are part of the gate facts, not just prompt context.
+    // They let the same deterministic stop-risk formula price FX, crypto,
+    // indices, and any future CFD in the account currency the broker reports.
+    let specs = symbol_specs(state, &markets).await;
+    account.symbol_specs = specs.iter().map(|(_, spec)| spec.clone()).collect();
+    let entry_markets = eligible_entry_markets(&markets, &specs, &policy, state.now());
     let observations: Vec<EntryObservation<'_>> = markets
         .iter()
         .map(|(symbol, series)| EntryObservation {
@@ -775,14 +783,10 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         // Nothing moved since the last proposal, so the model would be asked
         // an identical question. Stops and reviews already ran above.
         TickOutcome::Unchanged
-    } else if let Some(block) = crate::risk::window::entry_block(state.now(), policy.session()) {
-        // The session is shut — the daily rollover pause, the Friday cutoff,
-        // the weekend — so the gate would refuse whatever the model proposed.
-        // The sweep stops before the model and marks the observation settled,
-        // which holds the question until the next candle instead of asking a
-        // question whose only possible answer is a rejection.
+    } else if entry_markets.is_empty() {
+        let reason = empty_entry_reason(&markets, &policy, state.now());
         state.entry_watch().record(&observations);
-        record(state, "no_trade", None, None, Some(block.as_str())).await;
+        record(state, "no_trade", None, None, Some(reason)).await;
         TickOutcome::NoTrade
     } else {
         // Marked before the proposal, not after: whatever this sweep decides,
@@ -791,10 +795,6 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         // A sweep that dies before a verdict arms a retry instead (see
         // `mark_failed`), so the mark costs minutes rather than the candle.
         state.entry_watch().record(&observations);
-        // Fetch the venue contract for every menu instrument once: the model
-        // gets spread, stop-level, lot-band, and margin facts to size its
-        // decision, and the pre-queue contract check reuses the same data.
-        let specs = symbol_specs(state, &markets).await;
         // Scheduled news: a configured calendar that cannot answer aborts the
         // entry sweep; trading blind through a data outage is exactly what the
         // blackout exists to prevent.
@@ -807,7 +807,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             }
         };
         let input = proposal_input(
-            &markets,
+            &entry_markets,
             &judgements,
             &account,
             &managed,
@@ -815,13 +815,13 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             &events,
             unix_secs(state.now()),
         );
-        let instructions = proposal_instructions(state, &markets, &account);
+        let instructions = proposal_instructions(state, &entry_markets, &account);
         let engine = model.engine();
         let session = AgentSession {
             state,
             engine: engine.as_ref(),
             mode: AgentMode::Proposal,
-            markets: &markets,
+            markets: &entry_markets,
             account: &account,
             judgements: &judgements,
             tier: settings.tier(),
@@ -956,10 +956,10 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                             draft,
                             symbol_spec_for(&specs, symbol.as_str()),
                             account.free_margin,
-                            series_for_symbol(&markets, symbol.as_str())
+                            series_for_symbol(&entry_markets, symbol.as_str())
                                 .and_then(|series| series.last())
                                 .map(|candle| candle.close()),
-                            series_for_symbol(&markets, symbol.as_str())
+                            series_for_symbol(&entry_markets, symbol.as_str())
                                 .and_then(|series| average_true_range(series, ATR_PERIOD)),
                             policy.min_stop_atr_fraction(),
                         ) {
@@ -1194,6 +1194,65 @@ async fn symbol_specs(
     specs
 }
 
+/// Entry-only market menu after deterministic schedule and venue-contract
+/// checks. Managed positions remain in the full `markets` list for reviews;
+/// this filtered clone is the only menu the entry model can propose from.
+fn eligible_entry_markets(
+    markets: &[(Symbol, CandleSeries)],
+    specs: &[(Symbol, SymbolSpecPayload)],
+    policy: &RiskPolicy,
+    now: SystemTime,
+) -> Vec<(Symbol, CandleSeries)> {
+    let session_open = configured_session_open(policy, now);
+    markets
+        .iter()
+        .filter(|(symbol, _)| {
+            let schedule_open = policy.allows_weekend(symbol)
+                || crate::risk::window::entry_block(now, None).is_none();
+            let contract_open = match symbol_spec_for(specs, symbol.as_str()) {
+                Some(spec) => {
+                    spec.trade_allowed
+                        && spec.tick_size.is_finite()
+                        && spec.tick_size > 0.0
+                        && spec.tick_value.is_finite()
+                        && spec.tick_value > 0.0
+                }
+                None => crate::risk::valuation::supports_static_valuation(symbol),
+            };
+            session_open && schedule_open && contract_open
+        })
+        .cloned()
+        .collect()
+}
+
+fn configured_session_open(policy: &RiskPolicy, now: SystemTime) -> bool {
+    policy.session().is_none_or(|session| {
+        crate::risk::window::utc_now_parts(now)
+            .map(|(_, minute)| session.contains((minute / 60) as u8))
+            .unwrap_or(false)
+    })
+}
+
+/// Stable audit reason when no market can enter before a model call.
+fn empty_entry_reason(
+    markets: &[(Symbol, CandleSeries)],
+    policy: &RiskPolicy,
+    now: SystemTime,
+) -> &'static str {
+    if !configured_session_open(policy, now) {
+        return "session_closed";
+    }
+    if !markets.is_empty()
+        && markets
+            .iter()
+            .all(|(symbol, _)| !policy.allows_weekend(symbol))
+        && let Some(block) = crate::risk::window::entry_block(now, None)
+    {
+        return block.as_str();
+    }
+    "no_tradeable_candidates"
+}
+
 /// Fetches the scheduled events covering the decision horizon. Without a
 /// configured calendar the list is empty and both news behaviours are inert.
 async fn calendar_events(state: &AppState) -> Result<Vec<CalendarEvent>, String> {
@@ -1234,7 +1293,7 @@ fn judgement_for_symbol<'a>(judgements: &'a [(Symbol, Value)], symbol: &str) -> 
         .map(|(_, summary)| summary)
 }
 
-/// Parses a comma-separated symbol list: 1-8 distinct validated instruments.
+/// Parses a comma-separated symbol list: 1-16 distinct validated instruments.
 fn parse_symbol_list(raw: &str) -> Result<Vec<Symbol>, ConfigError> {
     let invalid = |reason: &'static str| ConfigError::InvalidEnvironmentVariable {
         name: "VEYRA_AUTOPILOT_SYMBOLS",
@@ -1264,7 +1323,7 @@ fn parse_symbol_list(raw: &str) -> Result<Vec<Symbol>, ConfigError> {
         return Err(invalid("at least one symbol is required"));
     }
     if symbols.len() > MAX_SYMBOLS {
-        return Err(invalid("at most 8 symbols may rotate"));
+        return Err(invalid("at most 16 symbols may rotate"));
     }
     Ok(symbols)
 }
@@ -3326,7 +3385,10 @@ mod tests {
             ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,,GBPUSD"),
             ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,"),
             ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,bad symbol"),
-            ("VEYRA_AUTOPILOT_SYMBOLS", "A,B,C,D,E,F,G,H,I"),
+            (
+                "VEYRA_AUTOPILOT_SYMBOLS",
+                "A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q",
+            ),
             ("VEYRA_AUTOPILOT_TIMEFRAME", "H6"),
             ("VEYRA_AUTOPILOT_BARS", "9"),
             ("VEYRA_AUTOPILOT_BARS", "241"),
@@ -3355,6 +3417,81 @@ mod tests {
                 "unexpected error for {name}={value}: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn weekend_entry_menu_keeps_only_explicit_live_contracts() {
+        let symbols = ["BTCUSD", "EURUSD", "SP500m"];
+        let markets: Vec<(Symbol, CandleSeries)> = symbols
+            .iter()
+            .map(|name| {
+                let symbol = Symbol::parse(name).expect("symbol");
+                (
+                    symbol.clone(),
+                    CandleSeries::from_validated(
+                        symbol,
+                        Timeframe::H4,
+                        vec![Candle::from_validated(
+                            1_700_000_000,
+                            1.0,
+                            1.1,
+                            0.9,
+                            1.05,
+                            10,
+                        )],
+                    ),
+                )
+            })
+            .collect();
+        let mut blocked_index = canned_spec("SP500m");
+        blocked_index.trade_allowed = false;
+        let specs = vec![
+            (
+                Symbol::parse("BTCUSD").expect("symbol"),
+                canned_spec("BTCUSD"),
+            ),
+            (
+                Symbol::parse("EURUSD").expect("symbol"),
+                canned_spec("EURUSD"),
+            ),
+            (Symbol::parse("SP500m").expect("symbol"), blocked_index),
+        ];
+        let policy = RiskPolicy::new(
+            false,
+            symbols
+                .iter()
+                .map(|name| Symbol::parse(name).expect("symbol"))
+                .collect(),
+            Volume::parse(0.05).expect("volume"),
+            Volume::parse(0.05).expect("volume"),
+            5,
+            Duration::ZERO,
+            None,
+        )
+        .apply_patch(&crate::risk::RiskPolicyPatch {
+            weekend_symbols: Some(vec!["BTCUSD".to_owned()]),
+            ..Default::default()
+        })
+        .expect("weekend list applies");
+
+        let weekend = eligible_entry_markets(&markets, &specs, &policy, sunday_morning());
+        assert_eq!(
+            weekend
+                .iter()
+                .map(|(symbol, _)| symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["BTCUSD"]
+        );
+
+        let weekday = eligible_entry_markets(&markets, &specs, &policy, test_now());
+        assert_eq!(
+            weekday
+                .iter()
+                .map(|(symbol, _)| symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["BTCUSD", "EURUSD"],
+            "the venue's tradeAllowed flag still removes a weekday index"
+        );
     }
 
     #[actix_web::test]
@@ -5664,6 +5801,7 @@ mod tests {
             open_symbols: vec![Symbol::parse("EURUSD").expect("symbol")],
             open_positions: Vec::new(),
             prices: vec![(Symbol::parse("EURUSD").expect("symbol"), 1.9)],
+            symbol_specs: Vec::new(),
             equity: None,
             free_margin: None,
             day_drawdown_percent: None,

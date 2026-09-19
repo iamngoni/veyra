@@ -45,11 +45,9 @@ pub async fn check_intent(
         return HttpResponse::ServiceUnavailable()
             .json(json!({ "error": "command_channel_unavailable" }));
     };
-    let account = crate::routes::account_facts(state.as_ref()).await;
-    match state
-        .risk()
-        .evaluate(&draft.into_inner(), account, state.now())
-    {
+    let draft = draft.into_inner();
+    let account = crate::routes::account_facts_for_draft(state.as_ref(), &draft).await;
+    match state.risk().evaluate(&draft, account, state.now()) {
         RiskDecision::Rejected(rejection) => {
             HttpResponse::Ok().json(RiskDecision::Rejected(rejection))
         }
@@ -581,11 +579,9 @@ pub async fn execute_intent(
     if !state.config().trading_enabled() {
         return HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }));
     }
-    let account = crate::routes::account_facts(state.as_ref()).await;
-    match state
-        .risk()
-        .evaluate(&draft.into_inner(), account, state.now())
-    {
+    let draft = draft.into_inner();
+    let account = crate::routes::account_facts_for_draft(state.as_ref(), &draft).await;
+    match state.risk().evaluate(&draft, account, state.now()) {
         RiskDecision::Rejected(rejection) => {
             HttpResponse::Ok().json(RiskDecision::Rejected(rejection))
         }

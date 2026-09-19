@@ -969,6 +969,7 @@ type PolicyDraft = {
   allowTradingWithoutJev: boolean
   weekendPositions: WeekendPositions
   symbols: string
+  weekendSymbols: string
   maxVolumePerOrder: string
   maxTotalLots: string
   maxOpenOrders: string
@@ -1013,6 +1014,7 @@ function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
     allowTradingWithoutJev: policy.allowTradingWithoutJev,
     weekendPositions: policy.weekendPositions,
     symbols: policy.symbols.join(', '),
+    weekendSymbols: (policy.weekendSymbols ?? []).join(', '),
     maxVolumePerOrder: String(policy.maxVolumePerOrder),
     maxTotalLots: String(policy.maxTotalLots),
     maxOpenOrders: String(policy.maxOpenOrders),
@@ -1034,6 +1036,10 @@ function patchFromDraft(draft: PolicyDraft): { patch?: RiskPolicyPatch; error?: 
     allowTradingWithoutJev: draft.allowTradingWithoutJev,
     weekendPositions: draft.weekendPositions,
     symbols: draft.symbols
+      .split(',')
+      .map((symbol) => symbol.trim())
+      .filter(Boolean),
+    weekendSymbols: draft.weekendSymbols
       .split(',')
       .map((symbol) => symbol.trim())
       .filter(Boolean),
@@ -1162,6 +1168,17 @@ export function RiskPanel({
             />
           </label>
           <label className={labelClass}>
+            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">
+              Weekend-traded symbols (must be allowed above)
+            </span>
+            <input
+              className={inputClass}
+              data-field="weekendSymbols"
+              value={draft.weekendSymbols}
+              onChange={handleField}
+            />
+          </label>
+          <label className={labelClass}>
             <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">Session UTC (8-17, empty = always open)</span>
             <input
               className={inputClass}
@@ -1236,6 +1253,10 @@ export function RiskPanel({
         <Field
           label="Symbols"
           value={policy ? (policy.symbols.length > 0 ? policy.symbols.join(' · ') : 'none allowed') : '—'}
+        />
+        <Field
+          label="Weekend markets"
+          value={policy ? ((policy.weekendSymbols ?? []).join(' · ') || 'none') : '—'}
         />
         <Field label="Max / order" value={policy ? `${policy.maxVolumePerOrder} lots` : '—'} />
         <Field label="Max total" value={policy ? `${policy.maxTotalLots} lots` : '—'} />

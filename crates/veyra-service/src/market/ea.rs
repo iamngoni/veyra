@@ -195,8 +195,16 @@ mod tests {
         assert_eq!(spec.spread_points, 12);
         assert!((spec.margin_for(0.02) - 0.065_8).abs() < 1e-9);
 
+        let mut estimate_unavailable = valid_spec();
+        estimate_unavailable.margin_required = 0.0;
+        let spec = spec_from_state(CommandState::Completed {
+            payload: CommandPayload::SymbolSpec(estimate_unavailable),
+        })
+        .expect("zero means the venue supplied no pre-queue margin estimate");
+        assert_eq!(spec.margin_for(0.02), 0.0);
+
         let mut broken = valid_spec();
-        broken.margin_required = 0.0;
+        broken.margin_required = -1.0;
         let error = spec_from_state(CommandState::Completed {
             payload: CommandPayload::SymbolSpec(broken),
         })

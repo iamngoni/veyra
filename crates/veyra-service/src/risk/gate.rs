@@ -17,7 +17,7 @@ use serde::{Serialize, Serializer};
 
 use super::RiskPolicy;
 use super::valuation::{self, PositionFact};
-use crate::broker::Symbol;
+use crate::broker::{Symbol, SymbolSpecPayload};
 use crate::trading::intent::{TradeIntent, TradeIntentDraft};
 
 /// How many approvals are remembered for duplicate suppression.
@@ -44,6 +44,9 @@ pub struct AccountFacts {
     /// Reference prices the caller can vouch for (venue snapshot `current`
     /// values plus any market data it holds), used to value draft risk.
     pub prices: Vec<(Symbol, f64)>,
+    /// Live venue contracts fetched for instruments considered in this
+    /// decision. Non-FX contracts require one so stop risk is never guessed.
+    pub symbol_specs: Vec<SymbolSpecPayload>,
     /// Account equity reported by the latest validated snapshot, when known.
     pub equity: Option<f64>,
     /// Free margin reported by the latest validated snapshot, when known.
@@ -299,9 +302,12 @@ impl RiskGate {
         if !policy.allows_symbol(draft.symbol()) {
             return Err(RiskCode::SymbolNotAllowed);
         }
-        // Built-in calendar guards: rollover blackout and the weekend cutoff.
-        // They run for every venue and cannot be disabled by an empty session.
-        if crate::risk::window::entry_block(now, None).is_some() {
+        // The standard calendar guards apply to FX, metals, and indices.
+        // Explicit weekend-capable instruments use the live venue contract
+        // instead, because their maintenance hours are provider-specific.
+        if !policy.allows_weekend(draft.symbol())
+            && crate::risk::window::entry_block(now, None).is_some()
+        {
             return Err(RiskCode::MarketWindowClosed);
         }
         if let Some(window) = policy.session()
@@ -317,6 +323,16 @@ impl RiskGate {
         };
         if !account.trade_allowed {
             return Err(RiskCode::TradingNotAllowed);
+        }
+        let spec = account
+            .symbol_specs
+            .iter()
+            .find(|spec| spec.symbol == draft.symbol().as_str());
+        if spec.is_some_and(|spec| !spec.trade_allowed) {
+            return Err(RiskCode::TradingNotAllowed);
+        }
+        if spec.is_none() && !valuation::supports_static_valuation(draft.symbol()) {
+            return Err(RiskCode::RiskUnverifiable);
         }
         if policy.max_daily_loss_percent() > 0.0
             && account
@@ -362,7 +378,13 @@ impl RiskGate {
             if let Some(reference) = reference
                 && let Some(equity) = account.equity
             {
-                match valuation::risk_percent(draft, Some(reference), equity, &account.prices) {
+                match valuation::risk_percent_with_spec(
+                    draft,
+                    Some(reference),
+                    equity,
+                    &account.prices,
+                    spec,
+                ) {
                     Some(risk) if risk > policy.max_risk_percent() + EXPOSURE_EPSILON => {
                         return Err(RiskCode::RiskAboveLimit);
                     }
@@ -477,6 +499,7 @@ mod tests {
             free_margin: Some(1_000.0),
             open_positions: Vec::new(),
             prices: Vec::new(),
+            symbol_specs: Vec::new(),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
         })
@@ -505,6 +528,59 @@ mod tests {
             gate.evaluate(&draft(0.1), facts(0), wednesday),
             RiskDecision::Approved(_)
         ));
+    }
+
+    #[test]
+    fn weekend_capability_uses_the_live_contract_and_keeps_fx_closed() {
+        let bitcoin = Symbol::parse("BTCUSD").expect("symbol");
+        let base = RiskPolicy::new(
+            false,
+            vec![bitcoin, symbol()],
+            Volume::parse(0.5).expect("volume"),
+            Volume::parse(0.5).expect("volume"),
+            2,
+            Duration::ZERO,
+            None,
+        )
+        .with_limits(5.0, 0.0, 0.0, 0.0);
+        let policy = base
+            .apply_patch(&crate::risk::RiskPolicyPatch {
+                weekend_symbols: Some(vec!["BTCUSD".to_owned()]),
+                ..Default::default()
+            })
+            .expect("weekend capability applies");
+        let gate = RiskGate::new(policy);
+        let saturday = UNIX_EPOCH + Duration::from_secs(1_768_046_400);
+
+        let crypto = draft_with_stop("BTCUSD", 0.01, 99_000.0);
+        let mut crypto_facts = facts_priced(&[("BTCUSD", 100_000.0)]);
+        crypto_facts.symbol_specs = vec![venue_spec("BTCUSD", true)];
+        assert!(matches!(
+            gate.evaluate(&crypto, Some(crypto_facts.clone()), saturday),
+            RiskDecision::Approved(_)
+        ));
+
+        assert_eq!(
+            expect_rejection(gate.evaluate(&draft(0.01), facts(0), saturday)).code(),
+            RiskCode::MarketWindowClosed,
+            "the weekend exception is per symbol"
+        );
+
+        crypto_facts.symbol_specs[0].trade_allowed = false;
+        assert_eq!(
+            expect_rejection(gate.evaluate(&crypto, Some(crypto_facts), saturday)).code(),
+            RiskCode::TradingNotAllowed
+        );
+        assert_eq!(
+            expect_rejection(gate.evaluate(
+                &crypto,
+                Some(facts_priced(&[("BTCUSD", 100_000.0)])),
+                saturday
+            ))
+            .code(),
+            RiskCode::RiskUnverifiable,
+            "a name-only CFD contract is never guessed"
+        );
     }
 
     #[test]
@@ -569,10 +645,34 @@ mod tests {
             open_symbols: Vec::new(),
             open_positions: Vec::new(),
             prices: Vec::new(),
+            symbol_specs: Vec::new(),
             equity: Some(1_000.0),
             free_margin: Some(1_000.0),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
+        }
+    }
+
+    fn venue_spec(name: &str, trade_allowed: bool) -> SymbolSpecPayload {
+        SymbolSpecPayload {
+            symbol: name.to_owned(),
+            digits: 2,
+            point: 0.01,
+            bid: 100_000.0,
+            ask: 100_001.0,
+            spread_points: 100,
+            stop_level_points: 0,
+            freeze_level_points: 0,
+            lot_min: 0.01,
+            lot_max: 10.0,
+            lot_step: 0.01,
+            tick_value: 0.01,
+            tick_size: 0.01,
+            margin_required: 100.0,
+            swap_long: 0.0,
+            swap_short: 0.0,
+            swap_type: 0,
+            trade_allowed,
         }
     }
 
@@ -765,6 +865,7 @@ mod tests {
             free_margin: Some(1_000.0),
             open_positions: Vec::new(),
             prices: Vec::new(),
+            symbol_specs: Vec::new(),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
         });

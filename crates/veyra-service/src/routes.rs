@@ -290,11 +290,26 @@ pub async fn evaluate_intent(
     state: Data<AppState>,
     draft: web::Json<TradeIntentDraft>,
 ) -> HttpResponse {
-    let account = account_facts(state.as_ref()).await;
-    let decision: RiskDecision = state
-        .risk()
-        .evaluate(&draft.into_inner(), account, state.now());
+    let draft = draft.into_inner();
+    let account = account_facts_for_draft(state.as_ref(), &draft).await;
+    let decision: RiskDecision = state.risk().evaluate(&draft, account, state.now());
     HttpResponse::Ok().json(decision)
+}
+
+/// Adds the requested instrument's live venue contract to fresh account facts.
+/// A failed lookup is left absent: built-in FX/metal valuation can still run,
+/// while every name-only CFD/crypto valuation fails closed in the gate.
+pub(crate) async fn account_facts_for_draft(
+    state: &AppState,
+    draft: &TradeIntentDraft,
+) -> Option<AccountFacts> {
+    let mut facts = account_facts(state).await?;
+    if let Some(market) = state.market()
+        && let Ok(spec) = market.feed().symbol_spec(draft.symbol()).await
+    {
+        facts.symbol_specs.push(spec);
+    }
+    Some(facts)
 }
 
 /// Assembles gate facts from a fresh link report. Any missing input fails
@@ -387,6 +402,7 @@ pub(crate) async fn account_facts(state: &AppState) -> Option<AccountFacts> {
         open_symbols,
         open_positions,
         prices,
+        symbol_specs: Vec::new(),
         equity,
         free_margin,
         day_drawdown_percent,

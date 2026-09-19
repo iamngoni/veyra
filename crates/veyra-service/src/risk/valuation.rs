@@ -13,7 +13,7 @@
 //! whose leg the caller does not report is unpriceable rather than
 //! approximated, and metals stay USD-quoted by construction.
 
-use crate::broker::Symbol;
+use crate::broker::{Symbol, SymbolSpecPayload};
 use crate::trading::intent::{Side, TradeIntentDraft};
 
 /// Currencies this valuation understands.
@@ -94,6 +94,12 @@ pub fn pip_size(symbol: &Symbol) -> Option<f64> {
         return Some(if quote == "JPY" { 0.01 } else { 0.0001 });
     }
     metal_spec(symbol).map(|metal| metal.pip_size)
+}
+
+/// Whether the built-in FX/metal contract model can value `symbol` without a
+/// live venue specification.
+pub fn supports_static_valuation(symbol: &Symbol) -> bool {
+    pip_size(symbol).is_some()
 }
 
 /// USD per one unit of `quote`, as this valuation sees it.
@@ -180,6 +186,51 @@ pub fn risk_percent(
     Some(risk / equity * 100.0)
 }
 
+/// Percentage of equity at risk using the venue's own tick economics when a
+/// live specification is present.
+///
+/// CFDs, crypto, indices, and broker-specific contracts cannot be valued from
+/// their names. For them the loss in account currency is the number of ticks
+/// between entry and stop, multiplied by the venue-reported tick value and lot
+/// volume. A present but unusable specification never falls back to an
+/// approximation; it returns `None` so the gate fails closed.
+pub fn risk_percent_with_spec(
+    draft: &TradeIntentDraft,
+    reference_price: Option<f64>,
+    equity: f64,
+    prices: &[(Symbol, f64)],
+    spec: Option<&SymbolSpecPayload>,
+) -> Option<f64> {
+    let Some(spec) = spec else {
+        return risk_percent(draft, reference_price, equity, prices);
+    };
+    if spec.symbol != draft.symbol().as_str()
+        || !equity.is_finite()
+        || equity <= 0.0
+        || !spec.tick_size.is_finite()
+        || spec.tick_size <= 0.0
+        || !spec.tick_value.is_finite()
+        || spec.tick_value <= 0.0
+    {
+        return None;
+    }
+    let stop = draft.stop_loss()?.value();
+    let entry = draft
+        .order()
+        .price()
+        .map(|price| price.value())
+        .or(reference_price)?;
+    let distance = (entry - stop).abs();
+    if !distance.is_finite() || distance <= 0.0 {
+        return None;
+    }
+    let loss = (distance / spec.tick_size) * spec.tick_value * draft.volume().value();
+    if !loss.is_finite() || loss <= 0.0 {
+        return None;
+    }
+    Some(loss / equity * 100.0)
+}
+
 /// USD direction of one long lot of `symbol`: +1 longs USD, -1 shorts it,
 /// `None` for instruments this model does not classify. USD-quoted metals
 /// behave like the currency pairs: long gold is short dollars.
@@ -253,6 +304,29 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn venue_spec(name: &str, tick_size: f64, tick_value: f64) -> SymbolSpecPayload {
+        SymbolSpecPayload {
+            symbol: name.to_owned(),
+            digits: 2,
+            point: tick_size,
+            bid: 100_000.0,
+            ask: 100_001.0,
+            spread_points: 1,
+            stop_level_points: 0,
+            freeze_level_points: 0,
+            lot_min: 0.01,
+            lot_max: 10.0,
+            lot_step: 0.01,
+            tick_value,
+            tick_size,
+            margin_required: 100.0,
+            swap_long: 0.0,
+            swap_short: 0.0,
+            swap_type: 0,
+            trade_allowed: true,
+        }
     }
 
     #[test]
@@ -398,6 +472,30 @@ mod tests {
             (risk - expected).abs() < 1e-9,
             "expected {expected}%, got {risk}"
         );
+    }
+
+    #[test]
+    fn venue_ticks_value_crypto_and_indices_without_name_assumptions() {
+        let bitcoin = draft("BTCUSD", Side::Buy, 0.01, Some(99_000.0), None);
+        let btc_spec = venue_spec("BTCUSD", 0.01, 0.01);
+        let risk = risk_percent_with_spec(&bitcoin, Some(100_000.0), 1_000.0, &[], Some(&btc_spec))
+            .expect("bitcoin risk valued");
+        assert!((risk - 1.0).abs() < 1e-9, "expected 1%, got {risk}");
+
+        let index = draft("SP500m", Side::Buy, 0.01, Some(5_990.0), None);
+        let index_spec = venue_spec("SP500m", 0.1, 1.0);
+        let risk = risk_percent_with_spec(&index, Some(6_000.0), 1_000.0, &[], Some(&index_spec))
+            .expect("index risk valued");
+        assert!((risk - 0.1).abs() < 1e-9, "expected 0.1%, got {risk}");
+
+        let unusable = venue_spec("BTCUSD", 0.01, 0.0);
+        assert_eq!(
+            risk_percent_with_spec(&bitcoin, Some(100_000.0), 1_000.0, &[], Some(&unusable)),
+            None,
+            "zero tick value fails closed"
+        );
+        assert!(!supports_static_valuation(&symbol("BTCUSD")));
+        assert!(supports_static_valuation(&symbol("EURUSD")));
     }
 
     #[test]

@@ -65,7 +65,8 @@ impl ContractViolation {
 /// account's free margin.
 ///
 /// `free_margin` is the venue-reported free margin; `None` means the latest
-/// account snapshot payload has not landed yet, so the margin estimate is
+/// account snapshot payload has not landed yet. A zero `marginRequired` also
+/// means the venue supplied no estimate. In either case the estimate is
 /// skipped here because the terminal re-validates margin when the order is
 /// sent. All other checks run on the contract alone.
 ///
@@ -99,6 +100,7 @@ pub(crate) fn validate_entry(
         return Err(ContractViolation::VolumeNotOnStep);
     }
     if let Some(free_margin) = free_margin
+        && spec.margin_required > 0.0
         && spec.margin_for(volume) > free_margin + VOLUME_EPSILON
     {
         return Err(ContractViolation::InsufficientMargin);
@@ -257,6 +259,18 @@ mod tests {
         );
         assert_eq!(
             check(&expensive, Some(&spec()), Some(0.07), Some(1.0950)),
+            Ok(())
+        );
+
+        let mut estimate_unavailable = spec();
+        estimate_unavailable.margin_required = 0.0;
+        assert_eq!(
+            check(
+                &expensive,
+                Some(&estimate_unavailable),
+                Some(0.0),
+                Some(1.0950)
+            ),
             Ok(())
         );
     }

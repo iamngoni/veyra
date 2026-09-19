@@ -582,7 +582,6 @@ fn tool_positions(session: &AgentSession<'_>) -> Result<Value, String> {
 /// Calendar state: session, rollover blackout, weekend guards.
 fn tool_market_window(session: &AgentSession<'_>) -> Result<Value, String> {
     let policy = session.state.risk().policy();
-    let block = crate::risk::window::entry_block(session.now, policy.session());
     let (weekday, minute) = crate::risk::window::utc_now_parts(session.now)
         .ok_or("the system clock is before the Unix epoch")?;
     let weekday_name = [
@@ -596,14 +595,46 @@ fn tool_market_window(session: &AgentSession<'_>) -> Result<Value, String> {
     ]
     .get(weekday as usize)
     .unwrap_or(&"Unknown");
+    let session_closed = policy
+        .session()
+        .is_some_and(|window| !window.contains((minute / 60) as u8));
+    let candidates: Vec<Value> = session
+        .markets
+        .iter()
+        .map(|(symbol, _)| {
+            let block = if session_closed {
+                Some(crate::risk::window::WindowBlock::SessionClosed)
+            } else if policy.allows_weekend(symbol) {
+                None
+            } else {
+                crate::risk::window::entry_block(session.now, None)
+            };
+            json!({
+                "symbol": symbol.as_str(),
+                "entry_window_open": block.is_none(),
+                "block": block.map(|value| value.as_str())
+            })
+        })
+        .collect();
+    let any_open = candidates
+        .iter()
+        .any(|candidate| candidate["entry_window_open"] == true);
+    let aggregate_block = if any_open {
+        None
+    } else if session_closed {
+        Some(crate::risk::window::WindowBlock::SessionClosed)
+    } else {
+        crate::risk::window::entry_block(session.now, None)
+    };
     Ok(json!({
         "utc_weekday": weekday_name,
         "utc_minute_of_day": minute,
-        "entry_window_open": block.is_none(),
-        "block": block.map(|block| json!({
+        "entry_window_open": any_open,
+        "block": aggregate_block.map(|block| json!({
             "code": block.as_str(),
             "detail": block.detail()
         })),
+        "candidates": candidates,
         "configured_session_utc": policy.session().map(|window| format!(
             "{:02}:00-{:02}:00",
             window.start_hour(),
@@ -840,6 +871,7 @@ mod tests {
             free_margin: Some(1_000.0),
             open_positions: Vec::new(),
             prices: Vec::new(),
+            symbol_specs: Vec::new(),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
         }

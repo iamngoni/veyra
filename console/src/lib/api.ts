@@ -56,6 +56,8 @@ export type Status = {
 export type RiskPolicy = {
   killSwitch: boolean
   symbols: string[]
+  /** Allowed symbols whose venue trades through the standard FX weekend. */
+  weekendSymbols?: string[]
   maxVolumePerOrder: number
   maxTotalLots: number
   maxOpenOrders: number
@@ -259,6 +261,7 @@ export type AuditPage = {
 export type RiskPolicyPatch = {
   killSwitch?: boolean
   symbols?: string[]
+  weekendSymbols?: string[]
   maxVolumePerOrder?: number
   maxTotalLots?: number
   maxOpenOrders?: number

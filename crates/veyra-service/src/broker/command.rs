@@ -600,6 +600,9 @@ pub struct SymbolSpecPayload {
     #[serde(rename = "tickSize")]
     pub tick_size: f64,
     /// Margin required to open one lot, in account currency.
+    ///
+    /// Some MT4 venues report zero when no pre-queue estimate is available.
+    /// The terminal remains authoritative and revalidates margin on send.
     #[serde(rename = "marginRequired")]
     pub margin_required: f64,
     /// Swap charged or credited for a long position, per lot.
@@ -622,8 +625,8 @@ impl SymbolSpecPayload {
     /// rather than a contract decision.
     const MAX_DIGITS: u32 = 10;
 
-    /// Margin the venue would require to open `lots`, in account currency.
-    /// Pure arithmetic so callers gate on the same number the terminal uses.
+    /// Margin the venue estimates it would require to open `lots`, in account
+    /// currency. Zero means the venue did not report a pre-queue estimate.
     pub fn margin_for(&self, lots: f64) -> f64 {
         self.margin_required * lots
     }
@@ -660,11 +663,13 @@ impl SymbolSpecPayload {
             ("lotMin", self.lot_min),
             ("lotMax", self.lot_max),
             ("lotStep", self.lot_step),
-            ("marginRequired", self.margin_required),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(format!("{name} must be a finite, positive number"));
             }
+        }
+        if !self.margin_required.is_finite() || self.margin_required < 0.0 {
+            return Err("marginRequired must be a finite, non-negative number".to_owned());
         }
         if self.lot_min > self.lot_max {
             return Err("lotMin must not exceed lotMax".to_owned());

@@ -581,6 +581,18 @@ void HandleModifyOrder(string response, string id)
    SendAck(id, ExecutionResultJson(true, 0, "stops changed", ticket, openPrice, digits));
   }
 
+// Adds an off-chart instrument to Market Watch before asking MT4 for its
+// history or contract. History hydration is asynchronous: the first rates
+// request may still report unavailable, and the next poll retries cleanly.
+bool EnsureSymbolSelected(string symbol)
+  {
+   ResetLastError();
+   if(SymbolSelect(symbol, true)) return true;
+   int selectError = GetLastError();
+   Print("VeyraProbe could not select symbol=", symbol, " error=", (string)selectError);
+   return false;
+  }
+
 // Reports the last `bars` closed candles for a symbol/timeframe. Oldest
 // candle first, so the array order matches time order. Only closed candles
 // are returned (shift 1..bars), never the forming bar.
@@ -593,6 +605,11 @@ void HandleRates(string response, string id)
    if(tf <= 0 || bars <= 0 || bars > 240)
      {
       SendAckError(id, "malformed rates request");
+      return;
+     }
+   if(!EnsureSymbolSelected(symbol))
+     {
+      SendAckError(id, "symbol unavailable");
       return;
      }
    if(iTime(symbol, tf, bars) == 0 || iClose(symbol, tf, 1) <= 0.0)
@@ -637,6 +654,11 @@ void HandleSymbolSpec(string response, string id)
   {
    string symbol = JsonString(response, "symbol");
    if(StringLen(symbol) == 0) symbol = Symbol();
+   if(!EnsureSymbolSelected(symbol))
+     {
+      SendAckError(id, "symbol unavailable");
+      return;
+     }
 
    double point = MarketInfo(symbol, MODE_POINT);
    double tickSize = MarketInfo(symbol, MODE_TICKSIZE);
@@ -650,9 +672,9 @@ void HandleSymbolSpec(string response, string id)
       SendAckError(id, "symbol spec unavailable");
       return;
      }
-   if(marginRequired <= 0.0)
+   if(marginRequired < 0.0)
      {
-      SendAckError(id, "symbol spec unavailable: no margin requirement reported");
+      SendAckError(id, "symbol spec unavailable: invalid margin requirement");
       return;
      }
 

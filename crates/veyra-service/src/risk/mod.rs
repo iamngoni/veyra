@@ -55,6 +55,8 @@ const DEFAULT_MIN_STOP_ATR_FRACTION: f64 = 0.25;
 const MAX_MIN_STOP_ATR_FRACTION: f64 = 2.0;
 
 const SYMBOLS_RULE: &str = "must list 1-64 comma-separated instrument symbols";
+const WEEKEND_SYMBOLS_RULE: &str =
+    "must list at most 64 distinct symbols that also appear in the instrument allowlist";
 const VOLUME_RULE: &str = "must be a finite number greater than 0 and at most 100";
 const OPEN_ORDERS_RULE: &str = "must be an integer from 0 through 1000";
 const DUPLICATE_WINDOW_RULE: &str = "must be an integer number of seconds from 0 through 86400";
@@ -89,6 +91,9 @@ pub struct RiskPolicyPatch {
     /// Replacement instrument allowlist (1-64 symbols; empty is rejected —
     /// stop trading with the kill switch instead).
     pub symbols: Option<Vec<String>>,
+    /// Allowed instruments whose venue trades through the standard FX weekend.
+    /// Every entry must also appear in `symbols`.
+    pub weekend_symbols: Option<Vec<String>>,
     /// Largest lot volume a single intent may request.
     pub max_volume_per_order: Option<f64>,
     /// Largest total open volume.
@@ -140,6 +145,47 @@ fn parse_symbol_entries(entries: &[String]) -> Result<Vec<Symbol>, RiskError> {
         return Err(invalid(SYMBOLS_RULE));
     }
     Ok(symbols)
+}
+
+/// Validates the optional weekend-capable list from the control surface.
+fn parse_weekend_symbol_entries(entries: &[String]) -> Result<Vec<Symbol>, RiskError> {
+    let invalid = |reason: &'static str| RiskError {
+        name: "weekendSymbols",
+        reason,
+    };
+    if entries.len() > MAX_SYMBOLS {
+        return Err(invalid(WEEKEND_SYMBOLS_RULE));
+    }
+    let mut symbols = Vec::new();
+    for entry in entries.iter().map(|entry| entry.trim()) {
+        if entry.is_empty() {
+            return Err(invalid(WEEKEND_SYMBOLS_RULE));
+        }
+        let symbol = parse_instrument(entry).map_err(|_| invalid(WEEKEND_SYMBOLS_RULE))?;
+        if !symbols.contains(&symbol) {
+            symbols.push(symbol);
+        }
+    }
+    Ok(symbols)
+}
+
+/// Ensures the weekend exception cannot widen the main instrument allowlist.
+fn validate_weekend_subset(
+    symbols: &[Symbol],
+    weekend_symbols: &[Symbol],
+    name: &'static str,
+) -> Result<(), RiskError> {
+    if weekend_symbols
+        .iter()
+        .all(|weekend| symbols.iter().any(|allowed| allowed == weekend))
+    {
+        Ok(())
+    } else {
+        Err(RiskError {
+            name,
+            reason: WEEKEND_SYMBOLS_RULE,
+        })
+    }
 }
 
 /// Validates one control-surface percentage.
@@ -249,6 +295,7 @@ impl WeekendPositions {
 pub struct RiskPolicy {
     kill_switch: bool,
     symbols: Vec<Symbol>,
+    weekend_symbols: Vec<Symbol>,
     max_volume_per_order: Volume,
     max_total_lots: Volume,
     max_open_orders: u32,
@@ -278,6 +325,7 @@ impl RiskPolicy {
         Self {
             kill_switch,
             symbols,
+            weekend_symbols: Vec::new(),
             max_volume_per_order,
             max_total_lots,
             max_open_orders,
@@ -384,6 +432,11 @@ impl RiskPolicy {
             None => Vec::new(),
             Some(raw) => parse_symbols(&raw)?,
         };
+        let weekend_symbols = match trimmed(&mut source, "VEYRA_RISK_WEEKEND_SYMBOLS") {
+            None => Vec::new(),
+            Some(raw) => parse_weekend_symbols(&raw)?,
+        };
+        validate_weekend_subset(&symbols, &weekend_symbols, "VEYRA_RISK_WEEKEND_SYMBOLS")?;
 
         let max_volume_per_order = match trimmed(&mut source, "VEYRA_RISK_MAX_VOLUME_PER_ORDER") {
             None => Volume::MINIMUM,
@@ -540,7 +593,7 @@ impl RiskPolicy {
             })?,
         };
 
-        Ok(Self::new(
+        let mut policy = Self::new(
             kill_switch,
             symbols,
             max_volume_per_order,
@@ -558,7 +611,9 @@ impl RiskPolicy {
         .with_calendar_blackout(calendar_blackout_minutes)
         .with_min_stop_atr_fraction(min_stop_atr_fraction)
         .with_trading_without_jev(allow_trading_without_jev)
-        .with_weekend_positions(weekend_positions))
+        .with_weekend_positions(weekend_positions);
+        policy.weekend_symbols = weekend_symbols;
+        Ok(policy)
     }
 
     /// Applies a partial update from the control surface, keeping every field
@@ -575,6 +630,11 @@ impl RiskPolicy {
             None => self.symbols.clone(),
             Some(entries) => parse_symbol_entries(entries)?,
         };
+        let weekend_symbols = match &patch.weekend_symbols {
+            None => self.weekend_symbols.clone(),
+            Some(entries) => parse_weekend_symbol_entries(entries)?,
+        };
+        validate_weekend_subset(&symbols, &weekend_symbols, "weekendSymbols")?;
 
         let max_volume_per_order = match patch.max_volume_per_order {
             None => self.max_volume_per_order,
@@ -676,7 +736,7 @@ impl RiskPolicy {
             })?,
         };
 
-        Ok(Self::new(
+        let mut policy = Self::new(
             kill_switch,
             symbols,
             max_volume_per_order,
@@ -694,7 +754,9 @@ impl RiskPolicy {
         .with_calendar_blackout(calendar_blackout_minutes)
         .with_min_stop_atr_fraction(min_stop_atr_fraction)
         .with_trading_without_jev(allow_trading_without_jev)
-        .with_weekend_positions(weekend_positions))
+        .with_weekend_positions(weekend_positions);
+        policy.weekend_symbols = weekend_symbols;
+        Ok(policy)
     }
 
     /// Whether the kill switch is engaged; engaged means every intent fails.
@@ -760,6 +822,12 @@ impl RiskPolicy {
             kill_switch: Some(self.kill_switch),
             symbols: (!self.symbols.is_empty())
                 .then(|| self.symbols.iter().map(|s| s.as_str().to_owned()).collect()),
+            weekend_symbols: Some(
+                self.weekend_symbols
+                    .iter()
+                    .map(|symbol| symbol.as_str().to_owned())
+                    .collect(),
+            ),
             max_volume_per_order: Some(self.max_volume_per_order.value()),
             max_total_lots: Some(self.max_total_lots.value()),
             max_open_orders: Some(self.max_open_orders),
@@ -795,6 +863,25 @@ impl RiskPolicy {
         self.weekend_positions
     }
 
+    /// Instruments allowed to trade through the standard FX weekend guard.
+    pub fn weekend_symbols(&self) -> &[Symbol] {
+        &self.weekend_symbols
+    }
+
+    /// Whether `symbol` uses its live venue contract instead of the standard
+    /// FX weekend schedule.
+    pub fn allows_weekend(&self, symbol: &Symbol) -> bool {
+        self.allows_weekend_name(symbol.as_str())
+    }
+
+    /// String form of [`RiskPolicy::allows_weekend`] for validated venue
+    /// positions whose wire payload retains the symbol as text.
+    pub fn allows_weekend_name(&self, symbol: &str) -> bool {
+        self.weekend_symbols
+            .iter()
+            .any(|allowed| allowed.as_str() == symbol)
+    }
+
     /// News blackout either side of a high-impact event, in minutes; zero
     /// disables the check.
     pub fn calendar_blackout_minutes(&self) -> u64 {
@@ -816,6 +903,11 @@ impl RiskPolicy {
             "killSwitch": self.kill_switch,
             "symbols": self
                 .symbols
+                .iter()
+                .map(|symbol| symbol.as_str())
+                .collect::<Vec<_>>(),
+            "weekendSymbols": self
+                .weekend_symbols
                 .iter()
                 .map(|symbol| symbol.as_str())
                 .collect::<Vec<_>>(),
@@ -920,6 +1012,28 @@ fn parse_symbols(raw: &str) -> Result<Vec<Symbol>, RiskError> {
     }
     if symbols.is_empty() || symbols.len() > MAX_SYMBOLS {
         return Err(invalid(SYMBOLS_RULE));
+    }
+    Ok(symbols)
+}
+
+fn parse_weekend_symbols(raw: &str) -> Result<Vec<Symbol>, RiskError> {
+    let invalid = |reason: &'static str| RiskError {
+        name: "VEYRA_RISK_WEEKEND_SYMBOLS",
+        reason,
+    };
+    let mut symbols = Vec::new();
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let symbol = parse_instrument(entry).map_err(|_| invalid(WEEKEND_SYMBOLS_RULE))?;
+        if !symbols.contains(&symbol) {
+            symbols.push(symbol);
+        }
+    }
+    if symbols.len() > MAX_SYMBOLS {
+        return Err(invalid(WEEKEND_SYMBOLS_RULE));
     }
     Ok(symbols)
 }
@@ -1069,6 +1183,36 @@ mod tests {
         assert_eq!(WeekendPositions::Agent.as_str(), "agent");
         assert_eq!(WeekendPositions::Hold.as_str(), "hold");
         assert_eq!(WeekendPositions::Flatten.as_str(), "flatten");
+    }
+
+    #[test]
+    fn weekend_symbols_must_remain_inside_the_main_allowlist() {
+        let policy = RiskPolicy::from_source(source(&[
+            ("VEYRA_RISK_SYMBOLS", "EURUSD,BTCUSD,ETHUSD"),
+            ("VEYRA_RISK_WEEKEND_SYMBOLS", "BTCUSD, ETHUSD, BTCUSD"),
+        ]))
+        .expect("weekend symbols parse");
+        assert!(policy.allows_weekend(&Symbol::parse("BTCUSD").expect("symbol")));
+        assert!(!policy.allows_weekend(&Symbol::parse("EURUSD").expect("symbol")));
+        assert_eq!(
+            policy.summary()["weekendSymbols"],
+            serde_json::json!(["BTCUSD", "ETHUSD"])
+        );
+
+        let error = RiskPolicy::from_source(source(&[
+            ("VEYRA_RISK_SYMBOLS", "EURUSD,BTCUSD"),
+            ("VEYRA_RISK_WEEKEND_SYMBOLS", "ETHUSD"),
+        ]))
+        .expect_err("weekend list cannot widen the allowlist");
+        assert_eq!(error.name, "VEYRA_RISK_WEEKEND_SYMBOLS");
+
+        let error = policy
+            .apply_patch(&RiskPolicyPatch {
+                symbols: Some(vec!["EURUSD".to_owned()]),
+                ..Default::default()
+            })
+            .expect_err("removing a weekend symbol must update both lists");
+        assert_eq!(error.name, "weekendSymbols");
     }
 
     #[test]

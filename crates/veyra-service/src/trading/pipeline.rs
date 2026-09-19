@@ -330,6 +330,7 @@ mod tests {
             free_margin: Some(1_000.0),
             open_positions: Vec::new(),
             prices: Vec::new(),
+            symbol_specs: Vec::new(),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
         })
