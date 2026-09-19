@@ -362,7 +362,7 @@ impl RiskGate {
             if let Some(reference) = reference
                 && let Some(equity) = account.equity
             {
-                match valuation::risk_percent(draft, Some(reference), equity) {
+                match valuation::risk_percent(draft, Some(reference), equity, &account.prices) {
                     Some(risk) if risk > policy.max_risk_percent() + EXPOSURE_EPSILON => {
                         return Err(RiskCode::RiskAboveLimit);
                     }
@@ -916,6 +916,53 @@ mod tests {
             gate.evaluate(&big, Some(facts_test(0)), now),
             RiskDecision::Approved(_)
         ));
+    }
+
+    #[test]
+    fn crosses_pass_the_risk_cap_once_their_usd_leg_is_priced() {
+        let now = at(10);
+
+        // The allowlist admits a cross and the per-trade cap is on.
+        let mut cross_policy = policy().with_limits(5.0, 0.0, 0.0, 0.0);
+        let mut symbols = cross_policy.symbols().to_vec();
+        symbols.push(Symbol::parse("EURJPY").expect("symbol"));
+        cross_policy = policy_with_symbols(cross_policy, symbols);
+        let cross_gate = RiskGate::new(cross_policy);
+
+        // 0.01 lots, 20-pip stop: 20 x (1,000/156) x 0.01 = $1.28 on $1,000,
+        // well inside the cap — but only once USDJPY is on hand to convert
+        // the yen leg.
+        let draft = draft_with_stop("EURJPY", 0.01, 155.80);
+        let with_leg = facts_priced(&[("EURJPY", 156.00), ("USDJPY", 156.00)]);
+        assert!(matches!(
+            cross_gate.evaluate(&draft, Some(with_leg), now),
+            RiskDecision::Approved(_)
+        ));
+
+        // The same draft fails closed when the leg is missing: a cross the
+        // caller cannot convert is unpriceable, not free.
+        let without_leg = facts_priced(&[("EURJPY", 156.00)]);
+        assert_eq!(
+            expect_rejection(cross_gate.evaluate(&draft, Some(without_leg), now)).code(),
+            RiskCode::RiskUnverifiable
+        );
+
+        // Ten times the size on the same stop is 1.28% and still valued: the
+        // cap decides on the converted number rather than the raw distance.
+        let tight = RiskGate::new(policy_with_symbols(
+            policy().with_limits(1.0, 0.0, 0.0, 0.0),
+            cross_gate.policy().symbols().to_vec(),
+        ));
+        let big = draft_with_stop("EURJPY", 0.10, 155.80);
+        assert_eq!(
+            expect_rejection(tight.evaluate(
+                &big,
+                Some(facts_priced(&[("EURJPY", 156.00), ("USDJPY", 156.00)])),
+                now
+            ))
+            .code(),
+            RiskCode::RiskAboveLimit
+        );
     }
 
     #[test]

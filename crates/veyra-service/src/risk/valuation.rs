@@ -6,9 +6,12 @@
 //! draft, the caller-supplied reference prices, and the open book.
 //!
 //! Conventions: one standard lot is 100,000 units; a pip is 0.01 for JPY
-//! quotes and 0.0001 otherwise. Pip value is only derived for USD-quoted and
-//! USD-based pairs; anything else (crosses, metals, synthetic symbols) is
-//! deliberately unpriceable and reported as such.
+//! quotes and 0.0001 otherwise. A pip is worth `pip_size x units` of the quote
+//! currency, so pricing it in USD needs one conversion: nothing for a
+//! USD-quoted pair, the pair's own price for a USD-based one, and the quote
+//! currency's USD leg for a cross (`EURJPY` prices through `USDJPY`). A cross
+//! whose leg the caller does not report is unpriceable rather than
+//! approximated, and metals stay USD-quoted by construction.
 
 use crate::broker::Symbol;
 use crate::trading::intent::{Side, TradeIntentDraft};
@@ -93,22 +96,49 @@ pub fn pip_size(symbol: &Symbol) -> Option<f64> {
     metal_spec(symbol).map(|metal| metal.pip_size)
 }
 
-/// Value of one pip for one standard lot, in USD. Only USD-quoted and
-/// USD-based instruments are priced; everything else (crosses, non-USD
-/// metals) stays deliberately unpriceable.
-pub fn pip_value_per_lot(symbol: &Symbol, price: f64) -> Option<f64> {
+/// USD per one unit of `quote`, as this valuation sees it.
+///
+/// USD-quoted instruments need no conversion. A USD-based pair carries its own
+/// conversion in `price` (`USDJPY` at 156 is 156 yen per dollar, so one yen is
+/// 1/156). Anything else is a cross, and its quote currency is converted
+/// through the USD leg the caller reports — `USDXXX` inverted, `XXXUSD` as
+/// written. A missing or unusable leg returns `None`, which the callers treat
+/// as unpriceable rather than approximated.
+fn quote_in_usd(base: &str, quote: &str, price: f64, prices: &[(Symbol, f64)]) -> Option<f64> {
+    if quote == "USD" {
+        return Some(1.0);
+    }
+    if base == "USD" {
+        return Some(1.0 / price);
+    }
+    let direct = format!("USD{quote}");
+    if let Some((_, leg)) = prices.iter().find(|(symbol, _)| symbol.as_str() == direct)
+        && leg.is_finite()
+        && *leg > 0.0
+    {
+        return Some(1.0 / *leg);
+    }
+    let inverse = format!("{quote}USD");
+    prices
+        .iter()
+        .find(|(symbol, _)| symbol.as_str() == inverse)
+        .map(|(_, leg)| *leg)
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+}
+
+/// Value of one pip for one standard lot, in USD.
+///
+/// `prices` are the caller's other reference prices. They are only read to
+/// convert a cross's quote currency; USD-quoted and USD-based instruments
+/// price from `price` alone, and passing an empty slice prices every
+/// instrument with a USD leg.
+pub fn pip_value_per_lot(symbol: &Symbol, price: f64, prices: &[(Symbol, f64)]) -> Option<f64> {
     if !price.is_finite() || price <= 0.0 {
         return None;
     }
     if let Some((base, quote)) = currency_pair(symbol) {
         let quote_per_pip = pip_size(symbol)? * UNITS_PER_LOT;
-        return if quote == "USD" {
-            Some(quote_per_pip)
-        } else if base == "USD" {
-            Some(quote_per_pip / price)
-        } else {
-            None
-        };
+        return Some(quote_per_pip * quote_in_usd(&base, &quote, price, prices)?);
     }
     let metal = metal_spec(symbol)?;
     if metal.quote_is_usd {
@@ -121,12 +151,15 @@ pub fn pip_value_per_lot(symbol: &Symbol, price: f64) -> Option<f64> {
 /// Percentage of `equity` a draft risks between its entry and its stop.
 ///
 /// `reference_price` is the caller's best entry reference for a market order;
-/// a draft with its own price uses that instead. `None` means the draft cannot
-/// be valued at all (no stop, no price, unpriceable symbol, unusable equity).
+/// a draft with its own price uses that instead. `prices` are the caller's
+/// other reference prices, read only to convert a cross's quote currency.
+/// `None` means the draft cannot be valued at all (no stop, no price,
+/// unpriceable symbol, unusable equity).
 pub fn risk_percent(
     draft: &TradeIntentDraft,
     reference_price: Option<f64>,
     equity: f64,
+    prices: &[(Symbol, f64)],
 ) -> Option<f64> {
     if !equity.is_finite() || equity <= 0.0 {
         return None;
@@ -142,7 +175,7 @@ pub fn risk_percent(
         return None;
     }
     let pip = pip_size(draft.symbol())?;
-    let value = pip_value_per_lot(draft.symbol(), entry)?;
+    let value = pip_value_per_lot(draft.symbol(), entry, prices)?;
     let risk = (distance / pip) * value * draft.volume().value();
     Some(risk / equity * 100.0)
 }
@@ -157,7 +190,11 @@ fn usd_sign(symbol: &Symbol) -> Option<f64> {
         } else if base == "USD" {
             Some(1.0)
         } else {
-            None
+            // A cross is long one non-USD currency against another, so its USD
+            // legs cancel: a long EURJPY is a long EURUSD (short dollars) plus
+            // a short USDJPY (long dollars). It carries no net USD direction
+            // and so consumes none of the directional cap.
+            Some(0.0)
         };
     }
     let metal = metal_spec(symbol)?;
@@ -232,48 +269,101 @@ mod tests {
         assert_eq!(currency_pair(&symbol("EURUSDX")), None);
 
         // EURUSD: one pip on one lot is ten dollars, whatever the price.
-        let eurusd = pip_value_per_lot(&symbol("EURUSD"), 1.10).expect("value");
+        let eurusd = pip_value_per_lot(&symbol("EURUSD"), 1.10, &[]).expect("value");
         assert!((eurusd - 10.0).abs() < 1e-9);
 
         // USDJPY: one pip on one lot is 1,000 JPY converted to USD.
-        let usdjpy = pip_value_per_lot(&symbol("USDJPY"), 156.0).expect("value");
+        let usdjpy = pip_value_per_lot(&symbol("USDJPY"), 156.0, &[]).expect("value");
         assert!((usdjpy - 1_000.0 / 156.0).abs() < 1e-9);
 
         // Crosses stay unpriceable rather than guessed.
-        assert_eq!(pip_value_per_lot(&symbol("EURGBP"), 0.86), None);
-        assert_eq!(pip_value_per_lot(&symbol("EURUSD"), 0.0), None);
+        assert_eq!(
+            pip_value_per_lot(&symbol("EURGBP"), 0.86, &[]),
+            None,
+            "a cross without its USD leg is unpriceable"
+        );
+        assert_eq!(pip_value_per_lot(&symbol("EURUSD"), 0.0, &[]), None);
 
         // Metals use their own contract: 100 oz of gold, 5,000 of silver,
         // quoted in dollars.
-        let gold = pip_value_per_lot(&symbol("XAUUSD"), 4_341.0).expect("gold value");
+        let gold = pip_value_per_lot(&symbol("XAUUSD"), 4_341.0, &[]).expect("gold value");
         assert!(
             (gold - 1.0).abs() < 1e-9,
             "one cent on 100 oz is $1, got {gold}"
         );
-        let silver = pip_value_per_lot(&symbol("XAGUSD"), 40.0).expect("silver value");
+        let silver = pip_value_per_lot(&symbol("XAGUSD"), 40.0, &[]).expect("silver value");
         assert!(
             (silver - 5.0).abs() < 1e-9,
             "0.001 on 5,000 oz is $5, got {silver}"
         );
-        assert_eq!(pip_value_per_lot(&symbol("XAUEUR"), 4_000.0), None);
-        assert_eq!(pip_value_per_lot(&symbol("XAUOIL"), 1.0), None);
+        assert_eq!(pip_value_per_lot(&symbol("XAUEUR"), 4_000.0, &[]), None);
+        assert_eq!(pip_value_per_lot(&symbol("XAUOIL"), 1.0, &[]), None);
+    }
+
+    #[test]
+    fn crosses_price_through_their_usd_leg() {
+        let legs = |pairs: &[(&str, f64)]| -> Vec<(Symbol, f64)> {
+            pairs
+                .iter()
+                .map(|(name, price)| (symbol(name), *price))
+                .collect()
+        };
+
+        // EURJPY through USDJPY at 156: one pip on one lot is 1,000 JPY,
+        // which is 1,000/156 dollars.
+        let usdjpy = legs(&[("USDJPY", 156.0), ("EURUSD", 1.1000)]);
+        let jpy_cross = pip_value_per_lot(&symbol("EURJPY"), 156.0, &usdjpy).expect("valued");
+        assert!(
+            (jpy_cross - 1_000.0 / 156.0).abs() < 1e-9,
+            "expected {}, got {jpy_cross}",
+            1_000.0 / 156.0
+        );
+
+        // The inverse leg states the same rate the other way up.
+        let jpyusd = legs(&[("JPYUSD", 1.0 / 156.0)]);
+        let same = pip_value_per_lot(&symbol("EURJPY"), 156.0, &jpyusd).expect("valued");
+        assert!((same - jpy_cross).abs() < 1e-9);
+
+        // A GBP-quoted cross reads GBPUSD as written.
+        let gbp = legs(&[("GBPUSD", 1.27)]);
+        let eurgbp = pip_value_per_lot(&symbol("EURGBP"), 0.86, &gbp).expect("valued");
+        assert!((eurgbp - 0.0001 * 100_000.0 * 1.27).abs() < 1e-9);
+
+        // An AUD-quoted cross prices the same way, and the legs of an
+        // already-converted symbol are ignored.
+        let aud = legs(&[("AUDUSD", 0.66)]);
+        let audjpy = pip_value_per_lot(&symbol("AUDJPY"), 103.0, &aud);
+        assert_eq!(audjpy, None, "AUDJPY needs the JPY leg, not the AUD one");
+        let both = legs(&[("AUDUSD", 0.66), ("USDJPY", 156.0)]);
+        let valued = pip_value_per_lot(&symbol("AUDJPY"), 103.0, &both).expect("valued");
+        assert!((valued - 1_000.0 / 156.0).abs() < 1e-9);
+
+        // Unusable legs are refused rather than approximated.
+        for broken in [
+            legs(&[]),
+            legs(&[("USDJPY", 0.0)]),
+            legs(&[("USDJPY", -156.0)]),
+            legs(&[("USDJPY", f64::NAN)]),
+        ] {
+            assert_eq!(pip_value_per_lot(&symbol("EURJPY"), 156.0, &broken), None);
+        }
     }
 
     #[test]
     fn risk_percent_values_the_stop_distance() {
         // EURUSD, 0.01 lots, 20-pip stop: 20 × $0.10 = $2 on $100 equity.
         let small = draft("EURUSD", Side::Buy, 0.01, Some(1.0980), None);
-        let risk = risk_percent(&small, Some(1.1000), 100.0).expect("valued");
+        let risk = risk_percent(&small, Some(1.1000), 100.0, &[]).expect("valued");
         assert!((risk - 2.0).abs() < 1e-9, "expected 2%, got {risk}");
 
         // A draft's own price wins over the caller reference.
         let limit = draft("EURUSD", Side::Buy, 0.01, Some(1.0980), Some(1.1000));
-        let risk = risk_percent(&limit, Some(1.1200), 100.0).expect("valued");
+        let risk = risk_percent(&limit, Some(1.1200), 100.0, &[]).expect("valued");
         assert!((risk - 2.0).abs() < 1e-9, "expected 2%, got {risk}");
 
         // USDJPY values in USD through the price.
         let jpy = draft("USDJPY", Side::Buy, 0.01, Some(155.90), None);
-        let risk = risk_percent(&jpy, Some(156.00), 100.0).expect("valued");
+        let risk = risk_percent(&jpy, Some(156.00), 100.0, &[]).expect("valued");
         let expected = (0.10 / 0.01) * (1_000.0 / 156.0) * 0.01 / 100.0 * 100.0;
         assert!(
             (risk - expected).abs() < 1e-9,
@@ -282,16 +372,32 @@ mod tests {
 
         // Gold: a one-dollar stop on one ounce risks one dollar.
         let gold = draft("XAUUSD", Side::Buy, 0.01, Some(4_340.0), None);
-        let risk = risk_percent(&gold, Some(4_341.0), 100.0).expect("gold valued");
+        let risk = risk_percent(&gold, Some(4_341.0), 100.0, &[]).expect("gold valued");
         assert!((risk - 1.0).abs() < 1e-9, "expected 1%, got {risk}");
 
         // Unpriceable or incomplete drafts return None.
-        assert_eq!(risk_percent(&small, None, 100.0), None);
-        assert_eq!(risk_percent(&small, Some(1.10), 0.0), None);
+        assert_eq!(risk_percent(&small, None, 100.0, &[]), None);
+        assert_eq!(risk_percent(&small, Some(1.10), 0.0, &[]), None);
         let no_stop = draft("EURUSD", Side::Buy, 0.01, None, None);
-        assert_eq!(risk_percent(&no_stop, Some(1.10), 100.0), None);
+        assert_eq!(risk_percent(&no_stop, Some(1.10), 100.0, &[]), None);
         let cross = draft("EURGBP", Side::Buy, 0.01, Some(0.85), None);
-        assert_eq!(risk_percent(&cross, Some(0.86), 100.0), None);
+        assert_eq!(
+            risk_percent(&cross, Some(0.86), 100.0, &[]),
+            None,
+            "without the GBP leg the risk stays unverifiable"
+        );
+        let legs = [("GBPUSD", 1.2700)];
+        let priced: Vec<(Symbol, f64)> = legs
+            .iter()
+            .map(|(name, price)| (symbol(name), *price))
+            .collect();
+        let risk = risk_percent(&cross, Some(0.86), 100.0, &priced).expect("cross valued");
+        // GBPUSD at 1.27: one pip on one lot is 0.0001 x 100,000 x 1.27.
+        let expected = (0.01 / 0.0001) * (0.0001 * 100_000.0 * 1.27) * 0.01 / 100.0 * 100.0;
+        assert!(
+            (risk - expected).abs() < 1e-9,
+            "expected {expected}%, got {risk}"
+        );
     }
 
     #[test]
@@ -325,6 +431,15 @@ mod tests {
         let flatten = draft("USDJPY", Side::Sell, 0.02, None, None);
         let net = net_usd_lots(&positions, &flatten);
         assert!(net.abs() < 1e-9, "flattens exactly, got {net}");
+
+        // A cross carries no net USD direction: its two legs cancel, so it
+        // neither consumes nor frees the directional cap.
+        let cross = draft("EURJPY", Side::Buy, 0.05, None, None);
+        assert!(net_usd_lots(&[], &cross).abs() < 1e-9);
+        assert!(
+            (net_usd_lots(&positions, &cross) - 0.02).abs() < 1e-9,
+            "the book's 0.01 + 0.01 is unchanged by a cross"
+        );
 
         // Long gold is short dollars, exactly like a USD-quoted pair.
         let gold = draft("XAUUSD", Side::Buy, 0.01, None, None);
