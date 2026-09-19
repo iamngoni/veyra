@@ -42,9 +42,9 @@ services:
       VEYRA_DATABASE_URL: postgres://veyra:${VEYRA_POSTGRES_PASSWORD}@postgres:5432/veyra
       VEYRA_EA_BIND_HOST: 0.0.0.0
       VEYRA_EA_ALLOW_NON_LOOPBACK: "true"
-      VEYRA_TRADING_ENABLED: "false"
-      VEYRA_EA_ALLOW_LIVE: "false"
-      VEYRA_AUTOPILOT_ENABLED: "false"
+      VEYRA_TRADING_ENABLED: ${VEYRA_TRADING_ENABLED:-false}
+      VEYRA_EA_ALLOW_LIVE: ${VEYRA_EA_ALLOW_LIVE:-false}
+      VEYRA_AUTOPILOT_ENABLED: ${VEYRA_AUTOPILOT_ENABLED:-false}
     expose:
       - "7801"
       - "8080"

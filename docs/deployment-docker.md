@@ -36,8 +36,9 @@ non-loopback binding without that opt-in.
 ## Prepare secrets and state
 
 Copy the existing `.env` over an encrypted SSH connection and keep it mode
-`0600`. Add a random `VEYRA_POSTGRES_PASSWORD` to that untracked file. The
-Compose profile overrides these settings regardless of the source file:
+`0600`. Add a random `VEYRA_POSTGRES_PASSWORD` to that untracked file. Keep
+these settings false during migration; Compose reads them from `.env` and
+defaults each missing value to false:
 
 ```dotenv
 VEYRA_ENV=production
@@ -119,7 +120,7 @@ The local cloudflared directory must contain `veyra-config.yml` plus the named
 tunnel credential JSON. Its ingress origin is `http://veyra:7801`, not
 localhost, because cloudflared and Veyra are separate containers.
 
-1. Leave both new live-trading switches false.
+1. Leave both live-trading switches and autopilot false.
 2. Disarm and stop the old service and MT4 EA.
 3. Create and copy one final verified database dump, then restore that dump into
    a fresh Docker PostgreSQL volume.
@@ -128,7 +129,9 @@ localhost, because cloudflared and Veyra are separate containers.
 6. Launch host-native MT4 and confirm successful polls, `/ready`, `/status`, and
    console activity.
 7. Arm only after explicit approval and after confirming the old machine cannot
-   trade the account.
+   trade the account. Set `VEYRA_TRADING_ENABLED=true`,
+   `VEYRA_EA_ALLOW_LIVE=true`, and `VEYRA_AUTOPILOT_ENABLED=true` in `.env`,
+   then recreate the Veyra container.
 
 Rollback is the reverse: keep the new switches false, stop the Docker tunnel,
 stop the new MT4 terminal, and restart the old stack from its retained database.
