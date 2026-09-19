@@ -92,6 +92,7 @@ const status: Status = {
     maxNetFactorLots: 0.01,
     calendarBlackoutMinutes: 30,
     minStopAtrFraction: 0.25,
+    weekendPositions: 'agent',
   },
 }
 
@@ -557,7 +558,43 @@ describe('MarketPanel', () => {
       fridayEntryCutoffMinute: 1140,
       sundayEntryOpenMinute: 1380,
     },
+    weekend: { policy: 'agent', closesInSecs: null },
   }
+
+  it('reports the weekend checkpoint while the window is open', () => {
+    const runUp: MarketSessions = {
+      now: 1_789_761_600, // Friday 2026-09-18 20:00 UTC
+      market: { state: 'open', nextEvent: 'closes', nextAt: 1_789_765_200 },
+      entries: {
+        open: false,
+        blockedBy: 'weekend_approach',
+        detail: 'the weekend entry cutoff has passed',
+      },
+      policy: {
+        rolloverBlackout: { startMinute: 1245, endMinute: 1335 },
+        fridayEntryCutoffMinute: 1140,
+        sundayEntryOpenMinute: 1380,
+      },
+      weekend: { policy: 'agent', closesInSecs: 3_600 },
+    }
+    const { rerender } = render(<MarketPanel series={series} sessions={runUp} account={account} />)
+    expect(screen.getByText(/Weekend checkpoint/)).toBeTruthy()
+    // Both the session line and the checkpoint line count down to the same
+    // close, so the label appears twice with the same instant.
+    expect(screen.getAllByText(/closes Fri 21:00 UTC/)).toHaveLength(2)
+    expect(screen.getAllByText(/in 1h 0m/)).toHaveLength(2)
+    expect(screen.getByText(/the analyst settles each open position/)).toBeTruthy()
+
+    // The operator's override reads differently on the same line.
+    rerender(
+      <MarketPanel
+        series={series}
+        sessions={{ ...runUp, weekend: { policy: 'flatten', closesInSecs: 1_800 } }}
+        account={account}
+      />,
+    )
+    expect(screen.getByText(/every open position is flattened/)).toBeTruthy()
+  })
 
   it('reports the closed week, the entry block, and what is held', () => {
     render(<MarketPanel series={series} sessions={closedSessions} account={account} />)
@@ -1024,12 +1061,27 @@ describe('RiskPanel editing', () => {
     fireEvent.click(screen.getByText('edit'))
     fireEvent.change(screen.getByLabelText(/^Symbols/), { target: { value: 'eurusd, gbpusd' } })
     fireEvent.change(screen.getByLabelText(/^Session UTC/), { target: { value: '8-17' } })
+    fireEvent.change(screen.getByLabelText(/Weekend positions/), { target: { value: 'flatten' } })
     fireEvent.click(screen.getByText('save'))
     await screen.findByText('gate active')
 
     const patch = onApply.mock.calls[0][0]
     expect(patch.symbols).toEqual(['eurusd', 'gbpusd'])
     expect(patch.sessionUtc).toBe('8-17')
+    expect(patch.weekendPositions).toBe('flatten')
+  })
+
+  it('names the weekend preference in the read-only summary', () => {
+    const { rerender } = render(<RiskPanel policy={status.risk_policy} status={status} />)
+    expect(screen.getByText('analyst decides')).toBeTruthy()
+    rerender(
+      <RiskPanel policy={{ ...status.risk_policy, weekendPositions: 'flatten' }} status={status} />,
+    )
+    expect(screen.getByText('flattened before close')).toBeTruthy()
+    rerender(
+      <RiskPanel policy={{ ...status.risk_policy, weekendPositions: 'hold' }} status={status} />,
+    )
+    expect(screen.getByText('held through')).toBeTruthy()
   })
 
   it('offers no edit affordance without a handler', () => {

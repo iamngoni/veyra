@@ -82,6 +82,7 @@ beforeEach(() => {
       maxNetFactorLots: 0.01,
       calendarBlackoutMinutes: 30,
       minStopAtrFraction: 0.25,
+      weekendPositions: 'agent',
     },
   })
   mocks.sessions.mockResolvedValue({
@@ -93,6 +94,7 @@ beforeEach(() => {
       fridayEntryCutoffMinute: 1140,
       sundayEntryOpenMinute: 1380,
     },
+    weekend: { policy: 'agent', closesInSecs: null },
   })
   mocks.performance.mockResolvedValue({
     days: 30,

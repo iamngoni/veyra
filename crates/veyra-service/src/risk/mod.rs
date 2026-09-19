@@ -67,6 +67,7 @@ const ATR_FRACTION_RULE: &str =
 const SESSION_RULE: &str = "must be `HH-HH` with UTC hours 0-23 and different bounds";
 const KILL_SWITCH_RULE: &str = "must be `true` or `false`";
 const WITHOUT_JEV_RULE: &str = "must be `true` or `false`";
+const WEEKEND_RULE: &str = "must be `agent`, `hold`, or `flatten`";
 
 /// Errors raised while parsing risk policy settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -114,6 +115,9 @@ pub struct RiskPolicyPatch {
     /// Whether a tick may continue when the semantic judge is unavailable.
     /// False — the default — stops trading until the judge answers again.
     pub allow_trading_without_jev: Option<bool>,
+    /// What happens to open positions in the final hours before Friday's
+    /// close: `agent`, `hold`, or `flatten`.
+    pub weekend_positions: Option<String>,
 }
 
 /// Validates one symbol list from the control surface.
@@ -200,6 +204,46 @@ impl SessionWindow {
     }
 }
 
+/// What happens to open positions in the final hours before Friday's close.
+///
+/// The weekend is the one stretch the bot cannot manage: the market is shut,
+/// stops rest at the broker, and Sunday's open can gap past them. The entry
+/// window closes two hours before the market does, so that stretch belongs to
+/// the book — this is the preference that decides what happens to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WeekendPositions {
+    /// The analyst gets one weekend review per open position and decides
+    /// hold-or-close with the gap risk in front of it.
+    #[default]
+    Agent,
+    /// Positions stay as they are; the weekend is accepted without a review.
+    Hold,
+    /// Every open position is closed before the market does, without a model
+    /// call — the verdict is the operator's, not the analyst's.
+    Flatten,
+}
+
+impl WeekendPositions {
+    /// Stable identifier for status output, storage, and the console.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Hold => "hold",
+            Self::Flatten => "flatten",
+        }
+    }
+
+    /// Parses the identifier accepted by the environment and the console.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "agent" => Some(Self::Agent),
+            "hold" => Some(Self::Hold),
+            "flatten" => Some(Self::Flatten),
+            _ => None,
+        }
+    }
+}
+
 /// Deterministic limits every intent must satisfy before it can execute.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RiskPolicy {
@@ -217,6 +261,7 @@ pub struct RiskPolicy {
     calendar_blackout_minutes: u64,
     min_stop_atr_fraction: f64,
     allow_trading_without_jev: bool,
+    weekend_positions: WeekendPositions,
 }
 
 impl RiskPolicy {
@@ -249,6 +294,9 @@ impl RiskPolicy {
             min_stop_atr_fraction: 0.0,
             // Degraded inputs stop trading unless the owner says otherwise.
             allow_trading_without_jev: false,
+            // The constructor is a baseline too: weekend positions are the
+            // analyst's call unless the operator says hold or flatten.
+            weekend_positions: WeekendPositions::default(),
         }
     }
 
@@ -260,6 +308,15 @@ impl RiskPolicy {
     #[must_use]
     pub fn with_trading_without_jev(mut self, allowed: bool) -> Self {
         self.allow_trading_without_jev = allowed;
+        self
+    }
+
+    /// Sets what happens to open positions in the final hours before Friday's
+    /// close: the analyst decides (the default), positions stay as they are,
+    /// or the book is flattened before the market shuts.
+    #[must_use]
+    pub fn with_weekend_positions(mut self, weekend_positions: WeekendPositions) -> Self {
+        self.weekend_positions = weekend_positions;
         self
     }
 
@@ -475,6 +532,14 @@ impl RiskPolicy {
                 }
             };
 
+        let weekend_positions = match trimmed(&mut source, "VEYRA_RISK_WEEKEND_POSITIONS") {
+            None => WeekendPositions::default(),
+            Some(raw) => WeekendPositions::parse(&raw).ok_or(RiskError {
+                name: "VEYRA_RISK_WEEKEND_POSITIONS",
+                reason: WEEKEND_RULE,
+            })?,
+        };
+
         Ok(Self::new(
             kill_switch,
             symbols,
@@ -492,7 +557,8 @@ impl RiskPolicy {
         )
         .with_calendar_blackout(calendar_blackout_minutes)
         .with_min_stop_atr_fraction(min_stop_atr_fraction)
-        .with_trading_without_jev(allow_trading_without_jev))
+        .with_trading_without_jev(allow_trading_without_jev)
+        .with_weekend_positions(weekend_positions))
     }
 
     /// Applies a partial update from the control surface, keeping every field
@@ -602,6 +668,14 @@ impl RiskPolicy {
             .allow_trading_without_jev
             .unwrap_or(self.allow_trading_without_jev);
 
+        let weekend_positions = match &patch.weekend_positions {
+            None => self.weekend_positions,
+            Some(raw) => WeekendPositions::parse(raw).ok_or(RiskError {
+                name: "weekendPositions",
+                reason: WEEKEND_RULE,
+            })?,
+        };
+
         Ok(Self::new(
             kill_switch,
             symbols,
@@ -619,7 +693,8 @@ impl RiskPolicy {
         )
         .with_calendar_blackout(calendar_blackout_minutes)
         .with_min_stop_atr_fraction(min_stop_atr_fraction)
-        .with_trading_without_jev(allow_trading_without_jev))
+        .with_trading_without_jev(allow_trading_without_jev)
+        .with_weekend_positions(weekend_positions))
     }
 
     /// Whether the kill switch is engaged; engaged means every intent fails.
@@ -701,6 +776,7 @@ impl RiskPolicy {
             calendar_blackout_minutes: Some(self.calendar_blackout_minutes),
             min_stop_atr_fraction: Some(self.min_stop_atr_fraction),
             allow_trading_without_jev: Some(self.allow_trading_without_jev),
+            weekend_positions: Some(self.weekend_positions.as_str().to_owned()),
         }
     }
 
@@ -711,6 +787,12 @@ impl RiskPolicy {
     /// than quietly trading on less evidence than the design assumes.
     pub fn allow_trading_without_jev(&self) -> bool {
         self.allow_trading_without_jev
+    }
+
+    /// What happens to open positions in the final hours before Friday's
+    /// close.
+    pub fn weekend_positions(&self) -> WeekendPositions {
+        self.weekend_positions
     }
 
     /// News blackout either side of a high-impact event, in minutes; zero
@@ -750,7 +832,8 @@ impl RiskPolicy {
             "maxNetFactorLots": self.max_net_factor_lots,
             "calendarBlackoutMinutes": self.calendar_blackout_minutes,
             "minStopAtrFraction": self.min_stop_atr_fraction,
-            "allowTradingWithoutJev": self.allow_trading_without_jev
+            "allowTradingWithoutJev": self.allow_trading_without_jev,
+            "weekendPositions": self.weekend_positions.as_str()
         })
     }
 
@@ -886,6 +969,7 @@ mod tests {
             DEFAULT_CALENDAR_BLACKOUT_MINUTES
         );
         assert_eq!(default["minStopAtrFraction"], DEFAULT_MIN_STOP_ATR_FRACTION);
+        assert_eq!(default["weekendPositions"], "agent");
     }
 
     fn source<'a>(
@@ -928,7 +1012,63 @@ mod tests {
             DEFAULT_MIN_STOP_ATR_FRACTION
         );
         assert!(!policy.allows_symbol(&parse_instrument("EURUSD").expect("symbol")));
+        assert_eq!(
+            policy.weekend_positions(),
+            WeekendPositions::Agent,
+            "the weekend is the analyst's call by default"
+        );
         assert_eq!(RiskPolicy::default(), policy);
+    }
+
+    #[test]
+    fn weekend_positions_default_to_the_analyst_and_follow_the_console() {
+        let unset = RiskPolicy::from_source(source(&[])).expect("valid settings");
+        assert_eq!(unset.weekend_positions(), WeekendPositions::Agent);
+
+        let flatten =
+            RiskPolicy::from_source(source(&[("VEYRA_RISK_WEEKEND_POSITIONS", "flatten")]))
+                .expect("valid settings");
+        assert_eq!(flatten.weekend_positions(), WeekendPositions::Flatten);
+
+        let error = RiskPolicy::from_source(source(&[("VEYRA_RISK_WEEKEND_POSITIONS", "maybe")]))
+            .expect_err("an unknown preference must fail");
+        assert_eq!(error.name, "VEYRA_RISK_WEEKEND_POSITIONS");
+
+        // A console edit applies, round-trips through the persisted snapshot,
+        // and rejects nonsense by the control-surface field name.
+        let patched = unset
+            .apply_patch(&RiskPolicyPatch {
+                weekend_positions: Some("hold".to_owned()),
+                ..Default::default()
+            })
+            .expect("patch applies");
+        assert_eq!(patched.weekend_positions(), WeekendPositions::Hold);
+        assert_eq!(patched.summary()["weekendPositions"], "hold");
+        let value = serde_json::to_value(patched.snapshot_patch()).expect("snapshot serializes");
+        let patch: RiskPolicyPatch = serde_json::from_value(value).expect("snapshot deserializes");
+        assert_eq!(
+            RiskPolicy::default()
+                .apply_patch(&patch)
+                .expect("snapshot applies")
+                .weekend_positions(),
+            WeekendPositions::Hold
+        );
+        let error = unset
+            .apply_patch(&RiskPolicyPatch {
+                weekend_positions: Some("panic".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("an unknown preference must fail");
+        assert_eq!(error.name, "weekendPositions");
+
+        assert_eq!(
+            WeekendPositions::parse(" agent "),
+            Some(WeekendPositions::Agent)
+        );
+        assert_eq!(WeekendPositions::parse("later"), None);
+        assert_eq!(WeekendPositions::Agent.as_str(), "agent");
+        assert_eq!(WeekendPositions::Hold.as_str(), "hold");
+        assert_eq!(WeekendPositions::Flatten.as_str(), "flatten");
     }
 
     #[test]
@@ -1172,6 +1312,7 @@ mod tests {
             ("VEYRA_RISK_MAX_NET_FACTOR_LOTS", "0.05"),
             ("VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES", "45"),
             ("VEYRA_RISK_MIN_STOP_ATR_FRACTION", "0.75"),
+            ("VEYRA_RISK_WEEKEND_POSITIONS", "flatten"),
         ]))
         .expect("valid settings");
 

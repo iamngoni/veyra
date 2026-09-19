@@ -152,6 +152,42 @@ fn market_session_at(weekday: u8, minute: u32, seconds: u64) -> MarketSession {
     }
 }
 
+/// How long before Friday's close the weekend checkpoint window opens. It
+/// starts exactly at the Friday entry cutoff (19:00 UTC), so from then until
+/// the close the tick manages the book and nothing new is opened.
+pub const WEEKEND_PREP_SECS: u64 = 2 * 60 * 60;
+
+/// The final stretch before the weekend close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeekendPrep {
+    /// When the week closes, Unix seconds.
+    pub closes_at: i64,
+    /// Whole seconds remaining until the close.
+    pub closes_in_secs: i64,
+}
+
+/// The window in which open positions get their weekend verdict: the last two
+/// hours before Friday's close, while the market is still open and a staged
+/// close can still execute. `None` outside it, including once the market has
+/// closed — a position that ran into the weekend belongs to the broker until
+/// the Sunday open, so a verdict then would only queue a command nothing can
+/// execute.
+pub fn weekend_prep(now: SystemTime) -> Option<WeekendPrep> {
+    let seconds = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let session = market_session(now)?;
+    if session.next_event != SessionEvent::Closes {
+        return None;
+    }
+    let closes_in_secs = session.next_at.checked_sub(seconds as i64)?;
+    if closes_in_secs <= 0 || closes_in_secs > WEEKEND_PREP_SECS as i64 {
+        return None;
+    }
+    Some(WeekendPrep {
+        closes_at: session.next_at,
+        closes_in_secs,
+    })
+}
+
 /// Why the entry window is closed, if it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowBlock {
@@ -398,5 +434,33 @@ mod tests {
         assert_eq!(WindowBlock::RolloverBlackout.as_str(), "rollover_blackout");
         assert_eq!(WindowBlock::WeekendOpen.as_str(), "weekend_open");
         assert!(!WindowBlock::SessionClosed.detail().is_empty());
+    }
+
+    #[test]
+    fn the_weekend_prep_window_brackets_fridays_close() {
+        // Friday before the cutoff: too early, the week is still trading.
+        assert!(weekend_prep(moment(5, 18 * 60 + 59)).is_none());
+
+        // At the entry cutoff the window opens, two hours before the close.
+        let prep = weekend_prep(moment(5, 19 * 60)).expect("prep");
+        assert_eq!(prep.closes_in_secs, WEEKEND_PREP_SECS as i64);
+        assert_eq!(prep.closes_at % 86_400, i64::from(MARKET_CLOSE_MINUTE) * 60);
+
+        // Inside the window, the countdown is what remains until the close.
+        let prep = weekend_prep(moment(5, 20 * 60 + 30)).expect("prep");
+        assert_eq!(prep.closes_in_secs, 1800);
+
+        // At and after the close there is nothing left to stage.
+        assert!(weekend_prep(moment(5, 21 * 60)).is_none());
+        assert!(weekend_prep(moment(5, 23 * 60)).is_none());
+
+        // Thursday night points at the same close but is a day early, and the
+        // daily pause points at the resume rather than the close.
+        assert!(weekend_prep(moment(4, 22 * 60)).is_none());
+        assert!(weekend_prep(moment(3, 20 * 60)).is_none());
+
+        // The weekend itself is closed.
+        assert!(weekend_prep(moment(6, 12 * 60)).is_none());
+        assert!(weekend_prep(moment(0, 23 * 60)).is_none());
     }
 }

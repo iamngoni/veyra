@@ -17,6 +17,7 @@ import type {
   Position,
   RiskPolicy,
   Status,
+  WeekendPositions,
 } from '../lib/api'
 import { LOG_LEVELS, VEYRA_MAGIC } from '../lib/api'
 import type { RiskPolicyPatch } from '../lib/api'
@@ -812,6 +813,13 @@ const ENTRY_BLOCK_LABELS: Record<string, string> = {
   session_closed: 'session window',
 }
 
+/** How the active weekend preference reads on the market line. */
+const WEEKEND_POLICY_LABELS: Record<WeekendPositions, string> = {
+  agent: 'the analyst settles each open position',
+  hold: 'positions stay through the weekend',
+  flatten: 'every open position is flattened',
+}
+
 export function MarketPanel({
   series,
   sessions,
@@ -870,6 +878,15 @@ export function MarketPanel({
             <div>
               Holding {held.join(' · ')}
               {state !== 'open' ? ' — market closed; stops rest at the broker' : ''}
+            </div>
+          ) : null}
+          {sessions.weekend.closesInSecs !== null ? (
+            <div>
+              <span className="text-[var(--color-warn)]">Weekend checkpoint</span>
+              {' · closes '}
+              {utcClock(sessions.now + sessions.weekend.closesInSecs)} (
+              {untilLabel(sessions.now + sessions.weekend.closesInSecs, sessions.now)}) {' — '}
+              {WEEKEND_POLICY_LABELS[sessions.weekend.policy]}
             </div>
           ) : null}
         </div>
@@ -950,6 +967,7 @@ export function AutopilotPanel({
 type PolicyDraft = {
   killSwitch: boolean
   allowTradingWithoutJev: boolean
+  weekendPositions: WeekendPositions
   symbols: string
   maxVolumePerOrder: string
   maxTotalLots: string
@@ -993,6 +1011,7 @@ function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
   return {
     killSwitch: policy.killSwitch,
     allowTradingWithoutJev: policy.allowTradingWithoutJev,
+    weekendPositions: policy.weekendPositions,
     symbols: policy.symbols.join(', '),
     maxVolumePerOrder: String(policy.maxVolumePerOrder),
     maxTotalLots: String(policy.maxTotalLots),
@@ -1013,6 +1032,7 @@ function patchFromDraft(draft: PolicyDraft): { patch?: RiskPolicyPatch; error?: 
   const patch: RiskPolicyPatch = {
     killSwitch: draft.killSwitch,
     allowTradingWithoutJev: draft.allowTradingWithoutJev,
+    weekendPositions: draft.weekendPositions,
     symbols: draft.symbols
       .split(',')
       .map((symbol) => symbol.trim())
@@ -1063,6 +1083,11 @@ export function RiskPanel({
     const value =
       event.target.type === 'checkbox' ? event.target.checked : event.target.value
     setDraft((current) => (current ? { ...current, [key]: value } : current))
+  }
+  /** The weekend preference is a choice, not free text. */
+  const handleSelect = (event: ChangeEvent<HTMLSelectElement>) => {
+    const value = event.target.value as WeekendPositions
+    setDraft((current) => (current ? { ...current, weekendPositions: value } : current))
   }
   const save = async () => {
     if (!draft || !onApply) return
@@ -1144,6 +1169,21 @@ export function RiskPanel({
               value={draft.sessionUtc}
               onChange={handleField}
             />
+          </label>
+          <label className={labelClass}>
+            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">
+              Weekend positions (final hours before Friday's close)
+            </span>
+            <select
+              className={inputClass}
+              data-field="weekendPositions"
+              value={draft.weekendPositions}
+              onChange={handleSelect}
+            >
+              <option value="agent">agent decides per position</option>
+              <option value="hold">hold through the weekend</option>
+              <option value="flatten">flatten before the close</option>
+            </select>
           </label>
           {POLICY_NUMBER_FIELDS.map((field) => (
             <label key={field.key} className={labelClass}>
@@ -1243,6 +1283,18 @@ export function RiskPanel({
           }
         />
         <Field label="Session UTC" value={policy?.sessionUtc ?? 'always open'} />
+        <Field
+          label="Weekend"
+          value={
+            policy
+              ? {
+                  agent: 'analyst decides',
+                  hold: 'held through',
+                  flatten: 'flattened before close',
+                }[policy.weekendPositions]
+              : '—'
+          }
+        />
         <Field
           label="Judge outage"
           value={policy ? (policy.allowTradingWithoutJev ? 'keeps trading' : 'pauses decisions') : '—'}

@@ -50,6 +50,8 @@ use crate::jev::{
 use crate::market::{Candle, CandleRequest, CandleSeries, Timeframe};
 use crate::model::ModelTier;
 use crate::risk::AccountFacts;
+use crate::risk::WeekendPositions;
+use crate::risk::window::WeekendPrep;
 use crate::trading::agent::{self, AgentDecision, AgentMode, AgentSession};
 use crate::trading::contract;
 use crate::trading::intent::TradeIntentDraft;
@@ -607,19 +609,61 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     state
         .review_watch()
         .retain(&managed.iter().map(|p| p.ticket).collect::<Vec<_>>());
-    if let Some(position) = next_review_position(&managed, state.rotation())
+    state
+        .weekend_watch()
+        .retain(&managed.iter().map(|p| p.ticket).collect::<Vec<_>>());
+
+    // Weekend posture: the last hours before Friday's close already refuse
+    // entries, so the whole window belongs to the book. Every open position
+    // gets one verdict there — a staged flatten for the `flatten` preference,
+    // one weekend review for `agent`, nothing for `hold` — and it is asked
+    // before the candle review so the weekend question owns the tick while a
+    // staged close can still execute.
+    let policy = state.risk().policy();
+    let weekend = crate::risk::window::weekend_prep(state.now());
+    // `hold` is the operator taking the weekend: neither preference below
+    // runs, and the candle reviews stay as they were — without the weekend
+    // framing, so the model cannot close for a risk the operator accepted.
+    let weekend_special = weekend.filter(|_| policy.weekend_positions() != WeekendPositions::Hold);
+    let weekend_due: Vec<ManagedPosition> = weekend_special
+        .map(|prep| {
+            managed
+                .iter()
+                .filter(|position| {
+                    state
+                        .weekend_watch()
+                        .should_review(position.ticket, prep.closes_at)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(prep) = weekend_special
+        && policy.weekend_positions() == WeekendPositions::Flatten
+        && !weekend_due.is_empty()
+    {
+        return flatten_before_weekend(state, &weekend_due, prep).await;
+    }
+    // Only the agent preference turns the weekend into a question for the
+    // model; under `hold` the candle review is left exactly as it was.
+    let weekend_context = weekend.filter(|_| policy.weekend_positions() == WeekendPositions::Agent);
+    let mut reviewed_weekend = false;
+    if let Some(prep) = weekend_context
+        && let Some(position) = weekend_target(&weekend_due, state.rotation())
         && matches!(
             position_age_secs(server_time, position.opened_at),
             Some(age) if age >= settings.min_hold().as_secs()
         )
         && let Some(series) = series_for_symbol(&markets, &position.symbol)
-        && let candle_time = series.last().map(|candle| candle.time()).unwrap_or(0)
-        && state
-            .review_watch()
-            .should_review(position.ticket, candle_time)
     {
-        // Marked before the verdict, so an error on the way to one cannot make
-        // the same question repeat every tick for the rest of the candle.
+        let candle_time = series.last().map(|candle| candle.time()).unwrap_or(0);
+        // Both watches are marked before the verdict: the weekend question is
+        // settled for this close, and the candle it was answered on is not
+        // asked again from the same bars. An error on the way to a verdict
+        // must not repeat either question every tick.
+        state
+            .weekend_watch()
+            .record(position.ticket, prep.closes_at);
         state.review_watch().record(position.ticket, candle_time);
         let engine = model.engine();
         let session = AgentSession {
@@ -638,6 +682,58 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             &session,
             series,
             std::slice::from_ref(&position),
+            Some(prep),
+            "autopilot_weekend",
+        )
+        .await;
+        if !matches!(outcome, TickOutcome::Held) {
+            return outcome;
+        }
+        reviewed_weekend = true;
+        reviewed_hold = true;
+    }
+
+    if !reviewed_weekend
+        && let Some(position) = next_review_position(&managed, state.rotation())
+        && matches!(
+            position_age_secs(server_time, position.opened_at),
+            Some(age) if age >= settings.min_hold().as_secs()
+        )
+        && let Some(series) = series_for_symbol(&markets, &position.symbol)
+        && let candle_time = series.last().map(|candle| candle.time()).unwrap_or(0)
+        && state
+            .review_watch()
+            .should_review(position.ticket, candle_time)
+    {
+        // Marked before the verdict, so an error on the way to one cannot make
+        // the same question repeat every tick for the rest of the candle.
+        state.review_watch().record(position.ticket, candle_time);
+        // A candle review inside the weekend window carries the same context,
+        // so it settles the weekend question for this close too.
+        if let Some(prep) = weekend_context {
+            state
+                .weekend_watch()
+                .record(position.ticket, prep.closes_at);
+        }
+        let engine = model.engine();
+        let session = AgentSession {
+            state,
+            engine: engine.as_ref(),
+            mode: AgentMode::Review,
+            markets: &markets,
+            account: &account,
+            judgements: &judgements,
+            tier: settings.tier(),
+            now: state.now(),
+        };
+        let outcome = review_positions(
+            state,
+            settings,
+            &session,
+            series,
+            std::slice::from_ref(&position),
+            weekend_context,
+            "autopilot_review",
         )
         .await;
         if !matches!(outcome, TickOutcome::Held) {
@@ -649,7 +745,6 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     // Entry: the deterministic caps decide whether another position is even
     // possible; only then is the model asked to pick from the menu, and it may
     // still answer `none` when no instrument is suitable.
-    let policy = state.risk().policy();
     // What the model would be shown, as the gate reads it. A candidate's live
     // price is only known when the venue reports one for it; without that the
     // gate falls back to new closed candles alone.
@@ -680,6 +775,15 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         // Nothing moved since the last proposal, so the model would be asked
         // an identical question. Stops and reviews already ran above.
         TickOutcome::Unchanged
+    } else if let Some(block) = crate::risk::window::entry_block(state.now(), policy.session()) {
+        // The session is shut — the daily rollover pause, the Friday cutoff,
+        // the weekend — so the gate would refuse whatever the model proposed.
+        // The sweep stops before the model and marks the observation settled,
+        // which holds the question until the next candle instead of asking a
+        // question whose only possible answer is a rejection.
+        state.entry_watch().record(&observations);
+        record(state, "no_trade", None, None, Some(block.as_str())).await;
+        TickOutcome::NoTrade
     } else {
         // Marked before the proposal, not after: whatever this sweep decides,
         // the question has now been asked about this market, and an error on
@@ -1176,6 +1280,112 @@ fn next_review_position(
     }
     let index = counter.fetch_add(1, Ordering::Relaxed) % managed.len();
     managed.get(index).cloned()
+}
+
+/// Next position in rotation order that still needs a weekend verdict.
+///
+/// The caller passes only the positions still due one, so this is the same
+/// rotation the candle review uses, over a smaller book.
+fn weekend_target(due: &[ManagedPosition], counter: &AtomicUsize) -> Option<ManagedPosition> {
+    if due.is_empty() {
+        return None;
+    }
+    let index = counter.fetch_add(1, Ordering::Relaxed) % due.len();
+    due.get(index).cloned()
+}
+
+/// How a refused staged close reads to the caller that asked for it: the
+/// journal label, the reason, and the tick outcome.
+///
+/// The position review and the weekend flatten ask the same question of the
+/// same venue, so a refusal has to read the same either way; the mapping lives
+/// here once rather than duplicated across both matches. `Queued` never
+/// reaches this — both callers handle the command it carries first — so the
+/// fallback reads as a stale position rather than panicking.
+fn close_refusal(failed: &StagedClose) -> (&'static str, String, TickOutcome) {
+    match failed {
+        StagedClose::TradingDisabled => (
+            "close_rejected",
+            "trading_disabled".to_owned(),
+            TickOutcome::Rejected {
+                code: "trading_disabled",
+            },
+        ),
+        StagedClose::ChannelUnavailable => {
+            let reason = "command channel unavailable".to_owned();
+            (
+                "unavailable",
+                reason.clone(),
+                TickOutcome::Unavailable { reason },
+            )
+        }
+        StagedClose::NoPositions | StagedClose::UnknownTicket | StagedClose::Queued { .. } => (
+            "close_rejected",
+            "stale_position".to_owned(),
+            TickOutcome::Rejected {
+                code: "stale_position",
+            },
+        ),
+        StagedClose::NotVeyra => (
+            "close_rejected",
+            "not_a_veyra_position".to_owned(),
+            TickOutcome::Rejected {
+                code: "not_a_veyra_position",
+            },
+        ),
+    }
+}
+
+/// Queues the weekend close for every position still due one, in this tick.
+///
+/// The verdict is the operator's, so there is no model call to ration and the
+/// whole book can be settled at once; the earliest tick in the window also
+/// leaves the most room to retry if the venue refuses. A position is marked
+/// only once its close is queued, so a refused close is asked again on the next
+/// tick rather than leaving the position to the gap.
+async fn flatten_before_weekend(
+    state: &AppState,
+    due: &[ManagedPosition],
+    prep: WeekendPrep,
+) -> TickOutcome {
+    let mut queued = None;
+    for position in due {
+        match queue_staged_close(state, position.ticket).await {
+            StagedClose::Queued { command, ticket } => {
+                let command_id = command.to_string();
+                record_symbol_event(
+                    state,
+                    "close_queued",
+                    "autopilot_weekend",
+                    &position.symbol,
+                    Some(ticket),
+                    None,
+                    Some(&command_id),
+                )
+                .await;
+                state.weekend_watch().record(ticket, prep.closes_at);
+                queued = Some(command.to_string());
+            }
+            failed => {
+                let (label, reason, outcome) = close_refusal(&failed);
+                record_symbol_event(
+                    state,
+                    label,
+                    "autopilot_weekend",
+                    &position.symbol,
+                    Some(position.ticket),
+                    Some(&reason),
+                    None,
+                )
+                .await;
+                return outcome;
+            }
+        }
+    }
+    match queued {
+        Some(command) => TickOutcome::CloseQueued { command },
+        None => TickOutcome::Unchanged,
+    }
 }
 
 /// Which policy produced a stop move.
@@ -1675,16 +1885,23 @@ pub(crate) fn parse_review(value: &serde_json::Value) -> Result<ReviewDecision, 
 
 /// Reviews the open managed position: hold, or close when the entry thesis no
 /// longer holds.
+///
+/// `weekend` is passed when the review is taken inside the pre-close window:
+/// the prompt then carries the weekend trade-off (gap risk against the cost of
+/// flattening), and `origin` names which question produced the verdict so the
+/// journal can tell the two apart.
 async fn review_positions(
     state: &AppState,
     settings: &AutopilotSettings,
     session: &AgentSession<'_>,
     series: &CandleSeries,
     positions: &[ManagedPosition],
+    weekend: Option<WeekendPrep>,
+    origin: &'static str,
 ) -> TickOutcome {
     let judgements = judgement_for_symbol(session.judgements, series.symbol().as_str());
-    let instructions = review_instructions(series, positions);
-    let input = review_input(state, series, positions, judgements);
+    let instructions = review_instructions(series, positions, weekend);
+    let input = review_input(state, series, positions, judgements, weekend);
     let outcome = match agent::run(session, &instructions, &input).await {
         Ok(outcome) => {
             state.decision_health().succeeded();
@@ -1726,7 +1943,7 @@ async fn review_positions(
             record_position_context(
                 state,
                 "close_rejected",
-                "autopilot_review",
+                origin,
                 series,
                 None,
                 Some("agent returned a proposal for a review"),
@@ -1745,7 +1962,7 @@ async fn review_positions(
             record_position_context(
                 state,
                 "held",
-                "autopilot_review",
+                origin,
                 series,
                 Some(positions[0].ticket),
                 None,
@@ -1760,7 +1977,7 @@ async fn review_positions(
                 record_position_context(
                     state,
                     "close_rejected",
-                    "autopilot_review",
+                    origin,
                     series,
                     Some(ticket),
                     Some("unknown_ticket"),
@@ -1783,7 +2000,7 @@ async fn review_positions(
                     record_position_context(
                         state,
                         "close_rejected",
-                        "autopilot_review",
+                        origin,
                         series,
                         Some(ticket),
                         Some("position_too_young"),
@@ -1799,7 +2016,7 @@ async fn review_positions(
                     record_position_context(
                         state,
                         "close_rejected",
-                        "autopilot_review",
+                        origin,
                         series,
                         Some(ticket),
                         Some("position_age_unknown"),
@@ -1818,7 +2035,7 @@ async fn review_positions(
                     record_position_context(
                         state,
                         "close_queued",
-                        "autopilot_review",
+                        origin,
                         series,
                         Some(ticket),
                         None,
@@ -1830,28 +2047,12 @@ async fn review_positions(
                         command: command.to_string(),
                     }
                 }
-                StagedClose::TradingDisabled => {
+                failed => {
+                    let (label, reason, outcome) = close_refusal(&failed);
                     record_position_context(
                         state,
-                        "close_rejected",
-                        "autopilot_review",
-                        series,
-                        Some(ticket),
-                        Some("trading_disabled"),
-                        None,
-                        context,
-                    )
-                    .await;
-                    TickOutcome::Rejected {
-                        code: "trading_disabled",
-                    }
-                }
-                StagedClose::ChannelUnavailable => {
-                    let reason = "command channel unavailable".to_owned();
-                    record_position_context(
-                        state,
-                        "unavailable",
-                        "autopilot_review",
+                        label,
+                        origin,
                         series,
                         Some(ticket),
                         Some(&reason),
@@ -1859,39 +2060,7 @@ async fn review_positions(
                         context,
                     )
                     .await;
-                    TickOutcome::Unavailable { reason }
-                }
-                StagedClose::NoPositions | StagedClose::UnknownTicket => {
-                    record_position_context(
-                        state,
-                        "close_rejected",
-                        "autopilot_review",
-                        series,
-                        Some(ticket),
-                        Some("stale_position"),
-                        None,
-                        context,
-                    )
-                    .await;
-                    TickOutcome::Rejected {
-                        code: "stale_position",
-                    }
-                }
-                StagedClose::NotVeyra => {
-                    record_position_context(
-                        state,
-                        "close_rejected",
-                        "autopilot_review",
-                        series,
-                        Some(ticket),
-                        Some("not_a_veyra_position"),
-                        None,
-                        context,
-                    )
-                    .await;
-                    TickOutcome::Rejected {
-                        code: "not_a_veyra_position",
-                    }
+                    outcome
                 }
             }
         }
@@ -1980,29 +2149,64 @@ async fn move_stop(state: &AppState, symbol: &str, plan: StopMove) -> TickOutcom
 }
 
 /// Instructions for the hold-or-close review.
-fn review_instructions(series: &CandleSeries, positions: &[ManagedPosition]) -> String {
+///
+/// Inside the pre-close window the same review carries the weekend question:
+/// the position would sit through Sunday's reopen with its stop resting at the
+/// broker, so the gap enters the hold-or-close decision.
+fn review_instructions(
+    series: &CandleSeries,
+    positions: &[ManagedPosition],
+    weekend: Option<WeekendPrep>,
+) -> String {
     let tickets: Vec<String> = positions
         .iter()
         .map(|position| position.ticket.to_string())
         .collect();
+    let weekend_rules = match weekend {
+        Some(prep) => format!(
+            " This is the weekend checkpoint: the market closes at {closes} UTC, in {left}. A          position held past it sits through Sunday's reopen with its stop resting at the broker,          where a weekend gap can open beyond it; holding across the weekend also accrues the          broker's swap. Flattening costs the spread and gives up the bracket, so close only when          the gap exposure is not justified by the position's stop distance and the latest          evidence; otherwise hold.",
+            closes = utc_clock(prep.closes_at),
+            left = duration_phrase(prep.closes_in_secs)
+        ),
+        None => String::new(),
+    };
     format!(
         "You are the analyst for Veyra, a single-instrument trading bot. Your open {symbol}          {timeframe} position(s) (ticket(s) {tickets}) were entered by this bot with a stop loss          and take profit attached.
          Decide for the reported position: `hold` keeps the entry bracket and lets the plan play          out; `close` flattens the ticket now because the thesis that justified the entry is no          longer supported by the latest candles and judgements.
-         Closing costs the spread and abandons the bracket, so hold unless the evidence has          genuinely shifted; do not close merely because the position shows a small loss — the          attached stop defines the risk.
+         Closing costs the spread and abandons the bracket, so hold unless the evidence has          genuinely shifted; do not close merely because the position shows a small loss — the          attached stop defines the risk.{weekend_rules}
          Answer with the provided schema only, including the ticket when you close, and a short `rationale` (a sentence or two, at most 280 characters) explaining the decision. Before answering you may call read-only tools: get_market(symbol, timeframe?, bars?), get_judgements(symbol), get_account(), get_positions(), and get_market_window(). Call a tool only when its result would change your decision.",
         symbol = series.symbol().as_str(),
         timeframe = series.timeframe().as_str(),
-        tickets = tickets.join(", ")
+        tickets = tickets.join(", "),
+        weekend_rules = weekend_rules
     )
 }
 
+/// `21:00` style UTC clock for prompts and events.
+fn utc_clock(unix: i64) -> String {
+    let minute = unix.rem_euclid(86_400) / 60;
+    format!("{:02}:{:02}", minute / 60, minute % 60)
+}
+
+/// Human phrase for a stretch that remains: `1h 05m` or `45m`.
+fn duration_phrase(secs: i64) -> String {
+    let minutes = (secs / 60).max(0);
+    if minutes >= 60 {
+        format!("{}h {:02}m", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 /// Model input for the review: the same market block plus the position and
-/// its bracket.
+/// its bracket, and the weekend close when the review is taken inside the
+/// pre-close window.
 fn review_input(
     state: &AppState,
     series: &CandleSeries,
     positions: &[ManagedPosition],
     judgements: Option<&Value>,
+    weekend: Option<WeekendPrep>,
 ) -> String {
     let recent: Vec<Value> = series
         .candles()
@@ -2063,6 +2267,12 @@ fn review_input(
     });
     if let Some(judgements) = judgements {
         input["judgements"] = judgements.clone();
+    }
+    if let Some(prep) = weekend {
+        input["weekend"] = json!({
+            "market_closes_at": prep.closes_at,
+            "market_closes_in_secs": prep.closes_in_secs
+        });
     }
     if let Some(snapshot) = &snapshot {
         input["account"] = json!({
@@ -2904,7 +3114,41 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_787_200)
     }
 
+    /// Friday 2026-09-18 20:00 UTC: inside the weekend window, one hour before
+    /// the close.
+    fn friday_run_up() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_789_761_600)
+    }
+
+    /// Sunday 2026-09-20 09:00 UTC: the week has been shut since Friday's
+    /// close and reopens at 21:00.
+    fn sunday_morning() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_789_894_800)
+    }
+
     fn build_harness(
+        settings: AutopilotSettings,
+        engine: Option<Arc<StubEngine>>,
+        feed: Option<StubFeed>,
+        judge: Option<Arc<StubJudge>>,
+        trading: bool,
+        record_snapshot: bool,
+    ) -> Rig {
+        build_harness_at(
+            test_now(),
+            settings,
+            engine,
+            feed,
+            judge,
+            trading,
+            record_snapshot,
+        )
+    }
+
+    /// Harness with an explicit clock, for the tests that depend on where the
+    /// trading week stands.
+    fn build_harness_at(
+        now: SystemTime,
         settings: AutopilotSettings,
         engine: Option<Arc<StubEngine>>,
         feed: Option<StubFeed>,
@@ -2930,9 +3174,9 @@ mod tests {
             state = state.with_jev(Some(JevRuntime::with_judge(JevProvider::TypeSafe, judge)));
         }
         state = state.with_audit(Some(AuditRuntime::new(trail.clone())));
-        // Pin the clock to Wednesday noon UTC so entry tests never trip the
-        // weekend or rollover guards by accident.
-        state = state.with_fixed_now(Some(test_now()));
+        // Pinned so the trading week is a test input: the default is
+        // Wednesday noon UTC, where no window guard applies.
+        state = state.with_fixed_now(Some(now));
         Rig {
             state,
             trail,
@@ -4700,6 +4944,612 @@ mod tests {
             tick(&harness.state).await,
             TickOutcome::CloseQueued { .. }
         ));
+    }
+
+    /// Snapshot for the weekend tests: mid-Friday, a day-old position.
+    fn friday_book(link: &std::sync::Arc<crate::broker::ea::EaLink>) {
+        link.retain_snapshot(managed_snapshot(10650805, 1_789_680_000, 1_789_761_600));
+    }
+
+    #[actix_web::test]
+    async fn the_weekend_checkpoint_lets_the_analyst_flatten_before_the_close() {
+        let engine = StubEngine::answering_review(
+            json!({
+                "action": "close",
+                "ticket": 10650805,
+                "rationale": "Gap risk outweighs the bracket."
+            }),
+            json!({"action": "none"}),
+        );
+        let harness = build_harness_at(
+            friday_run_up(),
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        friday_book(
+            &harness
+                .state
+                .broker()
+                .expect("broker")
+                .ea_link()
+                .expect("link"),
+        );
+
+        assert!(matches!(
+            tick(&harness.state).await,
+            TickOutcome::CloseQueued { .. }
+        ));
+        let request = &engine.requests()[0];
+        assert!(
+            request.instructions.contains("weekend checkpoint"),
+            "the prompt carries the weekend question: {}",
+            request.instructions
+        );
+        assert!(
+            request.instructions.contains("21:00 UTC"),
+            "the prompt names the close"
+        );
+        assert!(
+            request.instructions.contains("1h 00m"),
+            "the prompt states what remains"
+        );
+        let input: Value = serde_json::from_str(&request.input).expect("input is JSON");
+        assert_eq!(
+            input["weekend"],
+            json!({"market_closes_at": 1_789_765_200_i64, "market_closes_in_secs": 3_600})
+        );
+        let closed = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "close_queued")
+            .expect("the weekend close is recorded");
+        assert_eq!(closed.payload()["origin"], "autopilot_weekend");
+        assert_eq!(
+            closed.payload()["rationale"],
+            "Gap risk outweighs the bracket."
+        );
+
+        // One verdict per position per close: the same question is not bought
+        // again by the next tick.
+        let _ = tick(&harness.state).await;
+        assert_eq!(engine.requests().len(), 1, "the verdict is asked once");
+    }
+
+    #[actix_web::test]
+    async fn the_weekend_checkpoint_holds_when_the_analyst_holds() {
+        let engine = StubEngine::answering_review(
+            json!({"action": "hold", "rationale": "Stop is close; no gap edge either way."}),
+            json!({"action": "none"}),
+        );
+        let harness = build_harness_at(
+            friday_run_up(),
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        friday_book(
+            &harness
+                .state
+                .broker()
+                .expect("broker")
+                .ea_link()
+                .expect("link"),
+        );
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::Held);
+        let held = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "held")
+            .expect("the weekend hold is recorded");
+        assert_eq!(held.payload()["origin"], "autopilot_weekend");
+        assert_eq!(held.payload()["symbol"], "EURUSD");
+        // The window is shut for entries too, and the sweep says so without
+        // asking the model: both questions cost one request between them.
+        assert!(
+            harness.trail.events().iter().any(|event| {
+                event.payload()["outcome"] == "no_trade"
+                    && event.payload()["reason"] == "weekend_approach"
+            }),
+            "the closed entry window is stated in the journal"
+        );
+        assert_eq!(engine.requests().len(), 1, "one review, no entry sweep");
+    }
+
+    #[actix_web::test]
+    async fn the_weekend_checkpoint_runs_even_when_the_candle_was_reviewed() {
+        // The candle question has already been answered on a later bar, so
+        // the candle gate alone would skip this position; the weekend verdict
+        // is keyed to the close and still runs.
+        let engine = StubEngine::answering_review(
+            json!({"action": "hold", "rationale": "Carry covers the gap risk."}),
+            json!({"action": "none"}),
+        );
+        let harness = build_harness_at(
+            friday_run_up(),
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness.state.review_watch().record(10650805, i64::MAX);
+        friday_book(
+            &harness
+                .state
+                .broker()
+                .expect("broker")
+                .ea_link()
+                .expect("link"),
+        );
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::Held);
+        let held = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "held")
+            .expect("the weekend hold is recorded");
+        assert_eq!(
+            held.payload()["origin"],
+            "autopilot_weekend",
+            "the weekend question is not tied to a new candle"
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_weekend_flatten_preference_settles_the_book_without_the_model() {
+        let engine = StubEngine::answering_review(
+            json!({"action": "hold", "rationale": "never asked"}),
+            json!({"action": "none"}),
+        );
+        let harness = build_harness_at(
+            friday_run_up(),
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let policy = harness
+            .state
+            .risk()
+            .policy()
+            .with_weekend_positions(WeekendPositions::Flatten);
+        harness.state.risk().update_policy(policy);
+        let link = harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link");
+        let mut snapshot = managed_snapshot(10650805, 1_789_680_000, 1_789_761_600);
+        let mut second = snapshot.positions[0].clone();
+        second.ticket = 10650806;
+        snapshot.positions.push(second);
+        snapshot.orders = 2;
+        snapshot.lots = 0.02;
+        link.retain_snapshot(snapshot);
+
+        assert!(matches!(
+            tick(&harness.state).await,
+            TickOutcome::CloseQueued { .. }
+        ));
+        assert!(
+            engine.requests().is_empty(),
+            "the operator's verdict needs no model"
+        );
+        let closes = |harness: &Rig| {
+            harness
+                .trail
+                .events()
+                .iter()
+                .filter(|event| event.payload()["outcome"] == "close_queued")
+                .count()
+        };
+        assert_eq!(closes(&harness), 2, "the whole book settles in one tick");
+        assert!(
+            harness
+                .trail
+                .events()
+                .iter()
+                .filter(|event| event.payload()["outcome"] == "close_queued")
+                .all(|event| event.payload()["origin"] == "autopilot_weekend")
+        );
+
+        // Settled once: the next tick does not queue the same closes again.
+        let _ = tick(&harness.state).await;
+        assert_eq!(closes(&harness), 2);
+    }
+
+    #[actix_web::test]
+    async fn the_weekend_hold_preference_leaves_reviews_as_they_were() {
+        let engine = StubEngine::answering_review(
+            json!({"action": "hold", "rationale": "Bracket intact."}),
+            json!({"action": "none"}),
+        );
+        let harness = build_harness_at(
+            friday_run_up(),
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let policy = harness
+            .state
+            .risk()
+            .policy()
+            .with_weekend_positions(WeekendPositions::Hold);
+        harness.state.risk().update_policy(policy);
+        friday_book(
+            &harness
+                .state
+                .broker()
+                .expect("broker")
+                .ea_link()
+                .expect("link"),
+        );
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::Held);
+        let request = &engine.requests()[0];
+        assert!(
+            !request.instructions.contains("weekend checkpoint"),
+            "the operator took the weekend, so the reviewer is not asked about it"
+        );
+        let input: Value = serde_json::from_str(&request.input).expect("input is JSON");
+        assert!(input["weekend"].is_null());
+        let held = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "held")
+            .expect("the candle hold is recorded");
+        assert_eq!(held.payload()["origin"], "autopilot_review");
+        assert!(
+            !harness
+                .trail
+                .events()
+                .iter()
+                .any(|event| event.payload()["outcome"] == "close_queued"),
+            "nothing is flattened for a weekend the operator accepted"
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_weekend_checkpoint_waits_for_the_prep_window() {
+        // Wednesday noon: the preference is the default agent one, but the
+        // week is nowhere near closing, so the review stays the ordinary
+        // candle review and no checkpoint runs.
+        let engine = StubEngine::answering_review(
+            json!({"action": "hold", "rationale": "Midweek, bracket intact."}),
+            json!({"action": "none"}),
+        );
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        friday_book(
+            &harness
+                .state
+                .broker()
+                .expect("broker")
+                .ea_link()
+                .expect("link"),
+        );
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::Held);
+        let request = &engine.requests()[0];
+        assert!(!request.instructions.contains("weekend checkpoint"));
+        let input: Value = serde_json::from_str(&request.input).expect("input is JSON");
+        assert!(input["weekend"].is_null());
+        let held = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "held")
+            .expect("the candle hold is recorded");
+        assert_eq!(held.payload()["origin"], "autopilot_review");
+    }
+
+    #[actix_web::test]
+    async fn a_closed_market_stages_nothing_for_the_weekend() {
+        // Sunday morning: the position has already sat through the weekend,
+        // and the venue could not execute a close until the reopen anyway.
+        let engine = StubEngine::answering_review(
+            json!({"action": "close", "ticket": 10650805}),
+            json!({"action": "none"}),
+        );
+        let harness = build_harness_at(
+            sunday_morning(),
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness.state.review_watch().record(10650805, i64::MAX);
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot(10650805, 1_789_752_000, 1_789_894_800));
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        assert!(
+            engine.requests().is_empty(),
+            "nothing is decided while the market is shut"
+        );
+        assert!(
+            !harness
+                .trail
+                .events()
+                .iter()
+                .any(|event| event.payload()["outcome"] == "close_queued"),
+            "no close is staged that Sunday's gap could execute"
+        );
+    }
+
+    #[test]
+    fn a_refused_close_reads_the_same_from_every_caller() {
+        use crate::broker::CommandId;
+
+        // Each refusal carries the journal label, the reason, and the outcome
+        // the caller returns; the review and the weekend flatten share them.
+        assert_eq!(
+            close_refusal(&StagedClose::TradingDisabled),
+            (
+                "close_rejected",
+                "trading_disabled".to_owned(),
+                TickOutcome::Rejected {
+                    code: "trading_disabled"
+                }
+            )
+        );
+        assert_eq!(
+            close_refusal(&StagedClose::ChannelUnavailable),
+            (
+                "unavailable",
+                "command channel unavailable".to_owned(),
+                TickOutcome::Unavailable {
+                    reason: "command channel unavailable".to_owned()
+                }
+            )
+        );
+        for stale in [StagedClose::NoPositions, StagedClose::UnknownTicket] {
+            assert_eq!(
+                close_refusal(&stale),
+                (
+                    "close_rejected",
+                    "stale_position".to_owned(),
+                    TickOutcome::Rejected {
+                        code: "stale_position"
+                    }
+                )
+            );
+        }
+        assert_eq!(
+            close_refusal(&StagedClose::NotVeyra),
+            (
+                "close_rejected",
+                "not_a_veyra_position".to_owned(),
+                TickOutcome::Rejected {
+                    code: "not_a_veyra_position"
+                }
+            )
+        );
+        // A queued command is never asked about, but the mapping stays total.
+        assert_eq!(
+            close_refusal(&StagedClose::Queued {
+                command: CommandId::new(),
+                ticket: 42
+            }),
+            (
+                "close_rejected",
+                "stale_position".to_owned(),
+                TickOutcome::Rejected {
+                    code: "stale_position"
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn the_weekend_labels_read_the_way_operators_do() {
+        assert_eq!(utc_clock(1_789_765_200), "21:00");
+        assert_eq!(utc_clock(0), "00:00");
+        assert_eq!(duration_phrase(3_600), "1h 00m");
+        assert_eq!(duration_phrase(4_320), "1h 12m");
+        assert_eq!(duration_phrase(2_700), "45m");
+        assert_eq!(duration_phrase(0), "0m");
+    }
+
+    #[actix_web::test]
+    async fn a_refused_weekend_flatten_retries_on_the_next_tick() {
+        // The switch is off, so the close cannot be queued: the refusal is
+        // recorded, the position stays unmarked, and the next tick asks again
+        // rather than leaving the book to the gap.
+        let engine = StubEngine::answering_review(
+            json!({"action": "hold", "rationale": "never asked"}),
+            json!({"action": "none"}),
+        );
+        let harness = build_harness_at(
+            friday_run_up(),
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            false,
+            true,
+        );
+        let policy = harness
+            .state
+            .risk()
+            .policy()
+            .with_weekend_positions(WeekendPositions::Flatten);
+        harness.state.risk().update_policy(policy);
+        friday_book(
+            &harness
+                .state
+                .broker()
+                .expect("broker")
+                .ea_link()
+                .expect("link"),
+        );
+
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "trading_disabled"
+            }
+        );
+        let refused = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "close_rejected")
+            .expect("the refusal is recorded");
+        assert_eq!(refused.payload()["origin"], "autopilot_weekend");
+        assert_eq!(refused.payload()["reason"], "trading_disabled");
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "trading_disabled"
+            },
+            "an unsettled position is asked about again"
+        );
+    }
+
+    #[actix_web::test]
+    async fn closed_sessions_are_not_asked_of_the_model() {
+        // Friday past the cutoff: the gate would refuse any entry, so the
+        // sweep states the block instead of buying a proposal that cannot run.
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let harness = build_harness_at(
+            friday_run_up(),
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(cash_snapshot(20.0, 20.0));
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        assert!(
+            engine.requests().is_empty(),
+            "a shut window cannot open a position"
+        );
+        assert!(
+            harness.trail.events().iter().any(|event| {
+                event.payload()["outcome"] == "no_trade"
+                    && event.payload()["reason"] == "weekend_approach"
+            }),
+            "the block is stated in the journal"
+        );
+        // The observation is settled, so the next tick does not repeat it.
+        assert_eq!(tick(&harness.state).await, TickOutcome::Unchanged);
+        assert!(engine.requests().is_empty());
+
+        // The same book at Wednesday noon is asked as usual.
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(cash_snapshot(20.0, 20.0));
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        assert_eq!(
+            engine.requests().len(),
+            1,
+            "an open window consults the model"
+        );
     }
 
     #[actix_web::test]

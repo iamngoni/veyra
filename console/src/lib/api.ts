@@ -78,6 +78,8 @@ export type RiskPolicy = {
    * False — the default — pauses new decisions until the judge answers again.
    */
   allowTradingWithoutJev: boolean
+  /** What happens to open positions in the final hours before Friday's close. */
+  weekendPositions: WeekendPositions
 }
 
 export type Metrics = {
@@ -184,6 +186,9 @@ export type ClosedTrade = {
 }
 
 /** The standard trading week and our entry policy, from /market/sessions. */
+/** How open positions are treated as the week closes. */
+export type WeekendPositions = 'agent' | 'hold' | 'flatten'
+
 export type MarketSessions = {
   now: number
   market: {
@@ -200,6 +205,11 @@ export type MarketSessions = {
     rolloverBlackout: { startMinute: number; endMinute: number }
     fridayEntryCutoffMinute: number
     sundayEntryOpenMinute: number
+  }
+  weekend: {
+    policy: WeekendPositions
+    /** Seconds until Friday's close while the checkpoint window is open; null outside it. */
+    closesInSecs: number | null
   }
 }
 
@@ -261,6 +271,7 @@ export type RiskPolicyPatch = {
   calendarBlackoutMinutes?: number
   minStopAtrFraction?: number
   allowTradingWithoutJev?: boolean
+  weekendPositions?: WeekendPositions
 }
 
 export type CommandRecord = {

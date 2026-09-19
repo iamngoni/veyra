@@ -110,6 +110,16 @@
       and the console Market panel shows the state, the next boundary, whether
       entries are admitted, and which held instruments are exposed while the
       market is closed.
+- [x] Weekend posture: the final two hours before Friday's close (opened by
+      the 19:00 UTC entry cutoff) belong to the book. `weekendPositions`
+      (console-editable, default `agent`) decides what happens to open
+      positions: the analyst gets one weekend review per position with the
+      gap/swap trade-off stated, the book is flattened before the close
+      without a model call, or positions stay exactly as they are. The
+      checkpoint is keyed to the close rather than a candle, its verdicts are
+      journaled under the `autopilot_weekend` origin, and once the window
+      shuts the same tick stops asking the model for entries the gate would
+      refuse.
 - [x] Durable runtime state (`runtime_state` in Postgres): judge usage,
       model-budget windows, drawdown baselines, stop-policy memory, and the
       live risk policy all survive service restarts and reboots; volatile by

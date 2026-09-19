@@ -364,7 +364,9 @@ pub async fn market_candles(state: Data<AppState>, query: web::Query<CandleQuery
 /// Monday through Thursday. The `entries` block reports whether *our* policy
 /// currently admits entries (rollover blackout, Friday cutoff, Sunday reopen,
 /// or the configured session window), so the console can show both the market
-/// and the bot's own hours.
+/// and the bot's own hours. The `weekend` block reports the open-position
+/// preference and the countdown to the pre-close checkpoint, which runs in the
+/// final two hours before Friday's close.
 pub async fn market_sessions(state: Data<AppState>) -> HttpResponse {
     use crate::risk::window;
 
@@ -373,6 +375,7 @@ pub async fn market_sessions(state: Data<AppState>) -> HttpResponse {
         return HttpResponse::ServiceUnavailable().json(json!({ "error": "clock_unavailable" }));
     };
     let block = window::entry_block(now, state.risk().policy().session());
+    let policy = state.risk().policy();
     let now_unix = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
@@ -396,6 +399,10 @@ pub async fn market_sessions(state: Data<AppState>) -> HttpResponse {
             },
             "fridayEntryCutoffMinute": window::FRIDAY_CUTOFF_MINUTE,
             "sundayEntryOpenMinute": window::SUNDAY_OPEN_MINUTE
+        },
+        "weekend": {
+            "policy": policy.weekend_positions().as_str(),
+            "closesInSecs": window::weekend_prep(now).map(|prep| prep.closes_in_secs)
         }
     }))
 }
@@ -1835,6 +1842,27 @@ mod tests {
         assert_eq!(body["policy"]["sundayEntryOpenMinute"], 1_380);
         assert_eq!(body["policy"]["rolloverBlackout"]["startMinute"], 1_245);
         assert_eq!(body["policy"]["rolloverBlackout"]["endMinute"], 1_335);
+
+        // The weekend preference and its checkpoint window: the countdown is
+        // present only while the market is open toward Friday's close, and it
+        // always agrees with the close the market block reports.
+        let weekend_policy = body["weekend"]["policy"].as_str().expect("weekend policy");
+        assert!(
+            ["agent", "hold", "flatten"].contains(&weekend_policy),
+            "{weekend_policy}"
+        );
+        match body["weekend"]["closesInSecs"].as_i64() {
+            Some(closes_in) => {
+                assert!(closes_in > 0, "the checkpoint only runs before the close");
+                assert_eq!(market_state, "open");
+                assert_eq!(next_event, "closes");
+                assert_eq!(
+                    body["market"]["nextAt"].as_i64().expect("nextAt") - now,
+                    closes_in
+                );
+            }
+            None => assert!(body["weekend"]["closesInSecs"].is_null()),
+        }
     }
 
     #[actix_web::test]
