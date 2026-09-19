@@ -54,7 +54,7 @@ pub struct EaSettings {
 }
 
 impl EaSettings {
-    /// Builds settings from an already validated token and loopback address.
+    /// Builds settings from an already validated token and bind address.
     pub fn new(token: EaToken, bind: SocketAddr) -> Self {
         Self { token, bind }
     }
@@ -64,7 +64,7 @@ impl EaSettings {
         &self.token
     }
 
-    /// Loopback address the control channel binds.
+    /// Address the control channel binds.
     pub fn bind(&self) -> SocketAddr {
         self.bind
     }
@@ -88,6 +88,34 @@ pub enum BrokerSettings {
     Ea(EaSettings),
 }
 
+/// Deployment boundary for the EA listener.
+///
+/// Non-loopback binding is an explicit opt-in for an isolated container
+/// network. The default preserves the host deployment's loopback-only safety
+/// invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EaBindPolicy {
+    LoopbackOnly,
+    IsolatedNetwork,
+}
+
+impl EaBindPolicy {
+    fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value.trim() {
+            "" | "false" => Ok(Self::LoopbackOnly),
+            "true" => Ok(Self::IsolatedNetwork),
+            _ => Err(ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_EA_ALLOW_NON_LOOPBACK",
+                reason: "must be `true` or `false`",
+            }),
+        }
+    }
+
+    fn permits(self, address: IpAddr) -> bool {
+        address.is_loopback() || self == Self::IsolatedNetwork
+    }
+}
+
 impl BrokerSettings {
     /// Reads broker settings from the process environment.
     ///
@@ -103,7 +131,8 @@ impl BrokerSettings {
     ///
     /// # Errors
     /// Returns [`ConfigError`] when the provider is unsupported, the token is
-    /// missing or malformed, or the bind address is not loopback.
+    /// missing or malformed, or a non-loopback bind lacks the explicit
+    /// isolated-network opt-in.
     pub fn from_source(
         mut source: impl FnMut(&'static str) -> Result<String, ConfigError>,
     ) -> Result<Option<Self>, ConfigError> {
@@ -111,9 +140,14 @@ impl BrokerSettings {
         let token_raw = optional(&mut source, "VEYRA_EA_TOKEN");
         let host_raw = optional(&mut source, "VEYRA_EA_BIND_HOST");
         let port_raw = optional(&mut source, "VEYRA_EA_BIND_PORT");
+        let bind_policy_raw = optional(&mut source, "VEYRA_EA_ALLOW_NON_LOOPBACK");
 
         if provider_raw.is_empty() {
-            if token_raw.is_empty() && host_raw.is_empty() && port_raw.is_empty() {
+            if token_raw.is_empty()
+                && host_raw.is_empty()
+                && port_raw.is_empty()
+                && bind_policy_raw.is_empty()
+            {
                 return Ok(None);
             }
             return Err(ConfigError::MissingEnvironmentVariable {
@@ -142,16 +176,17 @@ impl BrokerSettings {
                 } else {
                     host_raw
                 };
+                let bind_policy = EaBindPolicy::parse(&bind_policy_raw)?;
                 let ip: IpAddr =
                     host.parse()
                         .map_err(|_| ConfigError::InvalidEnvironmentVariable {
                             name: "VEYRA_EA_BIND_HOST",
                             reason: "must be an IPv4 or IPv6 literal",
                         })?;
-                if !ip.is_loopback() {
+                if !bind_policy.permits(ip) {
                     return Err(ConfigError::InvalidEnvironmentVariable {
                         name: "VEYRA_EA_BIND_HOST",
-                        reason: "must be a loopback address; the EA channel is never exposed",
+                        reason: "must be loopback unless VEYRA_EA_ALLOW_NON_LOOPBACK=true is set for an isolated private network",
                     });
                 }
 
@@ -289,6 +324,20 @@ mod tests {
             }
         ));
 
+        let invalid_opt_in = BrokerSettings::from_source(source(&[
+            ("VEYRA_BROKER_PROVIDER", "ea"),
+            ("VEYRA_EA_TOKEN", TOKEN),
+            ("VEYRA_EA_ALLOW_NON_LOOPBACK", "yes"),
+        ]))
+        .expect_err("malformed opt-in must fail");
+        assert!(matches!(
+            invalid_opt_in,
+            ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_EA_ALLOW_NON_LOOPBACK",
+                ..
+            }
+        ));
+
         let malformed = BrokerSettings::from_source(source(&[
             ("VEYRA_BROKER_PROVIDER", "ea"),
             ("VEYRA_EA_TOKEN", TOKEN),
@@ -317,6 +366,24 @@ mod tests {
                     ..
                 }
             ));
+        }
+    }
+
+    #[test]
+    fn explicit_isolated_network_bind_is_accepted() {
+        let settings = BrokerSettings::from_source(source(&[
+            ("VEYRA_BROKER_PROVIDER", "ea"),
+            ("VEYRA_EA_TOKEN", TOKEN),
+            ("VEYRA_EA_BIND_HOST", "0.0.0.0"),
+            ("VEYRA_EA_ALLOW_NON_LOOPBACK", "true"),
+        ]))
+        .expect("explicit isolated network bind should be valid")
+        .expect("configured");
+
+        match settings {
+            BrokerSettings::Ea(ea) => {
+                assert_eq!(ea.bind(), "0.0.0.0:7801".parse().expect("addr"));
+            }
         }
     }
 

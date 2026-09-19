@@ -1,0 +1,130 @@
+# Runs Veyra as an observable hybrid stack: MT4 stays on macOS while every
+# server-side component remains isolated behind Docker and private ingress.
+name: veyra
+
+x-service-security: &service-security
+  init: true
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: veyra
+      POSTGRES_USER: veyra
+      POSTGRES_PASSWORD: ${VEYRA_POSTGRES_PASSWORD:?set VEYRA_POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veyra -d veyra"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - backend
+
+  veyra:
+    <<: *service-security
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      VEYRA_ENV: production
+      VEYRA_BIND_HOST: 0.0.0.0
+      VEYRA_DATABASE_URL: postgres://veyra:${VEYRA_POSTGRES_PASSWORD}@postgres:5432/veyra
+      VEYRA_EA_BIND_HOST: 0.0.0.0
+      VEYRA_EA_ALLOW_NON_LOOPBACK: "true"
+      VEYRA_TRADING_ENABLED: "false"
+      VEYRA_EA_ALLOW_LIVE: "false"
+      VEYRA_AUTOPILOT_ENABLED: "false"
+    expose:
+      - "7801"
+      - "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    networks:
+      - backend
+
+  console:
+    <<: *service-security
+    build:
+      context: ./console
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      veyra:
+        condition: service_healthy
+    environment:
+      VEYRA_API_TARGET: http://veyra:8080
+      VEYRA_CONSOLE_ALLOWED_HOSTS: ${VEYRA_CONSOLE_HOST:-veyra-console.antonlabs.cc}
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--output-document=/dev/null", "http://127.0.0.1:3000/"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    tmpfs:
+      - /app/node_modules/.vite-temp:size=8m,uid=1000,gid=1000,mode=0755
+      - /tmp:size=16m,mode=1777
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: media-server_default
+      traefik.http.routers.veyra-console.rule: Host(`${VEYRA_CONSOLE_HOST:-veyra-console.antonlabs.cc}`)
+      traefik.http.routers.veyra-console.entrypoints: websecure
+      traefik.http.routers.veyra-console.tls: "true"
+      traefik.http.services.veyra-console.loadbalancer.server.port: "3000"
+    networks:
+      - backend
+      - proxy
+
+  cloudflared:
+    <<: *service-security
+    image: cloudflare/cloudflared:latest
+    user: ${VEYRA_HOST_UID:-501}:${VEYRA_HOST_GID:-20}
+    profiles:
+      - tunnel
+    restart: unless-stopped
+    command:
+      - --no-autoupdate
+      - tunnel
+      - --config
+      - /etc/cloudflared/veyra-config.yml
+      - run
+    volumes:
+      - ${VEYRA_CLOUDFLARED_DIR:-/Users/modestnerd/.cloudflared}:/etc/cloudflared:ro
+    depends_on:
+      veyra:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    networks:
+      - backend
+
+volumes:
+  postgres-data:
+    name: veyra-postgres-data
+
+networks:
+  backend:
+    name: veyra-backend
+  proxy:
+    external: true
+    name: media-server_default

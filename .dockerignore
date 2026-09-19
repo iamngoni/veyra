@@ -1,0 +1,16 @@
+# Keep build contexts deterministic and exclude local credentials/state.
+.git
+.github
+.env
+.env.*
+target
+work
+coverage
+**/node_modules
+**/dist
+**/.output
+**/.tanstack
+**/.vinxi
+*.dump
+*.partial
+Library

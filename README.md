@@ -94,8 +94,9 @@ on loopback (`VEYRA_EA_BIND_HOST:VEYRA_EA_BIND_PORT`). Build and install the
 probe EA with `./scripts/compile_ea.sh` (reads `VEYRA_EA_TOKEN` from `.env`).
 
 Moving the stack to an always-on machine is covered step by step in
-`docs/deployment.md`; `scripts/preflight.sh` checks a target machine's
-prerequisites and `scripts/check.sh` runs every local quality gate.
+`docs/deployment.md`; the Mac mini hybrid Docker profile is in
+`docs/deployment-docker.md`. `scripts/preflight.sh` checks a launchd target
+machine's prerequisites and `scripts/check.sh` runs every local quality gate.
 
 For unattended operation, install the supervised stack (release build; the
 tunnel and service restart automatically, MT4 starts at login, logs rotate

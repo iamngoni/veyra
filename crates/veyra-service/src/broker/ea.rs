@@ -1,7 +1,8 @@
 //! EA control channel — the first [`BrokerLink`](crate::broker::BrokerLink)
 //! implementation.
 //!
-//! Veyra hosts a loopback-only HTTP endpoint; the MetaTrader 4 EA polls it,
+//! Veyra hosts a loopback HTTP endpoint by default; an explicit opt-in permits
+//! binding it to an isolated container network. The MetaTrader 4 EA polls it,
 //! presenting a shared token. This module records the venue state the EA
 //! reports, answers the probe protocol (`ping` requests a `pong`), and carries
 //! the idempotent command queue: commands are delivered on a poll, executed by
@@ -1086,7 +1087,7 @@ pub fn build_server(
         .shutdown_timeout(5)
         .bind(address)?
         .run();
-    tracing::info!(%address, "EA control channel listening (loopback only)");
+    tracing::info!(%address, "EA control channel listening");
     Ok(server)
 }
 

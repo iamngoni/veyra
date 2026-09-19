@@ -28,10 +28,10 @@ either directly under launchd (the current, best-supported layout) or in Docker.
 | PostgreSQL | Homebrew or Docker volume | private; never public |
 | `cloudflared` | launchd or Docker | `veyra.antonlabs.cc` → EA listener only |
 
-For first cutover, use launchd for all components. It matches the already
-proven setup and makes MT4, the tunnel, backups, and the service restart as one
-Mac login-managed stack. Move only the service/console/database into Docker
-after the host cutover has been verified.
+The launchd layout remains the proven reference. The supported hybrid Docker
+profile is documented separately in [deployment-docker.md](deployment-docker.md)
+and keeps MT4 native while containerizing the service, console, database, and
+tunnel connector.
 
 ## 1. Create a current-state backup on the old Mac
 
@@ -185,12 +185,13 @@ armed against the same account.
 
 ## Docker: yes, with MT4 on the host
 
-This is technically sound, but it is a hybrid deployment. The Dockerized
-service cannot access a host MT4 process through `127.0.0.1`; use the public
-Cloudflare hostname from MT4 and keep the tunnel and service on the same Docker
-network. In that layout:
+This is a supported hybrid deployment. Follow
+[deployment-docker.md](deployment-docker.md). The Dockerized service does not
+connect to a host MT4 process; MT4 polls the public Cloudflare hostname while
+the tunnel and service share a private Docker network. In that layout:
 
-- Veyra binds to `0.0.0.0` inside its container;
+- Veyra binds to `0.0.0.0` inside its un-published project network with the
+  explicit `VEYRA_EA_ALLOW_NON_LOOPBACK=true` container opt-in;
 - PostgreSQL uses a named persistent volume;
 - `cloudflared` routes `veyra.antonlabs.cc` to `http://veyra:7801`;
 - the console proxies `/api` to `http://veyra:8080` inside the Compose network;
@@ -202,9 +203,9 @@ Do not reuse the host launchd agents for the same ports when Docker Compose is
 running. Also keep backups outside the database container and test restoring a
 dump into a fresh PostgreSQL volume before relying on Docker for recovery.
 
-The current repository's launchd path is the deployment reference. Docker
-packaging should be introduced as a separate, verified deployment profile; it
-must not change the EA contract or expose the diagnostic API publicly.
+The Docker profile does not change the EA contract or expose the diagnostic API
+publicly. `compose.yaml` keeps the API, EA listener, and PostgreSQL off host
+ports; only the console joins the existing private Traefik network.
 
 ## Cutover and rollback
 
@@ -224,4 +225,3 @@ Useful logs on the host deployment:
 ~/Library/Logs/veyra/tunnel.out.log
 ~/Library/Logs/veyra/backup.out.log
 ```
-

@@ -1,0 +1,7 @@
+# Exclude host-only state from the console build context.
+node_modules
+dist
+coverage
+.env
+.env.*
+.DS_Store

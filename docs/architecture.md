@@ -31,7 +31,7 @@ Status at a glance (see `README.md` and `docs/roadmap.md` for evidence):
 | --- | --- | --- |
 | Service (`veyra-service`) | configuration, risk gate, command queue, autopilot, HTTP surface | Rust 2024 + Actix Web + Tokio, `crates/veyra-service` |
 | Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/market/candles`, `/market/spec`, `/market/sessions`, `/calendar`, `/performance`, `/reconciliation` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
-| EA channel listener | token-authenticated `POST /ea/poll` carrying heartbeats and the command queue | `127.0.0.1:7801` (`VEYRA_EA_BIND_*`); non-loopback binds are rejected at startup |
+| EA channel listener | token-authenticated `POST /ea/poll` carrying heartbeats and the command queue | `127.0.0.1:7801` by default (`VEYRA_EA_BIND_*`); an explicit `VEYRA_EA_ALLOW_NON_LOOPBACK=true` opt-in permits an unpublished isolated container bind |
 | MT4 terminal + `VeyraProbe` EA | holds the broker session, polls the channel, executes acknowledged commands, reports dry runs while disarmed | `ea/VeyraProbe.mq4` inside MetaTrader 4 (Wine) |
 | Cloudflare tunnel | `veyra.antonlabs.cc` → `127.0.0.1:7801` — the EA channel only | launchd agent, `KeepAlive` |
 | PostgreSQL | append-only `audit_events` via SQLx (`migrations/0001_audit_events.sql`) | `VEYRA_DATABASE_URL`; unreachable configured database fails startup |
@@ -70,7 +70,13 @@ flowchart LR
 
 Operational notes:
 
-- Everything is deployed loopback-only except the tunnel: the EA channel rejects non-loopback binds at startup, and the diagnostics/control bind is configured to `127.0.0.1` and must not be exposed directly. The tunnel carries the EA channel only; diagnostics are never exposed publicly. Exposing `/account` or the console beyond loopback requires authentication first.
+- The host deployment is loopback-only except for the tunnel. A hybrid Docker
+  deployment may opt the EA channel into a non-loopback bind only inside an
+  unpublished, isolated Compose network; startup rejects that bind unless
+  `VEYRA_EA_ALLOW_NON_LOOPBACK=true` is explicit. The tunnel carries the EA
+  channel only, and diagnostics are never exposed publicly. The console may be
+  routed privately over Tailscale-addressed ingress, but not through the public
+  EA tunnel.
 - MQL4 has no sockets and `WebRequest` only supports the scheme-default port, so the channel runs over HTTPS (443) to the tunnel; see ADR 0002.
 - The EA polls about once per second; state older than 10 s is stale. Commands are typed, delivered on a poll, redelivered until acknowledged, and fail after 15 s.
 - The service runs both listeners from one process: the main Actix app on 8080 and a one-route Actix app on 7801; the companion listener is stopped with the main server.
