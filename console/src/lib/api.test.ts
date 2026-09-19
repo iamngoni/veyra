@@ -31,6 +31,9 @@ describe('api', () => {
     await api.metrics()
     await api.commands(10)
     await api.candles(24)
+    await api.performance(7)
+    await api.sessions()
+    await api.audit(50)
 
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       '/api/status',
@@ -39,10 +42,37 @@ describe('api', () => {
       '/api/metrics',
       '/api/commands?limit=10',
       '/api/market/candles?timeframe=H4&bars=24',
+      '/api/performance?days=7',
+      '/api/market/sessions',
+      '/api/audit?limit=50',
     ])
     for (const call of fetchMock.mock.calls) {
       expect(call[1]?.headers).toEqual({ accept: 'application/json' })
     }
+  })
+
+  it('keeps the status detail when an error body is not JSON', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response('gateway said no', { status: 502, headers: { 'content-type': 'text/plain' } }),
+      ),
+    )
+    await expect(api.updatePolicy({ killSwitch: true })).rejects.toThrow('/risk/policy → 502')
+  })
+
+  it('defaults the audit, performance, and command windows', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.commands()
+    await api.performance()
+    await api.audit()
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      '/api/commands?limit=25',
+      '/api/performance?days=30',
+      '/api/audit?limit=200',
+    ])
   })
 
   it('defaults command and candle windows', async () => {

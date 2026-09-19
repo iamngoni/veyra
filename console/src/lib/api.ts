@@ -183,6 +183,26 @@ export type ClosedTrade = {
   magic: number
 }
 
+/** The standard trading week and our entry policy, from /market/sessions. */
+export type MarketSessions = {
+  now: number
+  market: {
+    state: 'open' | 'rollover' | 'closed'
+    nextEvent: 'opens' | 'closes' | 'pauses' | 'resumes'
+    nextAt: number
+  }
+  entries: {
+    open: boolean
+    blockedBy: string | null
+    detail: string | null
+  }
+  policy: {
+    rolloverBlackout: { startMinute: number; endMinute: number }
+    fridayEntryCutoffMinute: number
+    sundayEntryOpenMinute: number
+  }
+}
+
 /** Realized performance response for one lookback window. */
 export type Performance = {
   days: number
@@ -312,6 +332,7 @@ export const api = {
   commands: (limit = 25) => get<{ commands: CommandRecord[] }>(`/commands?limit=${limit}`),
   candles: (bars = 48) => get<CandleSeries>(`/market/candles?timeframe=H4&bars=${bars}`),
   performance: (days = 30) => get<Performance>(`/performance?days=${days}`),
+  sessions: () => get<MarketSessions>('/market/sessions'),
   events: (after: number | undefined, waitMs = 15000) =>
     get<Feed>(after === undefined ? '/events' : `/events?after=${after}&wait_ms=${waitMs}`),
   logs: (after: number | undefined, level: LogLevel, limit = 300) =>

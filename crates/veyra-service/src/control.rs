@@ -48,7 +48,7 @@ pub async fn check_intent(
     let account = crate::routes::account_facts(state.as_ref()).await;
     match state
         .risk()
-        .evaluate(&draft.into_inner(), account, SystemTime::now())
+        .evaluate(&draft.into_inner(), account, state.now())
     {
         RiskDecision::Rejected(rejection) => {
             HttpResponse::Ok().json(RiskDecision::Rejected(rejection))
@@ -356,6 +356,50 @@ pub async fn market_candles(state: Data<AppState>, query: web::Query<CandleQuery
     }
 }
 
+#[get("/market/sessions")]
+/// Returns the standard trading week and our entry policy.
+///
+/// Read-only and computed from the clock: the FX/metals week opens Sunday
+/// 21:00 UTC, closes Friday 21:00 UTC, and pauses daily 21:00-22:00 UTC
+/// Monday through Thursday. The `entries` block reports whether *our* policy
+/// currently admits entries (rollover blackout, Friday cutoff, Sunday reopen,
+/// or the configured session window), so the console can show both the market
+/// and the bot's own hours.
+pub async fn market_sessions(state: Data<AppState>) -> HttpResponse {
+    use crate::risk::window;
+
+    let now = state.now();
+    let Some(session) = window::market_session(now) else {
+        return HttpResponse::ServiceUnavailable().json(json!({ "error": "clock_unavailable" }));
+    };
+    let block = window::entry_block(now, state.risk().policy().session());
+    let now_unix = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    HttpResponse::Ok().json(json!({
+        "now": now_unix,
+        "market": {
+            "state": session.state.as_str(),
+            "nextEvent": session.next_event.as_str(),
+            "nextAt": session.next_at
+        },
+        "entries": {
+            "open": block.is_none(),
+            "blockedBy": block.map(|block| block.as_str()),
+            "detail": block.map(|block| block.detail())
+        },
+        "policy": {
+            "rolloverBlackout": {
+                "startMinute": window::ROLLOVER_START_MINUTE,
+                "endMinute": window::ROLLOVER_END_MINUTE
+            },
+            "fridayEntryCutoffMinute": window::FRIDAY_CUTOFF_MINUTE,
+            "sundayEntryOpenMinute": window::SUNDAY_OPEN_MINUTE
+        }
+    }))
+}
+
 /// Query for the realized-performance window.
 #[derive(Debug, Deserialize)]
 pub struct PerformanceQuery {
@@ -533,7 +577,7 @@ pub async fn execute_intent(
     let account = crate::routes::account_facts(state.as_ref()).await;
     match state
         .risk()
-        .evaluate(&draft.into_inner(), account, SystemTime::now())
+        .evaluate(&draft.into_inner(), account, state.now())
     {
         RiskDecision::Rejected(rejection) => {
             HttpResponse::Ok().json(RiskDecision::Rejected(rejection))
@@ -1752,6 +1796,161 @@ mod tests {
         let body: Value = test::read_body_json(response).await;
         assert_eq!(body["error"], "history_failed");
         assert_eq!(body["reason"], "history unavailable");
+    }
+
+    #[actix_web::test]
+    async fn sessions_route_reports_the_week_and_the_entry_policy() {
+        let (state, _) = audited_state(None);
+        let app = test::init_service(create_app(state)).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/market/sessions")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+
+        // The clock decides these, so assert structure and invariants rather
+        // than a fixed moment: a closed market always blocks entries.
+        let now = body["now"].as_i64().expect("now");
+        let market_state = body["market"]["state"].as_str().expect("state");
+        assert!(
+            ["open", "rollover", "closed"].contains(&market_state),
+            "{market_state}"
+        );
+        let next_event = body["market"]["nextEvent"].as_str().expect("event");
+        assert!(
+            ["opens", "closes", "pauses", "resumes"].contains(&next_event),
+            "{next_event}"
+        );
+        assert!(body["market"]["nextAt"].as_i64().expect("nextAt") > now);
+        let entries_open = body["entries"]["open"].as_bool().expect("entries.open");
+        if market_state != "open" {
+            assert!(!entries_open, "a non-open market never admits entries");
+            assert!(body["entries"]["blockedBy"].is_string());
+        }
+        assert_eq!(body["policy"]["fridayEntryCutoffMinute"], 1_140);
+        assert_eq!(body["policy"]["sundayEntryOpenMinute"], 1_380);
+        assert_eq!(body["policy"]["rolloverBlackout"]["startMinute"], 1_245);
+        assert_eq!(body["policy"]["rolloverBlackout"]["endMinute"], 1_335);
+    }
+
+    #[actix_web::test]
+    async fn command_status_flattens_pings_rates_and_failures() {
+        use crate::broker::CommandKind;
+
+        let (state, _) = audited_state(Some(StubFeed { fail: false }));
+        let link = state.broker().expect("broker").ea_link().expect("ea link");
+
+        // One command per shape the flattening has to cover.
+        let ping = link.enqueue(CommandKind::Ping);
+        let cached = link.enqueue(CommandKind::AccountSnapshot);
+        let rates = link.enqueue_rates(
+            crate::broker::RatesRequest::new(&Symbol::parse("EURUSD").expect("symbol"), 240, 1)
+                .expect("rates request"),
+        );
+
+        let ea_app = test::init_service(crate::broker::ea::create_ea_app(link.clone())).await;
+        let hello = serde_json::json!({
+            "t": "hb",
+            "token": "test-token-1234567890",
+            "acct": 94168,
+            "server": "IFCMarkets-Real",
+            "symbol": "EURUSD",
+            "connected": true,
+            "tradeAllowed": true,
+            "orders": 0,
+            "lots": 0.0
+        });
+        let mut pending = vec![ping, cached, rates];
+        while let Some(id) = pending.first().copied() {
+            let mut delivered = false;
+            for _ in 0..20 {
+                let response = test::call_service(
+                    &ea_app,
+                    test::TestRequest::post()
+                        .uri("/ea/poll")
+                        .set_payload(hello.to_string())
+                        .to_request(),
+                )
+                .await;
+                let body: Value = test::read_body_json(response).await;
+                if body["t"] == "cmd" {
+                    assert_eq!(body["id"], id.to_string());
+                    let ack = match body["kind"].as_str().expect("kind") {
+                        "ping" => {
+                            serde_json::json!({"t": "ack", "token": "test-token-1234567890", "id": body["id"], "ok": true})
+                        }
+                        "account_snapshot" => serde_json::json!({
+                            "t": "ack", "token": "test-token-1234567890", "id": body["id"], "ok": false,
+                            "error": "terminal busy"
+                        }),
+                        _ => serde_json::json!({
+                            "t": "ack", "token": "test-token-1234567890", "id": body["id"], "ok": true,
+                            "data": {
+                                "symbol": "EURUSD",
+                                "timeframeMinutes": 240,
+                                "candles": [{"time": 1_700_000_000, "open": 1.1, "high": 1.2, "low": 1.0, "close": 1.15, "volume": 4}]
+                            }
+                        }),
+                    };
+                    let response = test::call_service(
+                        &ea_app,
+                        test::TestRequest::post()
+                            .uri("/ea/poll")
+                            .set_payload(ack.to_string())
+                            .to_request(),
+                    )
+                    .await;
+                    assert!(response.status().is_success());
+                    delivered = true;
+                    break;
+                }
+                actix_web::rt::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(delivered, "command {id} was delivered");
+            pending.remove(0);
+        }
+
+        let app = test::init_service(create_app(state.clone())).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/commands/{ping}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let ping_body: Value = test::read_body_json(response).await;
+        assert_eq!(ping_body["status"], "completed");
+        assert_eq!(ping_body["result"], serde_json::json!({}));
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/commands/{cached}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let failed: Value = test::read_body_json(response).await;
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["error"], "terminal busy");
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/commands/{rates}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let rates_body: Value = test::read_body_json(response).await;
+        assert_eq!(rates_body["result"]["symbol"], "EURUSD");
+        assert_eq!(rates_body["result"]["candles"][0]["close"], 1.15);
     }
 
     #[actix_web::test]

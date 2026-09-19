@@ -30,7 +30,7 @@ Status at a glance (see `README.md` and `docs/roadmap.md` for evidence):
 | Piece | Role | Where |
 | --- | --- | --- |
 | Service (`veyra-service`) | configuration, risk gate, command queue, autopilot, HTTP surface | Rust 2024 + Actix Web + Tokio, `crates/veyra-service` |
-| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/market/candles`, `/market/spec`, `/calendar`, `/performance`, `/reconciliation` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
+| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/market/candles`, `/market/spec`, `/market/sessions`, `/calendar`, `/performance`, `/reconciliation` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
 | EA channel listener | token-authenticated `POST /ea/poll` carrying heartbeats and the command queue | `127.0.0.1:7801` (`VEYRA_EA_BIND_*`); non-loopback binds are rejected at startup |
 | MT4 terminal + `VeyraProbe` EA | holds the broker session, polls the channel, executes acknowledged commands, reports dry runs while disarmed | `ea/VeyraProbe.mq4` inside MetaTrader 4 (Wine) |
 | Cloudflare tunnel | `veyra.antonlabs.cc` → `127.0.0.1:7801` — the EA channel only | launchd agent, `KeepAlive` |
@@ -239,7 +239,7 @@ What deliberately stays volatile: the **pending command queue** (replaying undel
 | --- | --- |
 | Status pills | Terminal live/stale, EA armed/disarmed, trading enabled/disabled, autopilot cadence, audit provider, environment |
 | Account | Balance, equity, free margin, margin level, leverage, open orders, open lots, open P/L, server/login/symbol, freshness |
-| Market | 48 closed H4 candles via `/market/candles`: sparkline, last close, window change, last high/low |
+| Market | 48 closed H4 candles via `/market/candles`: sparkline, last close, window change, last high/low — plus the trading week from `/market/sessions`: open/rollover/closed, the next open, close, pause or resume in UTC, whether *our* entry policy is admitting entries, and which held instruments are exposed while the market is closed |
 | Autopilot | Enabled, cadence, timeframe, window, model tier, Jev mode, symbol menu, stop policies, model-budget usage, and the service's own Jev call/token counters |
 | Activity | `/events` cursor feed (streaming indicator); "focus" mode hides routine snapshots and read-only commands |
 | Positions | Ticket, symbol, side, lots, entry, SL, TP, swap, P/L, and owner (Veyra by magic 77041 vs manual); truncation flag |
@@ -249,6 +249,8 @@ What deliberately stays volatile: the **pending command queue** (replaying undel
 | Risk | Effective gate policy: symbols, caps, risk/drawdown brakes, net-exposure cap, news blackout minutes, ATR stop floor, execution/terminal state — with an inline editor for live changes |
 | Metrics | Top counters from `/metrics` and the feed sequence |
 | Agent log | `/logs` tail with a level filter (`error`…`trace`), polled every 2 s; shows the tracing target, message, and structured fields |
+
+**Trading-week state.** `GET /market/sessions` (read-only, computed from the clock) reports the standard FX/metals week — opens Sunday 21:00 UTC, closes Friday 21:00 UTC, daily rollover pause 21:00-22:00 UTC Monday through Thursday — alongside the entry policy that actually gates the bot: the rollover blackout (20:45-22:15 UTC), Friday's 19:00 UTC entry cutoff, Sunday's 23:00 UTC reopen, and the configured session window. The console's Market panel renders both, and names the held instruments when the market is closed so it is obvious what rests on broker-side stops until the week resumes.
 
 **Realized performance.** `GET /performance?days=1-365` queues one read-only `order_history` command; the EA walks the terminal's account history for the Veyra magic number and returns closed fills (open/close price and time, profit, swap, commission). The route aggregates them into wins / losses / win rate, net P/L, profit factor, average win/loss, and per-symbol totals, and the console renders that as the Performance panel. This is the honest source for success rate: the reconciler's `position_closed` event records the position's *last-seen floating* profit, which can differ from the fill that actually happened (the USDJPY take-profit closed between snapshots and read +0.47 when it really booked +1.36).
 

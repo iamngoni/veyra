@@ -360,9 +360,15 @@ mod tests {
             "EURUSD closed above its average.".to_owned(),
             ModelTier::Balanced,
             account,
-            SystemTime::now(),
+            test_now(),
         )
         .await
+    }
+
+    /// Wednesday 2026-01-07 12:00 UTC: the gate's entry window is open, so the
+    /// pipeline tests never depend on the day the suite runs.
+    fn test_now() -> SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_767_787_200)
     }
 
     #[test]

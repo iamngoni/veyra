@@ -630,7 +630,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             account: &account,
             judgements: &judgements,
             tier: settings.tier(),
-            now: SystemTime::now(),
+            now: state.now(),
         };
         let outcome = review_positions(
             state,
@@ -675,7 +675,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     } else if !state.entry_watch().should_evaluate(
         &observations,
         settings.entry_move_atr_fraction(),
-        unix_secs(SystemTime::now()),
+        unix_secs(state.now()),
     ) {
         // Nothing moved since the last proposal, so the model would be asked
         // an identical question. Stops and reviews already ran above.
@@ -697,14 +697,20 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         let events = match calendar_events(state).await {
             Ok(events) => events,
             Err(reason) => {
-                state
-                    .entry_watch()
-                    .mark_failed(unix_secs(SystemTime::now()));
+                state.entry_watch().mark_failed(unix_secs(state.now()));
                 record(state, "unavailable", None, None, Some(&reason)).await;
                 return TickOutcome::Unavailable { reason };
             }
         };
-        let input = proposal_input(&markets, &judgements, &account, &managed, &specs, &events);
+        let input = proposal_input(
+            &markets,
+            &judgements,
+            &account,
+            &managed,
+            &specs,
+            &events,
+            unix_secs(state.now()),
+        );
         let instructions = proposal_instructions(state, &markets, &account);
         let engine = model.engine();
         let session = AgentSession {
@@ -715,7 +721,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             account: &account,
             judgements: &judgements,
             tier: settings.tier(),
-            now: SystemTime::now(),
+            now: state.now(),
         };
         match agent::run(&session, &instructions, &input).await {
             Err(error) => {
@@ -725,7 +731,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                 };
                 // A refused request fails this tick and nothing else, so the
                 // run has to be counted somewhere a surface can read it.
-                let now = unix_secs(SystemTime::now());
+                let now = unix_secs(state.now());
                 state.decision_health().failed(&reason, now);
                 // The gate was marked for a market this sweep never judged.
                 state.entry_watch().mark_failed(now);
@@ -816,7 +822,7 @@ pub async fn tick(state: &AppState) -> TickOutcome {
                         if let Some(event) = calendar::blackout(
                             &events,
                             symbol.as_str(),
-                            unix_secs(SystemTime::now()),
+                            unix_secs(state.now()),
                             policy.calendar_blackout_minutes(),
                         ) {
                             tracing::debug!(
@@ -1090,7 +1096,7 @@ async fn calendar_events(state: &AppState) -> Result<Vec<CalendarEvent>, String>
     let Some(calendar) = state.calendar() else {
         return Ok(Vec::new());
     };
-    let now = unix_secs(SystemTime::now());
+    let now = unix_secs(state.now());
     calendar
         .feed()
         .events(now - CALENDAR_LOOKBACK_SECS, now + CALENDAR_HORIZON_SECS)
@@ -1691,7 +1697,7 @@ async fn review_positions(
             };
             state
                 .decision_health()
-                .failed(&reason, unix_secs(SystemTime::now()));
+                .failed(&reason, unix_secs(state.now()));
             record(
                 state,
                 "unavailable",
@@ -2383,8 +2389,8 @@ fn proposal_input(
     managed: &[ManagedPosition],
     specs: &[(Symbol, SymbolSpecPayload)],
     events: &[CalendarEvent],
+    now: i64,
 ) -> String {
-    let now = unix_secs(SystemTime::now());
     let assets: Vec<Value> = markets
         .iter()
         .map(|(symbol, series)| {
@@ -2893,6 +2899,11 @@ mod tests {
         _judge: Option<Arc<StubJudge>>,
     }
 
+    /// Wednesday 2026-01-07 12:00 UTC: midweek, mid-session, no window guard.
+    fn test_now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_787_200)
+    }
+
     fn build_harness(
         settings: AutopilotSettings,
         engine: Option<Arc<StubEngine>>,
@@ -2919,6 +2930,9 @@ mod tests {
             state = state.with_jev(Some(JevRuntime::with_judge(JevProvider::TypeSafe, judge)));
         }
         state = state.with_audit(Some(AuditRuntime::new(trail.clone())));
+        // Pin the clock to Wednesday noon UTC so entry tests never trip the
+        // weekend or rollover guards by accident.
+        state = state.with_fixed_now(Some(test_now()));
         Rig {
             state,
             trail,
@@ -3565,7 +3579,7 @@ mod tests {
             true,
             true,
         );
-        let now = unix_secs(SystemTime::now());
+        let now = unix_secs(test_now());
         let event =
             CalendarEvent::new("Non-Farm Employment Change", "USD", Impact::High, now + 600)
                 .expect("event");
@@ -3622,7 +3636,7 @@ mod tests {
             true,
             true,
         );
-        let now = unix_secs(SystemTime::now());
+        let now = unix_secs(test_now());
         let event = CalendarEvent::new("ECB Press Conference", "EUR", Impact::High, now + 7_200)
             .expect("event");
         harness.state = harness

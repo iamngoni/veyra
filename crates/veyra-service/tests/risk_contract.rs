@@ -82,6 +82,11 @@ async fn poll(link: Arc<EaLink>, payload: Value) -> (StatusCode, Value) {
     )
 }
 
+/// Wednesday 2026-01-07 12:00 UTC: midweek, mid-session, no window guard.
+fn test_now() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_767_787_200)
+}
+
 async fn evaluate(state: &AppState, payload: Value) -> (StatusCode, Value) {
     let app = test::init_service(create_app(state.clone())).await;
     let request = test::TestRequest::post()
@@ -145,7 +150,9 @@ async fn fresh_state_with_room_approves_and_reports_order_limits() {
     let (runtime, link) = broker();
     prime_snapshot(&link).await;
 
-    let state = AppState::new(test_config(), Some(runtime.clone()), None, gate(2, "0.5"));
+    let state = AppState::new(test_config(), Some(runtime.clone()), None, gate(2, "0.5"))
+        .with_fixed_now(Some(test_now()))
+        .with_fixed_now(Some(test_now()));
     let (status, decision) = evaluate(&state, market_draft("EURUSD")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(decision["decision"], "approved");
@@ -154,7 +161,8 @@ async fn fresh_state_with_room_approves_and_reports_order_limits() {
 
     // The same live account state rejects as soon as the configured cap is
     // reached; the gate consults real order counts, not an assumption.
-    let capped = AppState::new(test_config(), Some(runtime), None, gate(0, "0.5"));
+    let capped = AppState::new(test_config(), Some(runtime), None, gate(0, "0.5"))
+        .with_fixed_now(Some(test_now()));
     let (status, decision) = evaluate(&capped, market_draft("EURUSD")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(decision["decision"], "rejected");
@@ -165,7 +173,9 @@ async fn fresh_state_with_room_approves_and_reports_order_limits() {
 #[actix_web::test]
 async fn missing_and_disallowed_state_fail_closed() {
     let (runtime, link) = broker();
-    let state = AppState::new(test_config(), Some(runtime), None, gate(2, "0.5"));
+    let state = AppState::new(test_config(), Some(runtime), None, gate(2, "0.5"))
+        .with_fixed_now(Some(test_now()))
+        .with_fixed_now(Some(test_now()));
 
     // No heartbeat yet: the link holds no state, so the gate rejects.
     let (status, decision) = evaluate(&state, market_draft("EURUSD")).await;
@@ -186,7 +196,9 @@ async fn malformed_drafts_are_rejected_at_the_boundary() {
     let (status, _) = poll(link, heartbeat()).await;
     assert_eq!(status, StatusCode::OK);
 
-    let state = AppState::new(test_config(), Some(runtime), None, gate(2, "0.5"));
+    let state = AppState::new(test_config(), Some(runtime), None, gate(2, "0.5"))
+        .with_fixed_now(Some(test_now()))
+        .with_fixed_now(Some(test_now()));
 
     let (status, _) = evaluate(
         &state,

@@ -10,7 +10,16 @@ import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { LogLevel } from './api'
-import { clockTime, money, relativeTime, useEventFeed, useLogFeed, usePoll } from './hooks'
+import {
+  clockTime,
+  money,
+  relativeTime,
+  useEventFeed,
+  useLogFeed,
+  usePaged,
+  usePoll,
+  useTheme,
+} from './hooks'
 
 const mocks = vi.hoisted(() => ({ events: vi.fn(), logs: vi.fn() }))
 
@@ -25,6 +34,73 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers()
+})
+
+describe('useTheme', () => {
+  it('adopts a stored choice, applies it, and persists a deliberate toggle', () => {
+    window.localStorage.setItem('veyra.theme', 'light')
+    const { result } = renderHook(() => useTheme())
+
+    // Hydration starts dark, then the stored choice is adopted before paint.
+    expect(result.current.theme).toBe('light')
+    expect(document.documentElement.dataset.theme).toBe('light')
+
+    act(() => result.current.toggle())
+    expect(result.current.theme).toBe('dark')
+    expect(document.documentElement.dataset.theme).toBe('dark')
+    expect(window.localStorage.getItem('veyra.theme')).toBe('dark')
+  })
+
+  it('falls back to the system preference when nothing is stored', () => {
+    window.localStorage.clear()
+    vi.stubGlobal('matchMedia', (query: string) => ({ matches: true, media: query }))
+    const { result } = renderHook(() => useTheme())
+    expect(result.current.theme).toBe('light')
+    vi.unstubAllGlobals()
+  })
+
+  it('toggles from dark to light and back', () => {
+    window.localStorage.clear()
+    vi.stubGlobal('matchMedia', (query: string) => ({ matches: false, media: query }))
+    const { result } = renderHook(() => useTheme())
+    expect(result.current.theme).toBe('dark')
+    act(() => result.current.toggle())
+    expect(result.current.theme).toBe('light')
+    act(() => result.current.toggle())
+    expect(result.current.theme).toBe('dark')
+    vi.unstubAllGlobals()
+  })
+})
+
+describe('usePaged', () => {
+  it('windows a list and keeps the page in range as it changes', () => {
+    const { result, rerender } = renderHook(({ items }) => usePaged(items, 2), {
+      initialProps: { items: [1, 2, 3, 4, 5] },
+    })
+    expect(result.current.items).toEqual([1, 2])
+    expect(result.current.pages).toBe(3)
+
+    act(() => result.current.next())
+    expect(result.current.items).toEqual([3, 4])
+    act(() => result.current.next())
+    expect(result.current.items).toEqual([5])
+    // Past the end the page clamps instead of stranding the reader.
+    act(() => result.current.next())
+    expect(result.current.items).toEqual([5])
+
+    act(() => result.current.previous())
+    expect(result.current.items).toEqual([3, 4])
+    act(() => result.current.setPage(0))
+    expect(result.current.items).toEqual([1, 2])
+    act(() => result.current.previous())
+    expect(result.current.page).toBe(0)
+
+    // A shrinking list pulls the page back into range.
+    act(() => result.current.setPage(2))
+    rerender({ items: [1] })
+    expect(result.current.pages).toBe(1)
+    expect(result.current.items).toEqual([1])
+  })
 })
 
 describe('relativeTime', () => {

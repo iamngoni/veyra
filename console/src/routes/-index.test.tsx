@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   account: vi.fn(),
   commands: vi.fn(),
   performance: vi.fn(),
+  sessions: vi.fn(),
   candles: vi.fn(),
   metrics: vi.fn(),
   events: vi.fn(),
@@ -27,6 +28,7 @@ vi.mock('../lib/api', () => ({
     account: mocks.account,
     commands: mocks.commands,
     performance: mocks.performance,
+    sessions: mocks.sessions,
     candles: mocks.candles,
     metrics: mocks.metrics,
     events: mocks.events,
@@ -80,6 +82,16 @@ beforeEach(() => {
       maxNetFactorLots: 0.01,
       calendarBlackoutMinutes: 30,
       minStopAtrFraction: 0.25,
+    },
+  })
+  mocks.sessions.mockResolvedValue({
+    now: 1_789_800_000,
+    market: { state: 'closed', nextEvent: 'opens', nextAt: 1_790_000_400 },
+    entries: { open: false, blockedBy: 'weekend_open', detail: 'the market has not reopened for the week' },
+    policy: {
+      rolloverBlackout: { startMinute: 1245, endMinute: 1335 },
+      fridayEntryCutoffMinute: 1140,
+      sundayEntryOpenMinute: 1380,
     },
   })
   mocks.performance.mockResolvedValue({

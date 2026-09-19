@@ -17,6 +17,7 @@ import type {
   CommandRecord,
   FeedEvent,
   LogRecord,
+  MarketSessions,
   Performance,
   Status,
 } from '../lib/api'
@@ -27,6 +28,7 @@ import {
   ActivityFeed,
   AutopilotPanel,
   CommandsPanel,
+  HeroMetrics,
   LogsPanel,
   MarketPanel,
   MetricsPanel,
@@ -39,6 +41,8 @@ import {
   SafetyControls,
   StatusPills,
   systemPosture,
+  Tabs,
+  ThemeToggle,
   TracePanel,
 } from './veyra'
 
@@ -193,6 +197,96 @@ describe('Pill and StatusPills', () => {
   })
 })
 
+describe('Tabs, ThemeToggle, and HeroMetrics', () => {
+  it('renders a badge, selects tabs, and flips the theme label', () => {
+    const onSelect = vi.fn()
+    render(
+      <Tabs
+        tabs={[
+          { id: 'overview', label: 'Overview' },
+          { id: 'trace', label: 'Trace', badge: 7 },
+        ]}
+        active="overview"
+        onSelect={onSelect}
+      />,
+    )
+    expect(screen.getByText('7')).toBeTruthy()
+    fireEvent.click(screen.getByText('Trace'))
+    expect(onSelect).toHaveBeenCalledWith('trace')
+
+    const onToggle = vi.fn()
+    const view = render(<ThemeToggle theme="dark" onToggle={onToggle} />)
+    fireEvent.click(view.getByLabelText('Switch to light theme'))
+    expect(onToggle).toHaveBeenCalledTimes(1)
+    view.rerender(<ThemeToggle theme="light" onToggle={onToggle} />)
+    expect(view.getByLabelText('Switch to dark theme')).toBeTruthy()
+  })
+
+  it('sums open P/L with singular hints', () => {
+    render(<HeroMetrics account={account} />)
+    expect(screen.getByText('-0.32')).toBeTruthy()
+    expect(screen.getByText('1 position')).toBeTruthy()
+    expect(screen.getByText('1 order')).toBeTruthy()
+  })
+
+  it('pluralises a two-position book and skips absent money fields', () => {
+    const first = account.positions?.[0]
+    const { rerender } = render(
+      <HeroMetrics
+        account={{
+          ...account,
+          orders: 2,
+          lots: 0.02,
+          positions: first
+            ? [
+                { ...first, profit: 0.5 },
+                { ...first, ticket: 2, profit: -0.1 },
+              ]
+            : [],
+        }}
+      />,
+    )
+    expect(screen.getByText('+0.40')).toBeTruthy()
+    expect(screen.getByText('2 positions')).toBeTruthy()
+    expect(screen.getByText('2 orders')).toBeTruthy()
+
+    // Absent money fields keep their skeletons instead of rendering numbers.
+    rerender(
+      <HeroMetrics
+        account={{
+          ...account,
+          equity: undefined,
+          lots: undefined,
+          freeMargin: undefined,
+          marginLevel: undefined,
+        }}
+      />,
+    )
+    expect(screen.queryByText('1 order')).toBeNull()
+    expect(screen.queryByText(/balance/)).toBeNull()
+  })
+
+  it('treats a missing profit as zero in the open total', () => {
+    const first = account.positions?.[0]
+    render(
+      <HeroMetrics
+        account={{
+          ...account,
+          positions: first ? [{ ...first, profit: undefined as unknown as number }] : [],
+        }}
+      />,
+    )
+    expect(screen.getByText('+0.00')).toBeTruthy()
+  })
+
+  it('renders pending skeletons and an explicit outage', () => {
+    const { rerender } = render(<HeroMetrics />)
+    expect(screen.queryByText('unavailable')).toBeNull()
+    rerender(<HeroMetrics error="account down" />)
+    expect(screen.getAllByText('unavailable').length).toBe(4)
+  })
+})
+
 describe('AccountPanel', () => {
   it('renders balances, exposure, and the connected server', () => {
     render(<AccountPanel account={account} />)
@@ -278,6 +372,56 @@ describe('PositionsPanel', () => {
     expect(screen.getByText('-0.005')).toBeTruthy()
   })
 
+  it('falls back to two decimals when every price is zero', () => {
+    render(
+      <PositionsPanel
+        account={{
+          ...account,
+          positions: [
+            {
+              ticket: 9,
+              symbol: 'XAUUSD',
+              kind: 'buy',
+              lots: 0.01,
+              price: 0,
+              profit: 0,
+              sl: 0,
+              tp: 0,
+              magic: 0,
+            },
+          ],
+        }}
+      />,
+    )
+    expect(screen.getByText('+0.00')).toBeTruthy()
+  })
+
+  it('widens to two decimals when every quoted price is an integer', () => {
+    render(
+      <PositionsPanel
+        account={{
+          ...account,
+          positions: [
+            {
+              ticket: 11,
+              symbol: 'XAUUSD',
+              kind: 'buy',
+              lots: 0.01,
+              price: 2,
+              current: 2,
+              profit: 1.5,
+              sl: 0,
+              tp: 0,
+              magic: 0,
+            },
+          ],
+        }}
+      />,
+    )
+    expect(screen.getByText('+0.00')).toBeTruthy()
+    expect(screen.getByText('+1.50')).toBeTruthy()
+  })
+
   it('states a missing current price rather than implying one', () => {
     render(
       <PositionsPanel
@@ -335,6 +479,31 @@ describe('PerformancePanel', () => {
     expect(screen.getByText(/last 30d · 2 closed/)).toBeTruthy()
   })
 
+  it('reports a truncated window with breakeven trades and a cost-adjusted loss', () => {
+    render(
+      <PerformancePanel
+        performance={{
+          ...performance,
+          truncated: true,
+          report: {
+            ...performance.report,
+            trades: 3,
+            wins: 1,
+            losses: 1,
+            breakeven: 1,
+            net_profit: -0.25,
+            average_loss: 0.4,
+            by_symbol: [],
+          },
+        }}
+      />,
+    )
+    expect(screen.getByText(/last 30d · 2 closed · truncated/)).toBeTruthy()
+    expect(screen.getByText('1W · 1L · 1F')).toBeTruthy()
+    expect(screen.getByText('-0.25')).toBeTruthy()
+    expect(screen.getByText('-0.40')).toBeTruthy()
+  })
+
   it('shows waiting, error, and empty states', () => {
     const { rerender } = render(<PerformancePanel />)
     expect(screen.getByText('waiting…')).toBeTruthy()
@@ -378,6 +547,84 @@ describe('MarketPanel', () => {
     rerender(<MarketPanel error="feed down" />)
     expect(screen.getByText('feed down')).toBeTruthy()
   })
+
+  const closedSessions: MarketSessions = {
+    now: 1_789_776_000, // Saturday 2026-09-19 00:00 UTC
+    market: { state: 'closed', nextEvent: 'opens', nextAt: 1_789_938_000 }, // Sunday 21:00 UTC
+    entries: { open: false, blockedBy: 'weekend_open', detail: 'the market has not reopened for the week' },
+    policy: {
+      rolloverBlackout: { startMinute: 1245, endMinute: 1335 },
+      fridayEntryCutoffMinute: 1140,
+      sundayEntryOpenMinute: 1380,
+    },
+  }
+
+  it('reports the closed week, the entry block, and what is held', () => {
+    render(<MarketPanel series={series} sessions={closedSessions} account={account} />)
+    expect(screen.getByText('closed')).toBeTruthy()
+    expect(screen.getByText(/opens Sun 21:00 UTC/)).toBeTruthy()
+    expect(screen.getByText(/in 1d 21h/)).toBeTruthy()
+    expect(screen.getByText('blocked — weekend')).toBeTruthy()
+    expect(screen.getByText('Holding EURUSD — market closed; stops rest at the broker')).toBeTruthy()
+  })
+
+  it('reports an open market, an open rollover pause, and open entries', () => {
+    const { rerender } = render(
+      <MarketPanel
+        series={series}
+        sessions={{
+          ...closedSessions,
+          now: 1_789_776_000,
+          market: { state: 'open', nextEvent: 'pauses', nextAt: 1_789_776_000 + 3_600 },
+          entries: { open: true, blockedBy: null, detail: null },
+        }}
+      />,
+    )
+    expect(screen.getAllByText('open')).toHaveLength(2) // week state and entries
+    expect(screen.getByText(/rollover pause/)).toBeTruthy()
+    expect(screen.queryByText(/Holding/)).toBeNull()
+
+    // An open market with a position keeps the plain holding line.
+    rerender(
+      <MarketPanel
+        series={series}
+        account={account}
+        sessions={{
+          ...closedSessions,
+          market: { state: 'open', nextEvent: 'pauses', nextAt: 1_789_776_000 + 3_600 },
+          entries: { open: true, blockedBy: null, detail: null },
+        }}
+      />,
+    )
+    expect(screen.getByText('Holding EURUSD')).toBeTruthy()
+
+    rerender(
+      <MarketPanel
+        series={series}
+        sessions={{
+          ...closedSessions,
+          market: { state: 'rollover', nextEvent: 'resumes', nextAt: 1_789_776_000 + 600 },
+          entries: { open: false, blockedBy: 'rollover_blackout', detail: 'the daily rollover blackout is active' },
+        }}
+      />,
+    )
+    expect(screen.getByText('rollover')).toBeTruthy()
+    expect(screen.getByText('blocked — rollover blackout')).toBeTruthy()
+    expect(screen.getByText(/in 10m/)).toBeTruthy()
+  })
+
+  it('renders an unrecognised block reason verbatim instead of guessing', () => {
+    render(
+      <MarketPanel
+        series={series}
+        sessions={{
+          ...closedSessions,
+          entries: { open: false, blockedBy: 'broker_holiday', detail: 'closed for a holiday' },
+        }}
+      />,
+    )
+    expect(screen.getByText('blocked — broker_holiday')).toBeTruthy()
+  })
 })
 
 describe('AutopilotPanel', () => {
@@ -391,6 +638,17 @@ describe('AutopilotPanel', () => {
     expect(screen.getByText('5/120 h · 5/2000 d')).toBeTruthy()
     expect(screen.getByText('EURUSD')).toBeTruthy()
     expect(screen.getByText('12 calls · 5.5k tok')).toBeTruthy()
+  })
+
+  it('reports small token counts and judge failures verbatim', () => {
+    render(
+      <AutopilotPanel
+        status={autopilot}
+        budget={status.model_budget}
+        jevUsage={{ calls: 3, failures: 2, inputTokens: 420, outputTokens: 80 }}
+      />,
+    )
+    expect(screen.getByText('3 calls · 500 tok · 2 failed')).toBeTruthy()
   })
 
   it('renders a multi-symbol rotation and the chart-symbol fallback', () => {
@@ -437,6 +695,18 @@ describe('RiskPanel', () => {
       />,
     )
     expect(screen.getAllByText('off').length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('states whether a judge outage keeps trading or pauses decisions', () => {
+    const { rerender } = render(<RiskPanel policy={status.risk_policy} status={status} />)
+    expect(screen.getByText('pauses decisions')).toBeTruthy()
+    rerender(
+      <RiskPanel
+        policy={{ ...status.risk_policy, allowTradingWithoutJev: true }}
+        status={status}
+      />,
+    )
+    expect(screen.getByText('keeps trading')).toBeTruthy()
   })
 
   it('renders the kill switch and missing policy', () => {
@@ -510,6 +780,43 @@ describe('TracePanel', () => {
     )
     expect(screen.getByText('disabled')).toBeTruthy()
   })
+
+  it('states an absent page and an errored trail explicitly', () => {
+    const { rerender } = render(<TracePanel kind="all" onKindChange={() => {}} />)
+    expect(screen.getByText('No durable events recorded yet.')).toBeTruthy()
+
+    rerender(<TracePanel error="audit down" kind="all" onKindChange={() => {}} />)
+    expect(screen.getByText('audit down')).toBeTruthy()
+    expect(screen.getByText('Trail unavailable.')).toBeTruthy()
+  })
+
+  it('collapses a row, and tolerates an unknown kind, no payload, and a bad time', () => {
+    const rows = {
+      status: 'ok' as const,
+      events: [
+        { id: 'mystery-1', at: 'not a timestamp', kind: 'mystery_event' },
+        { id: 'plain-2', at: '2026-09-18 17:47:46.844116+00', kind: 'service_started', payload: {} },
+      ],
+    }
+    const onKindChange = vi.fn()
+    render(<TracePanel page={rows as never} kind="all" onKindChange={onKindChange} />)
+
+    // An unreadable instant is a dash, never a confident wrong time.
+    expect(screen.getByText('—')).toBeTruthy()
+    // Payload-less rows still report themselves honestly.
+    expect(screen.getAllByText('0 fields').length).toBe(2)
+
+    // Clicking a kind chip asks the dashboard to filter; clicking a row twice
+    // expands and collapses it.
+    fireEvent.click(screen.getAllByText('mystery_event')[0])
+    expect(onKindChange).toHaveBeenCalledWith('mystery_event')
+    const list = screen.getByRole('list')
+    fireEvent.click(within(list).getByText('mystery_event'))
+    const expanded = screen.queryAllByRole('button', { expanded: true })
+    expect(expanded.length).toBe(1)
+    fireEvent.click(within(list).getByText('mystery_event'))
+    expect(screen.queryAllByRole('button', { expanded: true }).length).toBe(0)
+  })
 })
 
 describe('systemPosture', () => {
@@ -540,6 +847,12 @@ describe('systemPosture', () => {
     expect(systemPosture(refusing).label).toBe('NOT DECIDING')
     expect(systemPosture(refusing).tone).toBe('bad')
     expect(systemPosture(refusing).detail).toContain('Thinking mode')
+
+    // The reason can be missing; the banner says so rather than guessing.
+    expect(
+      systemPosture({ ...status, decisions: { consecutiveFailures: 2, lastFailure: null, lastFailureAt: 0 } })
+        .detail,
+    ).toContain('no reason reported')
 
     // One failure is a hiccup, not an outage.
     expect(
@@ -582,6 +895,38 @@ describe('SafetyControls', () => {
     fireEvent.click(screen.getByText('Confirm'))
     expect(await screen.findByText('invalid_policy')).toBeTruthy()
     expect(onApply).toHaveBeenCalledWith({ allowTradingWithoutJev: true })
+  })
+
+  it('cancels a confirmation and stays quiet while the judge is healthy', () => {
+    render(<SafetyControls policy={status.risk_policy} jevHealthy={true} onApply={vi.fn()} />)
+    const killSwitch = screen.getByRole('switch', { name: 'Kill switch' })
+    fireEvent.click(killSwitch)
+    expect(screen.getByText('Halt all new intents?')).toBeTruthy()
+    fireEvent.click(killSwitch)
+    expect(screen.queryByText('Halt all new intents?')).toBeNull()
+    expect(screen.queryByText(/judge is not answering/)).toBeNull()
+  })
+
+  it('cancels the judge-override confirmation', () => {
+    render(<SafetyControls policy={status.risk_policy} onApply={vi.fn()} />)
+    const judge = screen.getByRole('switch', { name: 'Trade without the judge' })
+    fireEvent.click(judge)
+    expect(screen.getByText('Allow trading without the judge?')).toBeTruthy()
+    fireEvent.click(judge)
+    expect(screen.queryByText('Allow trading without the judge?')).toBeNull()
+  })
+
+  it('describes engaged switches and their release actions', () => {
+    render(
+      <SafetyControls
+        policy={{ ...status.risk_policy, killSwitch: true, allowTradingWithoutJev: true }}
+        onApply={vi.fn()}
+      />,
+    )
+    expect(screen.getByText(/Engaged. Every new intent is refused/)).toBeTruthy()
+    expect(screen.getByText(/Override active/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('switch', { name: 'Kill switch' }))
+    expect(screen.getByText('Release the kill switch?')).toBeTruthy()
   })
 
   it('warns while the judge is failing, differently for each setting', () => {
@@ -708,6 +1053,11 @@ describe('MetricsPanel', () => {
     expect(screen.getByText('proposal.held')).toBeTruthy()
     expect(screen.getByText('9')).toBeTruthy()
     expect(screen.getByText('feed #44')).toBeTruthy()
+  })
+
+  it('renders the waiting state before any poll lands', () => {
+    render(<MetricsPanel />)
+    expect(screen.getByText('No counters yet.')).toBeTruthy()
   })
 
   it('renders empty and error states', () => {

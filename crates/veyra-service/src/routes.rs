@@ -5,7 +5,7 @@
 //! response exposes credentials, account balances, or model prompts. Adding an
 //! executable route requires an explicit design change plus the risk gate.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use actix_web::web::{self, Data};
 use actix_web::{HttpResponse, get, post};
@@ -291,10 +291,9 @@ pub async fn evaluate_intent(
     draft: web::Json<TradeIntentDraft>,
 ) -> HttpResponse {
     let account = account_facts(state.as_ref()).await;
-    let decision: RiskDecision =
-        state
-            .risk()
-            .evaluate(&draft.into_inner(), account, SystemTime::now());
+    let decision: RiskDecision = state
+        .risk()
+        .evaluate(&draft.into_inner(), account, state.now());
     HttpResponse::Ok().json(decision)
 }
 
@@ -689,6 +688,19 @@ mod tests {
             audit_health(&healthy, Duration::from_millis(500)).await,
             "ok"
         );
+
+        // The stub's write paths are part of the contract too: a hung read
+        // must not make a best-effort write look successful.
+        assert!(
+            HangingTrail
+                .record(AuditEvent::new(
+                    crate::audit::AuditKind::ServiceStarted,
+                    serde_json::json!({})
+                ))
+                .await
+                .is_ok()
+        );
+        assert_eq!(HangingTrail.prune(30).await.expect("prune stub"), 0);
 
         let hanging = AuditRuntime::new(Arc::new(HangingTrail));
         let started = Instant::now();

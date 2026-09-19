@@ -22,6 +22,11 @@ use veyra_service::risk::{RiskGate, RiskPolicy};
 
 const TOKEN: &str = "test-token-1234567890";
 
+/// Wednesday 2026-01-07 12:00 UTC: midweek, mid-session, no window guard.
+fn test_now() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_767_787_200)
+}
+
 fn test_config() -> ServiceConfig {
     ServiceConfig::from_source(|name| match name {
         "VEYRA_BIND_HOST" => Ok("127.0.0.1".to_owned()),
@@ -241,7 +246,8 @@ async fn approved_drafts_become_order_checks_and_report_their_result() {
     let (runtime, link) = broker();
     prime(&link).await;
 
-    let state = AppState::new(test_config(), Some(runtime), None, gate());
+    let state =
+        AppState::new(test_config(), Some(runtime), None, gate()).with_fixed_now(Some(test_now()));
     let (status, decision) = check(
         &state,
         json!({"symbol": "EURUSD", "side": "buy", "order_type": "market", "volume": 0.01}),
@@ -297,7 +303,8 @@ async fn rejected_drafts_never_reach_the_terminal() {
     let (runtime, link) = broker();
     prime(&link).await;
 
-    let state = AppState::new(test_config(), Some(runtime), None, gate());
+    let state =
+        AppState::new(test_config(), Some(runtime), None, gate()).with_fixed_now(Some(test_now()));
     let (status, decision) = check(
         &state,
         json!({"symbol": "GBPUSD", "side": "buy", "order_type": "market", "volume": 0.01}),
@@ -316,7 +323,8 @@ async fn account_snapshot_requests_report_exposure() {
     let (runtime, link) = broker();
     prime(&link).await;
 
-    let state = AppState::new(test_config(), Some(runtime), None, gate());
+    let state =
+        AppState::new(test_config(), Some(runtime), None, gate()).with_fixed_now(Some(test_now()));
     let app = test::init_service(create_app(state.clone())).await;
     let request = test::TestRequest::post()
         .uri("/commands/account_snapshot")
@@ -380,7 +388,8 @@ async fn command_lookup_validates_its_inputs() {
     let (runtime, link) = broker();
     prime(&link).await;
 
-    let state = AppState::new(test_config(), Some(runtime), None, gate());
+    let state =
+        AppState::new(test_config(), Some(runtime), None, gate()).with_fixed_now(Some(test_now()));
     let (status, _) = command_status(&state, "not-a-uuid").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
@@ -391,7 +400,9 @@ async fn command_lookup_validates_its_inputs() {
 
 #[actix_web::test]
 async fn control_routes_require_a_command_channel() {
-    let state = AppState::new(test_config(), None, None, gate());
+    let state = AppState::new(test_config(), None, None, gate())
+        .with_fixed_now(Some(test_now()))
+        .with_fixed_now(Some(test_now()));
     let (status, body) = check(
         &state,
         json!({"symbol": "EURUSD", "side": "buy", "order_type": "market", "volume": 0.01}),
@@ -409,7 +420,8 @@ async fn execution_is_refused_until_trading_is_enabled() {
     let (runtime, link) = broker();
     prime(&link).await;
 
-    let state = AppState::new(test_config(), Some(runtime), None, gate());
+    let state =
+        AppState::new(test_config(), Some(runtime), None, gate()).with_fixed_now(Some(test_now()));
     let (status, body) = execute(
         &state,
         json!({"symbol": "EURUSD", "side": "buy", "order_type": "market", "volume": 0.01}),
@@ -427,7 +439,9 @@ async fn execution_is_refused_until_trading_is_enabled() {
 async fn enabled_execution_queues_an_order_and_reports_the_dry_run() {
     let (runtime, link) = broker();
     prime(&link).await;
-    let state = AppState::new(config_with_trading(true), Some(runtime), None, gate());
+    let state = AppState::new(config_with_trading(true), Some(runtime), None, gate())
+        .with_fixed_now(Some(test_now()))
+        .with_fixed_now(Some(test_now()));
 
     let (status, body) = execute(
         &state,
@@ -484,7 +498,9 @@ async fn closing_requires_enablement_state_and_ownership() {
     prime(&link).await;
 
     // Disabled: refused before any state is consulted.
-    let state = AppState::new(test_config(), Some(runtime.clone()), None, gate());
+    let state = AppState::new(test_config(), Some(runtime.clone()), None, gate())
+        .with_fixed_now(Some(test_now()))
+        .with_fixed_now(Some(test_now()));
     let (status, body) = close(&state, 123).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "trading_disabled");
@@ -495,7 +511,8 @@ async fn closing_requires_enablement_state_and_ownership() {
         Some(runtime.clone()),
         None,
         gate(),
-    );
+    )
+    .with_fixed_now(Some(test_now()));
     let (status, body) = close(&enabled, 123).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"], "position_state_unavailable");
@@ -556,7 +573,9 @@ async fn closing_refuses_positions_veyra_does_not_own() {
     prime(&link).await;
     retain_position(&link, 0).await;
 
-    let state = AppState::new(config_with_trading(true), Some(runtime), None, gate());
+    let state = AppState::new(config_with_trading(true), Some(runtime), None, gate())
+        .with_fixed_now(Some(test_now()))
+        .with_fixed_now(Some(test_now()));
     let (status, body) = close(&state, 123).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"], "not_a_veyra_position");
@@ -572,7 +591,9 @@ async fn modifying_requires_enablement_and_valid_stops() {
     prime(&link).await;
 
     // Disabled: refused before any state is consulted.
-    let state = AppState::new(test_config(), Some(runtime.clone()), None, gate());
+    let state = AppState::new(test_config(), Some(runtime.clone()), None, gate())
+        .with_fixed_now(Some(test_now()))
+        .with_fixed_now(Some(test_now()));
     let (status, body) = modify(&state, json!({"ticket": 123, "stop_loss": 1.05})).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "trading_disabled");
@@ -582,7 +603,8 @@ async fn modifying_requires_enablement_and_valid_stops() {
         Some(runtime.clone()),
         None,
         gate(),
-    );
+    )
+    .with_fixed_now(Some(test_now()));
     let (status, body) = modify(&enabled, json!({"ticket": 0, "stop_loss": 1.05})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "invalid_ticket");
@@ -612,7 +634,9 @@ async fn modifying_targets_only_veyra_positions() {
         Some(runtime.clone()),
         None,
         gate(),
-    );
+    )
+    .with_fixed_now(Some(test_now()))
+    .with_fixed_now(Some(test_now()));
     let (status, body) = modify(&state, json!({"ticket": 123, "stop_loss": 1.05})).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"], "not_a_veyra_position");
@@ -666,14 +690,16 @@ async fn modifying_targets_only_veyra_positions() {
 #[actix_web::test]
 async fn reconciliation_walks_from_unavailable_to_drift() {
     // No command channel at all.
-    let bare = AppState::new(test_config(), None, None, gate());
+    let bare = AppState::new(test_config(), None, None, gate()).with_fixed_now(Some(test_now()));
     let (status, body) = reconciliation(&bare).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "unavailable");
 
     // A channel that has never heard from the terminal is stale.
     let (runtime, link) = broker();
-    let state = AppState::new(test_config(), Some(runtime.clone()), None, gate());
+    let state = AppState::new(test_config(), Some(runtime.clone()), None, gate())
+        .with_fixed_now(Some(test_now()))
+        .with_fixed_now(Some(test_now()));
     let (status, body) = reconciliation(&state).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "stale");
@@ -708,7 +734,9 @@ async fn queued_commands_and_the_audit_route_share_one_trail() {
     let (runtime, link) = broker();
     prime(&link).await;
     let state = AppState::new(test_config(), Some(runtime), None, gate())
-        .with_audit(Some(AuditRuntime::new(trail.clone())));
+        .with_audit(Some(AuditRuntime::new(trail.clone())))
+        .with_fixed_now(Some(test_now()))
+        .with_fixed_now(Some(test_now()));
 
     let (status, body) = check(
         &state,
@@ -741,7 +769,9 @@ async fn queued_commands_and_the_audit_route_share_one_trail() {
 
 #[actix_web::test]
 async fn the_audit_route_reports_disabled_without_a_trail() {
-    let state = AppState::new(test_config(), None, None, gate());
+    let state = AppState::new(test_config(), None, None, gate())
+        .with_fixed_now(Some(test_now()))
+        .with_fixed_now(Some(test_now()));
     let app = test::init_service(create_app(state)).await;
     let request = test::TestRequest::get().uri("/audit").to_request();
     let response = test::call_service(&app, request).await;

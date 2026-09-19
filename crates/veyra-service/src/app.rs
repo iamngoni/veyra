@@ -34,6 +34,7 @@ pub fn create_app(
         .service(crate::control::reconciliation)
         .service(crate::control::market_candles)
         .service(crate::control::market_spec)
+        .service(crate::control::market_sessions)
         .service(crate::control::calendar_events)
         .service(crate::control::performance)
         .service(crate::control::audit_log)

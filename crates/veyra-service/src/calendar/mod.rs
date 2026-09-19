@@ -304,6 +304,7 @@ impl CalendarRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn event(title: &str, currency: &str, impact: Impact, time: i64) -> CalendarEvent {
         CalendarEvent::new(title, currency, impact, time).expect("valid event")
@@ -324,6 +325,21 @@ mod tests {
         }
         assert_eq!(Impact::parse("severe"), None);
         assert_eq!(Impact::High.as_str(), "high");
+    }
+
+    #[actix_web::test]
+    async fn the_settings_factory_builds_the_selected_provider() {
+        use crate::calendar::settings::ForexfactorySettings;
+
+        let runtime = CalendarRuntime::from_settings(CalendarSettings::Forexfactory(
+            ForexfactorySettings::new(Duration::from_secs(5), Duration::from_secs(900)),
+        ))
+        .expect("factory builds");
+        assert_eq!(
+            runtime.feed().provider(),
+            CalendarProvider::Forexfactory,
+            "the configured provider answers"
+        );
     }
 
     #[test]

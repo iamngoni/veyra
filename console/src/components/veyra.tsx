@@ -11,6 +11,7 @@ import type {
   FeedEvent,
   LogLevel,
   LogRecord,
+  MarketSessions,
   Metrics,
   Performance,
   Position,
@@ -777,10 +778,59 @@ function Sparkline({ candles }: { candles: Candle[] }) {
   )
 }
 
-export function MarketPanel({ series, error }: { series?: CandleSeries; error?: string }) {
+/** UTC clock label for an instant, e.g. `Fri 21:00 UTC`. */
+function utcClock(unix: number): string {
+  const date = new Date(unix * 1000)
+  const weekday = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][date.getUTCDay()]
+  const hh = String(date.getUTCHours()).padStart(2, '0')
+  const mm = String(date.getUTCMinutes()).padStart(2, '0')
+  return `${weekday} ${hh}:${mm} UTC`
+}
+
+/** Compact time-until label, e.g. `in 3h 12m`. */
+function untilLabel(unix: number, now: number): string {
+  const seconds = Math.max(0, unix - now)
+  const days = Math.floor(seconds / 86_400)
+  const hours = Math.floor((seconds % 86_400) / 3_600)
+  const minutes = Math.floor((seconds % 3_600) / 60)
+  if (days > 0) return `in ${days}d ${hours}h`
+  if (hours > 0) return `in ${hours}h ${minutes}m`
+  return `in ${minutes}m`
+}
+
+const SESSION_EVENT_LABELS: Record<MarketSessions['market']['nextEvent'], string> = {
+  opens: 'opens',
+  closes: 'closes',
+  pauses: 'rollover pause',
+  resumes: 'resumes',
+}
+
+const ENTRY_BLOCK_LABELS: Record<string, string> = {
+  rollover_blackout: 'rollover blackout',
+  weekend_approach: 'weekend cutoff',
+  weekend_open: 'weekend',
+  session_closed: 'session window',
+}
+
+export function MarketPanel({
+  series,
+  sessions,
+  account,
+  error,
+}: {
+  series?: CandleSeries
+  sessions?: MarketSessions
+  /** Positions are surfaced here so the panel names what is exposed when the market is closed. */
+  account?: Account
+  error?: string
+}) {
   const last = series?.candles.at(-1)
   const first = series?.candles.at(0)
   const change = last && first ? ((last.close - first.close) / first.close) * 100 : undefined
+  const held = (account?.positions ?? []).map((position) => position.symbol)
+  const state = sessions?.market.state
+  const stateTone =
+    state === 'open' ? 'text-[var(--color-ok)]' : state === 'rollover' ? 'text-amber-400' : 'text-[var(--color-bad)]'
   return (
     <Panel
       title="Market"
@@ -798,6 +848,32 @@ export function MarketPanel({ series, error }: { series?: CandleSeries; error?: 
           <Field label="H / L" value={last ? `${last.high.toFixed(5)} / ${last.low.toFixed(5)}` : '—'} />
         </div>
       </div>
+      {sessions ? (
+        <div className="border-t border-[var(--color-line)] px-3 py-2 text-[11px] leading-relaxed text-[var(--color-muted)]">
+          <div>
+            <span className={`font-semibold uppercase ${stateTone}`}>{state}</span>
+            {' · '}
+            {SESSION_EVENT_LABELS[sessions.market.nextEvent]} {utcClock(sessions.market.nextAt)} (
+            {untilLabel(sessions.market.nextAt, sessions.now)})
+          </div>
+          <div>
+            Entries{' '}
+            {sessions.entries.open ? (
+              <span className="text-[var(--color-ok)]">open</span>
+            ) : (
+              <span className="text-amber-400">
+                blocked — {ENTRY_BLOCK_LABELS[sessions.entries.blockedBy ?? ''] ?? sessions.entries.blockedBy}
+              </span>
+            )}
+          </div>
+          {held.length > 0 ? (
+            <div>
+              Holding {held.join(' · ')}
+              {state !== 'open' ? ' — market closed; stops rest at the broker' : ''}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </Panel>
   )
 }

@@ -1684,6 +1684,83 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_validation_rejects_unusable_money_and_positions() {
+        let position = || PositionPayload {
+            ticket: 1,
+            symbol: "EURUSD".to_owned(),
+            magic: ORDER_MAGIC,
+            kind: PositionKind::Buy,
+            lots: 0.01,
+            price: 1.1,
+            profit: 0.0,
+            stop_loss: 0.0,
+            take_profit: 0.0,
+            opened_at: 1_700_000_000,
+            current: 1.1,
+            swap: 0.0,
+        };
+        let base = || AccountSnapshotPayload {
+            balance: 1.0,
+            equity: 1.0,
+            free_margin: 1.0,
+            orders: 1,
+            lots: 0.01,
+            positions: vec![position()],
+            positions_truncated: false,
+            server_time: 1_700_000_000,
+            leverage: 100,
+            margin_level: 0.0,
+        };
+
+        let mut negative_margin_level = base();
+        negative_margin_level.margin_level = -1.0;
+        assert!(
+            negative_margin_level
+                .validate()
+                .expect_err("negative margin level")
+                .contains("marginLevel")
+        );
+
+        for (name, mutate) in [
+            (
+                "profit",
+                Box::new(|payload: &mut AccountSnapshotPayload| {
+                    payload.positions[0].profit = f64::NAN;
+                }) as Box<dyn Fn(&mut AccountSnapshotPayload)>,
+            ),
+            (
+                "swap",
+                Box::new(|payload: &mut AccountSnapshotPayload| {
+                    payload.positions[0].swap = f64::INFINITY;
+                }),
+            ),
+            (
+                "sl",
+                Box::new(|payload: &mut AccountSnapshotPayload| {
+                    payload.positions[0].stop_loss = -1.0;
+                }),
+            ),
+            (
+                "openedAt",
+                Box::new(|payload: &mut AccountSnapshotPayload| {
+                    payload.positions[0].opened_at = -1;
+                }),
+            ),
+            (
+                "current",
+                Box::new(|payload: &mut AccountSnapshotPayload| {
+                    payload.positions[0].current = -1.0;
+                }),
+            ),
+        ] {
+            let mut broken = base();
+            mutate(&mut broken);
+            let error = broken.validate().expect_err(name);
+            assert!(error.contains(name), "{name}: {error}");
+        }
+    }
+
+    #[test]
     fn payloads_are_validated_per_command_kind() {
         let error = payload_for(CommandKind::AccountSnapshot, None).expect_err("missing data");
         assert!(error.contains("missing data"), "unexpected error: {error}");

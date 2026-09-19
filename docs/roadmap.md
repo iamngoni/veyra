@@ -104,6 +104,12 @@
       broker's minimum distance, or a console-editable ATR(14) noise floor
       (`minStopAtrFraction`, default 0.25) — proven live against IFC Markets
       for the whole menu (EURUSD/USDJPY/GBPUSD/XAUUSD).
+- [x] Trading-week awareness: `GET /market/sessions` reports the standard
+      week (Sunday 21:00 UTC open, Friday 21:00 UTC close, daily rollover
+      pause) plus the entry policy (blackout, Friday cutoff, Sunday reopen),
+      and the console Market panel shows the state, the next boundary, whether
+      entries are admitted, and which held instruments are exposed while the
+      market is closed.
 - [x] Durable runtime state (`runtime_state` in Postgres): judge usage,
       model-budget windows, drawdown baselines, stop-policy memory, and the
       live risk policy all survive service restarts and reboots; volatile by

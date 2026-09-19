@@ -21,6 +21,136 @@ pub const ROLLOVER_END_MINUTE: u32 = 22 * 60 + 15;
 pub const FRIDAY_CUTOFF_MINUTE: u32 = 19 * 60;
 /// Sunday entries resume at this minute (inclusive), minutes since midnight UTC.
 pub const SUNDAY_OPEN_MINUTE: u32 = 23 * 60;
+/// Minute the standard week opens on Sunday (and the daily rollover pause
+/// begins Monday through Thursday), minutes since midnight UTC.
+pub const MARKET_OPEN_MINUTE: u32 = 21 * 60;
+/// Minute the daily rollover pause ends, minutes since midnight UTC.
+pub const MARKET_RESUME_MINUTE: u32 = 22 * 60;
+/// Minute the standard week closes on Friday, minutes since midnight UTC.
+pub const MARKET_CLOSE_MINUTE: u32 = 21 * 60;
+
+/// Where the standard trading week stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketState {
+    /// The week is open and outside the daily rollover pause.
+    Open,
+    /// The daily rollover pause (21:00-22:00 UTC, Monday through Thursday).
+    Rollover,
+    /// The weekend: after Friday's close, before Sunday's open.
+    Closed,
+}
+
+impl MarketState {
+    /// Stable identifier for status output and the console.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Rollover => "rollover",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// The next scheduled change of the trading week.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// The week reopens (or the rollover pause ends).
+    Opens,
+    /// The week closes for the weekend.
+    Closes,
+    /// The daily rollover pause begins.
+    Pauses,
+    /// The daily rollover pause ends.
+    Resumes,
+}
+
+impl SessionEvent {
+    /// Stable identifier for status output and the console.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Opens => "opens",
+            Self::Closes => "closes",
+            Self::Pauses => "pauses",
+            Self::Resumes => "resumes",
+        }
+    }
+}
+
+/// The state of the standard FX/metals week at one instant, with the next
+/// scheduled change. Times are UTC; brokers can differ by an hour around
+/// daylight-saving switches and around holidays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketSession {
+    /// Current state.
+    pub state: MarketState,
+    /// What happens next.
+    pub next_event: SessionEvent,
+    /// When it happens (Unix seconds).
+    pub next_at: i64,
+}
+
+/// The standard trading week at `now`: opens Sunday 21:00 UTC, closes Friday
+/// 21:00 UTC, pauses daily 21:00-22:00 UTC Monday through Thursday.
+pub fn market_session(now: SystemTime) -> Option<MarketSession> {
+    let seconds = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let weekday = ((seconds / 86_400 + 4) % 7) as u8;
+    let minute = ((seconds % 86_400) / 60) as u32;
+    Some(market_session_at(weekday, minute, seconds))
+}
+
+fn market_session_at(weekday: u8, minute: u32, seconds: u64) -> MarketSession {
+    let day_start = (seconds - seconds % 86_400) as i64;
+    let at =
+        |day_offset: i64, minute: u32| day_start + day_offset * 86_400 + i64::from(minute) * 60;
+    let open = MarketSession {
+        state: MarketState::Open,
+        next_event: SessionEvent::Pauses,
+        next_at: at(1, MARKET_OPEN_MINUTE),
+    };
+    match weekday {
+        // Saturday: closed until Sunday's open.
+        6 => MarketSession {
+            state: MarketState::Closed,
+            next_event: SessionEvent::Opens,
+            next_at: at(1, MARKET_OPEN_MINUTE),
+        },
+        // Sunday: closed before 21:00, then the week opens.
+        0 if minute < MARKET_OPEN_MINUTE => MarketSession {
+            state: MarketState::Closed,
+            next_event: SessionEvent::Opens,
+            next_at: at(0, MARKET_OPEN_MINUTE),
+        },
+        0 => open,
+        // Monday through Thursday: open, with the daily pause in the middle,
+        // and Thursday night points at Friday's weekend close.
+        1..=4 if minute < MARKET_OPEN_MINUTE => MarketSession {
+            next_at: at(0, MARKET_OPEN_MINUTE),
+            ..open
+        },
+        1..=4 if minute < MARKET_RESUME_MINUTE => MarketSession {
+            state: MarketState::Rollover,
+            next_event: SessionEvent::Resumes,
+            next_at: at(0, MARKET_RESUME_MINUTE),
+        },
+        1..=4 if weekday == 4 => MarketSession {
+            state: MarketState::Open,
+            next_event: SessionEvent::Closes,
+            next_at: at(1, MARKET_CLOSE_MINUTE),
+        },
+        1..=4 => open,
+        // Friday: open until 21:00, then closed until Sunday's open.
+        _ if minute < MARKET_CLOSE_MINUTE => MarketSession {
+            state: MarketState::Open,
+            next_event: SessionEvent::Closes,
+            next_at: at(0, MARKET_CLOSE_MINUTE),
+        },
+        _ => MarketSession {
+            state: MarketState::Closed,
+            next_event: SessionEvent::Opens,
+            next_at: at(2, MARKET_OPEN_MINUTE),
+        },
+    }
+}
 
 /// Why the entry window is closed, if it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +241,104 @@ mod tests {
     /// Wednesday 2026-01-07 12:00 UTC.
     fn wednesday_noon() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_767_787_200)
+    }
+
+    /// A UTC timestamp from weekday (`0` = Sunday) and minute of day.
+    /// 2026-09-13 is a Sunday.
+    fn moment(weekday: u8, minute: u32) -> SystemTime {
+        let sunday = 1_789_257_600_u64;
+        UNIX_EPOCH
+            + Duration::from_secs(sunday + u64::from(weekday) * 86_400 + u64::from(minute) * 60)
+    }
+
+    #[test]
+    fn the_week_opens_and_closes_on_schedule() {
+        // Saturday: closed, next is Sunday's 21:00 open.
+        let session = market_session(moment(6, 10 * 60)).expect("session");
+        assert_eq!(session.state, MarketState::Closed);
+        assert_eq!(session.next_event, SessionEvent::Opens);
+        assert_eq!(session.next_at % 86_400, i64::from(MARKET_OPEN_MINUTE) * 60);
+
+        // Sunday before 21:00: closed, opens today.
+        let session = market_session(moment(0, 20 * 60)).expect("session");
+        assert_eq!(session.state, MarketState::Closed);
+        assert_eq!(session.next_at % 86_400, i64::from(MARKET_OPEN_MINUTE) * 60);
+
+        // Sunday after 21:00: open, next pause is Monday's rollover.
+        let session = market_session(moment(0, 22 * 60)).expect("session");
+        assert_eq!(session.state, MarketState::Open);
+        assert_eq!(session.next_event, SessionEvent::Pauses);
+
+        // Friday before 21:00: open, closes today.
+        let session = market_session(moment(5, 19 * 60)).expect("session");
+        assert_eq!(session.state, MarketState::Open);
+        assert_eq!(session.next_event, SessionEvent::Closes);
+        assert_eq!(
+            session.next_at % 86_400,
+            i64::from(MARKET_CLOSE_MINUTE) * 60
+        );
+
+        // Friday after 21:00: closed until Sunday.
+        let session = market_session(moment(5, 21 * 60 + 30)).expect("session");
+        assert_eq!(session.state, MarketState::Closed);
+        assert_eq!(session.next_event, SessionEvent::Opens);
+        assert_eq!(session.next_at % 86_400, i64::from(MARKET_OPEN_MINUTE) * 60);
+    }
+
+    #[test]
+    fn the_daily_rollover_pause_is_reported() {
+        // Wednesday before the pause: open, pauses at 21:00.
+        let session = market_session(moment(3, 20 * 60)).expect("session");
+        assert_eq!(session.state, MarketState::Open);
+        assert_eq!(session.next_event, SessionEvent::Pauses);
+        assert_eq!(session.next_at % 86_400, i64::from(MARKET_OPEN_MINUTE) * 60);
+
+        // Wednesday inside the pause: rollover, resumes at 22:00.
+        let session = market_session(moment(3, 21 * 60 + 10)).expect("session");
+        assert_eq!(session.state, MarketState::Rollover);
+        assert_eq!(session.next_event, SessionEvent::Resumes);
+        assert_eq!(
+            session.next_at % 86_400,
+            i64::from(MARKET_RESUME_MINUTE) * 60
+        );
+
+        // Wednesday after the pause: open again, next pause tomorrow.
+        let session = market_session(moment(3, 22 * 60 + 30)).expect("session");
+        assert_eq!(session.state, MarketState::Open);
+        assert_eq!(session.next_event, SessionEvent::Pauses);
+        assert!(session.next_at % 86_400 == i64::from(MARKET_OPEN_MINUTE) * 60);
+
+        // Thursday after the pause: the next change is Friday's close.
+        let session = market_session(moment(4, 23 * 60)).expect("session");
+        assert_eq!(session.state, MarketState::Open);
+        assert_eq!(session.next_event, SessionEvent::Closes);
+
+        assert_eq!(MarketState::Open.as_str(), "open");
+        assert_eq!(MarketState::Rollover.as_str(), "rollover");
+        assert_eq!(MarketState::Closed.as_str(), "closed");
+        assert_eq!(SessionEvent::Opens.as_str(), "opens");
+        assert_eq!(SessionEvent::Closes.as_str(), "closes");
+        assert_eq!(SessionEvent::Pauses.as_str(), "pauses");
+        assert_eq!(SessionEvent::Resumes.as_str(), "resumes");
+    }
+
+    #[test]
+    fn every_window_block_names_and_describes_itself() {
+        for block in [
+            WindowBlock::SessionClosed,
+            WindowBlock::RolloverBlackout,
+            WindowBlock::WeekendApproach,
+            WindowBlock::WeekendOpen,
+        ] {
+            assert!(!block.as_str().is_empty());
+            assert!(!block.detail().is_empty());
+        }
+        assert_eq!(WindowBlock::WeekendApproach.as_str(), "weekend_approach");
+        assert_eq!(
+            WindowBlock::WeekendApproach.detail(),
+            "the weekend entry cutoff has passed"
+        );
+        assert_eq!(WindowBlock::SessionClosed.as_str(), "session_closed");
     }
 
     #[test]

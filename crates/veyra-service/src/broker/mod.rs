@@ -468,10 +468,17 @@ mod tests {
     async fn a_non_ea_link_satisfies_the_generic_contract() {
         use crate::audit::{AuditRuntime, MemoryTrail};
 
+        use crate::trading::intent::{
+            OrderKind, Side, TradeIntent, TradeIntentDraft, Volume, parse_instrument,
+        };
+
         let link: Arc<dyn BrokerLink> = Arc::new(StubLink);
+        assert_eq!(link.provider(), BrokerProvider::Ea);
         assert!(!link.report().await.fresh);
         assert!(link.last_account().is_none());
+        assert!(link.last_account_age(SystemTime::now()).is_none());
         assert!(link.command(CommandId::new()).is_none());
+        assert!(link.recent_commands(5).is_empty());
         assert!(!link.has_pending(CommandKind::OpenOrder));
         link.attach_audit(Arc::new(AuditRuntime::new(
             Arc::new(MemoryTrail::default()),
@@ -481,6 +488,35 @@ mod tests {
                 .await,
             CommandState::Failed { .. }
         ));
+
+        // Every enqueue method answers with a fresh command id, so a venue
+        // without the EA transport still satisfies the whole contract.
+        let intent = TradeIntent::approve(TradeIntentDraft::new(
+            parse_instrument("EURUSD").expect("symbol"),
+            Side::Buy,
+            OrderKind::Market,
+            Volume::parse(0.01).expect("volume"),
+            None,
+            None,
+            None,
+        ));
+        let symbol = parse_instrument("EURUSD").expect("symbol");
+        let ids = [
+            link.enqueue_account_snapshot(),
+            link.enqueue_order_check(OrderRequest::from_intent(&intent)),
+            link.enqueue_open_order(OrderRequest::from_intent(&intent)),
+            link.enqueue_close_order(CloseOrderRequest::new(1, ORDER_MAGIC)),
+            link.enqueue_modify_order(ModifyOrderRequest::new(1, ORDER_MAGIC, Some(1.0), None)),
+            link.enqueue_rates(RatesRequest::new(&symbol, 240, 1).expect("rates")),
+            link.enqueue_symbol_spec(SymbolSpecRequest::new(&symbol)),
+            link.enqueue_order_history(OrderHistoryRequest::new(30, ORDER_MAGIC).expect("history")),
+        ];
+        for (index, id) in ids.iter().enumerate() {
+            assert!(
+                !ids[..index].contains(id),
+                "each queued command gets its own id"
+            );
+        }
     }
 
     #[test]

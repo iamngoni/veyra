@@ -55,6 +55,8 @@ pub struct AppState {
     logs: Option<Arc<LogBuffer>>,
     risk: RiskGate,
     runtime_state: RuntimeState,
+    /// Pinned instant for deterministic tests; production reads the clock.
+    fixed_now: Option<std::time::SystemTime>,
     stop_basis: Arc<StopBasis>,
     entry_watch: Arc<crate::trading::autopilot::EntryWatch>,
     judgements: Arc<crate::trading::autopilot::JudgementCache>,
@@ -84,6 +86,7 @@ impl AppState {
             logs: None,
             risk,
             runtime_state: RuntimeState::disabled(),
+            fixed_now: None,
             stop_basis: Arc::new(StopBasis::default()),
             entry_watch: Arc::new(crate::trading::autopilot::EntryWatch::default()),
             judgements: Arc::new(crate::trading::autopilot::JudgementCache::default()),
@@ -98,6 +101,18 @@ impl AppState {
     pub fn with_market(mut self, market: Option<MarketRuntime>) -> Self {
         self.market = market;
         self
+    }
+
+    /// Pins the wall clock so window-dependent behaviour is deterministic in
+    /// tests; production never calls this and reads the real clock.
+    pub fn with_fixed_now(mut self, now: Option<std::time::SystemTime>) -> Self {
+        self.fixed_now = now;
+        self
+    }
+
+    /// The current instant: the pinned test clock when set, else the wall clock.
+    pub fn now(&self) -> std::time::SystemTime {
+        self.fixed_now.unwrap_or_else(std::time::SystemTime::now)
     }
 
     /// Attaches the durable runtime-state facade.
