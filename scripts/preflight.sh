@@ -57,14 +57,14 @@ else
 fi
 
 if [ -d "/Applications/MetaTrader 4.app" ]; then
-  ok "MetaTrader 4.app installed"
+  ok "MetaTrader 4.app installed on the host"
 else
   bad "MetaTrader 4.app (install the terminal before migrating the EA)"
 fi
 if [ -d "$HOME/Library/Application Support/net.metaquotes.wine.MetaTrader4" ]; then
-  ok "MT4 Wine prefix present"
+  note "legacy MT4 Wine prefix present; native installations may use another data location"
 else
-  bad "MT4 Wine prefix (launch MT4 once, then attach the VeyraProbe EA)"
+  note "native MT4 data location must be verified in the terminal before attaching VeyraProbe"
 fi
 
 if command -v cloudflared >/dev/null 2>&1; then

@@ -3,8 +3,8 @@
 <plist version="1.0">
 <!--
   Starts the MetaTrader 4 terminal at login. Deliberately no KeepAlive: a
-  clean quit should stay quit, and Wine's exit codes are not trustworthy enough
-  for crash-restart. The EA re-attaches itself from the saved chart profile.
+  clean quit should stay quit. The EA re-attaches itself from the saved chart
+  profile.
 -->
 <dict>
     <key>Label</key>

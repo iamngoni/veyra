@@ -1,5 +1,9 @@
 # Deploying Veyra to an always-on machine
 
+For the final home Mac mini migration, follow the more complete
+[Mac mini deployment runbook](deployment-mac-mini.md). This document remains the
+general architecture reference.
+
 The stack currently runs on one Mac with launchd supervision (ADR 0005).
 This guide moves it to another always-on Mac with the same shape, and lists
 what to verify before arming live trading there. `scripts/preflight.sh`
@@ -9,7 +13,7 @@ checks every prerequisite it can read; run it on the target first.
 
 | Component | Role | Runtime |
 | --- | --- | --- |
-| MT4 terminal (`MetaTrader 4.app`, Wine) | holds the account and the `VeyraProbe` EA; the EA polls the tunnel | `cc.antonlabs.veyra.terminal` (starts at login) |
+| MT4 terminal (`MetaTrader 4.app`) | native host application holding the account and `VeyraProbe`; the EA polls the tunnel | `cc.antonlabs.veyra.terminal` (starts at login) |
 | Cloudflare tunnel (`cloudflared`) | `veyra.antonlabs.cc` → `127.0.0.1:7801` | `cc.antonlabs.veyra.tunnel` (KeepAlive) |
 | Veyra service (Rust) | EA channel on 7801, diagnostics on 8080, autopilot | `cc.antonlabs.veyra.service` (KeepAlive) |
 | PostgreSQL 17 | audit trail (required once `VEYRA_DATABASE_URL` is set) | Homebrew service |
@@ -26,8 +30,8 @@ channel. The console and diagnostics are never exposed publicly.
   would need the scripts ported to systemd/Windows services first.
 - Homebrew with `postgresql@17`, `cloudflared`, and Node.js >= 20.
 - Rust toolchain (`rustup`) to build the service.
-- `MetaTrader 4.app` installed and launched once (the Wine prefix lives at
-  `~/Library/Application Support/net.metaquotes.wine.MetaTrader4`).
+- `MetaTrader 4.app` installed on the host and launched once. The terminal
+  profile/data location is installation-specific; do not assume a Wine prefix.
 - Cloudflare account access for the `veyra` tunnel and the
   `veyra.antonlabs.cc` DNS record.
 - Network allowed to reach the broker (IFC Markets), OpenRouter, TypeSafe,
@@ -83,10 +87,11 @@ ingress:
   - service: http_status:404
 YAML
 
-# 6. Terminal: install MT4, launch it once, attach VeyraProbe to the chart,
-#    then compile the EA from this checkout (writes into the Wine prefix):
+# 6. Terminal: install MT4 on the host, launch it once, attach VeyraProbe to
+#    the chart, and install the compiled EA through MetaTrader's own data
+#    folder/MetaEditor. The legacy compile_ea.sh helper is Wine-specific.
 set -a && source .env && set +a
-./scripts/compile_ea.sh     # prints whether it compiled ARMED or disarmed
+# Use MetaEditor on the host for a native MT4 installation.
 
 # 7. Supervision
 ./scripts/preflight.sh      # everything it can check must pass
