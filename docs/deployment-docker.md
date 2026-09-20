@@ -114,6 +114,10 @@ the console, PostgreSQL, or `cloudflared`. The installer refuses to continue if
 any incompatible full-host Veyra agent is already loaded. Remove the two hybrid
 agents with `./scripts/install-docker-launchd.sh --uninstall`.
 
+The terminal LaunchAgent runs `scripts/watch-terminal.sh`: it checks the real
+Wine `terminal.exe` process every fifteen seconds and reopens MetaTrader 4 if
+the process exits. The launcher itself remains under launchd `KeepAlive`.
+
 ## Final tunnel cutover
 
 The local cloudflared directory must contain `veyra-config.yml` plus the named

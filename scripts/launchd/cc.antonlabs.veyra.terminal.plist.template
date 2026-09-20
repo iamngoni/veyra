@@ -1,21 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<!--
-  Starts the MetaTrader 4 terminal at login. Deliberately no KeepAlive: a
-  clean quit should stay quit. The EA re-attaches itself from the saved chart
-  profile.
--->
+<!-- Keeps the native MT4/Wine terminal running for unattended operation. -->
 <dict>
     <key>Label</key>
     <string>cc.antonlabs.veyra.terminal</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/open</string>
-        <string>-a</string>
-        <string>MetaTrader 4</string>
+        <string>__ROOT__/scripts/watch-terminal.sh</string>
     </array>
     <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
     <true/>
     <key>ThrottleInterval</key>
     <integer>30</integer>

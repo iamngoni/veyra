@@ -6,7 +6,9 @@ Accepted 2026-09-17; installed and proven (service and tunnel both restarted
 after `SIGKILL`, and the EA link reconnected automatically). Amended the same
 day: hourly log rotation, a daily verified audit backup, the operations
 console, and a two-minute alert probe joined the agent set (see the hosting
-section of `docs/architecture.md`).
+section of `docs/architecture.md`). Amended 2026-09-21 after an unattended MT4
+exit: the terminal agent now supervises the real Wine `terminal.exe` process
+and reopens the app when it disappears.
 
 ## Context
 
@@ -21,9 +23,10 @@ section of `docs/architecture.md`).
 
 - Seven LaunchAgents, rendered from portable templates in `scripts/launchd/`
   by `scripts/install-launchd.sh` (idempotent, removable with `--uninstall`):
-  - `cc.antonlabs.veyra.terminal` starts MT4 at login (`open -a`). No
-    KeepAlive: a clean quit should stay quit, and Wine exit codes are not
-    trustworthy enough for crash classification.
+  - `cc.antonlabs.veyra.terminal` runs `scripts/watch-terminal.sh` with
+    KeepAlive. The wrapper checks the real Wine `terminal.exe` process every
+    fifteen seconds and reopens MT4 when it disappears. This avoids relying on
+    the short-lived `open -a` process or Wine exit-code classification.
   - `cc.antonlabs.veyra.tunnel` runs the named Cloudflare tunnel with
     KeepAlive.
   - `cc.antonlabs.veyra.service` runs `scripts/run-service.sh`, which sources
@@ -54,5 +57,6 @@ section of `docs/architecture.md`).
 - Log rotation and local audit backups are supervised; monitoring and
   alerting, a durable host/VPS, managed secrets, and off-machine backups
   remain the deployment phase.
-- MT4 crash-restart and checkpointed reconciliation across service restarts are
-  deliberate later steps (persistence lands with the storage phase).
+- MT4 is restarted when its terminal process disappears. Link-level failures
+  where the process remains alive are still detected by the stale-link health
+  checks and alerts rather than force-restarting a possibly interactive app.
