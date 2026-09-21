@@ -303,6 +303,11 @@ pub trait BrokerLink: Send + Sync + fmt::Debug + 'static {
     /// Whether a command of `kind` is still awaiting acknowledgement.
     fn has_pending(&self, kind: CommandKind) -> bool;
 
+    /// Whether an open-order command has not yet been reflected by a newer
+    /// account snapshot. Entry admission fails closed while this is true so
+    /// concurrent callers cannot both act on the same pre-trade book.
+    fn has_unreconciled_open_order(&self) -> bool;
+
     /// Newest-first commands for the control surface, capped at `limit`.
     fn recent_commands(&self, limit: usize) -> Vec<ListedCommand>;
 
@@ -438,6 +443,10 @@ mod tests {
         }
 
         fn has_pending(&self, _kind: CommandKind) -> bool {
+            false
+        }
+
+        fn has_unreconciled_open_order(&self) -> bool {
             false
         }
 

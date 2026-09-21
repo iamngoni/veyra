@@ -230,6 +230,7 @@ struct EaCommand {
     kind: CommandKind,
     state: CommandState,
     issued_at: Instant,
+    completed_at: Option<Instant>,
     request: Option<CommandRequest>,
 }
 
@@ -255,6 +256,7 @@ enum CommandRequest {
 struct StoredAccount {
     payload: AccountSnapshotPayload,
     at: SystemTime,
+    observed_at: Instant,
 }
 
 /// Shared state of the EA control channel.
@@ -361,6 +363,7 @@ impl EaLink {
                 kind,
                 state: CommandState::Pending,
                 issued_at: Instant::now(),
+                completed_at: None,
                 request,
             });
             while queue.len() > COMMAND_HISTORY {
@@ -486,6 +489,7 @@ impl EaLink {
                         .clone()
                         .unwrap_or_else(|| "acknowledged failure".to_owned()),
                 };
+                command.completed_at = Some(Instant::now());
                 return None;
             }
             match payload_for(command.kind, ack.data.clone()) {
@@ -502,10 +506,12 @@ impl EaLink {
                         | CommandPayload::OrderHistory(_) => None,
                     };
                     command.state = CommandState::Completed { payload };
+                    command.completed_at = Some(Instant::now());
                     retained
                 }
                 Err(reason) => {
                     command.state = CommandState::Failed { reason };
+                    command.completed_at = Some(Instant::now());
                     None
                 }
             }
@@ -516,6 +522,7 @@ impl EaLink {
                 *slot = Some(StoredAccount {
                     payload: snapshot,
                     at: SystemTime::now(),
+                    observed_at: Instant::now(),
                 });
                 previous
             });
@@ -665,6 +672,7 @@ impl EaLink {
             *slot = Some(StoredAccount {
                 payload,
                 at: SystemTime::now(),
+                observed_at: Instant::now(),
             });
         });
     }
@@ -690,6 +698,31 @@ impl EaLink {
         self.with_commands(|queue| {
             queue.iter().any(|command| {
                 command.kind == kind && matches!(command.state, CommandState::Pending)
+            })
+        })
+    }
+
+    /// Returns true from the moment an open command is queued until a newer
+    /// account snapshot has observed the venue after its successful ack.
+    pub fn has_unreconciled_open_order(&self) -> bool {
+        let account_observed_at =
+            self.with_last_account(|slot| slot.as_ref().map(|stored| stored.observed_at));
+        self.with_commands(|queue| {
+            queue.iter().any(|command| {
+                if command.kind != CommandKind::OpenOrder {
+                    return false;
+                }
+                match &command.state {
+                    CommandState::Pending => true,
+                    CommandState::Completed {
+                        payload: CommandPayload::OpenOrder(result),
+                    } if result.executed => account_observed_at.is_none_or(|snapshot_at| {
+                        command
+                            .completed_at
+                            .is_some_and(|completed_at| completed_at > snapshot_at)
+                    }),
+                    CommandState::Completed { .. } | CommandState::Failed { .. } => false,
+                }
             })
         })
     }
@@ -792,6 +825,10 @@ impl BrokerLink for EaLink {
 
     fn has_pending(&self, kind: CommandKind) -> bool {
         EaLink::has_pending(self, kind)
+    }
+
+    fn has_unreconciled_open_order(&self) -> bool {
+        EaLink::has_unreconciled_open_order(self)
     }
 
     fn recent_commands(&self, limit: usize) -> Vec<ListedCommand> {
@@ -1950,6 +1987,96 @@ mod tests {
         assert_eq!(delivered_id, id);
         assert_eq!(kind, CommandKind::OpenOrder);
         assert_eq!(order, Some(CommandRequest::Order(request)));
+    }
+
+    #[test]
+    fn open_orders_remain_unreconciled_until_a_newer_account_snapshot() {
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        let baseline = link.enqueue(CommandKind::AccountSnapshot);
+        link.apply_ack(&EaAck {
+            id: baseline,
+            ok: true,
+            data: Some(serde_json::json!({
+                "balance": 20.57,
+                "equity": 20.57,
+                "freeMargin": 20.57,
+                "orders": 0,
+                "lots": 0.0,
+                "positions": [],
+                "positionsTruncated": false,
+                "serverTime": 1_758_000_000
+            })),
+            error: None,
+        });
+        assert!(!link.has_unreconciled_open_order());
+
+        let intent = TradeIntent::approve(TradeIntentDraft::new(
+            parse_instrument("EURUSD").expect("symbol"),
+            Side::Buy,
+            OrderKind::Market,
+            Volume::parse(0.01).expect("volume"),
+            None,
+            None,
+            None,
+        ));
+        let open = link.enqueue_order(OrderRequest::from_intent(&intent));
+        assert!(
+            link.has_unreconciled_open_order(),
+            "pending entry reserves the book"
+        );
+        link.apply_ack(&EaAck {
+            id: open,
+            ok: true,
+            data: Some(serde_json::json!({
+                "executed": true,
+                "retcode": 0,
+                "comment": "done",
+                "ticket": 123456,
+                "price": 1.095
+            })),
+            error: None,
+        });
+        assert!(
+            link.has_unreconciled_open_order(),
+            "an executed entry stays reserved until the venue book catches up"
+        );
+
+        let refreshed = link.enqueue(CommandKind::AccountSnapshot);
+        link.apply_ack(&EaAck {
+            id: refreshed,
+            ok: true,
+            data: Some(serde_json::json!({
+                "balance": 20.57,
+                "equity": 20.57,
+                "freeMargin": 15.57,
+                "orders": 1,
+                "lots": 0.01,
+                "positions": [],
+                "positionsTruncated": false,
+                "serverTime": 1_758_000_001
+            })),
+            error: None,
+        });
+        assert!(!link.has_unreconciled_open_order());
+
+        let dry_run = link.enqueue_order(OrderRequest::from_intent(&intent));
+        link.apply_ack(&EaAck {
+            id: dry_run,
+            ok: true,
+            data: Some(serde_json::json!({
+                "executed": false,
+                "retcode": 0,
+                "comment": "live orders disabled",
+                "ticket": 0,
+                "price": 0.0
+            })),
+            error: None,
+        });
+        assert!(!link.has_unreconciled_open_order());
     }
 
     #[test]

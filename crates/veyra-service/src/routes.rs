@@ -314,10 +314,16 @@ pub(crate) async fn account_facts_for_draft(
     state: &AppState,
     draft: &TradeIntentDraft,
 ) -> Option<AccountFacts> {
+    // Resolve the venue contract first, then take the account snapshot. A
+    // broker lookup can take seconds; reading the book last minimizes the
+    // window between dynamic risk facts and final order admission.
+    let spec = if let Some(market) = state.market() {
+        market.feed().symbol_spec(draft.symbol()).await.ok()
+    } else {
+        None
+    };
     let mut facts = account_facts(state).await?;
-    if let Some(market) = state.market()
-        && let Ok(spec) = market.feed().symbol_spec(draft.symbol()).await
-    {
+    if let Some(spec) = spec {
         facts.symbol_specs.push(spec);
     }
     Some(facts)

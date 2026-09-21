@@ -27,7 +27,7 @@ use crate::broker::{
     OrderHistoryRequest, OrderRequest,
 };
 use crate::market::{CandleRequest, Timeframe};
-use crate::risk::RiskDecision;
+use crate::risk::{RiskDecision, RiskRejection};
 use crate::state::StateKey;
 use crate::trading::{TradeIntent, TradeIntentDraft};
 
@@ -600,6 +600,9 @@ pub async fn execute_intent(
             }
             StagedExecution::ChannelUnavailable => HttpResponse::ServiceUnavailable()
                 .json(json!({ "error": "command_channel_unavailable" })),
+            StagedExecution::Rejected { rejection } => {
+                HttpResponse::Ok().json(RiskDecision::Rejected(rejection))
+            }
         },
     }
 }
@@ -618,6 +621,12 @@ pub enum StagedExecution {
     TradingDisabled,
     /// The active broker exposes no command channel.
     ChannelUnavailable,
+    /// Dynamic account facts changed after the original approval, so the
+    /// final broker-boundary gate refused the order.
+    Rejected {
+        /// Stable deterministic reason.
+        rejection: RiskRejection,
+    },
 }
 
 /// Queues one approved intent as a live order command.
@@ -633,6 +642,24 @@ pub async fn queue_staged_order(state: &AppState, intent: &TradeIntent) -> Stage
     if !state.config().trading_enabled() {
         return StagedExecution::TradingDisabled;
     }
+
+    // Approval can precede execution by an arbitrarily slow model/tool turn.
+    // Serialize this last check with enqueue, reject while a prior open has not
+    // reached a newer account snapshot, and rebuild facts from the latest book.
+    // The preview applies every deterministic rule without consuming the
+    // duplicate-intent memory a second time.
+    let _admission = state.order_admission().lock().await;
+    let account = if link.has_unreconciled_open_order() {
+        None
+    } else {
+        crate::routes::account_facts_for_draft(state, intent.draft()).await
+    };
+    if let RiskDecision::Rejected(rejection) =
+        state.risk().preview(intent.draft(), account, state.now())
+    {
+        return StagedExecution::Rejected { rejection };
+    }
+
     let command = link.enqueue_open_order(OrderRequest::from_intent(intent));
     audit(
         state,

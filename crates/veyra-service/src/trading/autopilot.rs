@@ -1262,6 +1262,22 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                                 .await;
                                 TickOutcome::Unavailable { reason }
                             }
+                            StagedExecution::Rejected { rejection } => {
+                                let code = rejection.code().as_str();
+                                let intent_id = intent.id().to_string();
+                                record_event_context(
+                                    state,
+                                    "rejected",
+                                    Some(&symbol),
+                                    Some(draft),
+                                    Some(code),
+                                    Some(&intent_id),
+                                    None,
+                                    context,
+                                )
+                                .await;
+                                TickOutcome::Rejected { code }
+                            }
                         }
                     }
                 }
@@ -3723,7 +3739,9 @@ mod tests {
 
     use super::*;
     use crate::audit::{AuditRuntime, MemoryTrail};
-    use crate::broker::{AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName};
+    use crate::broker::{
+        AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, OrderRequest, ServerName,
+    };
     use crate::broker::{AccountSnapshotPayload, CommandKind};
     use crate::calendar::{
         CalendarError, CalendarProvider, CalendarRuntime, EventCalendar, Impact,
@@ -3737,7 +3755,7 @@ mod tests {
         DecisionAnswer, DecisionEngine, DecisionRequest, ModelError, ModelProvider, ModelRuntime,
     };
     use crate::risk::{RiskGate, RiskPolicy};
-    use crate::trading::intent::Volume;
+    use crate::trading::intent::{Side, TradeIntent, Volume};
 
     /// Engine that records every request and returns one canned answer.
     #[derive(Debug)]
@@ -4724,6 +4742,55 @@ mod tests {
         let id = crate::broker::CommandId::parse(&command).expect("command id");
         let record = link.command(id).expect("record retained");
         assert_eq!(record.kind, CommandKind::OpenOrder);
+    }
+
+    #[actix_web::test]
+    async fn tick_refuses_an_entry_while_a_previous_open_is_unreconciled() {
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let link = harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link");
+        let competing = TradeIntent::approve(TradeIntentDraft::new(
+            Symbol::parse("USDJPY").expect("symbol"),
+            Side::Buy,
+            crate::trading::intent::OrderKind::Market,
+            Volume::parse(0.01).expect("volume"),
+            None,
+            None,
+            None,
+        ));
+        link.enqueue_order(OrderRequest::from_intent(&competing));
+
+        assert_eq!(
+            tick(&harness.state).await,
+            TickOutcome::Rejected {
+                code: "account_state_unavailable"
+            }
+        );
+        let rejection = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "rejected")
+            .expect("final admission rejection recorded");
+        assert_eq!(rejection.payload()["reason"], "account_state_unavailable");
+        assert_eq!(rejection.payload()["symbol"], "EURUSD");
     }
 
     #[actix_web::test]

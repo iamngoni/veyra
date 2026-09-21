@@ -66,6 +66,7 @@ pub struct AppState {
     decision_health: Arc<crate::trading::autopilot::DecisionHealth>,
     rotation: Arc<AtomicUsize>,
     equity_guard: Arc<EquityGuard>,
+    order_admission: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -98,6 +99,7 @@ impl AppState {
             decision_health: Arc::new(crate::trading::autopilot::DecisionHealth::default()),
             rotation: Arc::new(AtomicUsize::new(0)),
             equity_guard: Arc::new(EquityGuard::new()),
+            order_admission: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -258,5 +260,11 @@ impl AppState {
     /// Equity baseline tracker feeding the daily and peak drawdown breakers.
     pub fn equity_guard(&self) -> &Arc<EquityGuard> {
         &self.equity_guard
+    }
+
+    /// Serializes the final account revalidation and open-order enqueue so two
+    /// callers cannot both authorize against the same pre-trade snapshot.
+    pub fn order_admission(&self) -> &Arc<tokio::sync::Mutex<()>> {
+        &self.order_admission
     }
 }

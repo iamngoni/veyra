@@ -18,7 +18,9 @@ use veyra_service::broker::{
     BrokerRuntime, BrokerSettings, CommandKind, EaLink, ORDER_MAGIC, create_ea_app,
 };
 use veyra_service::config::{ConfigError, ServiceConfig};
-use veyra_service::risk::{RiskGate, RiskPolicy};
+use veyra_service::control::{StagedExecution, queue_staged_order};
+use veyra_service::risk::{AccountFacts, RiskDecision, RiskGate, RiskPolicy};
+use veyra_service::trading::TradeIntentDraft;
 
 const TOKEN: &str = "test-token-1234567890";
 
@@ -319,6 +321,96 @@ async fn rejected_drafts_never_reach_the_terminal() {
 }
 
 #[actix_web::test]
+async fn execution_revalidates_the_latest_book_after_an_earlier_approval() {
+    let (runtime, link) = broker();
+    prime(&link).await;
+    let state = AppState::new(config_with_trading(true), Some(runtime), None, gate())
+        .with_fixed_now(Some(test_now()));
+    let draft: TradeIntentDraft = serde_json::from_value(json!({
+        "symbol": "EURUSD",
+        "side": "buy",
+        "order_type": "market",
+        "volume": 0.01
+    }))
+    .expect("draft");
+    let initial = AccountFacts {
+        trade_allowed: true,
+        open_orders: 0,
+        open_lots: 0.0,
+        open_symbols: Vec::new(),
+        open_positions: Vec::new(),
+        prices: Vec::new(),
+        symbol_specs: Vec::new(),
+        equity: Some(20.57),
+        free_margin: Some(20.57),
+        day_drawdown_percent: Some(0.0),
+        peak_drawdown_percent: Some(0.0),
+    };
+    let RiskDecision::Approved(intent) = state.risk().evaluate(&draft, Some(initial), test_now())
+    else {
+        panic!("the original snapshot should approve the draft");
+    };
+
+    let unavailable = AppState::new(config_with_trading(true), None, None, gate())
+        .with_fixed_now(Some(test_now()));
+    assert_eq!(
+        queue_staged_order(&unavailable, &intent).await,
+        StagedExecution::ChannelUnavailable
+    );
+    let (disabled_runtime, _) = broker();
+    let disabled = AppState::new(
+        config_with_trading(false),
+        Some(disabled_runtime),
+        None,
+        gate(),
+    )
+    .with_fixed_now(Some(test_now()));
+    assert_eq!(
+        queue_staged_order(&disabled, &intent).await,
+        StagedExecution::TradingDisabled
+    );
+
+    // Simulate the slow-agent gap: another entry appears before the approved
+    // intent reaches execution. The final admission check must see this newer
+    // snapshot and refuse a second position on the symbol.
+    retain_position(&link, ORDER_MAGIC).await;
+    let result = queue_staged_order(&state, &intent).await;
+    let StagedExecution::Rejected { rejection } = result else {
+        panic!("the changed book must reject the stale approval: {result:?}");
+    };
+    assert_eq!(rejection.code().as_str(), "symbol_already_open");
+    assert!(!link.has_pending(CommandKind::OpenOrder));
+}
+
+#[actix_web::test]
+async fn execution_refuses_a_second_entry_until_the_first_is_reconciled() {
+    let (runtime, link) = broker();
+    prime(&link).await;
+    let state = AppState::new(config_with_trading(true), Some(runtime), None, gate())
+        .with_fixed_now(Some(test_now()));
+
+    let (status, first) = execute(
+        &state,
+        json!({"symbol": "EURUSD", "side": "buy", "order_type": "market", "volume": 0.01}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["decision"], "approved");
+    assert!(link.has_unreconciled_open_order());
+
+    // A different side avoids duplicate-intent suppression and proves the
+    // execution boundary itself reserves the account until a fresh snapshot.
+    let (status, second) = execute(
+        &state,
+        json!({"symbol": "EURUSD", "side": "sell", "order_type": "market", "volume": 0.01}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["decision"], "rejected");
+    assert_eq!(second["code"], "account_state_unavailable");
+}
+
+#[actix_web::test]
 async fn account_snapshot_requests_report_exposure() {
     let (runtime, link) = broker();
     prime(&link).await;
@@ -404,6 +496,14 @@ async fn control_routes_require_a_command_channel() {
         .with_fixed_now(Some(test_now()))
         .with_fixed_now(Some(test_now()));
     let (status, body) = check(
+        &state,
+        json!({"symbol": "EURUSD", "side": "buy", "order_type": "market", "volume": 0.01}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "command_channel_unavailable");
+
+    let (status, body) = execute(
         &state,
         json!({"symbol": "EURUSD", "side": "buy", "order_type": "market", "volume": 0.01}),
     )
