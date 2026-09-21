@@ -95,6 +95,12 @@
       behind the best price; the most protective candidate wins, stops never
       move backwards, and an entry-risk memory supplies the basis after a move
       (off by default; both enabled at 1R in the live environment).
+- [x] Profit harvesting: an opt-in deterministic policy observes spread-,
+      swap-, and commission-adjusted floating profit on the autopilot cadence,
+      persists a per-ticket high-water mark, ratchets a broker stop before TP,
+      and banks a still-positive configured giveback through the shared staged
+      close. A durable 15-minute cooldown plus a post-close market baseline
+      prevents the same H4 evidence from churning back into the symbol.
 - [x] Venue contract reporting: a read-only `symbol_spec` command returns the
       instrument's spread and stop level (points), lot band and step, margin
       per lot, swap rates, and trade permission; `GET /market/spec` exposes it

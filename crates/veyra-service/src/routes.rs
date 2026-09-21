@@ -147,6 +147,16 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
 
     let market_provider = state.market().map(|runtime| runtime.provider().as_str());
     let autopilot = state.autopilot().map(|settings| {
+        let profit_harvest = settings.profit_harvest().map(|policy| {
+            json!({
+                "arm_r": policy.arm_r(),
+                "trail_r": policy.trail_r(),
+                "min_profit": policy.min_profit(),
+                "giveback_fraction": policy.giveback_fraction(),
+                "min_hold_secs": policy.min_hold().as_secs(),
+                "reentry_cooldown_secs": policy.reentry_cooldown().as_secs()
+            })
+        });
         json!({
             "enabled": settings.enabled(),
             "interval_secs": settings.interval().as_secs(),
@@ -161,7 +171,8 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
                 .collect::<Vec<_>>(),
             "jev": settings.jev().as_str(),
             "breakeven_r": settings.breakeven_r(),
-            "trail_r": settings.trail_r()
+            "trail_r": settings.trail_r(),
+            "profit_harvest": profit_harvest
         })
     });
     let model_provider = state.model().map(|runtime| runtime.provider().as_str());

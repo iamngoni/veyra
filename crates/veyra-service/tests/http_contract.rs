@@ -149,6 +149,7 @@ async fn status_reports_autopilot_configuration() {
         "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
         "VEYRA_AUTOPILOT_SYMBOL" => Ok("EURUSD".to_owned()),
         "VEYRA_AUTOPILOT_TIER" => Ok("reasoning".to_owned()),
+        "VEYRA_AUTOPILOT_PROFIT_HARVEST" => Ok("true".to_owned()),
         _ => Err(ConfigError::MissingEnvironmentVariable { name }),
     })
     .expect("settings parse")
@@ -169,6 +170,17 @@ async fn status_reports_autopilot_configuration() {
     assert_eq!(body["autopilot"]["jev"], "auto");
     assert_eq!(body["autopilot"]["breakeven_r"], 0.0);
     assert_eq!(body["autopilot"]["trail_r"], 0.0);
+    assert_eq!(body["autopilot"]["profit_harvest"]["arm_r"], 0.2);
+    assert_eq!(body["autopilot"]["profit_harvest"]["trail_r"], 0.2);
+    assert_eq!(body["autopilot"]["profit_harvest"]["min_profit"], 0.5);
+    assert_eq!(
+        body["autopilot"]["profit_harvest"]["giveback_fraction"],
+        0.35
+    );
+    assert_eq!(
+        body["autopilot"]["profit_harvest"]["reentry_cooldown_secs"],
+        900
+    );
 }
 
 #[actix_web::test]

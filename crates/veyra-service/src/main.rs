@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::time::MissedTickBehavior;
 use veyra_service::audit::{AuditEvent, AuditKind, AuditRuntime, AuditTrail};
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
 use veyra_service::calendar::{CalendarRuntime, CalendarSettings};
@@ -185,17 +186,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Autonomous loop: decide on a cadence, obeying the same gate and staged
-    // execution as the control surface. The first tick runs one interval after
-    // startup so a restart never fires immediately.
+    // Autonomous loops: deterministic open-position management has its own
+    // cadence, so slow market/model work cannot delay profit protection. Both
+    // obey the same staged execution path and start one interval after startup.
     if let Some(settings) = state.autopilot().filter(|settings| settings.enabled()) {
         let period = settings.interval();
-        tracing::info!(?period, "autopilot loop enabled");
+        tracing::info!(?period, "autopilot decision and position loops enabled");
+        let position_state = state.clone();
+        actix_web::rt::spawn(async move {
+            let first = actix_web::rt::time::Instant::now() + period;
+            let mut cadence = actix_web::rt::time::interval_at(first, period);
+            cadence.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                cadence.tick().await;
+                match veyra_service::trading::autopilot::manage_open_positions(&position_state)
+                    .await
+                {
+                    TickOutcome::Skipped { reason } => {
+                        tracing::debug!(reason, "position-management tick skipped");
+                    }
+                    TickOutcome::Unchanged => {
+                        tracing::debug!("position-management tick found nothing changed");
+                    }
+                    outcome => tracing::info!(?outcome, "position-management tick"),
+                }
+            }
+        });
         let autopilot_state = state.clone();
         actix_web::rt::spawn(async move {
+            let first = actix_web::rt::time::Instant::now() + period;
+            let mut cadence = actix_web::rt::time::interval_at(first, period);
+            cadence.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
-                actix_web::rt::time::sleep(period).await;
-                match veyra_service::trading::autopilot::tick(&autopilot_state).await {
+                cadence.tick().await;
+                match veyra_service::trading::autopilot::decision_tick(&autopilot_state).await {
                     TickOutcome::Skipped { reason } => {
                         tracing::debug!(reason, "autopilot tick skipped");
                     }
@@ -257,6 +281,11 @@ async fn restore_runtime_state(state: &AppState, runtime: &RuntimeState) {
     {
         tracing::warn!(%error, "stored stop basis is unusable; re-learning");
     }
+    if let Some(value) = runtime.load(StateKey::ProfitHarvest).await
+        && let Err(error) = state.profit_harvest_book().restore_state(&value)
+    {
+        tracing::warn!(%error, "stored profit-harvest state is unusable; re-learning");
+    }
 }
 
 /// Snapshots durable counters and baselines; best-effort by design.
@@ -282,5 +311,11 @@ async fn persist_runtime_state(state: &AppState, runtime: &RuntimeState) {
         .await;
     runtime
         .save(StateKey::StopBasis, &state.stop_basis().state_snapshot())
+        .await;
+    runtime
+        .save(
+            StateKey::ProfitHarvest,
+            &state.profit_harvest_book().state_snapshot(),
+        )
         .await;
 }

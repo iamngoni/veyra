@@ -1,8 +1,8 @@
 //! Durable runtime state boundary.
 //!
 //! Counters and baselines that must survive restarts — judge usage, the model
-//! call budget, drawdown baselines, stop-policy memory, and the live risk
-//! policy — are stored as one JSON row per key. The service snapshots them on
+//! call budget, drawdown baselines, stop/profit-policy memory, and the live
+//! risk policy — are stored as one JSON row per key. The service snapshots them on
 //! a cadence (and the policy immediately on every accepted edit), then loads
 //! them before it starts serving, so a restart resumes rather than resets.
 //!
@@ -28,6 +28,8 @@ pub enum StateKey {
     EquityBaselines,
     /// Stop-policy entry-risk memory, keyed by ticket.
     StopBasis,
+    /// Profit high-water marks plus post-close symbol cooldowns.
+    ProfitHarvest,
     /// The effective risk policy as an apply-able snapshot patch.
     RiskPolicy,
 }
@@ -40,6 +42,7 @@ impl StateKey {
             Self::ModelBudget => "model_budget",
             Self::EquityBaselines => "equity_baselines",
             Self::StopBasis => "stop_basis",
+            Self::ProfitHarvest => "profit_harvest",
             Self::RiskPolicy => "risk_policy",
         }
     }

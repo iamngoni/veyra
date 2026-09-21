@@ -26,6 +26,9 @@
 //! expressed as multiples of the entry risk. The most protective candidate
 //! wins, stops only ever move in the favourable direction, and improvements
 //! smaller than a tenth of the entry risk are suppressed to bound churn.
+//! Optional profit harvesting adds a spread-and-cost-aware high-water mark:
+//! it ratchets the broker stop before TP, banks a still-positive retracement,
+//! and requires both a cooldown and fresh market movement before re-entry.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,7 +39,7 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::audit::{AuditEvent, AuditKind};
 use crate::broker::Symbol;
-use crate::broker::{ORDER_MAGIC, PositionPayload, SymbolSpecPayload};
+use crate::broker::{CommandKind, ORDER_MAGIC, PositionPayload, SymbolSpecPayload};
 use crate::calendar::{self, CalendarEvent};
 use crate::config::ConfigError;
 use crate::control::{
@@ -82,8 +85,64 @@ const MAX_LISTED_EVENTS: usize = 6;
 const DEFAULT_MIN_HOLD_SECS: u64 = 300;
 /// Default mid-candle trigger: a quarter of the instrument's own ATR.
 const DEFAULT_ENTRY_MOVE_ATR_FRACTION: f64 = 0.25;
+/// Earliest favourable move that arms profit harvesting, in entry-risk units.
+const DEFAULT_HARVEST_ARM_R: f64 = 0.2;
+/// Distance kept behind favourable price after harvesting arms.
+const DEFAULT_HARVEST_TRAIL_R: f64 = 0.2;
+/// Smallest spread-adjusted floating profit that can arm harvesting.
+const DEFAULT_HARVEST_MIN_PROFIT: f64 = 0.5;
+/// Fraction of the best floating profit surrendered before a direct close.
+const DEFAULT_HARVEST_GIVEBACK: f64 = 0.35;
+/// Minimum position age before profit harvesting may act.
+const DEFAULT_HARVEST_MIN_HOLD_SECS: u64 = 300;
+/// Quiet period after a position disappears before its symbol may re-enter.
+const DEFAULT_HARVEST_REENTRY_COOLDOWN_SECS: u64 = 900;
 /// Largest minimum-hold window the parser accepts.
 const MAX_MIN_HOLD_SECS: u64 = 86_400;
+
+/// Validated deterministic policy for banking profit before the original take
+/// profit while preventing immediate same-signal re-entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfitHarvestPolicy {
+    arm_r: f64,
+    trail_r: f64,
+    min_profit: f64,
+    giveback_fraction: f64,
+    min_hold: Duration,
+    reentry_cooldown: Duration,
+}
+
+impl ProfitHarvestPolicy {
+    /// Favourable move, in original entry-risk units, required to arm.
+    pub fn arm_r(&self) -> f64 {
+        self.arm_r
+    }
+
+    /// Entry-risk distance kept behind the best favourable price.
+    pub fn trail_r(&self) -> f64 {
+        self.trail_r
+    }
+
+    /// Minimum live net profit in account currency required to arm.
+    pub fn min_profit(&self) -> f64 {
+        self.min_profit
+    }
+
+    /// Fraction of the high-water profit whose surrender queues a close.
+    pub fn giveback_fraction(&self) -> f64 {
+        self.giveback_fraction
+    }
+
+    /// Minimum verified broker age before harvesting may act.
+    pub fn min_hold(&self) -> Duration {
+        self.min_hold
+    }
+
+    /// Minimum quiet period before the same symbol can be proposed again.
+    pub fn reentry_cooldown(&self) -> Duration {
+        self.reentry_cooldown
+    }
+}
 
 /// Whether the loop consults the configured judgement engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +186,7 @@ pub struct AutopilotSettings {
     breakeven_r: f64,
     trail_r: f64,
     entry_move_atr_fraction: f64,
+    profit_harvest: Option<ProfitHarvestPolicy>,
 }
 
 impl AutopilotSettings {
@@ -160,6 +220,14 @@ impl AutopilotSettings {
         let breakeven_raw = optional(&mut source, "VEYRA_AUTOPILOT_BREAKEVEN_R");
         let trail_raw = optional(&mut source, "VEYRA_AUTOPILOT_TRAIL_R");
         let entry_move_raw = optional(&mut source, "VEYRA_AUTOPILOT_ENTRY_MOVE_ATR");
+        let harvest_enabled_raw = optional(&mut source, "VEYRA_AUTOPILOT_PROFIT_HARVEST");
+        let harvest_arm_raw = optional(&mut source, "VEYRA_AUTOPILOT_HARVEST_ARM_R");
+        let harvest_trail_raw = optional(&mut source, "VEYRA_AUTOPILOT_HARVEST_TRAIL_R");
+        let harvest_min_profit_raw = optional(&mut source, "VEYRA_AUTOPILOT_HARVEST_MIN_PROFIT");
+        let harvest_giveback_raw = optional(&mut source, "VEYRA_AUTOPILOT_HARVEST_GIVEBACK");
+        let harvest_min_hold_raw = optional(&mut source, "VEYRA_AUTOPILOT_HARVEST_MIN_HOLD_SECS");
+        let harvest_reentry_raw =
+            optional(&mut source, "VEYRA_AUTOPILOT_HARVEST_REENTRY_COOLDOWN_SECS");
 
         if enabled_raw.is_empty()
             && symbol_raw.is_empty()
@@ -172,6 +240,14 @@ impl AutopilotSettings {
             && min_hold_raw.is_empty()
             && breakeven_raw.is_empty()
             && trail_raw.is_empty()
+            && entry_move_raw.is_empty()
+            && harvest_enabled_raw.is_empty()
+            && harvest_arm_raw.is_empty()
+            && harvest_trail_raw.is_empty()
+            && harvest_min_profit_raw.is_empty()
+            && harvest_giveback_raw.is_empty()
+            && harvest_min_hold_raw.is_empty()
+            && harvest_reentry_raw.is_empty()
         {
             return Ok(None);
         }
@@ -295,6 +371,129 @@ impl AutopilotSettings {
             "" => DEFAULT_ENTRY_MOVE_ATR_FRACTION,
             other => multiple("VEYRA_AUTOPILOT_ENTRY_MOVE_ATR", other)?,
         };
+        let harvest_values_present = [
+            &harvest_arm_raw,
+            &harvest_trail_raw,
+            &harvest_min_profit_raw,
+            &harvest_giveback_raw,
+            &harvest_min_hold_raw,
+            &harvest_reentry_raw,
+        ]
+        .iter()
+        .any(|value| !value.is_empty());
+        let harvest_enabled = match harvest_enabled_raw.as_str() {
+            "" | "false" if !harvest_values_present => false,
+            "true" => true,
+            "" | "false" => {
+                return Err(ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_AUTOPILOT_PROFIT_HARVEST",
+                    reason: "must be `true` when profit-harvest settings are present",
+                });
+            }
+            _ => {
+                return Err(ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_AUTOPILOT_PROFIT_HARVEST",
+                    reason: "must be `true` or `false`",
+                });
+            }
+        };
+        let profit_harvest = if harvest_enabled {
+            let positive = |name: &'static str,
+                            raw: &str,
+                            default: f64,
+                            maximum: f64|
+             -> Result<f64, ConfigError> {
+                let value = if raw.is_empty() {
+                    default
+                } else {
+                    raw.parse::<f64>()
+                        .map_err(|_| ConfigError::InvalidEnvironmentVariable {
+                            name,
+                            reason: "must be a finite positive number within the documented bound",
+                        })?
+                };
+                if !value.is_finite() || value <= 0.0 || value > maximum {
+                    return Err(ConfigError::InvalidEnvironmentVariable {
+                        name,
+                        reason: "must be a finite positive number within the documented bound",
+                    });
+                }
+                Ok(value)
+            };
+            let seconds =
+                |name: &'static str, raw: &str, default: u64| -> Result<Duration, ConfigError> {
+                    let value = if raw.is_empty() {
+                        default
+                    } else {
+                        raw.parse::<u64>()
+                            .map_err(|_| ConfigError::InvalidEnvironmentVariable {
+                                name,
+                                reason: "must be an integer number of seconds from 0 through 86400",
+                            })?
+                    };
+                    if value > MAX_MIN_HOLD_SECS {
+                        return Err(ConfigError::InvalidEnvironmentVariable {
+                            name,
+                            reason: "must be an integer number of seconds from 0 through 86400",
+                        });
+                    }
+                    Ok(Duration::from_secs(value))
+                };
+            let arm_r = positive(
+                "VEYRA_AUTOPILOT_HARVEST_ARM_R",
+                &harvest_arm_raw,
+                DEFAULT_HARVEST_ARM_R,
+                10.0,
+            )?;
+            let trail_r = positive(
+                "VEYRA_AUTOPILOT_HARVEST_TRAIL_R",
+                &harvest_trail_raw,
+                DEFAULT_HARVEST_TRAIL_R,
+                10.0,
+            )?;
+            if trail_r > arm_r {
+                return Err(ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_AUTOPILOT_HARVEST_TRAIL_R",
+                    reason: "must be less than or equal to VEYRA_AUTOPILOT_HARVEST_ARM_R",
+                });
+            }
+            let min_profit = positive(
+                "VEYRA_AUTOPILOT_HARVEST_MIN_PROFIT",
+                &harvest_min_profit_raw,
+                DEFAULT_HARVEST_MIN_PROFIT,
+                1_000_000.0,
+            )?;
+            let giveback_fraction = positive(
+                "VEYRA_AUTOPILOT_HARVEST_GIVEBACK",
+                &harvest_giveback_raw,
+                DEFAULT_HARVEST_GIVEBACK,
+                0.95,
+            )?;
+            if giveback_fraction < 0.05 {
+                return Err(ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_AUTOPILOT_HARVEST_GIVEBACK",
+                    reason: "must be a number from 0.05 through 0.95",
+                });
+            }
+            Some(ProfitHarvestPolicy {
+                arm_r,
+                trail_r,
+                min_profit,
+                giveback_fraction,
+                min_hold: seconds(
+                    "VEYRA_AUTOPILOT_HARVEST_MIN_HOLD_SECS",
+                    &harvest_min_hold_raw,
+                    DEFAULT_HARVEST_MIN_HOLD_SECS,
+                )?,
+                reentry_cooldown: seconds(
+                    "VEYRA_AUTOPILOT_HARVEST_REENTRY_COOLDOWN_SECS",
+                    &harvest_reentry_raw,
+                    DEFAULT_HARVEST_REENTRY_COOLDOWN_SECS,
+                )?,
+            })
+        } else {
+            None
+        };
 
         Ok(Some(Self {
             enabled,
@@ -308,6 +507,7 @@ impl AutopilotSettings {
             breakeven_r,
             trail_r,
             entry_move_atr_fraction,
+            profit_harvest,
         }))
     }
 
@@ -371,6 +571,11 @@ impl AutopilotSettings {
     pub fn trail_r(&self) -> f64 {
         self.trail_r
     }
+
+    /// Deterministic early-profit policy, when explicitly enabled.
+    pub fn profit_harvest(&self) -> Option<&ProfitHarvestPolicy> {
+        self.profit_harvest.as_ref()
+    }
 }
 
 fn optional(
@@ -431,6 +636,22 @@ pub enum TickOutcome {
 /// call degrades to an audited outcome or a skip.
 #[tracing::instrument(skip_all, name = "autopilot.tick", fields(symbols = tracing::field::Empty))]
 pub async fn tick(state: &AppState) -> TickOutcome {
+    tick_inner(state, true).await
+}
+
+/// Runs the model/market decision cycle while leaving deterministic position
+/// management to its independent cadence. Production uses this so slow market
+/// providers cannot delay profit protection on the already-open book.
+#[tracing::instrument(
+    skip_all,
+    name = "autopilot.decision",
+    fields(symbols = tracing::field::Empty)
+)]
+pub async fn decision_tick(state: &AppState) -> TickOutcome {
+    tick_inner(state, false).await
+}
+
+async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
     let Some(settings) = state.autopilot() else {
         return TickOutcome::Skipped {
             reason: "not_configured",
@@ -439,14 +660,6 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     if !settings.enabled() {
         return TickOutcome::Skipped { reason: "disabled" };
     }
-    let Some(model) = state.model() else {
-        return TickOutcome::Skipped { reason: "no_model" };
-    };
-    let Some(market) = state.market() else {
-        return TickOutcome::Skipped {
-            reason: "no_market",
-        };
-    };
     let Some(broker) = state.broker() else {
         return TickOutcome::Skipped {
             reason: "no_broker",
@@ -459,11 +672,31 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             reason: "stale_link",
         };
     }
+    if manage_positions
+        && let Some(outcome) = manage_open_positions_after_link(state, settings).await
+    {
+        return outcome;
+    }
+
+    let managed = managed_positions(state);
+    let snapshot = broker.link().last_account();
+    let server_time = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.server_time)
+        .unwrap_or(0);
+
+    let Some(model) = state.model() else {
+        return TickOutcome::Skipped { reason: "no_model" };
+    };
+    let Some(market) = state.market() else {
+        return TickOutcome::Skipped {
+            reason: "no_market",
+        };
+    };
     // Candidate menu: configured symbols first, then any symbol carrying an
     // open Veyra position (so every managed position stays managed), capped by
     // the settings parser. With nothing configured, the chart symbol is the
     // whole menu.
-    let managed = managed_positions(state);
     let mut candidates = candidate_symbols(settings.symbols(), &managed);
     if candidates.is_empty()
         && let Some(snapshot) = report.snapshot.as_ref()
@@ -573,24 +806,6 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         }
     }
 
-    // Capital preservation first: any managed position whose stop policy is
-    // due moves before reviews or entries, and a stop move ends the tick.
-    if state.config().trading_enabled()
-        && let Some(plan) = stop_plan(
-            &managed,
-            settings.breakeven_r(),
-            settings.trail_r(),
-            state.stop_basis(),
-        )
-    {
-        let symbol = managed
-            .iter()
-            .find(|position| position.ticket == plan.ticket)
-            .map(|position| position.symbol.clone())
-            .unwrap_or_default();
-        return move_stop(state, &symbol, plan).await;
-    }
-
     // One position review per tick, rotating through the open book; a close
     // ends the tick, a hold falls through so entries can still be considered.
     //
@@ -600,11 +815,6 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     // venue reports no verifiable age: that close is refused too. Stop moves
     // above are deliberately not gated — they guard money already at risk.
     let mut reviewed_hold = false;
-    let server_time = state
-        .broker()
-        .and_then(|broker| broker.link().last_account())
-        .map(|snapshot| snapshot.server_time)
-        .unwrap_or(0);
     state
         .review_watch()
         .retain(&managed.iter().map(|p| p.ticket).collect::<Vec<_>>());
@@ -755,7 +965,8 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     // indices, and any future CFD in the account currency the broker reports.
     let specs = symbol_specs(state, &markets).await;
     account.symbol_specs = specs.iter().map(|(_, spec)| spec.clone()).collect();
-    let entry_markets = eligible_entry_markets(&markets, &specs, &policy, state.now());
+    let mut entry_markets = eligible_entry_markets(&markets, &specs, &policy, state.now());
+    let eligible_before_cooldown = !entry_markets.is_empty();
     let observations: Vec<EntryObservation<'_>> = markets
         .iter()
         .map(|(symbol, series)| EntryObservation {
@@ -769,6 +980,27 @@ pub async fn tick(state: &AppState) -> TickOutcome {
             atr: average_true_range(series, ATR_PERIOD),
         })
         .collect();
+    if settings.profit_harvest().is_some() {
+        let pending = state.profit_harvest_book().pending_fresh_baselines();
+        if !pending.is_empty() {
+            let captured = state.entry_watch().record_symbols(&observations, &pending);
+            state.profit_harvest_book().mark_fresh_baselines(&captured);
+        }
+        let awaiting_fresh = state.profit_harvest_book().fresh_market_required();
+        let newly_fresh = state.entry_watch().changed_symbols(
+            &observations,
+            &awaiting_fresh,
+            settings.entry_move_atr_fraction(),
+        );
+        state.profit_harvest_book().mark_fresh_market(&newly_fresh);
+        let now = unix_secs(state.now());
+        entry_markets.retain(|(symbol, _)| {
+            !state.profit_harvest_book().cooling(symbol.as_str(), now)
+                && !state
+                    .profit_harvest_book()
+                    .requires_fresh_market(symbol.as_str())
+        });
+    }
     let entry_outcome = if account.open_orders >= policy.max_open_orders() {
         record(state, "no_trade", None, None, Some("open_order_cap")).await;
         TickOutcome::NoTrade
@@ -784,7 +1016,11 @@ pub async fn tick(state: &AppState) -> TickOutcome {
         // an identical question. Stops and reviews already ran above.
         TickOutcome::Unchanged
     } else if entry_markets.is_empty() {
-        let reason = empty_entry_reason(&markets, &policy, state.now());
+        let reason = if eligible_before_cooldown {
+            "reentry_cooldown"
+        } else {
+            empty_entry_reason(&markets, &policy, state.now())
+        };
         state.entry_watch().record(&observations);
         record(state, "no_trade", None, None, Some(reason)).await;
         TickOutcome::NoTrade
@@ -1041,6 +1277,129 @@ pub async fn tick(state: &AppState) -> TickOutcome {
     }
 }
 
+/// Runs only deterministic management of the open book. It has no market-data,
+/// judge, or model dependency and is scheduled separately in production so a
+/// slow decision sweep cannot delay a profitable close or protective stop.
+#[tracing::instrument(skip_all, name = "autopilot.positions")]
+pub async fn manage_open_positions(state: &AppState) -> TickOutcome {
+    let Some(settings) = state.autopilot() else {
+        return TickOutcome::Skipped {
+            reason: "not_configured",
+        };
+    };
+    if !settings.enabled() {
+        return TickOutcome::Skipped { reason: "disabled" };
+    }
+    let Some(broker) = state.broker() else {
+        return TickOutcome::Skipped {
+            reason: "no_broker",
+        };
+    };
+    if !broker.link().report().await.fresh {
+        return TickOutcome::Skipped {
+            reason: "stale_link",
+        };
+    }
+    manage_open_positions_after_link(state, settings)
+        .await
+        .unwrap_or(TickOutcome::Unchanged)
+}
+
+async fn manage_open_positions_after_link(
+    state: &AppState,
+    settings: &AutopilotSettings,
+) -> Option<TickOutcome> {
+    let broker = state.broker()?;
+    let managed = managed_positions(state);
+    let snapshot = broker.link().last_account();
+    let server_time = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.server_time)
+        .unwrap_or(0);
+    let max_snapshot_age = Duration::from_secs(
+        settings
+            .interval()
+            .as_secs()
+            .saturating_mul(2)
+            .max(MIN_INTERVAL_SECS),
+    );
+    let snapshot_is_complete_and_fresh = snapshot
+        .as_ref()
+        .is_some_and(|snapshot| !snapshot.positions_truncated)
+        && broker
+            .link()
+            .last_account_age(state.now())
+            .is_some_and(|age| age <= max_snapshot_age);
+    if !snapshot_is_complete_and_fresh {
+        return None;
+    }
+
+    // Profit harvesting only learns from a fresh, complete venue book: an old
+    // or truncated snapshot can never fabricate a close or a disappeared
+    // ticket. One staged close/modify at a time prevents command duplication.
+    state.stop_basis().observe(&managed);
+    let execution_pending = broker.link().has_pending(CommandKind::CloseOrder)
+        || broker.link().has_pending(CommandKind::ModifyOrder);
+    if let Some(policy) = settings.profit_harvest() {
+        state.profit_harvest_book().observe(
+            &managed,
+            unix_secs(state.now()),
+            policy.reentry_cooldown(),
+        );
+        if state.config().trading_enabled() && !execution_pending {
+            if let Some(plan) = harvest_close_plan(
+                &managed,
+                policy,
+                state.stop_basis(),
+                state.profit_harvest_book(),
+                server_time,
+                unix_secs(state.now()),
+            ) {
+                return Some(close_harvest(state, plan).await);
+            }
+            if let Some(plan) = harvest_stop_plan(
+                &managed,
+                policy,
+                state.stop_basis(),
+                state.profit_harvest_book(),
+                server_time,
+            ) {
+                let Some(symbol) = managed
+                    .iter()
+                    .find(|position| position.ticket == plan.ticket)
+                    .map(|position| position.symbol.as_str())
+                else {
+                    return Some(TickOutcome::Unavailable {
+                        reason: "profit-harvest stop lost its position context".to_owned(),
+                    });
+                };
+                return Some(move_stop(state, symbol, plan).await);
+            }
+        }
+    }
+    if state.config().trading_enabled()
+        && !execution_pending
+        && let Some(plan) = stop_plan(
+            &managed,
+            settings.breakeven_r(),
+            settings.trail_r(),
+            state.stop_basis(),
+        )
+    {
+        let Some(symbol) = managed
+            .iter()
+            .find(|position| position.ticket == plan.ticket)
+            .map(|position| position.symbol.as_str())
+        else {
+            return Some(TickOutcome::Unavailable {
+                reason: "stop policy lost its position context".to_owned(),
+            });
+        };
+        return Some(move_stop(state, symbol, plan).await);
+    }
+    None
+}
+
 /// Direction of a managed position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedSide {
@@ -1073,6 +1432,15 @@ struct ManagedPosition {
     opened_at: i64,
     current: f64,
     swap: f64,
+    commission: f64,
+    is_market: bool,
+}
+
+impl ManagedPosition {
+    /// Spread-adjusted live result including the venue costs reported so far.
+    fn net_profit(&self) -> f64 {
+        self.profit + self.swap + self.commission
+    }
 }
 
 /// Managed positions from the latest completed snapshot.
@@ -1117,6 +1485,11 @@ fn managed_from_payload(position: &PositionPayload) -> ManagedPosition {
         opened_at: position.opened_at,
         current: position.current,
         swap: position.swap,
+        commission: position.commission,
+        is_market: matches!(
+            position.kind,
+            crate::broker::PositionKind::Buy | crate::broker::PositionKind::Sell
+        ),
     }
 }
 
@@ -1454,6 +1827,8 @@ enum StopMoveKind {
     BreakEven,
     /// The stop trailed behind the best favourable price.
     Trail,
+    /// The early-profit policy ratcheted the stop before the original target.
+    ProfitHarvest,
 }
 
 impl StopMoveKind {
@@ -1461,6 +1836,7 @@ impl StopMoveKind {
         match self {
             Self::BreakEven => "break_even",
             Self::Trail => "trailing_stop",
+            Self::ProfitHarvest => "profit_harvest_stop",
         }
     }
 }
@@ -1471,6 +1847,15 @@ struct StopMove {
     ticket: i64,
     stop: f64,
     kind: StopMoveKind,
+}
+
+/// A profitable position whose high-water retracement should be banked now.
+#[derive(Debug, Clone, PartialEq)]
+struct HarvestClosePlan {
+    ticket: i64,
+    symbol: String,
+    high_net_profit: f64,
+    net_profit: f64,
 }
 
 /// Smallest improvement worth another modify round trip, as a fraction of the
@@ -1489,6 +1874,261 @@ const STOP_MIN_STEP_RATIO: f64 = 0.1;
 #[derive(Debug, Default)]
 pub struct StopBasis {
     risks: std::sync::Mutex<std::collections::HashMap<i64, f64>>,
+}
+
+/// Durable floating-profit memory and re-entry guard for the harvest policy.
+#[derive(Debug, Default)]
+pub struct ProfitHarvestBook {
+    state: std::sync::Mutex<ProfitHarvestState>,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfitHarvestState {
+    positions: std::collections::HashMap<i64, ProfitHighWater>,
+    cooldowns: std::collections::HashMap<String, i64>,
+    #[serde(default)]
+    pending_fresh_baselines: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    fresh_market_required: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    close_guards: std::collections::HashMap<i64, i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfitHighWater {
+    symbol: String,
+    high_net_profit: f64,
+    #[serde(default)]
+    armed: bool,
+}
+
+impl ProfitHarvestBook {
+    /// Observes the complete managed book, advances profit high-water marks,
+    /// and starts a symbol cooldown when a previously observed ticket closes.
+    fn observe(&self, positions: &[ManagedPosition], now: i64, cooldown: Duration) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let live: std::collections::HashSet<i64> =
+            positions.iter().map(|position| position.ticket).collect();
+        let closed: Vec<ProfitHighWater> = state
+            .positions
+            .iter()
+            .filter(|(ticket, _)| !live.contains(ticket))
+            .map(|(_, seen)| seen.clone())
+            .collect();
+        state.positions.retain(|ticket, _| live.contains(ticket));
+        state
+            .close_guards
+            .retain(|ticket, until| live.contains(ticket) && *until > now);
+        for seen in closed {
+            let cooldown_secs = cooldown.as_secs().min(i64::MAX as u64) as i64;
+            let until = now.saturating_add(cooldown_secs);
+            state
+                .cooldowns
+                .entry(seen.symbol.clone())
+                .and_modify(|current| *current = (*current).max(until))
+                .or_insert(until);
+            state.pending_fresh_baselines.insert(seen.symbol.clone());
+            state.fresh_market_required.insert(seen.symbol);
+        }
+        state.cooldowns.retain(|_, until| *until > now);
+        for position in positions.iter().filter(|position| position.is_market) {
+            let net = position.net_profit().max(0.0);
+            state
+                .positions
+                .entry(position.ticket)
+                .and_modify(|seen| {
+                    seen.high_net_profit = seen.high_net_profit.max(net);
+                    seen.symbol.clone_from(&position.symbol);
+                })
+                .or_insert_with(|| ProfitHighWater {
+                    symbol: position.symbol.clone(),
+                    high_net_profit: net,
+                    armed: false,
+                });
+        }
+    }
+
+    /// Highest spread-and-cost-adjusted floating result observed for a ticket.
+    fn high_net_profit(&self, ticket: i64) -> Option<f64> {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state
+            .positions
+            .get(&ticket)
+            .map(|seen| seen.high_net_profit)
+    }
+
+    fn is_armed(&self, ticket: i64) -> bool {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.positions.get(&ticket).is_some_and(|seen| seen.armed)
+    }
+
+    fn mark_armed(&self, ticket: i64) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(seen) = state.positions.get_mut(&ticket) {
+            seen.armed = true;
+        }
+    }
+
+    fn close_guarded(&self, ticket: i64, now: i64) -> bool {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state
+            .close_guards
+            .get(&ticket)
+            .is_some_and(|until| *until > now)
+    }
+
+    fn guard_close(&self, ticket: i64, now: i64) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.close_guards.insert(ticket, now.saturating_add(120));
+    }
+
+    /// Whether a recently closed symbol is still inside its quiet period.
+    fn cooling(&self, symbol: &str, now: i64) -> bool {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state
+            .cooldowns
+            .get(symbol)
+            .is_some_and(|until| *until > now)
+    }
+
+    /// Symbols whose entry baseline must be reset at the first post-close
+    /// market observation, so the next entry needs genuinely fresh movement.
+    fn pending_fresh_baselines(&self) -> Vec<String> {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.pending_fresh_baselines.iter().cloned().collect()
+    }
+
+    /// Marks post-close baselines as captured for the supplied symbols.
+    fn mark_fresh_baselines(&self, symbols: &[String]) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for symbol in symbols {
+            state.pending_fresh_baselines.remove(symbol);
+        }
+    }
+
+    /// Symbols that remain ineligible until their own market changes from the
+    /// post-close baseline. This is independent of movement in other symbols.
+    fn fresh_market_required(&self) -> Vec<String> {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.fresh_market_required.iter().cloned().collect()
+    }
+
+    fn requires_fresh_market(&self, symbol: &str) -> bool {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.fresh_market_required.contains(symbol)
+    }
+
+    /// Releases only symbols whose own candle or ATR-scaled price move is new.
+    fn mark_fresh_market(&self, symbols: &[String]) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for symbol in symbols {
+            state.fresh_market_required.remove(symbol);
+        }
+    }
+
+    /// Serializable snapshot of high-water marks and cooldowns.
+    pub fn state_snapshot(&self) -> Value {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match serde_json::to_value(&*state) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, "profit-harvest state serialization failed");
+                json!({})
+            }
+        }
+    }
+
+    /// Restores validated high-water and cooldown state.
+    ///
+    /// # Errors
+    /// Returns a description when stored state is malformed or unsafe.
+    pub fn restore_state(&self, value: &Value) -> Result<(), String> {
+        let restored: ProfitHarvestState = serde_json::from_value(value.clone())
+            .map_err(|error| format!("profit-harvest state is unreadable: {error}"))?;
+        for (ticket, seen) in &restored.positions {
+            if *ticket <= 0 {
+                return Err("profit-harvest ticket must be positive".to_owned());
+            }
+            Symbol::parse(&seen.symbol)
+                .map_err(|error| format!("profit-harvest symbol is invalid: {error}"))?;
+            if !seen.high_net_profit.is_finite() || seen.high_net_profit < 0.0 {
+                return Err(format!(
+                    "profit-harvest high-water mark for ticket {ticket} is unusable"
+                ));
+            }
+        }
+        for (symbol, until) in &restored.cooldowns {
+            Symbol::parse(symbol)
+                .map_err(|error| format!("profit-harvest cooldown symbol is invalid: {error}"))?;
+            if *until < 0 {
+                return Err(format!(
+                    "profit-harvest cooldown for {symbol} must be non-negative"
+                ));
+            }
+        }
+        for symbol in &restored.pending_fresh_baselines {
+            Symbol::parse(symbol).map_err(|error| {
+                format!("profit-harvest pending-baseline symbol is invalid: {error}")
+            })?;
+        }
+        for symbol in &restored.fresh_market_required {
+            Symbol::parse(symbol).map_err(|error| {
+                format!("profit-harvest fresh-market symbol is invalid: {error}")
+            })?;
+        }
+        for (ticket, until) in &restored.close_guards {
+            if *ticket <= 0 || *until < 0 {
+                return Err("profit-harvest close guard is unusable".to_owned());
+            }
+        }
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *state = restored;
+        Ok(())
+    }
 }
 
 /// One instrument's market as the entry sweep last saw it.
@@ -1724,6 +2364,61 @@ impl EntryWatch {
         }
     }
 
+    /// Resets selected instruments to a post-close market baseline. A later
+    /// proposal therefore needs a new candle or a fresh ATR-scaled move from
+    /// the exit area rather than movement accumulated during the old trade.
+    fn record_symbols(
+        &self,
+        observations: &[EntryObservation<'_>],
+        symbols: &[String],
+    ) -> Vec<String> {
+        let selected: Vec<EntryObservation<'_>> = observations
+            .iter()
+            .copied()
+            .filter(|observation| symbols.iter().any(|symbol| symbol == observation.symbol))
+            .collect();
+        self.record(&selected);
+        selected
+            .iter()
+            .map(|observation| observation.symbol.to_owned())
+            .collect()
+    }
+
+    /// Returns guarded symbols whose own market changed from the post-close
+    /// baseline. Unlike the global sweep gate, movement elsewhere cannot make
+    /// a recently closed symbol eligible.
+    fn changed_symbols(
+        &self,
+        observations: &[EntryObservation<'_>],
+        symbols: &[String],
+        fraction: f64,
+    ) -> Vec<String> {
+        let Ok(seen) = self.seen.lock() else {
+            // This gate is anti-churn. A poisoned lock therefore fails closed
+            // for re-entry even though the ordinary entry sweep fails open.
+            return Vec::new();
+        };
+        observations
+            .iter()
+            .filter(|observation| symbols.iter().any(|symbol| symbol == observation.symbol))
+            .filter(|observation| {
+                let Some(previous) = seen.get(observation.symbol) else {
+                    return false;
+                };
+                if observation.candle_time > previous.candle_time {
+                    return true;
+                }
+                let (Some(now), Some(before), Some(atr)) =
+                    (observation.price, previous.price, observation.atr)
+                else {
+                    return false;
+                };
+                fraction > 0.0 && atr > 0.0 && (now - before).abs() >= atr * fraction
+            })
+            .map(|observation| observation.symbol.to_owned())
+            .collect()
+    }
+
     /// Notes that this sweep died before reaching a verdict, arming a retry.
     pub fn mark_failed(&self, now: i64) {
         if let Ok(mut failed_at) = self.failed_at.lock() {
@@ -1810,6 +2505,117 @@ impl StopBasis {
         };
         risks.get(&ticket).copied()
     }
+}
+
+fn harvest_is_armed(
+    position: &ManagedPosition,
+    policy: &ProfitHarvestPolicy,
+    basis: &StopBasis,
+    book: &ProfitHarvestBook,
+    server_time: i64,
+) -> Option<(f64, f64)> {
+    if !position.is_market
+        || position.current <= 0.0
+        || position.entry <= 0.0
+        || position_age_secs(server_time, position.opened_at)? < policy.min_hold().as_secs()
+    {
+        return None;
+    }
+    let risk = basis.risk(position.ticket)?;
+    if risk <= 0.0 {
+        return None;
+    }
+    let favourable = match position.side {
+        ManagedSide::Buy => position.current - position.entry,
+        ManagedSide::Sell => position.entry - position.current,
+    };
+    let high = book.high_net_profit(position.ticket)?;
+    if book.is_armed(position.ticket) {
+        return Some((risk, high));
+    }
+    if favourable >= policy.arm_r() * risk && high >= policy.min_profit() {
+        book.mark_armed(position.ticket);
+        return Some((risk, high));
+    }
+    None
+}
+
+/// Plans a direct profitable close once an armed position gives back the
+/// configured fraction of its observed high-water result.
+fn harvest_close_plan(
+    positions: &[ManagedPosition],
+    policy: &ProfitHarvestPolicy,
+    basis: &StopBasis,
+    book: &ProfitHarvestBook,
+    server_time: i64,
+    now: i64,
+) -> Option<HarvestClosePlan> {
+    for position in positions {
+        if book.close_guarded(position.ticket, now) {
+            continue;
+        }
+        let Some((_, high)) = harvest_is_armed(position, policy, basis, book, server_time) else {
+            continue;
+        };
+        let net = position.net_profit();
+        if net <= 0.0 || high <= 0.0 || net >= high {
+            continue;
+        }
+        let giveback = (high - net) / high;
+        if giveback >= policy.giveback_fraction() {
+            return Some(HarvestClosePlan {
+                ticket: position.ticket,
+                symbol: position.symbol.clone(),
+                high_net_profit: high,
+                net_profit: net,
+            });
+        }
+    }
+    None
+}
+
+/// Plans a broker-side profit ratchet as soon as harvesting arms. The stop is
+/// computed from live close price and original risk, then the shared modify
+/// path and terminal still enforce venue stop-distance rules.
+fn harvest_stop_plan(
+    positions: &[ManagedPosition],
+    policy: &ProfitHarvestPolicy,
+    basis: &StopBasis,
+    book: &ProfitHarvestBook,
+    server_time: i64,
+) -> Option<StopMove> {
+    for position in positions {
+        let Some((risk, _)) = harvest_is_armed(position, policy, basis, book, server_time) else {
+            continue;
+        };
+        if position.stop_loss <= 0.0 {
+            continue;
+        }
+        let candidate = match position.side {
+            ManagedSide::Buy => position.current - policy.trail_r() * risk,
+            ManagedSide::Sell => position.current + policy.trail_r() * risk,
+        };
+        let locks_non_negative = match position.side {
+            ManagedSide::Buy => candidate >= position.entry,
+            ManagedSide::Sell => candidate <= position.entry,
+        };
+        if !locks_non_negative {
+            continue;
+        }
+        let min_step = risk * STOP_MIN_STEP_RATIO;
+        let improves = match position.side {
+            ManagedSide::Buy => candidate >= position.stop_loss + min_step,
+            ManagedSide::Sell => candidate <= position.stop_loss - min_step,
+        };
+        if improves {
+            return Some(StopMove {
+                ticket: position.ticket,
+                stop: candidate,
+                kind: StopMoveKind::ProfitHarvest,
+            });
+        }
+    }
+    None
 }
 
 /// Plans the most protective stop change for the first eligible position.
@@ -2207,6 +3013,35 @@ async fn move_stop(state: &AppState, symbol: &str, plan: StopMove) -> TickOutcom
     }
 }
 
+/// Banks one armed high-water retracement through the same ownership-checked
+/// staged close path used by the operator and AI reviewer.
+async fn close_harvest(state: &AppState, plan: HarvestClosePlan) -> TickOutcome {
+    match queue_staged_close(state, plan.ticket).await {
+        StagedClose::Queued { command, ticket: _ } => {
+            state
+                .profit_harvest_book()
+                .guard_close(plan.ticket, unix_secs(state.now()));
+            let command_id = command.to_string();
+            record_harvest_event(
+                state,
+                "profit_harvest_close",
+                &plan,
+                None,
+                Some(&command_id),
+            )
+            .await;
+            TickOutcome::CloseQueued {
+                command: command_id,
+            }
+        }
+        failed => {
+            let (label, reason, outcome) = close_refusal(&failed);
+            record_harvest_event(state, label, &plan, Some(&reason), None).await;
+            outcome
+        }
+    }
+}
+
 /// Instructions for the hold-or-close review.
 ///
 /// Inside the pre-close window the same review carries the weekend question:
@@ -2303,6 +3138,8 @@ fn review_input(
                 "entry": position.entry,
                 "profit": position.profit,
                 "swap": position.swap,
+                "commission": position.commission,
+                "net_profit": position.net_profit(),
                 "stop_loss": position.stop_loss,
                 "take_profit": position.take_profit,
                 "age_secs": position_age_secs(server_time, position.opened_at)
@@ -2401,6 +3238,36 @@ async fn record_symbol_event(
         DecisionContext::default(),
     )
     .await;
+}
+
+/// Records the money high-water context for an automatic profitable close.
+async fn record_harvest_event(
+    state: &AppState,
+    outcome: &'static str,
+    plan: &HarvestClosePlan,
+    reason: Option<&str>,
+    command_id: Option<&str>,
+) {
+    let Some(audit) = state.audit() else {
+        return;
+    };
+    let mut payload = json!({
+        "outcome": outcome,
+        "origin": "profit_harvest",
+        "symbol": plan.symbol,
+        "ticket": plan.ticket,
+        "high_net_profit": plan.high_net_profit,
+        "net_profit": plan.net_profit
+    });
+    if let Some(reason) = reason {
+        payload["reason"] = json!(reason);
+    }
+    if let Some(command_id) = command_id {
+        payload["command_id"] = json!(command_id);
+    }
+    audit
+        .try_record(AuditEvent::new(AuditKind::ProposalEvaluated, payload))
+        .await;
 }
 
 /// Records one position decision with model context.
@@ -3320,6 +4187,7 @@ mod tests {
         assert_eq!(defaults.min_hold(), Duration::from_secs(300));
         assert_eq!(defaults.breakeven_r(), 0.0, "break-even is opt-in");
         assert_eq!(defaults.trail_r(), 0.0, "trailing is opt-in");
+        assert!(defaults.profit_harvest().is_none(), "harvesting is opt-in");
         assert!(defaults.symbols().is_empty());
 
         let custom = settings_from(|name| match name {
@@ -3333,6 +4201,13 @@ mod tests {
             "VEYRA_AUTOPILOT_MIN_HOLD_SECS" => Ok("0".to_owned()),
             "VEYRA_AUTOPILOT_BREAKEVEN_R" => Ok("1.5".to_owned()),
             "VEYRA_AUTOPILOT_TRAIL_R" => Ok("2".to_owned()),
+            "VEYRA_AUTOPILOT_PROFIT_HARVEST" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_HARVEST_ARM_R" => Ok("0.4".to_owned()),
+            "VEYRA_AUTOPILOT_HARVEST_TRAIL_R" => Ok("0.25".to_owned()),
+            "VEYRA_AUTOPILOT_HARVEST_MIN_PROFIT" => Ok("0.75".to_owned()),
+            "VEYRA_AUTOPILOT_HARVEST_GIVEBACK" => Ok("0.3".to_owned()),
+            "VEYRA_AUTOPILOT_HARVEST_MIN_HOLD_SECS" => Ok("120".to_owned()),
+            "VEYRA_AUTOPILOT_HARVEST_REENTRY_COOLDOWN_SECS" => Ok("600".to_owned()),
             _ => Err(ConfigError::MissingEnvironmentVariable { name }),
         });
         assert!(custom.enabled());
@@ -3345,6 +4220,13 @@ mod tests {
         assert_eq!(custom.tier(), ModelTier::Reasoning);
         assert_eq!(custom.interval(), Duration::from_secs(60));
         assert_eq!(custom.jev(), JevPreference::Off);
+        let harvest = custom.profit_harvest().expect("harvest enabled");
+        assert_eq!(harvest.arm_r(), 0.4);
+        assert_eq!(harvest.trail_r(), 0.25);
+        assert_eq!(harvest.min_profit(), 0.75);
+        assert_eq!(harvest.giveback_fraction(), 0.3);
+        assert_eq!(harvest.min_hold(), Duration::from_secs(120));
+        assert_eq!(harvest.reentry_cooldown(), Duration::from_secs(600));
         let multi = settings_from(|name| match name {
             "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
             "VEYRA_AUTOPILOT_SYMBOLS" => Ok(" eurusd, GBPUSD ,eurusd, XAUUSD ".to_owned()),
@@ -3403,9 +4285,17 @@ mod tests {
             ("VEYRA_AUTOPILOT_BREAKEVEN_R", "soon"),
             ("VEYRA_AUTOPILOT_TRAIL_R", "11"),
             ("VEYRA_AUTOPILOT_TRAIL_R", "trail"),
+            ("VEYRA_AUTOPILOT_PROFIT_HARVEST", "perhaps"),
+            ("VEYRA_AUTOPILOT_HARVEST_ARM_R", "0"),
+            ("VEYRA_AUTOPILOT_HARVEST_TRAIL_R", "-0.1"),
+            ("VEYRA_AUTOPILOT_HARVEST_MIN_PROFIT", "none"),
+            ("VEYRA_AUTOPILOT_HARVEST_GIVEBACK", "0.01"),
+            ("VEYRA_AUTOPILOT_HARVEST_MIN_HOLD_SECS", "86401"),
+            ("VEYRA_AUTOPILOT_HARVEST_REENTRY_COOLDOWN_SECS", "never"),
         ] {
             let error = AutopilotSettings::from_source(|requested| match requested {
                 _ if requested == name => Ok(value.to_owned()),
+                "VEYRA_AUTOPILOT_PROFIT_HARVEST" => Ok("true".to_owned()),
                 _ => Err(ConfigError::MissingEnvironmentVariable { name: requested }),
             })
             .expect_err("malformed values must fail startup");
@@ -3417,6 +4307,34 @@ mod tests {
                 "unexpected error for {name}={value}: {error:?}"
             );
         }
+
+        let contradictory = AutopilotSettings::from_source(|name| match name {
+            "VEYRA_AUTOPILOT_PROFIT_HARVEST" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_HARVEST_ARM_R" => Ok("0.2".to_owned()),
+            "VEYRA_AUTOPILOT_HARVEST_TRAIL_R" => Ok("0.3".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        })
+        .expect_err("the trail cannot sit beyond the arming move");
+        assert!(matches!(
+            contradictory,
+            ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_AUTOPILOT_HARVEST_TRAIL_R",
+                ..
+            }
+        ));
+
+        let not_enabled = AutopilotSettings::from_source(|name| match name {
+            "VEYRA_AUTOPILOT_HARVEST_MIN_PROFIT" => Ok("0.5".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        })
+        .expect_err("harvest values require the explicit switch");
+        assert!(matches!(
+            not_enabled,
+            ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_AUTOPILOT_PROFIT_HARVEST",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -4541,6 +5459,50 @@ mod tests {
         assert!(!watch.should_evaluate(&[unpriced], 0.25, GATE_NOW));
     }
 
+    #[test]
+    fn post_close_fresh_market_gate_is_per_symbol() {
+        let watch = EntryWatch::default();
+        let observation = |symbol: &'static str, candle_time: i64, price: f64| EntryObservation {
+            symbol,
+            candle_time,
+            price: Some(price),
+            atr: Some(0.0040),
+        };
+        watch.record(&[
+            observation("EURUSD", GATE_NOW, 1.1000),
+            observation("GBPUSD", GATE_NOW, 1.2500),
+        ]);
+        let guarded = vec!["EURUSD".to_owned()];
+
+        assert!(
+            watch
+                .changed_symbols(
+                    &[
+                        observation("EURUSD", GATE_NOW, 1.1000),
+                        observation("GBPUSD", GATE_NOW, 1.2600),
+                    ],
+                    &guarded,
+                    0.25,
+                )
+                .is_empty(),
+            "another symbol's move cannot release EURUSD"
+        );
+        assert_eq!(
+            watch.changed_symbols(&[observation("EURUSD", GATE_NOW, 1.1012)], &guarded, 0.25,),
+            guarded,
+            "EURUSD's own ATR-scaled move releases it"
+        );
+        assert_eq!(
+            watch.changed_symbols(
+                &[observation("EURUSD", GATE_NOW + 14_400, 1.1000)],
+                &["EURUSD".to_owned()],
+                0.25,
+            ),
+            vec!["EURUSD".to_owned()],
+            "EURUSD's own new candle also releases it"
+        );
+    }
+
     #[actix_web::test]
     async fn tick_continues_without_judgements_when_the_owner_allows_it() {
         let engine = StubEngine::answering(json!({"action": "none"}));
@@ -4754,6 +5716,7 @@ mod tests {
                 opened_at,
                 current,
                 swap: -0.11,
+                commission: 0.0,
                 magic: crate::broker::ORDER_MAGIC,
             }],
             positions_truncated: false,
@@ -5738,6 +6701,8 @@ mod tests {
             opened_at: 1_758_000_000,
             current,
             swap: 0.0,
+            commission: 0.0,
+            is_market: true,
         }
     }
 
@@ -6007,6 +6972,140 @@ mod tests {
         assert!((bought.stop - (1.14757 + risk)).abs() < 1e-9);
     }
 
+    fn harvest_policy() -> ProfitHarvestPolicy {
+        settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_PROFIT_HARVEST" => Ok("true".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        })
+        .profit_harvest()
+        .expect("harvest policy")
+        .clone()
+    }
+
+    #[test]
+    fn profit_harvest_arms_on_net_profit_then_banks_a_positive_giveback() {
+        let policy = harvest_policy();
+        let basis = StopBasis::default();
+        let book = ProfitHarvestBook::default();
+        let risk = 1.1497 - 1.14757;
+        let mut position =
+            managed_position(ManagedSide::Sell, 1.14757, 1.1497, 1.14757 - 0.25 * risk);
+        position.profit = 0.66;
+        position.swap = -0.11;
+        position.commission = -0.05;
+        basis.observe(std::slice::from_ref(&position));
+        book.observe(
+            std::slice::from_ref(&position),
+            1_758_003_600,
+            Duration::from_secs(900),
+        );
+
+        let ratchet = harvest_stop_plan(
+            std::slice::from_ref(&position),
+            &policy,
+            &basis,
+            &book,
+            1_758_003_600,
+        )
+        .expect("the net 0.50 high-water mark arms harvesting");
+        assert_eq!(ratchet.kind, StopMoveKind::ProfitHarvest);
+        assert!(ratchet.stop < position.entry, "the sell stop locks profit");
+
+        position.current = position.entry - 0.10 * risk;
+        position.profit = 0.29;
+        position.swap = 0.0;
+        position.commission = 0.0;
+        book.observe(
+            std::slice::from_ref(&position),
+            1_758_003_630,
+            Duration::from_secs(900),
+        );
+        let close = harvest_close_plan(
+            std::slice::from_ref(&position),
+            &policy,
+            &basis,
+            &book,
+            1_758_003_630,
+            1_758_003_630,
+        )
+        .expect("a 42 percent giveback is banked while still positive");
+        assert_eq!(close.ticket, position.ticket);
+        assert_eq!(close.high_net_profit, 0.5);
+        assert_eq!(close.net_profit, 0.29);
+
+        position.profit = -0.01;
+        book.observe(
+            std::slice::from_ref(&position),
+            1_758_003_660,
+            Duration::from_secs(900),
+        );
+        assert_eq!(
+            harvest_close_plan(
+                &[position],
+                &policy,
+                &basis,
+                &book,
+                1_758_003_660,
+                1_758_003_660,
+            ),
+            None,
+            "a missed positive exit never becomes a deterministic losing close"
+        );
+    }
+
+    #[test]
+    fn profit_harvest_cooldown_and_high_water_survive_restart() {
+        let book = ProfitHarvestBook::default();
+        let mut position = managed_position(ManagedSide::Buy, 1.1, 1.09, 1.105);
+        position.profit = 0.75;
+        book.observe(
+            std::slice::from_ref(&position),
+            1_000,
+            Duration::from_secs(900),
+        );
+        book.mark_armed(position.ticket);
+
+        let snapshot = book.state_snapshot();
+        let restarted = ProfitHarvestBook::default();
+        restarted
+            .restore_state(&snapshot)
+            .expect("valid harvest state restores");
+        assert_eq!(restarted.high_net_profit(position.ticket), Some(0.75));
+        assert!(restarted.is_armed(position.ticket));
+
+        restarted.observe(&[], 1_100, Duration::from_secs(900));
+        let closed_snapshot = restarted.state_snapshot();
+        let after_close_restart = ProfitHarvestBook::default();
+        after_close_restart
+            .restore_state(&closed_snapshot)
+            .expect("cooldown state restores");
+        assert!(after_close_restart.cooling("EURUSD", 1_999));
+        assert!(!after_close_restart.cooling("EURUSD", 2_000));
+        assert_eq!(
+            after_close_restart.pending_fresh_baselines(),
+            vec!["EURUSD".to_owned()]
+        );
+        assert!(after_close_restart.requires_fresh_market("EURUSD"));
+        after_close_restart.mark_fresh_baselines(&["EURUSD".to_owned()]);
+        assert!(after_close_restart.pending_fresh_baselines().is_empty());
+        after_close_restart.mark_fresh_market(&["EURUSD".to_owned()]);
+        assert!(!after_close_restart.requires_fresh_market("EURUSD"));
+
+        for broken in [
+            json!({"positions": {"0": {"symbol": "EURUSD", "highNetProfit": 1.0, "armed": true}}, "cooldowns": {}, "pendingFreshBaselines": []}),
+            json!({"positions": {"1": {"symbol": "bad symbol", "highNetProfit": 1.0, "armed": true}}, "cooldowns": {}, "pendingFreshBaselines": []}),
+            json!({"positions": {"1": {"symbol": "EURUSD", "highNetProfit": -1.0, "armed": true}}, "cooldowns": {}, "pendingFreshBaselines": []}),
+            json!({"positions": {}, "cooldowns": {"EURUSD": -1}, "pendingFreshBaselines": []}),
+            json!({"positions": {}, "cooldowns": {}, "pendingFreshBaselines": [], "freshMarketRequired": ["bad symbol"]}),
+        ] {
+            assert!(
+                after_close_restart.restore_state(&broken).is_err(),
+                "{broken}"
+            );
+        }
+    }
+
     #[test]
     fn stop_basis_survives_a_restart_through_a_snapshot() {
         let risk = 1.1497 - 1.14757;
@@ -6152,6 +7251,113 @@ mod tests {
             .ea_link()
             .expect("link");
         assert!(link.has_pending(CommandKind::ModifyOrder));
+    }
+
+    #[actix_web::test]
+    async fn position_loop_harvests_profit_without_market_or_model_work() {
+        let settings = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_PROFIT_HARVEST" => Ok("true".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        let harness = build_harness(settings.clone(), None, None, None, true, true);
+        let risk = 1.1497 - 1.14757;
+        let mut snapshot = managed_snapshot_at(
+            10650805,
+            1_758_000_000,
+            1_758_003_600,
+            1.14757 - 0.25 * risk,
+        );
+        snapshot.positions[0].profit = 0.7;
+        snapshot.positions[0].swap = -0.1;
+        snapshot.positions[0].commission = -0.05;
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(snapshot);
+
+        assert!(matches!(
+            manage_open_positions(&harness.state).await,
+            TickOutcome::StopMoved { .. }
+        ));
+        assert!(
+            outcomes(&harness.trail).contains(&"profit_harvest_stop".to_owned()),
+            "the deterministic ratchet is audited without needing a model"
+        );
+
+        let close_harness = build_harness(settings, None, None, None, true, true);
+        let mut high = managed_snapshot_at(
+            10650805,
+            1_758_000_000,
+            1_758_003_600,
+            1.14757 - 0.25 * risk,
+        );
+        high.positions[0].profit = 0.7;
+        high.positions[0].swap = -0.1;
+        high.positions[0].commission = -0.05;
+        close_harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(high);
+        let managed = managed_positions(&close_harness.state);
+        close_harness.state.stop_basis().observe(&managed);
+        close_harness.state.profit_harvest_book().observe(
+            &managed,
+            1_758_003_600,
+            Duration::from_secs(900),
+        );
+        assert!(
+            harvest_stop_plan(
+                &managed,
+                close_harness
+                    .state
+                    .autopilot()
+                    .and_then(AutopilotSettings::profit_harvest)
+                    .expect("policy"),
+                close_harness.state.stop_basis(),
+                close_harness.state.profit_harvest_book(),
+                1_758_003_600,
+            )
+            .is_some(),
+            "the first profitable observation arms the high-water mark"
+        );
+
+        let mut retraced = managed_snapshot_at(
+            10650805,
+            1_758_000_000,
+            1_758_003_630,
+            1.14757 - 0.10 * risk,
+        );
+        retraced.positions[0].profit = 0.3;
+        retraced.positions[0].swap = 0.0;
+        retraced.positions[0].commission = 0.0;
+        close_harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(retraced);
+
+        assert!(matches!(
+            manage_open_positions(&close_harness.state).await,
+            TickOutcome::CloseQueued { .. }
+        ));
+        assert!(
+            close_harness
+                .state
+                .broker()
+                .expect("broker")
+                .link()
+                .has_pending(CommandKind::CloseOrder)
+        );
+        assert!(outcomes(&close_harness.trail).contains(&"profit_harvest_close".to_owned()));
     }
 
     #[actix_web::test]

@@ -935,6 +935,14 @@ export function AutopilotPanel({
           }
         />
         <Field
+          label="Profit harvest"
+          value={
+            status?.profit_harvest
+              ? `${status.profit_harvest.arm_r}R arm · ${status.profit_harvest.trail_r}R trail · ${status.profit_harvest.min_profit.toFixed(2)} floor`
+              : 'off'
+          }
+        />
+        <Field
           label="Model calls"
           value={
             budget

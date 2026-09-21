@@ -20,6 +20,15 @@ export type AutopilotStatus = {
   breakeven_r: number
   /** Trailing distance in multiples of the entry risk; zero when disabled. */
   trail_r: number
+  /** Deterministic early-profit ratchet; null when disabled. */
+  profit_harvest?: {
+    arm_r: number
+    trail_r: number
+    min_profit: number
+    giveback_fraction: number
+    min_hold_secs: number
+    reentry_cooldown_secs: number
+  } | null
 }
 
 export type Status = {
@@ -104,6 +113,8 @@ export type Position = {
   tp: number
   /** Swap charged or credited so far, in account currency (absent on older terminals). */
   swap?: number
+  /** Commission charged or credited so far, in account currency (absent on older terminals). */
+  commission?: number
   /**
    * Price the position would close at now. Zero or absent when the terminal
    * does not report it, which is also when the break-even policy is skipped.

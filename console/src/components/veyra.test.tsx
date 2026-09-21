@@ -703,6 +703,25 @@ describe('AutopilotPanel', () => {
     expect(screen.getByText('bracket only')).toBeTruthy()
     expect(screen.getAllByText('—').length).toBeGreaterThan(0)
   })
+
+  it('shows the deterministic profit-harvest policy', () => {
+    render(
+      <AutopilotPanel
+        status={{
+          ...autopilot,
+          profit_harvest: {
+            arm_r: 0.2,
+            trail_r: 0.2,
+            min_profit: 0.5,
+            giveback_fraction: 0.35,
+            min_hold_secs: 300,
+            reentry_cooldown_secs: 900,
+          },
+        }}
+      />,
+    )
+    expect(screen.getByText('0.2R arm · 0.2R trail · 0.50 floor')).toBeTruthy()
+  })
 })
 
 describe('RiskPanel', () => {

@@ -39,7 +39,7 @@ use model::ModelRuntime;
 use risk::RiskGate;
 use risk::guard::EquityGuard;
 use state::RuntimeState;
-use trading::autopilot::{AutopilotSettings, StopBasis};
+use trading::autopilot::{AutopilotSettings, ProfitHarvestBook, StopBasis};
 
 /// Immutable runtime state shared by HTTP handlers.
 #[derive(Debug, Clone)]
@@ -58,6 +58,7 @@ pub struct AppState {
     /// Pinned instant for deterministic tests; production reads the clock.
     fixed_now: Option<std::time::SystemTime>,
     stop_basis: Arc<StopBasis>,
+    profit_harvest_book: Arc<ProfitHarvestBook>,
     entry_watch: Arc<crate::trading::autopilot::EntryWatch>,
     judgements: Arc<crate::trading::autopilot::JudgementCache>,
     review_watch: Arc<crate::trading::autopilot::ReviewWatch>,
@@ -89,6 +90,7 @@ impl AppState {
             runtime_state: RuntimeState::disabled(),
             fixed_now: None,
             stop_basis: Arc::new(StopBasis::default()),
+            profit_harvest_book: Arc::new(ProfitHarvestBook::default()),
             entry_watch: Arc::new(crate::trading::autopilot::EntryWatch::default()),
             judgements: Arc::new(crate::trading::autopilot::JudgementCache::default()),
             review_watch: Arc::new(crate::trading::autopilot::ReviewWatch::default()),
@@ -187,6 +189,12 @@ impl AppState {
     /// across ticks for the lifetime of the process.
     pub fn stop_basis(&self) -> &Arc<StopBasis> {
         &self.stop_basis
+    }
+
+    /// Floating-profit high-water marks and re-entry cooldowns shared across
+    /// deterministic harvest checks.
+    pub fn profit_harvest_book(&self) -> &Arc<ProfitHarvestBook> {
+        &self.profit_harvest_book
     }
 
     /// Market the entry sweep last judged each instrument on; survives across

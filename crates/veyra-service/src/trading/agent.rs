@@ -1421,6 +1421,7 @@ mod tests {
                     opened_at: 1_700_000_000,
                     current: 1.105,
                     swap: -0.11,
+                    commission: 0.0,
                 }],
                 positions_truncated: false,
                 server_time: 1_700_000_000,

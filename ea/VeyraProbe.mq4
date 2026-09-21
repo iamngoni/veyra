@@ -413,6 +413,7 @@ string PositionsJson(int maxEntries)
             + ",\"tp\":" + DoubleToString(OrderTakeProfit(), digits)
             + ",\"current\":" + DoubleToString(OrderClosePrice(), digits)
             + ",\"swap\":" + DoubleToString(OrderSwap(), 2)
+            + ",\"commission\":" + DoubleToString(OrderCommission(), 2)
             + ",\"openedAt\":" + (string)(long)OrderOpenTime() + "}";
       included++;
      }

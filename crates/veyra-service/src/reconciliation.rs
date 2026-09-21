@@ -140,6 +140,7 @@ mod tests {
             opened_at: 1_758_000_000,
             current: 1.096,
             swap: 0.0,
+            commission: 0.0,
             magic,
         }
     }

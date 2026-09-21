@@ -1398,6 +1398,7 @@ mod tests {
             opened_at: 1_758_000_000,
             current: 1.096,
             swap: -0.11,
+            commission: 0.0,
             magic,
         }
     }
@@ -1699,6 +1700,7 @@ mod tests {
             opened_at: 1_700_000_000,
             current: 1.1,
             swap: 0.0,
+            commission: 0.0,
         };
         let base = || AccountSnapshotPayload {
             balance: 1.0,
@@ -1733,6 +1735,12 @@ mod tests {
                 "swap",
                 Box::new(|payload: &mut AccountSnapshotPayload| {
                     payload.positions[0].swap = f64::INFINITY;
+                }),
+            ),
+            (
+                "commission",
+                Box::new(|payload: &mut AccountSnapshotPayload| {
+                    payload.positions[0].commission = f64::NAN;
                 }),
             ),
             (

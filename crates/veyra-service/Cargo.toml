@@ -19,6 +19,7 @@ serde_json.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio = { version = "1", features = ["time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true

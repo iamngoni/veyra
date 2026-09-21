@@ -138,6 +138,10 @@ pub struct PositionPayload {
     /// Absent on older terminals that do not report it.
     #[serde(default)]
     pub swap: f64,
+    /// Commission charged or credited on the open position so far, in account
+    /// currency. Absent on older terminals that do not report it.
+    #[serde(default)]
+    pub commission: f64,
 }
 
 /// Order kinds the terminal can report.
@@ -249,6 +253,9 @@ impl AccountSnapshotPayload {
             }
             if !position.swap.is_finite() {
                 return Err("position swap must be a finite number".to_owned());
+            }
+            if !position.commission.is_finite() {
+                return Err("position commission must be a finite number".to_owned());
             }
         }
         Ok(())
