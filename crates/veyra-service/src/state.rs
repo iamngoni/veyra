@@ -32,6 +32,8 @@ pub enum StateKey {
     ProfitHarvest,
     /// The effective risk policy as an apply-able snapshot patch.
     RiskPolicy,
+    /// Operator overrides layered over the environment for live settings.
+    RuntimeConfig,
 }
 
 impl StateKey {
@@ -44,6 +46,7 @@ impl StateKey {
             Self::StopBasis => "stop_basis",
             Self::ProfitHarvest => "profit_harvest",
             Self::RiskPolicy => "risk_policy",
+            Self::RuntimeConfig => "runtime_config",
         }
     }
 }

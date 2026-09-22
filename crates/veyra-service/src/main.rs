@@ -259,6 +259,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Restores durable counters and baselines. Unusable values log and fall back
 /// to in-memory defaults rather than blocking startup.
 async fn restore_runtime_state(state: &AppState, runtime: &RuntimeState) {
+    // First, because it decides what every other section is: the operator's
+    // live settings shadow the environment, so a restart must resume their
+    // intent rather than silently reverting to the deployed baseline.
+    if let Some(value) = runtime.load(StateKey::RuntimeConfig).await {
+        let restored = state.runtime_config().restore(&value);
+        if restored > 0 {
+            let overlay = state.runtime_config().snapshot();
+            let pending = std::collections::BTreeMap::new();
+            match veyra_service::runtime_config::validate(state.runtime_config(), &pending) {
+                Ok(staged) => match veyra_service::runtime_config::adopt(state, staged) {
+                    Ok(()) => tracing::info!(
+                        settings = restored,
+                        "resumed live settings saved by the console"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "stored settings could not be applied; running on the environment baseline"
+                    ),
+                },
+                // A stored value this build no longer accepts must not stop the
+                // service from starting; the baseline is always valid.
+                Err(rejected) => tracing::warn!(
+                    field = %rejected.name,
+                    reason = %rejected.reason,
+                    overlay = %overlay,
+                    "stored settings are unusable; running on the environment baseline"
+                ),
+            }
+        }
+    }
     if let Some(value) = runtime.load(StateKey::JevUsage).await
         && let Some(jev) = state.jev()
         && let Err(error) = jev.restore_state(&value)

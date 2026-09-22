@@ -28,6 +28,7 @@ import {
   ActivityFeed,
   AutopilotPanel,
   CommandsPanel,
+  LiveSettingsPanel,
   HeroMetrics,
   LogsPanel,
   MarketPanel,
@@ -1424,5 +1425,61 @@ describe('LogsPanel', () => {
     rerender(<LogsPanel logs={[]} error="logs down" level="info" onLevelChange={vi.fn()} />)
     expect(screen.getByText('logs down')).toBeTruthy()
     expect(screen.getByText('Log tail unavailable.')).toBeTruthy()
+  })
+})
+
+
+describe('LiveSettingsPanel', () => {
+  const settings = {
+    VEYRA_TRADING_ENABLED: { value: 'false', overridden: false },
+    VEYRA_AUTOPILOT_PROFIT_HARVEST: { value: 'true', overridden: true },
+    VEYRA_AUTOPILOT_TRAIL_R: { value: '', overridden: false },
+    VEYRA_MODEL_FALLBACKS: { value: 'z-ai/glm-5.3-flash', overridden: false },
+  }
+
+  it('sends only the fields that actually changed', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+
+    fireEvent.change(document.querySelector('[data-field="VEYRA_AUTOPILOT_TRAIL_R"]')!, {
+      target: { value: '1.5' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_TRAIL_R: '1.5' })
+  })
+
+  it('keeps the draft on screen when the service refuses it', async () => {
+    const onApply = vi
+      .fn()
+      .mockResolvedValue('VEYRA_AUTOPILOT_TRAIL_R: must be a finite positive number')
+    render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+
+    fireEvent.change(document.querySelector('[data-field="VEYRA_AUTOPILOT_TRAIL_R"]')!, {
+      target: { value: '99' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('must be a finite positive number')
+    expect(
+      document.querySelector<HTMLInputElement>('[data-field="VEYRA_AUTOPILOT_TRAIL_R"]')!.value,
+    ).toBe('99')
+  })
+
+  it('clears an override with null rather than an empty string', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+
+    fireEvent.click(screen.getByTitle('Clear this override and return to the deployed value'))
+
+    expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_PROFIT_HARVEST: null })
+  })
+
+  it('marks only the values an operator has moved', () => {
+    render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} />)
+
+    expect(screen.getAllByTitle('Clear this override and return to the deployed value')).toHaveLength(
+      1,
+    )
   })
 })

@@ -173,6 +173,7 @@ One append-only PostgreSQL table (`audit_events`: id, timestamp, kind, JSONB pay
 | `broker_snapshot` | A validated `account_snapshot` ack is retained |
 | `agent_tool_called` | The decision loop executed one read-only tool (tool, bounded arguments and result, step, rationale) |
 | `risk_policy_updated` | The live risk policy was replaced from the control surface (full resulting policy attached) |
+| `runtime_config_updated` | One or more live settings were changed from the control surface (changed names and the resulting overlay attached) |
 | `proposal_evaluated` | Every autopilot decision attempt (`outcome`: `no_trade`, `rejected`, `approved_dry_run`, `queued`, `unavailable`, `held`, `close_queued`, `close_rejected`, `stop_rejected`, `break_even`, `trailing_stop`, …). Entry and review decisions carry the model's `rationale` and, when a judge is configured, the chosen asset's `judgements`, so the why is queryable next to the what |
 | `reconciliation_drift` | A snapshot shows orders Veyra does not own, or a truncated position list |
 | `position_closed` | A managed ticket disappears from the book (last observed values, including P/L) |
@@ -213,6 +214,7 @@ The surrounding guards:
 - **ATR noise floor** — `VEYRA_RISK_MIN_STOP_ATR_FRACTION` (default 0.25, console-editable, 0 disables) refuses a stop closer to the entry than that fraction of ATR(14) (`stop_inside_noise`). ATR is measured from the same closed candles the tick already fetched; when the window is too short to measure, the floor is skipped rather than failing entries the tick cannot assess.
 - **Bounded execution deviation** — the EA caps `OrderSend` slippage at twice the live spread, floored at 10 points and capped at 30, so a spread blowout cannot become a blank cheque.
 - **Bounded model budget** — `BudgetedEngine` wraps whatever engine a provider builds; `VEYRA_MODEL_MAX_CALLS_PER_HOUR` / `_PER_DAY` (0 = unlimited, the default) refuse calls past a fixed window, and `/status` reports usage against the caps.
+- **Model failover** — each tier resolves to an ordered chain (`VEYRA_MODEL_FALLBACKS`, or a per-tier list that replaces it), capped at 4 fallbacks because every extra candidate costs a live round trip during an outage. A candidate is abandoned for the next one when the provider refuses it — out of credits (HTTP 402), rate limited, overloaded, an unexpected status, or an answer that does not satisfy the schema. A *transport* failure is the exception: the provider was never reached, so the next candidate would fail identically and the retry policy already covers it. Fallback candidates must accept forced tool calls for the same reason the primaries must. The chain is reported on `/status` as `autopilot.model_fallbacks`, so a stalled loop can be told apart from one that ran out of configured options; a serving fallback is logged with the model that answered.
 - **Judge usage counters** — the Jev runtime counts calls, failures, and the provider-reported input/output tokens; `/status` carries the totals and the console shows them in the Autopilot panel. The counters are snapshotted to durable runtime state every minute, so the service's authoritative usage view — the one that matters because the provider's dashboard can lag, aggregate differently, or belong to another project — survives restarts and reboots.
 - **Duplicate window** — `VEYRA_RISK_DUPLICATE_WINDOW_SECS` (default 60) suppresses an identical approved draft.
 - **Missing or stale state rejects.** No fresh link report or no connected terminal means `account_state_unavailable`, not an assumption.
@@ -220,12 +222,25 @@ The surrounding guards:
 
 ## Live policy control
 
-Environment variables are **startup defaults and secrets** (bind addresses, tokens, provider selection, database URL) — nothing a bad edit over a UI should be able to break. Everything an operator tunes day to day lives in the **risk policy** and can be changed from the console while the service runs:
+Environment variables are the **startup baseline**. Two things stay there permanently and cannot be set over the control surface: **secrets** (anything ending `_API_KEY`, `_TOKEN`, or `_SECRET` — matched on shape, so a credential added later is refused by default) and **boot-only infrastructure** (bind addresses, the database URL, the deployment label), which cannot take effect without rebinding sockets or reconnecting pools. Accepting one of those would report a success that never happened.
+
+Everything else is editable while the service runs, through the **risk policy** and the **live settings overlay**:
 
 - `GET /risk/policy` returns the effective policy; `POST /risk/policy` applies a partial patch (omitted fields keep their value).
 - The patch is validated by exactly the same rules as the environment parser — caps, booleans, symbol list, session window, breaks — so a console edit can never widen behaviour beyond what a restart would accept. Unknown fields are rejected, and failures name the field and reason.
 - Every accepted change is journaled as `risk_policy_updated` (with the resulting policy) and takes effect atomically for all decisions; the kill switch is just one field of the patch.
 - Accepted changes are persisted as an apply-able snapshot: a restart resumes the operator's intent (validated again by the same rules) instead of reverting to the `.env` baseline. The `.env` values remain the startup baseline and the recovery path — delete the `risk_policy` row in `runtime_state` to fall back to them. The console's editor panel exposes the fields directly, and the control surface is loopback-only like everything else.
+
+### Live settings (`/config`)
+
+Beyond the risk policy, the autopilot, the model integration, and the service half of the execution switch are editable at runtime:
+
+- `GET /config` returns every settable setting with its effective value and an `overridden` flag separating an operator's choice from the deployed baseline. `POST /config` applies a partial patch keyed by environment-variable name; `null` clears an override and returns that setting to the environment.
+- The overlay is expressed in the same vocabulary as `.env` rather than as a bespoke patch type per section. That is what lets an edit be validated by re-parsing the affected section through the *same* `from_source` that validates `.env` — a console edit can never widen behaviour beyond what a restart would accept, and no acceptance rule exists in two places to drift apart.
+- Validation is all-or-nothing: a patch touching three settings with one bad value changes none of them, and every refusal is reported at once so a form can mark all its bad fields in one round trip.
+- `execution`, `autopilot`, and `model` apply immediately. Other sections are stored and honoured at the next start, and `GET /config` says which is which rather than implying an edit landed when it did not.
+- Changing model settings rebuilds the provider engine in place; the call-budget counters are carried across, so an edit cannot be used — even accidentally — to reset a cap that exists to bound spend.
+- Accepted changes are journaled as `runtime_config_updated` and persisted under the `runtime_config` state key, so a restart resumes the operator's intent. Delete that row to fall back to the `.env` baseline. Rows naming settings this build no longer accepts are dropped on load rather than blocking startup.
 
 ## Durable runtime state
 

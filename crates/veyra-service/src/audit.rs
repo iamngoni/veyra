@@ -45,6 +45,8 @@ pub enum AuditKind {
     Failure,
     /// The live risk policy was replaced from the control surface.
     RiskPolicyUpdated,
+    /// One or more live settings were changed from the control surface.
+    RuntimeConfigUpdated,
 }
 
 impl AuditKind {
@@ -63,6 +65,7 @@ impl AuditKind {
             Self::AgentTurn => "agent_turn",
             Self::Failure => "failure",
             Self::RiskPolicyUpdated => "risk_policy_updated",
+            Self::RuntimeConfigUpdated => "runtime_config_updated",
         }
     }
 }

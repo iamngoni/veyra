@@ -154,6 +154,102 @@ pub async fn update_risk_policy(
     }
 }
 
+/// Returns every live setting with its effective value.
+///
+/// `overridden` marks the ones an operator has moved away from the deployed
+/// baseline; `applies` says whether a change lands immediately or waits for a
+/// restart, so the console never implies an edit took effect when it did not.
+#[get("/config")]
+pub async fn runtime_config(state: Data<AppState>) -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "settings": state.runtime_config().effective(),
+        "live_sections": crate::runtime_config::LIVE_SECTIONS,
+    }))
+}
+
+/// Applies a validated partial update to the live settings.
+///
+/// Validation is deliberately not written here: a proposed edit is layered
+/// over the current overlay and every affected section is re-parsed through
+/// the same `from_source` that validates `.env`. A console edit therefore
+/// cannot widen behaviour beyond what a restart would accept, and an
+/// acceptance rule only ever exists in one place.
+///
+/// Nothing is committed until every section parses, so a patch touching three
+/// settings with one bad value changes none of them.
+#[post("/config")]
+pub async fn update_runtime_config(
+    state: Data<AppState>,
+    patch: web::Json<serde_json::Map<String, serde_json::Value>>,
+) -> HttpResponse {
+    let patch = patch.into_inner();
+    if patch.is_empty() {
+        return HttpResponse::BadRequest().json(json!({
+            "error": "empty_patch",
+            "reason": "supply at least one setting to change"
+        }));
+    }
+
+    let accepted = match state.runtime_config().screen(&patch) {
+        Ok(accepted) => accepted,
+        Err(rejected) => {
+            return HttpResponse::BadRequest().json(json!({
+                "error": "invalid_settings",
+                "rejected": rejected
+                    .iter()
+                    .map(|edit| json!({"field": edit.name, "reason": edit.reason}))
+                    .collect::<Vec<_>>()
+            }));
+        }
+    };
+
+    // Re-parse every affected section against the proposed overlay before any
+    // of it is committed.
+    let staged = match crate::runtime_config::validate(state.runtime_config(), &accepted) {
+        Ok(staged) => staged,
+        Err(edit) => {
+            return HttpResponse::BadRequest().json(json!({
+                "error": "invalid_settings",
+                "rejected": [{"field": edit.name, "reason": edit.reason}]
+            }));
+        }
+    };
+
+    let changed: Vec<String> = accepted.keys().cloned().collect();
+    state.runtime_config().commit(accepted);
+
+    if let Err(reason) = crate::runtime_config::adopt(&state, staged) {
+        // The overlay is already committed, so the edit is not lost: it will
+        // be picked up on the next start even though the swap failed here.
+        return HttpResponse::InternalServerError().json(json!({
+            "error": "settings_saved_but_not_applied",
+            "reason": reason
+        }));
+    }
+
+    let snapshot = state.runtime_config().snapshot();
+    state
+        .runtime_state()
+        .save(StateKey::RuntimeConfig, &snapshot)
+        .await;
+
+    audit(
+        &state,
+        AuditKind::RuntimeConfigUpdated,
+        json!({
+            "origin": "control_surface",
+            "changed": changed,
+            "settings": snapshot
+        }),
+    )
+    .await;
+
+    HttpResponse::Ok().json(json!({
+        "changed": changed,
+        "settings": state.runtime_config().effective()
+    }))
+}
+
 /// Query for `GET /commands`.
 #[derive(Debug, Deserialize)]
 pub struct CommandsQuery {
@@ -576,7 +672,7 @@ pub async fn execute_intent(
         return HttpResponse::ServiceUnavailable()
             .json(json!({ "error": "command_channel_unavailable" }));
     }
-    if !state.config().trading_enabled() {
+    if !state.trading_enabled() {
         return HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }));
     }
     let draft = draft.into_inner();
@@ -639,7 +735,7 @@ pub async fn queue_staged_order(state: &AppState, intent: &TradeIntent) -> Stage
     let Some(link) = command_link(state) else {
         return StagedExecution::ChannelUnavailable;
     };
-    if !state.config().trading_enabled() {
+    if !state.trading_enabled() {
         return StagedExecution::TradingDisabled;
     }
 
@@ -697,7 +793,7 @@ pub async fn close_position(state: Data<AppState>, body: web::Json<CloseRequest>
         return HttpResponse::ServiceUnavailable()
             .json(json!({ "error": "command_channel_unavailable" }));
     }
-    if !state.config().trading_enabled() {
+    if !state.trading_enabled() {
         return HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }));
     }
     if body.ticket <= 0 {
@@ -759,7 +855,7 @@ pub async fn queue_staged_close(state: &AppState, ticket: i64) -> StagedClose {
     let Some(link) = command_link(state) else {
         return StagedClose::ChannelUnavailable;
     };
-    if !state.config().trading_enabled() {
+    if !state.trading_enabled() {
         return StagedClose::TradingDisabled;
     }
     let Some(snapshot) = link.last_account() else {
@@ -821,7 +917,7 @@ pub async fn modify_position(
         return HttpResponse::ServiceUnavailable()
             .json(json!({ "error": "command_channel_unavailable" }));
     }
-    if !state.config().trading_enabled() {
+    if !state.trading_enabled() {
         return HttpResponse::Forbidden().json(json!({ "error": "trading_disabled" }));
     }
     if body.ticket <= 0 {
@@ -895,7 +991,7 @@ pub async fn queue_staged_modify(
     let Some(link) = command_link(state) else {
         return StagedModify::ChannelUnavailable;
     };
-    if !state.config().trading_enabled() {
+    if !state.trading_enabled() {
         return StagedModify::TradingDisabled;
     }
     let Some(snapshot) = link.last_account() else {

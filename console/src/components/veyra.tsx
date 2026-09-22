@@ -10,6 +10,7 @@ import type {
   CommandRecord,
   FeedEvent,
   LogLevel,
+  LiveSetting,
   LogRecord,
   MarketSessions,
   Metrics,
@@ -20,7 +21,7 @@ import type {
   WeekendPositions,
 } from '../lib/api'
 import { LOG_LEVELS, VEYRA_MAGIC } from '../lib/api'
-import type { RiskPolicyPatch } from '../lib/api'
+import type { RiskPolicyPatch, RuntimeConfigPatch } from '../lib/api'
 import {
   commandTone,
   detailRows,
@@ -943,6 +944,15 @@ export function AutopilotPanel({
           }
         />
         <Field
+          label="Model fallbacks"
+          value={
+            status?.model_fallbacks?.length
+              ? status.model_fallbacks.join(' → ')
+              : 'none — a provider outage stops the loop'
+          }
+          tone={status?.model_fallbacks?.length ? undefined : 'text-[var(--color-warn)]'}
+        />
+        <Field
           label="Model calls"
           value={
             budget
@@ -1787,6 +1797,249 @@ export function LogsPanel({
         onPrevious={paged.previous}
         onNext={paged.next}
       />
+    </Panel>
+  )
+}
+
+/**
+ * Settings grouped the way an operator thinks about them, not the way the
+ * environment file happens to be ordered.
+ */
+const SETTING_GROUPS: Array<{ title: string; detail: string; names: string[] }> = [
+  {
+    title: 'Execution',
+    detail: 'the service half of the two-key control',
+    names: ['VEYRA_TRADING_ENABLED'],
+  },
+  {
+    title: 'Autopilot',
+    detail: 'the autonomous loop',
+    names: [
+      'VEYRA_AUTOPILOT_ENABLED',
+      'VEYRA_AUTOPILOT_SYMBOL',
+      'VEYRA_AUTOPILOT_SYMBOLS',
+      'VEYRA_AUTOPILOT_TIMEFRAME',
+      'VEYRA_AUTOPILOT_BARS',
+      'VEYRA_AUTOPILOT_TIER',
+      'VEYRA_AUTOPILOT_INTERVAL_SECS',
+      'VEYRA_AUTOPILOT_JEV',
+      'VEYRA_AUTOPILOT_MIN_HOLD_SECS',
+      'VEYRA_AUTOPILOT_ENTRY_MOVE_ATR',
+      'VEYRA_AUTOPILOT_BREAKEVEN_R',
+      'VEYRA_AUTOPILOT_TRAIL_R',
+    ],
+  },
+  {
+    title: 'Profit harvesting',
+    detail: 'the deterministic early-profit ratchet',
+    names: [
+      'VEYRA_AUTOPILOT_PROFIT_HARVEST',
+      'VEYRA_AUTOPILOT_HARVEST_ARM_R',
+      'VEYRA_AUTOPILOT_HARVEST_TRAIL_R',
+      'VEYRA_AUTOPILOT_HARVEST_MIN_PROFIT',
+      'VEYRA_AUTOPILOT_HARVEST_GIVEBACK',
+      'VEYRA_AUTOPILOT_HARVEST_MIN_HOLD_SECS',
+      'VEYRA_AUTOPILOT_HARVEST_REENTRY_COOLDOWN_SECS',
+    ],
+  },
+  {
+    title: 'Model',
+    detail: 'tiers, fallbacks and the call budget',
+    names: [
+      'VEYRA_MODEL_FAST',
+      'VEYRA_MODEL_BALANCED',
+      'VEYRA_MODEL_REASONING',
+      'VEYRA_MODEL_FALLBACKS',
+      'VEYRA_MODEL_FAST_FALLBACKS',
+      'VEYRA_MODEL_BALANCED_FALLBACKS',
+      'VEYRA_MODEL_REASONING_FALLBACKS',
+      'VEYRA_MODEL_MAX_CALLS_PER_HOUR',
+      'VEYRA_MODEL_MAX_CALLS_PER_DAY',
+      'VEYRA_MODEL_COMPEL_STRUCTURED',
+      'VEYRA_MODEL_PROVIDER',
+      'VEYRA_MODEL_BASE_URL',
+      'VEYRA_MODEL_HTTP_REFERER',
+      'VEYRA_MODEL_APP_TITLE',
+      'VEYRA_MODEL_APP_HIDDEN',
+    ],
+  },
+  {
+    title: 'Judgement and market data',
+    detail: 'applies at the next restart',
+    names: [
+      'VEYRA_JEV_PROVIDER',
+      'VEYRA_JEV_BASE_URL',
+      'VEYRA_JEV_MODEL',
+      'VEYRA_MARKET_PROVIDER',
+      'VEYRA_MARKET_EA_AWAIT_SECS',
+    ],
+  },
+  {
+    title: 'Housekeeping',
+    detail: 'applies at the next restart',
+    names: ['VEYRA_RECONCILE_SECS', 'VEYRA_AUDIT_RETENTION_DAYS', 'VEYRA_ALERT_WEBHOOK'],
+  },
+]
+
+/** Sections the service applies immediately; the rest wait for a restart. */
+const LIVE_GROUPS = new Set(['Execution', 'Autopilot', 'Profit harvesting', 'Model'])
+
+/** Drops the shared prefix so the label reads as a setting, not a shout. */
+function settingLabel(name: string) {
+  return name.replace(/^VEYRA_/, '').replace(/_/g, ' ').toLowerCase()
+}
+
+/**
+ * Live settings, editable without a restart.
+ *
+ * Every field is a plain text box on purpose: the service validates an edit
+ * with the same parser that validates `.env`, so the console does not need to
+ * restate a single acceptance rule — and cannot drift from one. A rejected
+ * patch changes nothing, so the draft stays on screen to be corrected.
+ */
+export function LiveSettingsPanel({
+  settings,
+  onApply,
+  onRefresh,
+}: {
+  settings?: Record<string, LiveSetting>
+  /** Applies a patch; resolves to an error message or undefined on success. */
+  onApply?: (patch: RuntimeConfigPatch) => Promise<string | undefined>
+  onRefresh?: () => void
+}) {
+  const [draft, setDraft] = useState<Record<string, string>>({})
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const [saved, setSaved] = useState(false)
+
+  if (!settings) {
+    return (
+      <Panel title="Live settings">
+        <div className="p-3.5 text-[13px] text-[var(--color-ink-faint)]">Loading…</div>
+      </Panel>
+    )
+  }
+
+  const effective = (name: string) => draft[name] ?? settings[name]?.value ?? ''
+  const dirty = Object.keys(draft).filter((name) => draft[name] !== (settings[name]?.value ?? ''))
+
+  const submit = async () => {
+    if (!onApply || dirty.length === 0) return
+    setBusy(true)
+    setError(undefined)
+    setSaved(false)
+    const patch: RuntimeConfigPatch = {}
+    for (const name of dirty) patch[name] = draft[name]
+    const failure = await onApply(patch)
+    setBusy(false)
+    if (failure) {
+      setError(failure)
+      return
+    }
+    setDraft({})
+    setSaved(true)
+    onRefresh?.()
+  }
+
+  const revert = async (name: string) => {
+    if (!onApply) return
+    setBusy(true)
+    setError(undefined)
+    const failure = await onApply({ [name]: null })
+    setBusy(false)
+    if (failure) {
+      setError(failure)
+      return
+    }
+    setDraft((current) => {
+      const next = { ...current }
+      delete next[name]
+      return next
+    })
+    onRefresh?.()
+  }
+
+  return (
+    <Panel
+      title="Live settings"
+      detail={
+        dirty.length > 0
+          ? `${dirty.length} unsaved`
+          : saved
+            ? 'applied'
+            : 'credentials stay in the environment'
+      }
+    >
+      <div className="flex flex-col gap-4 p-3.5">
+        {error ? (
+          <p role="alert" className="text-[12px] text-[var(--color-bad)]">
+            {error}
+          </p>
+        ) : null}
+
+        {SETTING_GROUPS.map((group) => (
+          <section key={group.title}>
+            <div className="mb-2 flex items-baseline justify-between gap-2">
+              <h3 className="label text-[var(--color-ink-muted)]">{group.title}</h3>
+              <span className="text-[11px] text-[var(--color-ink-faint)]">
+                {LIVE_GROUPS.has(group.title) ? group.detail : `${group.detail}`}
+              </span>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {group.names
+                .filter((name) => settings[name] !== undefined)
+                .map((name) => (
+                  <label key={name} className="min-w-0">
+                    <span className="label flex items-center gap-1.5">
+                      {settingLabel(name)}
+                      {settings[name].overridden ? (
+                        <button
+                          type="button"
+                          onClick={() => void revert(name)}
+                          disabled={busy}
+                          title="Clear this override and return to the deployed value"
+                          className="rounded border border-[var(--color-line)] px-1 text-[10px] text-[var(--color-ink-faint)] hover:text-[var(--color-ink)]"
+                        >
+                          set · revert
+                        </button>
+                      ) : null}
+                    </span>
+                    <input
+                      data-field={name}
+                      value={effective(name)}
+                      disabled={busy}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setDraft((current) => ({ ...current, [name]: event.target.value }))
+                      }
+                      className="readout mt-0.5 w-full rounded border border-[var(--color-line)] bg-[var(--color-surface-2)] px-2 py-1 text-[13px]"
+                    />
+                  </label>
+                ))}
+            </div>
+          </section>
+        ))}
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void submit()}
+            disabled={busy || dirty.length === 0}
+            className="rounded border border-[var(--color-line)] bg-[var(--color-surface-2)] px-3 py-1.5 text-[13px] disabled:opacity-50"
+          >
+            {busy ? 'Applying…' : 'Apply'}
+          </button>
+          {dirty.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => setDraft({})}
+              disabled={busy}
+              className="text-[12px] text-[var(--color-ink-faint)] hover:text-[var(--color-ink)]"
+            >
+              Discard
+            </button>
+          ) : null}
+        </div>
+      </div>
     </Panel>
   )
 }

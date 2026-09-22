@@ -6,22 +6,22 @@
 # environment at compile time, so no secret or environment hostname is
 # committed. VEYRA_EA_URL defaults to the loopback endpoint; set it to the
 # tunnel URL (https://veyra.antonlabs.cc/ea/poll) when the terminal reaches
-# Veyra through Cloudflare instead of localhost. VEYRA_EA_ALLOW_LIVE is
-# required rather than defaulted: the repository source never ships armed, and
-# arming or disarming is an explicit compile-time decision recorded in the
-# produced .ex4. The script prints which one it compiled.
+# Veyra through Cloudflare instead of localhost. VEYRA_EA_ALLOW_LIVE defaults
+# to true: this terminal exists to trade, and the service-side controls
+# (VEYRA_TRADING_ENABLED and the kill switch, both live) are the ones an
+# operator reaches for. The script prints which one it compiled.
 # Run: `set -a; source .env; set +a; ./scripts/compile_ea.sh`
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TOKEN="${VEYRA_EA_TOKEN:?VEYRA_EA_TOKEN must be set (source .env first)}"
 URL="${VEYRA_EA_URL:-http://127.0.0.1:7801/ea/poll}"
-# Deliberately has no default. Either default is silent at the worst moment:
-# false quietly disarms a terminal that was placing orders, true quietly arms
-# one that was not, and both happen precisely when the variable was forgotten.
-# Requiring it makes that a loud failure rather than a surprise discovered in
-# the market. Sourcing .env supplies it, so the normal workflow is unchanged.
-ALLOW_LIVE="${VEYRA_EA_ALLOW_LIVE:?must be set to true or false (source .env first)}"
+# Defaults to armed. This is the compiled-in default for the EA's
+# InAllowLiveOrders input, not the last word on it: the input stays editable in
+# the terminal's EA properties without recompiling, and the service still has
+# to agree before any command reaches the terminal. Disarming here is for a
+# terminal that must never place an order whatever the service says.
+ALLOW_LIVE="${VEYRA_EA_ALLOW_LIVE:-true}"
 case "$ALLOW_LIVE" in
   true|false) ;;
   *) echo "VEYRA_EA_ALLOW_LIVE must be true or false" >&2; exit 1 ;;

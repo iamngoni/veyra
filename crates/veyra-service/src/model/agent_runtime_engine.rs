@@ -8,12 +8,12 @@
 use std::fmt;
 
 use agent_runtime::{
-    Agent as RuntimeAgent, AgentProviderKind, Llm, ModelTier as ProviderModelTier, ModelTiers,
-    ResponseFormat, RetryPolicy,
+    Agent as RuntimeAgent, AgentProviderKind, Llm, ModelTiers, ProviderError, ResponseFormat,
+    RetryPolicy,
 };
 use async_trait::async_trait;
 
-use crate::model::settings::ModelSettings;
+use crate::model::settings::{ModelSettings, TierModels};
 use crate::model::{
     DecisionAnswer, DecisionEngine, DecisionRequest, ModelError, ModelProvider, ModelTier,
 };
@@ -22,6 +22,10 @@ use crate::model::{
 pub struct AgentRuntimeEngine {
     llm: Llm,
     provider: ModelProvider,
+    /// Ordered candidates per tier. The library's own tier resolution only
+    /// knows the primary, so the chain is kept here and the model is passed
+    /// explicitly on each attempt.
+    tiers: TierModels,
 }
 
 impl fmt::Debug for AgentRuntimeEngine {
@@ -121,7 +125,28 @@ impl AgentRuntimeEngine {
         Ok(Self {
             llm,
             provider: settings.provider(),
+            tiers: settings.tiers().clone(),
         })
+    }
+}
+
+/// Whether another model is worth trying after this failure.
+///
+/// The question is never "was this request valid" but "could a different model
+/// answer it". An exhausted balance, a rate limit, an overloaded upstream, or a
+/// flat rejection are all properties of the model that was asked, so the next
+/// candidate gets a turn. A transport fault is the exception: the provider was
+/// never reached, so the same failure would repeat on every candidate and the
+/// runtime's own retry policy is the right layer to handle it.
+fn worth_failing_over(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<ProviderError>() {
+        Some(ProviderError::Transport { .. }) => false,
+        // A classified provider refusal: credits, rate limit, overload, an
+        // unexpected status, or a response with nothing usable in it.
+        Some(_) => true,
+        // Not a provider error at all — most often the answer came back but
+        // did not satisfy the schema. Another model may well comply.
+        None => true,
     }
 }
 
@@ -132,27 +157,54 @@ impl DecisionEngine for AgentRuntimeEngine {
     }
 
     async fn answer(&self, request: DecisionRequest) -> Result<DecisionAnswer, ModelError> {
-        let provider_tier = match request.tier {
-            ModelTier::Fast => ProviderModelTier::Cheapest,
-            ModelTier::Balanced => ProviderModelTier::Default,
-            ModelTier::Reasoning => ProviderModelTier::Smartest,
-        };
+        let candidates = self.tiers.chain(request.tier);
+        let mut failures: Vec<String> = Vec::new();
 
-        let agent = InlineAgent {
-            instructions: request.instructions,
-            model: self.llm.model_for(provider_tier).to_string(),
-        };
-        let format = ResponseFormat::new(request.format.name, request.format.schema);
+        for (position, model) in candidates.iter().enumerate() {
+            let agent = InlineAgent {
+                instructions: request.instructions.clone(),
+                model: model.clone(),
+            };
+            let format =
+                ResponseFormat::new(request.format.name.clone(), request.format.schema.clone());
 
-        let value = self
-            .llm
-            .run_structured_with_format(&agent, request.input, format)
-            .await
-            .map_err(|error| ModelError::Request {
-                reason: format!("{error:#}"),
-            })?;
+            match self
+                .llm
+                .run_structured_with_format(&agent, request.input.clone(), format)
+                .await
+            {
+                Ok(value) => {
+                    if position > 0 {
+                        tracing::warn!(
+                            tier = %request.tier,
+                            model = %model,
+                            skipped = position,
+                            "model fallback served the decision"
+                        );
+                    }
+                    return Ok(DecisionAnswer { value });
+                }
+                Err(error) => {
+                    let reason = format!("{error:#}");
+                    let last = position + 1 == candidates.len();
+                    if last || !worth_failing_over(&error) {
+                        failures.push(format!("{model}: {reason}"));
+                        break;
+                    }
+                    tracing::warn!(
+                        tier = %request.tier,
+                        model = %model,
+                        %reason,
+                        "model failed; trying the next fallback"
+                    );
+                    failures.push(format!("{model}: {reason}"));
+                }
+            }
+        }
 
-        Ok(DecisionAnswer { value })
+        Err(ModelError::Request {
+            reason: failures.join(" | "),
+        })
     }
 }
 
@@ -457,5 +509,122 @@ mod tests {
             .await
             .expect_err("must fail");
         assert!(matches!(error, ModelError::Request { .. }));
+    }
+
+    /// Settings whose balanced tier carries two fallbacks behind the primary.
+    fn settings_with_fallbacks() -> ModelSettings {
+        ModelSettings::from_source(|name| {
+            Ok(match name {
+                "VEYRA_MODEL_PROVIDER" => "openrouter",
+                "VEYRA_MODEL_API_KEY" => "test-key-12345678",
+                "VEYRA_MODEL_FAST" => "vendor/fast",
+                "VEYRA_MODEL_BALANCED" => "vendor/balanced",
+                "VEYRA_MODEL_REASONING" => "vendor/reasoning",
+                "VEYRA_MODEL_BALANCED_FALLBACKS" => "vendor/second, vendor/third",
+                _ => return Err(ConfigError::MissingEnvironmentVariable { name }),
+            }
+            .to_owned())
+        })
+        .expect("settings parse")
+        .expect("model configured")
+    }
+
+    /// The model each queued request actually asked for, in order.
+    fn models_requested(mock: &QueueClient) -> Vec<String> {
+        mock.requests
+            .lock()
+            .expect("mock mutex")
+            .iter()
+            .map(|request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("request body is JSON");
+                body["model"].as_str().expect("model field").to_owned()
+            })
+            .collect()
+    }
+
+    // The motivating outage: the primary's balance is gone, so the tick must be
+    // served by the next model rather than lost.
+    #[actix_web::test]
+    async fn an_exhausted_balance_falls_over_to_the_next_model() {
+        let mock = Arc::new(QueueClient::default());
+        mock.push(
+            402,
+            json!({"error": {"message": "Insufficient credits"}}).to_string(),
+        );
+        mock.push(
+            200,
+            structured_response("bias", r#"{"bias":"bullish","confidence":0.7}"#),
+        );
+        let engine = AgentRuntimeEngine::build_with_client(
+            &settings_with_fallbacks(),
+            Some(mock.clone() as SharedHttpClient),
+        )
+        .expect("engine builds");
+
+        let answer = engine
+            .answer(request(ModelTier::Balanced))
+            .await
+            .expect("the fallback must serve the decision");
+
+        assert_eq!(answer.value["bias"], "bullish");
+        assert_eq!(
+            models_requested(&mock),
+            vec!["vendor/balanced", "vendor/second"],
+            "the primary is tried first, then exactly one fallback"
+        );
+    }
+
+    // Exhausting the chain must report every model that refused, so the log
+    // says which options were actually burned rather than only the last one.
+    #[actix_web::test]
+    async fn exhausting_the_chain_reports_each_failure() {
+        let mock = Arc::new(QueueClient::default());
+        for _ in 0..3 {
+            mock.push(
+                402,
+                json!({"error": {"message": "Insufficient credits"}}).to_string(),
+            );
+        }
+        let engine = AgentRuntimeEngine::build_with_client(
+            &settings_with_fallbacks(),
+            Some(mock.clone() as SharedHttpClient),
+        )
+        .expect("engine builds");
+
+        let error = engine
+            .answer(request(ModelTier::Balanced))
+            .await
+            .expect_err("every candidate refused");
+
+        let ModelError::Request { reason } = error else {
+            panic!("a provider refusal is a request error");
+        };
+        for model in ["vendor/balanced", "vendor/second", "vendor/third"] {
+            assert!(reason.contains(model), "{model} must appear in: {reason}");
+        }
+        assert_eq!(models_requested(&mock).len(), 3, "the chain is not re-run");
+    }
+
+    // A tier without fallbacks must keep its old single-shot behaviour, so the
+    // failover path cannot silently multiply spend on an unconfigured tier.
+    #[actix_web::test]
+    async fn a_tier_without_fallbacks_is_asked_exactly_once() {
+        let mock = Arc::new(QueueClient::default());
+        mock.push(
+            402,
+            json!({"error": {"message": "Insufficient credits"}}).to_string(),
+        );
+        let engine = AgentRuntimeEngine::build_with_client(
+            &settings_with_fallbacks(),
+            Some(mock.clone() as SharedHttpClient),
+        )
+        .expect("engine builds");
+
+        engine
+            .answer(request(ModelTier::Fast))
+            .await
+            .expect_err("no fallback is configured for the fast tier");
+        assert_eq!(models_requested(&mock), vec!["vendor/fast"]);
     }
 }

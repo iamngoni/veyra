@@ -44,35 +44,68 @@ impl fmt::Debug for ApiKey {
     }
 }
 
-/// Concrete model per capability tier.
+/// Concrete model per capability tier, each as an ordered candidate chain.
+///
+/// Index 0 is the configured primary; anything after it is a fallback tried in
+/// order when the one before it cannot serve the request — the provider is out
+/// of credits, rate limiting, overloaded, or rejects the model outright. A
+/// tier always holds at least its primary, so an empty chain is unreachable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierModels {
-    fast: String,
-    balanced: String,
-    reasoning: String,
+    fast: Vec<String>,
+    balanced: Vec<String>,
+    reasoning: Vec<String>,
 }
 
 impl TierModels {
-    /// Builds tiers from validated model identifiers.
+    /// Builds tiers from validated model identifiers, with no fallbacks.
     pub fn new(
         fast: impl Into<String>,
         balanced: impl Into<String>,
         reasoning: impl Into<String>,
     ) -> Self {
         Self {
-            fast: fast.into(),
-            balanced: balanced.into(),
-            reasoning: reasoning.into(),
+            fast: vec![fast.into()],
+            balanced: vec![balanced.into()],
+            reasoning: vec![reasoning.into()],
         }
     }
 
-    /// Resolves a tier to its configured model identifier.
+    /// Appends the fallback chain for one tier, preserving the primary at the
+    /// head. Duplicates of an earlier candidate are dropped: retrying the same
+    /// model against the same outage only burns budget.
+    #[must_use]
+    pub fn with_fallbacks(mut self, tier: ModelTier, fallbacks: Vec<String>) -> Self {
+        let chain = match tier {
+            ModelTier::Fast => &mut self.fast,
+            ModelTier::Balanced => &mut self.balanced,
+            ModelTier::Reasoning => &mut self.reasoning,
+        };
+        for candidate in fallbacks {
+            if !chain.iter().any(|existing| existing == &candidate) {
+                chain.push(candidate);
+            }
+        }
+        self
+    }
+
+    /// Resolves a tier to its primary model identifier.
     pub fn resolve(&self, tier: ModelTier) -> &str {
+        &self.chain(tier)[0]
+    }
+
+    /// The full ordered candidate chain for a tier: primary first.
+    pub fn chain(&self, tier: ModelTier) -> &[String] {
         match tier {
             ModelTier::Fast => &self.fast,
             ModelTier::Balanced => &self.balanced,
             ModelTier::Reasoning => &self.reasoning,
         }
+    }
+
+    /// Fallbacks only, for status output and round-tripping configuration.
+    pub fn fallbacks(&self, tier: ModelTier) -> &[String] {
+        &self.chain(tier)[1..]
     }
 }
 
@@ -124,6 +157,10 @@ impl ModelSettings {
         let compel_raw = optional(&mut source, "VEYRA_MODEL_COMPEL_STRUCTURED");
         let hourly_cap_raw = optional(&mut source, "VEYRA_MODEL_MAX_CALLS_PER_HOUR");
         let daily_cap_raw = optional(&mut source, "VEYRA_MODEL_MAX_CALLS_PER_DAY");
+        let fallbacks_raw = optional(&mut source, "VEYRA_MODEL_FALLBACKS");
+        let fast_fallbacks_raw = optional(&mut source, "VEYRA_MODEL_FAST_FALLBACKS");
+        let balanced_fallbacks_raw = optional(&mut source, "VEYRA_MODEL_BALANCED_FALLBACKS");
+        let reasoning_fallbacks_raw = optional(&mut source, "VEYRA_MODEL_REASONING_FALLBACKS");
 
         if key_raw.is_empty() {
             let any_other = !provider_raw.is_empty()
@@ -133,7 +170,11 @@ impl ModelSettings {
                 || !reasoning_raw.is_empty()
                 || !referer_raw.is_empty()
                 || !hourly_cap_raw.is_empty()
-                || !daily_cap_raw.is_empty();
+                || !daily_cap_raw.is_empty()
+                || !fallbacks_raw.is_empty()
+                || !fast_fallbacks_raw.is_empty()
+                || !balanced_fallbacks_raw.is_empty()
+                || !reasoning_fallbacks_raw.is_empty();
             if any_other {
                 return Err(ConfigError::MissingEnvironmentVariable {
                     name: "VEYRA_MODEL_API_KEY",
@@ -172,10 +213,34 @@ impl ModelSettings {
             }
         };
 
+        // A shared list applies to every tier; a tier-specific list replaces it
+        // for that tier rather than extending it, so one narrow override never
+        // has to restate the shared chain.
+        let shared_fallbacks = parse_fallbacks("VEYRA_MODEL_FALLBACKS", &fallbacks_raw)?;
+        let per_tier = |name: &'static str, raw: &str| -> Result<Vec<String>, ConfigError> {
+            if raw.is_empty() {
+                Ok(shared_fallbacks.clone())
+            } else {
+                parse_fallbacks(name, raw)
+            }
+        };
+
         let tiers = TierModels::new(
             tier("VEYRA_MODEL_FAST", fast_raw)?,
             tier("VEYRA_MODEL_BALANCED", balanced_raw)?,
             tier("VEYRA_MODEL_REASONING", reasoning_raw)?,
+        )
+        .with_fallbacks(
+            ModelTier::Fast,
+            per_tier("VEYRA_MODEL_FAST_FALLBACKS", &fast_fallbacks_raw)?,
+        )
+        .with_fallbacks(
+            ModelTier::Balanced,
+            per_tier("VEYRA_MODEL_BALANCED_FALLBACKS", &balanced_fallbacks_raw)?,
+        )
+        .with_fallbacks(
+            ModelTier::Reasoning,
+            per_tier("VEYRA_MODEL_REASONING_FALLBACKS", &reasoning_fallbacks_raw)?,
         );
 
         // Zero means unlimited; the cap bounds accidents, not normal use.
@@ -308,6 +373,46 @@ fn optional(
     source(name)
         .map(|value| value.trim().to_owned())
         .unwrap_or_default()
+}
+
+/// Maximum fallbacks accepted per tier.
+///
+/// Every candidate past the first costs a live round trip during an outage, so
+/// the chain is bounded: a deep list turns one slow tick into a very slow one
+/// and delays the decision loop far more than it rescues it.
+const MAX_FALLBACKS_PER_TIER: usize = 4;
+
+/// Parses a comma-separated fallback chain into validated model identifiers.
+///
+/// Blank segments are skipped so a trailing comma is harmless. Identifiers are
+/// only shape-checked (`vendor/model`); whether the provider actually serves
+/// one is not knowable here, and a wrong id simply fails over to the next
+/// candidate at request time.
+fn parse_fallbacks(name: &'static str, raw: &str) -> Result<Vec<String>, ConfigError> {
+    let mut models = Vec::new();
+    for segment in raw.split(',') {
+        let candidate = segment.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        if !candidate.contains('/') || candidate.starts_with('/') || candidate.ends_with('/') {
+            return Err(ConfigError::InvalidEnvironmentVariable {
+                name,
+                reason: "each fallback must be a `vendor/model` identifier",
+            });
+        }
+        if models.iter().any(|existing| existing == candidate) {
+            continue;
+        }
+        models.push(candidate.to_owned());
+    }
+    if models.len() > MAX_FALLBACKS_PER_TIER {
+        return Err(ConfigError::InvalidEnvironmentVariable {
+            name,
+            reason: "at most 4 fallbacks per tier",
+        });
+    }
+    Ok(models)
 }
 
 #[cfg(test)]
@@ -496,5 +601,122 @@ mod tests {
             Some(ModelProvider::OpenRouter)
         );
         assert_eq!(ModelProvider::parse("jaeger"), None);
+    }
+
+    #[test]
+    fn a_shared_fallback_list_applies_to_every_tier() {
+        let settings = ModelSettings::from_source(source(&full(&[(
+            "VEYRA_MODEL_FALLBACKS",
+            "z-ai/glm-5.3-flash, xiaomi/mimo-v2.6-flash",
+        )])))
+        .expect("settings parse")
+        .expect("configured");
+
+        for tier in [ModelTier::Fast, ModelTier::Balanced, ModelTier::Reasoning] {
+            assert_eq!(
+                settings.tiers().fallbacks(tier),
+                ["z-ai/glm-5.3-flash", "xiaomi/mimo-v2.6-flash"],
+                "tier {tier:?} inherits the shared chain"
+            );
+        }
+        assert_eq!(
+            settings.tiers().chain(ModelTier::Balanced).first().unwrap(),
+            "vendor/balanced",
+            "the primary stays at the head of the chain"
+        );
+    }
+
+    #[test]
+    fn a_tier_specific_list_replaces_the_shared_one() {
+        let settings = ModelSettings::from_source(source(&full(&[
+            ("VEYRA_MODEL_FALLBACKS", "z-ai/glm-5.3-flash"),
+            ("VEYRA_MODEL_REASONING_FALLBACKS", "xiaomi/mimo-v2.6-pro"),
+        ])))
+        .expect("settings parse")
+        .expect("configured");
+
+        assert_eq!(
+            settings.tiers().fallbacks(ModelTier::Reasoning),
+            ["xiaomi/mimo-v2.6-pro"],
+            "the narrow override wins outright rather than extending"
+        );
+        assert_eq!(
+            settings.tiers().fallbacks(ModelTier::Fast),
+            ["z-ai/glm-5.3-flash"],
+            "untouched tiers keep the shared chain"
+        );
+    }
+
+    #[test]
+    fn a_fallback_repeating_the_primary_is_dropped() {
+        let settings = ModelSettings::from_source(source(&full(&[(
+            "VEYRA_MODEL_BALANCED_FALLBACKS",
+            "vendor/balanced, z-ai/glm-5.3-flash",
+        )])))
+        .expect("settings parse")
+        .expect("configured");
+
+        assert_eq!(
+            settings.tiers().chain(ModelTier::Balanced),
+            ["vendor/balanced", "z-ai/glm-5.3-flash"],
+            "retrying the primary against the same outage only burns budget"
+        );
+    }
+
+    #[test]
+    fn malformed_and_oversized_fallback_lists_fail_closed() {
+        let bad = ModelSettings::from_source(source(&full(&[(
+            "VEYRA_MODEL_FALLBACKS",
+            "not-a-model-id",
+        )])));
+        assert!(
+            matches!(
+                bad,
+                Err(ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_MODEL_FALLBACKS",
+                    ..
+                })
+            ),
+            "an identifier without a vendor is a configuration error"
+        );
+
+        let too_many = ModelSettings::from_source(source(&full(&[(
+            "VEYRA_MODEL_FALLBACKS",
+            "a/1, b/2, c/3, d/4, e/5",
+        )])));
+        assert!(
+            matches!(
+                too_many,
+                Err(ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_MODEL_FALLBACKS",
+                    ..
+                })
+            ),
+            "a deep chain turns one slow tick into a very slow one"
+        );
+
+        // A trailing comma is a typo, not a failure.
+        let forgiving = ModelSettings::from_source(source(&full(&[(
+            "VEYRA_MODEL_FALLBACKS",
+            "z-ai/glm-5.3-flash,",
+        )])))
+        .expect("settings parse")
+        .expect("configured");
+        assert_eq!(
+            forgiving.tiers().fallbacks(ModelTier::Fast),
+            ["z-ai/glm-5.3-flash"]
+        );
+    }
+
+    #[test]
+    fn fallbacks_alone_still_require_a_key() {
+        let orphaned =
+            ModelSettings::from_source(source(&[("VEYRA_MODEL_FALLBACKS", "z-ai/glm-5.3-flash")]));
+        assert!(matches!(
+            orphaned,
+            Err(ConfigError::MissingEnvironmentVariable {
+                name: "VEYRA_MODEL_API_KEY"
+            })
+        ));
     }
 }

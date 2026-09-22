@@ -673,7 +673,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
         };
     }
     if manage_positions
-        && let Some(outcome) = manage_open_positions_after_link(state, settings).await
+        && let Some(outcome) = manage_open_positions_after_link(state, &settings).await
     {
         return outcome;
     }
@@ -888,7 +888,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
         };
         let outcome = review_positions(
             state,
-            settings,
+            &settings,
             &session,
             series,
             std::slice::from_ref(&position),
@@ -940,7 +940,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
         };
         let outcome = review_positions(
             state,
-            settings,
+            &settings,
             &session,
             series,
             std::slice::from_ref(&position),
@@ -1316,7 +1316,7 @@ pub async fn manage_open_positions(state: &AppState) -> TickOutcome {
             reason: "stale_link",
         };
     }
-    manage_open_positions_after_link(state, settings)
+    manage_open_positions_after_link(state, &settings)
         .await
         .unwrap_or(TickOutcome::Unchanged)
 }
@@ -1362,7 +1362,7 @@ async fn manage_open_positions_after_link(
             unix_secs(state.now()),
             policy.reentry_cooldown(),
         );
-        if state.config().trading_enabled() && !execution_pending {
+        if state.trading_enabled() && !execution_pending {
             if let Some(plan) = harvest_close_plan(
                 &managed,
                 policy,
@@ -1393,7 +1393,7 @@ async fn manage_open_positions_after_link(
             }
         }
     }
-    if state.config().trading_enabled()
+    if state.trading_enabled()
         && !execution_pending
         && let Some(plan) = stop_plan(
             &managed,
@@ -7379,14 +7379,14 @@ mod tests {
             1_758_003_600,
             Duration::from_secs(900),
         );
+        let harvest_settings = close_harness
+            .state
+            .autopilot()
+            .expect("autopilot configured");
         assert!(
             harvest_stop_plan(
                 &managed,
-                close_harness
-                    .state
-                    .autopilot()
-                    .and_then(AutopilotSettings::profit_harvest)
-                    .expect("policy"),
+                harvest_settings.profit_harvest().expect("policy"),
                 close_harness.state.stop_basis(),
                 close_harness.state.profit_harvest_book(),
                 1_758_003_600,

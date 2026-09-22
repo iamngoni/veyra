@@ -94,7 +94,7 @@ pub async fn readiness(state: Data<AppState>) -> HttpResponse {
     };
     HttpResponse::Ok().json(ReadinessResponse {
         status: overall,
-        trading_enabled: state.config().trading_enabled(),
+        trading_enabled: state.trading_enabled(),
         broker,
         audit,
     })
@@ -146,6 +146,14 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
     };
 
     let market_provider = state.market().map(|runtime| runtime.provider().as_str());
+    // The models the autopilot's tier will actually try, in order. Reported so
+    // a stalled loop can be told apart from one that simply ran out of
+    // configured options.
+    let tier_chain = state.autopilot().as_ref().and_then(|settings| {
+        state
+            .model()
+            .map(|runtime| runtime.chain(settings.tier()).to_vec())
+    });
     let autopilot = state.autopilot().map(|settings| {
         let profit_harvest = settings.profit_harvest().map(|policy| {
             json!({
@@ -172,7 +180,11 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
             "jev": settings.jev().as_str(),
             "breakeven_r": settings.breakeven_r(),
             "trail_r": settings.trail_r(),
-            "profit_harvest": profit_harvest
+            "profit_harvest": profit_harvest,
+            "model_fallbacks": tier_chain
+                .as_ref()
+                .map(|chain| chain.iter().skip(1).cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
         })
     });
     let model_provider = state.model().map(|runtime| runtime.provider().as_str());
@@ -211,7 +223,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         persistence,
         calendar_provider,
         broker_connected,
-        trading_enabled: state.config().trading_enabled(),
+        trading_enabled: state.trading_enabled(),
         ea_live_orders,
         autopilot,
         model_budget,

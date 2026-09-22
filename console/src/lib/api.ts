@@ -20,6 +20,8 @@ export type AutopilotStatus = {
   breakeven_r: number
   /** Trailing distance in multiples of the entry risk; zero when disabled. */
   trail_r: number
+  /** Ordered fallback models for the tier in use; empty when none are set. */
+  model_fallbacks?: string[]
   /** Deterministic early-profit ratchet; null when disabled. */
   profit_harvest?: {
     arm_r: number
@@ -317,6 +319,29 @@ export type Reconciliation = {
   positions?: Array<Record<string, unknown>>
 }
 
+/**
+ * One live setting as the service reports it.
+ *
+ * `overridden` separates a value an operator chose from one still coming from
+ * the deployment's environment, so the console can show what has drifted from
+ * the baseline rather than presenting every field as a decision someone made.
+ */
+export type LiveSetting = { value: string; overridden: boolean }
+
+export type RuntimeConfig = {
+  settings: Record<string, LiveSetting>
+  /** Sections whose edits take effect without a restart. */
+  live_sections: string[]
+}
+
+/**
+ * Partial update to the live settings, keyed by environment-variable name.
+ *
+ * `null` clears an override, returning that setting to whatever the
+ * environment says — the only way back to the startup baseline.
+ */
+export type RuntimeConfigPatch = Record<string, string | number | boolean | null>
+
 const BASE = '/api'
 
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -339,8 +364,17 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   if (!response.ok) {
     let detail = `${path} → ${response.status}`
     try {
-      const payload = (await response.json()) as { field?: string; reason?: string }
+      const payload = (await response.json()) as {
+        field?: string
+        reason?: string
+        rejected?: Array<{ field: string; reason: string }>
+      }
       if (payload.field && payload.reason) detail = `${payload.field}: ${payload.reason}`
+      // A settings patch reports every bad field at once, so the message names
+      // all of them rather than only the first.
+      else if (payload.rejected?.length) {
+        detail = payload.rejected.map((edit) => `${edit.field}: ${edit.reason}`).join('; ')
+      }
     } catch {
       // Keep the status-only detail when the body is not JSON.
     }
@@ -365,6 +399,9 @@ export const api = {
   /** Durable trail, newest first. Survives restarts, unlike the log ring. */
   audit: (limit = 200) => get<AuditPage>(`/audit?limit=${limit}`),
   updatePolicy: (patch: RiskPolicyPatch) => post<RiskPolicy>('/risk/policy', patch),
+  config: () => get<RuntimeConfig>('/config'),
+  updateConfig: (patch: RuntimeConfigPatch) =>
+    post<{ changed: string[]; settings: Record<string, LiveSetting> }>('/config', patch),
 }
 
 export const VEYRA_MAGIC = 77041

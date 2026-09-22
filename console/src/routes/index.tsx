@@ -8,6 +8,7 @@ import {
   AutopilotPanel,
   CommandsPanel,
   HeroMetrics,
+  LiveSettingsPanel,
   LogsPanel,
   MarketPanel,
   MetricsPanel,
@@ -37,6 +38,7 @@ const TABS = [
   { id: 'risk', label: 'Risk' },
   { id: 'trace', label: 'Trace' },
   { id: 'diagnostics', label: 'Diagnostics' },
+  { id: 'settings', label: 'Settings' },
 ] as const
 
 type TabId = (typeof TABS)[number]['id']
@@ -54,6 +56,9 @@ export function Dashboard() {
   const [logLevel, setLogLevel] = useState<LogLevel>('info')
   const { logs, error: logsError } = useLogFeed(logLevel)
   const { data: audit, error: auditError } = usePoll(() => api.audit(200), 15000)
+  // Settings change only when someone changes them, so this polls slowly and
+  // is refetched immediately after an edit.
+  const { data: liveConfig, refetch: refetchConfig } = usePoll(api.config, 60000)
   const [traceKind, setTraceKind] = useState('all')
   const { theme, toggle } = useTheme()
   const [tab, setTab] = useState<TabId>('overview')
@@ -84,6 +89,18 @@ export function Dashboard() {
       await api.updatePolicy(patch)
       // Reflect the new policy at once instead of leaving a stale reading on
       // screen until the next poll.
+      void refetchStatus()
+      return undefined
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  const applyConfig = async (patch: Parameters<typeof api.updateConfig>[0]) => {
+    try {
+      await api.updateConfig(patch)
+      // A settings edit can move the autopilot and the execution switch, both
+      // of which the header reads, so refresh status alongside the settings.
       void refetchStatus()
       return undefined
     } catch (error) {
@@ -139,6 +156,14 @@ export function Dashboard() {
           <ActivityFeed events={events} connected={connected} focus={focus} onFocusChange={setFocus} />
           <CommandsPanel commands={commands?.commands} />
         </div>
+      ) : null}
+
+      {tab === 'settings' ? (
+        <LiveSettingsPanel
+          settings={liveConfig?.settings}
+          onApply={applyConfig}
+          onRefresh={() => void refetchConfig()}
+        />
       ) : null}
 
       {tab === 'risk' ? (

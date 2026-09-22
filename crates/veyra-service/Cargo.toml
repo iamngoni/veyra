@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 actix-web.workspace = true
 agent-runtime.workspace = true
+anyhow.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true

@@ -20,6 +20,7 @@ pub mod performance;
 pub mod reconciliation;
 pub mod risk;
 pub mod routes;
+pub mod runtime_config;
 pub mod server;
 pub mod state;
 pub mod store;
@@ -48,8 +49,17 @@ pub struct AppState {
     broker: Option<BrokerRuntime>,
     market: Option<MarketRuntime>,
     calendar: Option<CalendarRuntime>,
-    autopilot: Option<AutopilotSettings>,
-    model: Option<ModelRuntime>,
+    /// Live autopilot settings. Behind a lock because the console edits them
+    /// without a restart; every reader takes a snapshot for the duration of a
+    /// tick rather than holding the guard across an await.
+    autopilot: Arc<std::sync::RwLock<Option<AutopilotSettings>>>,
+    /// Live model integration, rebuilt in place when its settings change.
+    model: Arc<std::sync::RwLock<Option<ModelRuntime>>>,
+    /// The service half of the execution control, overridable at runtime.
+    /// `None` means "as configured at startup".
+    trading_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Writable overlay in front of the environment for every live setting.
+    runtime_config: crate::runtime_config::RuntimeConfig,
     jev: Option<JevRuntime>,
     audit: Option<AuditRuntime>,
     logs: Option<Arc<LogBuffer>>,
@@ -77,13 +87,17 @@ impl AppState {
         model: Option<ModelRuntime>,
         risk: RiskGate,
     ) -> Self {
+        let trading_enabled =
+            Arc::new(std::sync::atomic::AtomicBool::new(config.trading_enabled()));
         Self {
             config,
             broker,
             market: None,
             calendar: None,
-            autopilot: None,
-            model,
+            autopilot: Arc::new(std::sync::RwLock::new(None)),
+            model: Arc::new(std::sync::RwLock::new(model)),
+            trading_enabled,
+            runtime_config: crate::runtime_config::RuntimeConfig::new(),
             jev: None,
             audit: None,
             logs: None,
@@ -134,8 +148,14 @@ impl AppState {
     }
 
     /// Attaches the configured autonomous loop settings, if any.
-    pub fn with_autopilot(mut self, autopilot: Option<AutopilotSettings>) -> Self {
-        self.autopilot = autopilot;
+    pub fn with_autopilot(self, autopilot: Option<AutopilotSettings>) -> Self {
+        *self.autopilot_slot() = autopilot;
+        self
+    }
+
+    /// Attaches the writable overlay in front of the environment.
+    pub fn with_runtime_config(mut self, config: crate::runtime_config::RuntimeConfig) -> Self {
+        self.runtime_config = config;
         self
     }
 
@@ -182,9 +202,45 @@ impl AppState {
         &self.runtime_state
     }
 
-    /// Returns the autonomous loop settings, if any were configured.
-    pub fn autopilot(&self) -> Option<&AutopilotSettings> {
-        self.autopilot.as_ref()
+    /// Returns a snapshot of the autonomous loop settings, if any.
+    ///
+    /// This clones rather than lending: the settings can change under a
+    /// running tick, and a tick that read half its configuration from before
+    /// an edit and half from after would be far harder to reason about than
+    /// one that finishes on the settings it started with.
+    pub fn autopilot(&self) -> Option<AutopilotSettings> {
+        self.autopilot_slot().clone()
+    }
+
+    /// Replaces the live autopilot settings.
+    pub fn set_autopilot(&self, settings: Option<AutopilotSettings>) {
+        *self.autopilot_slot() = settings;
+    }
+
+    fn autopilot_slot(&self) -> std::sync::RwLockWriteGuard<'_, Option<AutopilotSettings>> {
+        self.autopilot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The writable overlay in front of the environment.
+    pub fn runtime_config(&self) -> &crate::runtime_config::RuntimeConfig {
+        &self.runtime_config
+    }
+
+    /// Whether the service half of the execution control is armed.
+    ///
+    /// Prefer this over [`ServiceConfig::trading_enabled`]: the startup value
+    /// is only the baseline, and the console can move it.
+    pub fn trading_enabled(&self) -> bool {
+        self.trading_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Arms or disarms the service half of the execution control.
+    pub fn set_trading_enabled(&self, enabled: bool) {
+        self.trading_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Entry-risk memory shared by the autopilot's stop policies; survives
@@ -226,9 +282,21 @@ impl AppState {
         &self.decision_health
     }
 
-    /// Returns the active model integration, if one is configured.
-    pub fn model(&self) -> Option<&ModelRuntime> {
-        self.model.as_ref()
+    /// Returns a snapshot of the active model integration, if one is
+    /// configured. Cloned for the same reason as [`AppState::autopilot`].
+    pub fn model(&self) -> Option<ModelRuntime> {
+        self.model
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replaces the live model integration.
+    pub fn set_model(&self, model: Option<ModelRuntime>) {
+        *self
+            .model
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = model;
     }
 
     /// Returns the active judgement integration, if one is configured.

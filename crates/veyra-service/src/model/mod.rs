@@ -155,6 +155,10 @@ pub struct ModelRuntime {
     provider: ModelProvider,
     engine: Arc<dyn DecisionEngine>,
     budget: Arc<BudgetTracker>,
+    /// Kept so a surface can report which models a tier will actually try,
+    /// which is the difference between "the decision failed" and "the decision
+    /// failed on every model configured for it".
+    tiers: TierModels,
 }
 
 impl ModelRuntime {
@@ -174,6 +178,7 @@ impl ModelRuntime {
                     provider: settings.provider(),
                     engine,
                     budget,
+                    tiers: settings.tiers().clone(),
                 })
             }
         }
@@ -187,6 +192,12 @@ impl ModelRuntime {
     /// Domain-level engine contract used by the decision layer.
     pub fn engine(&self) -> Arc<dyn DecisionEngine> {
         self.engine.clone()
+    }
+
+    /// The ordered candidate models for a tier: primary first, then the
+    /// fallbacks tried when it cannot serve a decision.
+    pub fn chain(&self, tier: ModelTier) -> &[String] {
+        self.tiers.chain(tier)
     }
 
     /// Current call usage against the configured budget.
@@ -214,6 +225,7 @@ impl ModelRuntime {
             provider,
             engine,
             budget: Arc::new(BudgetTracker::new(BudgetPolicy::default())),
+            tiers: TierModels::new("test/fast", "test/balanced", "test/reasoning"),
         }
     }
 }
