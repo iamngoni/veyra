@@ -20,6 +20,7 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::audit::{AuditEvent, AuditKind};
+use crate::balance::{BalanceAccount, BalanceHistory, sample_points};
 use crate::broker::BrokerLink;
 use crate::broker::Symbol;
 use crate::broker::{
@@ -373,6 +374,113 @@ pub async fn account_state(state: Data<AppState>) -> HttpResponse {
         body["serverTime"] = json!(account.server_time);
     }
     HttpResponse::Ok().json(body)
+}
+
+/// Optional lookback window for real broker-balance observations.
+#[derive(Debug, Deserialize)]
+pub struct BalanceHistoryQuery {
+    /// Days to include, from 1 through 365; defaults to 30.
+    pub days: Option<u16>,
+}
+
+#[get("/account/balance-history")]
+/// Reads persisted `AccountBalance()` observations for the active account.
+///
+/// This never enqueues a broker command and never reconstructs balances from
+/// trade P/L. Balances include deposits, withdrawals, and non-Veyra activity.
+pub async fn balance_history(
+    state: Data<AppState>,
+    query: web::Query<BalanceHistoryQuery>,
+) -> HttpResponse {
+    let days = query.days.unwrap_or(30);
+    if !(1..=365).contains(&days) {
+        return HttpResponse::BadRequest().json(json!({ "error": "invalid_days" }));
+    }
+    let report = if let Some(broker) = state.broker() {
+        Some(broker.link().report().await)
+    } else {
+        None
+    };
+    let account = report
+        .as_ref()
+        .and_then(|report| report.snapshot.as_ref())
+        .map(|snapshot| BalanceAccount {
+            login: snapshot.login().value(),
+            server: snapshot.server().as_str().to_owned(),
+        });
+    let retention_days = state.config().audit_retention_days();
+    let Some(audit) = state.audit() else {
+        return HttpResponse::Ok().json(BalanceHistory {
+            status: "disabled",
+            source: "broker_balance",
+            account,
+            days,
+            retention_days,
+            currency: None,
+            points: Vec::new(),
+            first_observed_at_ms: None,
+            last_observed_at_ms: None,
+            sampled: false,
+            fresh: false,
+        });
+    };
+    let Some(account) = account else {
+        return HttpResponse::Ok().json(BalanceHistory {
+            status: "waiting_for_account",
+            source: "broker_balance",
+            account: None,
+            days,
+            retention_days,
+            currency: None,
+            points: Vec::new(),
+            first_observed_at_ms: None,
+            last_observed_at_ms: None,
+            sampled: false,
+            fresh: false,
+        });
+    };
+    let now_ms = state
+        .now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let since_ms = now_ms.saturating_sub(u64::from(days) * 86_400_000);
+    let points = match audit
+        .trail()
+        .balance_history(account.login, &account.server, since_ms)
+        .await
+    {
+        Ok(points) => points,
+        Err(error) => {
+            tracing::warn!(%error, "balance history read failed");
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({ "error": "balance_history_unavailable" }));
+        }
+    };
+    let (points, sampled) = sample_points(points);
+    let first_observed_at_ms = points.first().map(|point| point.at_ms);
+    let last_observed_at_ms = points.last().map(|point| point.at_ms);
+    let fresh = report.as_ref().is_some_and(|report| {
+        report.fresh
+            && report
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.connected())
+    }) && last_observed_at_ms
+        .is_some_and(|at_ms| now_ms.saturating_sub(at_ms) <= 90_000);
+    HttpResponse::Ok().json(BalanceHistory {
+        status: "ok",
+        source: "broker_balance",
+        account: Some(account),
+        days,
+        retention_days,
+        currency: None,
+        points,
+        first_observed_at_ms,
+        last_observed_at_ms,
+        sampled,
+        fresh,
+    })
 }
 
 /// Query for `GET /market/candles`; every field is optional.

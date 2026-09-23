@@ -34,7 +34,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
       <head>
         <HeadContent />
       </head>
-      <body className="bg-[#07090d] text-slate-200 antialiased">
+      <body className="bg-[var(--color-surface-0)] text-[var(--color-ink)] antialiased">
         {children}
         <TanStackDevtools
           config={{

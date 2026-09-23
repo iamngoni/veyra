@@ -31,6 +31,7 @@ describe('api', () => {
     await api.metrics()
     await api.commands(10)
     await api.candles(24)
+    await api.balanceHistory(7)
     await api.performance(7)
     await api.sessions()
     await api.audit(50)
@@ -42,6 +43,7 @@ describe('api', () => {
       '/api/metrics',
       '/api/commands?limit=10',
       '/api/market/candles?timeframe=H4&bars=24',
+      '/api/account/balance-history?days=7',
       '/api/performance?days=7',
       '/api/market/sessions',
       '/api/audit?limit=50',
@@ -66,10 +68,12 @@ describe('api', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     await api.commands()
+    await api.balanceHistory()
     await api.performance()
     await api.audit()
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       '/api/commands?limit=25',
+      '/api/account/balance-history?days=30',
       '/api/performance?days=30',
       '/api/audit?limit=200',
     ])

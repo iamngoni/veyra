@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use actix_web::body::BoxBody;
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
@@ -92,6 +92,8 @@ pub struct EaPoll {
     orders: Option<u32>,
     #[serde(default)]
     lots: Option<f64>,
+    #[serde(default)]
+    balance: Option<Value>,
     #[serde(rename = "id", default)]
     command_id: Option<CommandId>,
     #[serde(default)]
@@ -259,6 +261,15 @@ struct StoredAccount {
     observed_at: Instant,
 }
 
+/// Last accepted heartbeat balance, used only to bound audit write volume.
+#[derive(Debug)]
+struct BalanceSampleState {
+    login: u64,
+    server: String,
+    balance: f64,
+    at_ms: u64,
+}
+
 /// Shared state of the EA control channel.
 #[derive(Debug)]
 pub struct EaLink {
@@ -271,6 +282,7 @@ pub struct EaLink {
     last_account: Mutex<Option<StoredAccount>>,
     previous_account: Mutex<Option<StoredAccount>>,
     audit: Mutex<Option<Arc<AuditRuntime>>>,
+    balance_sample: Mutex<Option<BalanceSampleState>>,
 }
 
 impl EaLink {
@@ -288,6 +300,7 @@ impl EaLink {
             last_account: Mutex::new(None),
             previous_account: Mutex::new(None),
             audit: Mutex::new(None),
+            balance_sample: Mutex::new(None),
         }
     }
 
@@ -583,6 +596,59 @@ impl EaLink {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.clone()
+    }
+
+    /// Builds a durable observation from one validated, connected heartbeat.
+    /// Missing or invalid optional balance data never changes the poll reply.
+    fn balance_observation(
+        &self,
+        snapshot: &AccountSnapshot,
+        balance: Option<f64>,
+    ) -> Option<(Arc<AuditRuntime>, AuditEvent)> {
+        let audit = self.attached_audit()?;
+        let balance = balance.filter(|value| value.is_finite())?;
+        if !snapshot.connected() {
+            return None;
+        }
+        let at_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_millis(),
+        )
+        .ok()?;
+        let login = snapshot.login().value();
+        let server = snapshot.server().as_str();
+        let mut slot = self
+            .balance_sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|previous| {
+            previous.login == login
+                && previous.server == server
+                && previous.balance == balance
+                && at_ms.saturating_sub(previous.at_ms) < 60_000
+        }) {
+            return None;
+        }
+        *slot = Some(BalanceSampleState {
+            login,
+            server: server.to_owned(),
+            balance,
+            at_ms,
+        });
+        Some((
+            audit,
+            AuditEvent::new(
+                AuditKind::BalanceObserved,
+                serde_json::json!({
+                    "login": login,
+                    "server": server,
+                    "balance": balance,
+                    "atMs": at_ms
+                }),
+            ),
+        ))
     }
 
     /// Records the terminal state of an acknowledged command, when auditing is
@@ -906,7 +972,13 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
         EaKind::Ack => HttpResponse::Ok().json(EaReply::None),
         EaKind::Hello | EaKind::Hb => match poll.snapshot() {
             Ok(snapshot) => {
+                let observation = link
+                    .balance_observation(&snapshot, poll.balance.as_ref().and_then(Value::as_f64));
                 link.record(snapshot);
+                if let Some((audit, event)) = observation {
+                    // Database latency must not delay command delivery to MT4.
+                    actix_web::rt::spawn(async move { audit.try_record(event).await });
+                }
                 let reply = match link.deliverable() {
                     Some((id, kind, request)) => {
                         let (order, close, modify, rates, spec, history) = match request {
@@ -1171,6 +1243,67 @@ mod tests {
         assert_eq!(CommandKind::ModifyOrder.as_str(), "modify_order");
         assert_eq!(CommandKind::Rates.as_str(), "rates");
         assert_eq!(CommandKind::SymbolSpec.as_str(), "symbol_spec");
+    }
+
+    #[test]
+    fn balance_observations_are_validated_scoped_and_sampled() {
+        use crate::audit::{AuditKind, AuditRuntime, MemoryTrail};
+        use crate::broker::{AccountLogin, AccountSnapshot, ServerName, Symbol};
+
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        link.set_audit(Arc::new(AuditRuntime::new(
+            Arc::new(MemoryTrail::default()),
+        )));
+        let snapshot = |login, connected| {
+            AccountSnapshot::new(
+                AccountLogin::parse(login).expect("login"),
+                ServerName::parse("IFCMarkets-Real").expect("server"),
+                Symbol::parse("EURUSD").expect("symbol"),
+                connected,
+                true,
+                0,
+                0.0,
+            )
+        };
+        let first = link
+            .balance_observation(&snapshot(94168, true), Some(20.0))
+            .expect("first value");
+        assert_eq!(first.1.kind(), AuditKind::BalanceObserved);
+        assert_eq!(first.1.payload()["login"], 94168);
+        assert_eq!(first.1.payload()["server"], "IFCMarkets-Real");
+        assert_eq!(first.1.payload()["balance"], 20.0);
+        assert!(
+            link.balance_observation(&snapshot(94168, true), Some(20.0))
+                .is_none()
+        );
+        assert!(
+            link.balance_observation(&snapshot(94168, true), None)
+                .is_none()
+        );
+        assert!(
+            link.balance_observation(&snapshot(94168, true), Some(-1.0))
+                .is_some()
+        );
+        assert!(
+            link.balance_observation(&snapshot(94168, true), Some(f64::NAN))
+                .is_none()
+        );
+        assert!(
+            link.balance_observation(&snapshot(94168, false), Some(21.0))
+                .is_none()
+        );
+        assert!(
+            link.balance_observation(&snapshot(94168, true), Some(0.0))
+                .is_some()
+        );
+        assert!(
+            link.balance_observation(&snapshot(94169, true), Some(0.0))
+                .is_some()
+        );
     }
 
     fn candle(time: i64) -> CandlePayload {

@@ -47,4 +47,5 @@ pub fn create_app(
         .service(crate::control::update_runtime_config)
         .service(crate::control::event_feed)
         .service(crate::control::account_state)
+        .service(crate::control::balance_history)
 }

@@ -5,6 +5,7 @@ import type { ReactNode } from 'react'
 import type {
   Account,
   AuditPage,
+  BalanceHistory,
   Candle,
   CandleSeries,
   CommandRecord,
@@ -162,7 +163,7 @@ export function Tabs({
   onSelect: (id: string) => void
 }) {
   return (
-    <div role="tablist" className="flex flex-wrap gap-1 rounded-lg border border-[var(--color-line)] bg-[var(--color-surface-1)] p-1">
+    <div role="tablist" className="console-tabs flex flex-wrap gap-1 rounded-lg border border-[var(--color-line)] bg-[var(--color-surface-1)] p-1">
       {tabs.map((tab) => {
         const selected = tab.id === active
         return (
@@ -752,6 +753,157 @@ export function PerformancePanel({
           ))}
         </div>
       ) : null}
+    </Panel>
+  )
+}
+
+/* ---------- account balance history ---------- */
+
+function historyTime(ms: number): string {
+  const date = new Date(ms)
+  return date.toLocaleString([], {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+  })
+}
+
+function historyValue(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(2) : '—'
+}
+
+/**
+ * Shows only broker-observed balance points for the currently connected
+ * account. A single point is intentionally rendered as a dot, not a line;
+ * an empty history never gets an invented percentage or trend.
+ */
+export function BalanceHistoryPanel({
+  history,
+  account,
+  error,
+}: {
+  history?: BalanceHistory
+  account?: Account
+  error?: string
+}) {
+  const sameAccount = Boolean(
+    history?.account &&
+      account?.login != null &&
+      account.server &&
+      history.account.login === account.login &&
+      history.account.server === account.server,
+  )
+  const current = sameAccount ? history : undefined
+  const points = current?.points ?? []
+  const first = points[0]
+  const last = points.at(-1)
+  const spanMs = first && last ? Math.max(last.atMs - first.atMs, 1) : 1
+  const values = points.map((point) => point.balance).filter(Number.isFinite)
+  const min = values.length ? Math.min(...values) : 0
+  const max = values.length ? Math.max(...values) : 1
+  const padding = values.length > 1 ? Math.max((max - min) * 0.12, Math.abs(max) * 0.001, 0.01) : 1
+  const low = min - padding
+  const high = max + padding
+  const range = high - low || 1
+  const plotWidth = 760
+  const plotHeight = 220
+  const chartPoints = points.map((point) => {
+      const x = points.length === 1 ? plotWidth / 2 : ((point.atMs - (first?.atMs ?? point.atMs)) / spanMs) * plotWidth
+      const y = plotHeight - ((point.balance - low) / range) * plotHeight
+      return { x, y, atMs: point.atMs }
+    })
+  const maxGapMs = current?.sampled ? Math.max(300_000, (spanMs / Math.max(points.length - 1, 1)) * 4) : 300_000
+  const segments: Array<typeof chartPoints> = []
+  for (const point of chartPoints) {
+    const segment = segments.at(-1)
+    if (!segment || (point.atMs - segment.at(-1)!.atMs) > maxGapMs) {
+      segments.push([point])
+    } else {
+      segment.push(point)
+    }
+  }
+  const change = first && last && points.length > 1 ? last.balance - first.balance : null
+  const changeText = change == null || change === 0 ? null : `${change > 0 ? '+' : '−'}${historyValue(Math.abs(change))}`
+  const statusText =
+    history?.status === 'disabled'
+      ? 'Balance history is disabled.'
+      : history?.status === 'waiting_for_account'
+        ? 'Waiting for the broker account.'
+        : error
+          ? error
+          : !account
+            ? 'Waiting for the current account.'
+            : !sameAccount && history?.account
+              ? 'Waiting for this account’s history.'
+              : 'History starts with the next broker reading.'
+
+  return (
+    <Panel
+      title="Account balance"
+      detail={
+        error ? (
+          <span className="text-[var(--color-bad)]">unavailable</span>
+        ) : current && points.length > 0 ? (
+          <span>
+            {current.days}d · {current.sampled ? 'sampled' : 'observed'}
+          </span>
+        ) : (
+          'broker history'
+        )
+      }
+      className="balance-history-panel"
+    >
+      {points.length === 0 ? (
+        <div className="balance-history-empty" role="status">
+          <span className="balance-history-empty-mark" aria-hidden="true" />
+          <div>
+            <strong>{statusText}</strong>
+          </div>
+        </div>
+      ) : (
+        <figure className="balance-history-figure" aria-label="Broker-observed account balance over time">
+          <div className="balance-history-summary">
+            <div>
+              <span className="label">Latest balance</span>
+              <strong className="readout">{historyValue(last?.balance ?? NaN)}</strong>
+              {changeText ? <span className={`balance-history-change ${change! > 0 ? 'is-positive' : change! < 0 ? 'is-negative' : ''}`}>Balance change {changeText}</span> : null}
+            </div>
+            <div className="balance-history-range">
+              <span>{first ? historyTime(first.atMs) : '—'}</span>
+              <span>{last ? historyTime(last.atMs) : '—'}</span>
+            </div>
+          </div>
+          <div className="balance-history-chart-wrap">
+            <svg className="balance-history-chart" viewBox={`0 0 ${plotWidth} ${plotHeight}`} role="img">
+              <title>Observed account balance history</title>
+              {[0, 0.5, 1].map((fraction) => {
+                const y = plotHeight * fraction
+                const value = high - range * fraction
+                return (
+                  <g key={fraction}>
+                    <line x1="0" x2={plotWidth} y1={y} y2={y} className="chart-grid-line" />
+                    <text x="0" y={Math.max(12, y - 5)} className="chart-axis-label">
+                      {historyValue(value)}
+                    </text>
+                  </g>
+                )
+              })}
+              {segments.map((segment, index) => segment.length > 1 ? (
+                <path
+                  key={index}
+                  d={segment.slice(1).reduce((path, point) => `${path} H ${point.x.toFixed(2)} V ${point.y.toFixed(2)}`, `M ${segment[0].x.toFixed(2)} ${segment[0].y.toFixed(2)}`)}
+                  className="balance-history-line"
+                />
+              ) : (
+                <circle key={index} cx={segment[0].x} cy={segment[0].y} r="4" className="balance-history-dot" />
+              ))}
+              {chartPoints.length > 1 && last ? <circle cx={chartPoints.at(-1)?.x} cy={chartPoints.at(-1)?.y} r="4" className="balance-history-dot" /> : null}
+            </svg>
+          </div>
+          <figcaption>
+            <span>{points.length === 1 ? '1 broker observation' : `${points.length} broker observations`}</span>
+            <span>{error ? 'last known · refresh failed' : current?.fresh ? 'fresh' : 'last known'}</span>
+          </figcaption>
+        </figure>
+      )}
     </Panel>
   )
 }

@@ -315,6 +315,25 @@ export type Candle = {
 
 export type CandleSeries = { symbol: string; timeframe: string; candles: Candle[] }
 
+/**
+ * Broker-observed balance history. This is deliberately separate from
+ * realized performance: it is the account balance the EA reported, not an
+ * inferred equity curve or a fabricated return series.
+ */
+export type BalanceHistory = {
+  status: 'ok' | 'disabled' | 'waiting_for_account'
+  source: 'broker_balance'
+  account: { login: number; server: string } | null
+  days: number
+  retentionDays: number
+  currency: string | null
+  points: Array<{ atMs: number; balance: number }>
+  firstObservedAtMs: number | null
+  lastObservedAtMs: number | null
+  sampled: boolean
+  fresh: boolean
+}
+
 export type Reconciliation = {
   status: string
   accountAgeSecs?: number
@@ -396,6 +415,7 @@ export const api = {
   metrics: () => get<Metrics>('/metrics'),
   commands: (limit = 25) => get<{ commands: CommandRecord[] }>(`/commands?limit=${limit}`),
   candles: (bars = 48) => get<CandleSeries>(`/market/candles?timeframe=H4&bars=${bars}`),
+  balanceHistory: (days = 30) => get<BalanceHistory>(`/account/balance-history?days=${days}`),
   performance: (days = 30) => get<Performance>(`/performance?days=${days}`),
   sessions: () => get<MarketSessions>('/market/sessions'),
   events: (after: number | undefined, waitMs = 15000) =>

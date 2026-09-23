@@ -80,6 +80,12 @@ describe('isRoutine', () => {
     expect(isRoutine(event('position_closed', {}))).toBe(false)
     expect(isRoutine(event('command_queued', {}))).toBe(false)
   })
+
+  it('hides balance samples and read-only broker requests in focus mode', () => {
+    expect(isRoutine(event('balance_observed', { balance: 36.39 }))).toBe(true)
+    expect(isRoutine(event('command_completed', { kind: 'symbol_spec' }))).toBe(true)
+    expect(isRoutine(event('command_completed', { kind: 'order_history' }))).toBe(true)
+  })
 })
 
 describe('detailRows', () => {

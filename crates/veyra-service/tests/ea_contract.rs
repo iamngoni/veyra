@@ -8,6 +8,7 @@ use std::time::Duration;
 use actix_web::http::StatusCode;
 use actix_web::test;
 use serde_json::{Value, json};
+use veyra_service::audit::{AuditKind, AuditRuntime, MemoryTrail};
 
 use veyra_service::broker::{
     BrokerLink, BrokerProvider, CommandKind, CommandPayload, CommandState, EaLink, EaToken,
@@ -79,6 +80,48 @@ async fn hello_is_answered_with_ping_and_records_snapshot() {
     assert!(snapshot.connected());
     assert!(snapshot.trade_allowed());
     assert!(report.fresh);
+}
+
+#[actix_web::test]
+async fn invalid_optional_balance_does_not_block_heartbeat_or_commands() {
+    let link = link(Duration::from_secs(10));
+    let command = link.enqueue_account_snapshot();
+    let mut payload = body("hello");
+    payload["balance"] = json!("unavailable");
+    let (status, response) = post(link.clone(), payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["t"], "cmd");
+    assert_eq!(response["id"], command.to_string());
+    assert!(link.report().await.snapshot.is_some());
+}
+
+#[actix_web::test]
+async fn valid_heartbeat_balance_is_persisted_without_changing_the_reply() {
+    let link = link(Duration::from_secs(10));
+    let trail = Arc::new(MemoryTrail::default());
+    link.set_audit(Arc::new(AuditRuntime::new(trail.clone())));
+    let mut payload = body("hello");
+    payload["balance"] = json!(36.39);
+    let (status, response) = post(link, payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["t"], "ping");
+    for _ in 0..20 {
+        if trail
+            .events()
+            .iter()
+            .any(|event| event.kind() == AuditKind::BalanceObserved)
+        {
+            break;
+        }
+        actix_web::rt::time::sleep(Duration::from_millis(5)).await;
+    }
+    let events = trail.events();
+    let observation = events
+        .iter()
+        .find(|event| event.kind() == AuditKind::BalanceObserved)
+        .expect("validated balance was recorded");
+    assert_eq!(observation.payload()["balance"], 36.39);
+    assert_eq!(observation.payload()["login"], 94168);
 }
 
 #[actix_web::test]

@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type {
   Account,
   CandleSeries,
+  BalanceHistory,
   CommandRecord,
   FeedEvent,
   LogRecord,
@@ -27,6 +28,7 @@ import {
   AccountPanel,
   ActivityFeed,
   AutopilotPanel,
+  BalanceHistoryPanel,
   CommandsPanel,
   LiveSettingsPanel,
   HeroMetrics,
@@ -313,6 +315,76 @@ describe('AccountPanel', () => {
     expect(screen.getByText('waiting…')).toBeTruthy()
     rerender(<AccountPanel error="account down" />)
     expect(screen.getByText('account down')).toBeTruthy()
+  })
+})
+
+describe('BalanceHistoryPanel', () => {
+  const history: BalanceHistory = {
+    status: 'ok',
+    source: 'broker_balance',
+    account: { login: 123456, server: 'ICMarketsSC-MT4' },
+    days: 30,
+    retentionDays: 365,
+    currency: null,
+    points: [
+      { atMs: 1_700_000_000_000, balance: 1000 },
+      { atMs: 1_700_086_400_000, balance: 1004.5 },
+    ],
+    firstObservedAtMs: 1_700_000_000_000,
+    lastObservedAtMs: 1_700_086_400_000,
+    sampled: true,
+    fresh: true,
+  }
+
+  it('renders observed balance points without inventing a return metric', () => {
+    render(<BalanceHistoryPanel history={history} account={account} />)
+    expect(screen.getByText('1004.50')).toBeTruthy()
+    expect(screen.getByText('2 broker observations')).toBeTruthy()
+    expect(screen.queryByText(/%/)).toBeNull()
+  })
+
+  it('discards history when the connected account changes', () => {
+    render(<BalanceHistoryPanel history={history} account={{ ...account, login: 999999 }} />)
+    expect(screen.getByText('Waiting for this account’s history.')).toBeTruthy()
+    expect(screen.queryByText('1004.50')).toBeNull()
+  })
+
+  it('keeps a one-point history honest', () => {
+    render(<BalanceHistoryPanel history={{ ...history, points: [history.points[0]] }} account={account} />)
+    expect(screen.getByText('1 broker observation')).toBeTruthy()
+    expect(screen.queryByText('No broker balance observations yet.')).toBeNull()
+  })
+
+  it('shows a negative observed balance without calling the change profit', () => {
+    render(<BalanceHistoryPanel history={{ ...history, points: [{ atMs: history.points[0].atMs, balance: 4 }, { atMs: history.points[0].atMs + 60_000, balance: -2.5 }] }} account={account} />)
+    expect(screen.getByText('-2.50')).toBeTruthy()
+    expect(screen.getByText('Balance change −6.50')).toBeTruthy()
+    expect(screen.queryByText(/profit/i)).toBeNull()
+  })
+
+  it('shows dates for observations spanning days', () => {
+    const dated = {
+      ...history,
+      points: [
+        { atMs: Date.parse('2026-09-20T12:00:00Z'), balance: 20 },
+        { atMs: Date.parse('2026-09-23T12:00:00Z'), balance: 21 },
+      ],
+    }
+    render(<BalanceHistoryPanel history={dated} account={account} error="refresh failed" />)
+    const range = document.querySelector('.balance-history-range')
+    expect(range?.textContent).toContain('Sep 20')
+    expect(range?.textContent).toContain('Sep 23')
+    expect(screen.getByText('last known · refresh failed')).toBeTruthy()
+  })
+
+  it('names disabled and waiting history without drawing a series', () => {
+    const empty = { ...history, account: null, points: [], firstObservedAtMs: null, lastObservedAtMs: null }
+    const { rerender } = render(<BalanceHistoryPanel history={{ ...empty, status: 'disabled' }} account={account} />)
+    expect(screen.getByText('Balance history is disabled.')).toBeTruthy()
+    expect(document.querySelector('.balance-history-chart')).toBeNull()
+    rerender(<BalanceHistoryPanel history={{ ...empty, status: 'waiting_for_account' }} account={account} />)
+    expect(screen.getByText('Waiting for the broker account.')).toBeTruthy()
+    expect(document.querySelector('.balance-history-chart')).toBeNull()
   })
 })
 

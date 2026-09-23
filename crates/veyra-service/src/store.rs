@@ -14,6 +14,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
 use crate::audit::{AuditError, AuditEvent, AuditProvider, AuditRow, AuditTrail};
+use crate::balance::BalancePoint;
 use crate::state::{StateError, StateStore};
 
 /// PostgreSQL-backed audit trail.
@@ -163,6 +164,40 @@ impl AuditTrail for Store {
 
     async fn recent(&self, limit: u32) -> Result<Vec<AuditRow>, AuditError> {
         self.list(limit).await
+    }
+
+    async fn balance_history(
+        &self,
+        login: u64,
+        server: &str,
+        since_ms: u64,
+    ) -> Result<Vec<BalancePoint>, AuditError> {
+        let rows = sqlx::query(
+            "select (payload->>'atMs')::bigint as at_ms, \
+                    (payload->>'balance')::double precision as balance \
+             from audit_events \
+             where kind = 'balance_observed' \
+               and payload->>'login' = $1 \
+               and payload->>'server' = $2 \
+               and (payload->>'atMs')::bigint >= $3 \
+             order by (payload->>'atMs')::bigint asc, at asc, id asc",
+        )
+        .bind(login.to_string())
+        .bind(server)
+        .bind(i64::try_from(since_ms).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| storage_error("balance history", &error))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let at_ms = u64::try_from(row.get::<i64, _>("at_ms")).ok()?;
+                let balance = row.get::<f64, _>("balance");
+                balance
+                    .is_finite()
+                    .then_some(BalancePoint { at_ms, balance })
+            })
+            .collect())
     }
 
     async fn prune(&self, keep_days: u32) -> Result<u64, AuditError> {

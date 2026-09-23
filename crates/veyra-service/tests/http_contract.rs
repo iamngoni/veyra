@@ -144,6 +144,128 @@ async fn status_reports_broker_link_state() {
 }
 
 #[actix_web::test]
+async fn balance_history_only_returns_real_points_for_the_active_account() {
+    let broker = ea_broker();
+    let link = broker.ea_link().expect("EA link");
+    link.record(snapshot());
+    let trail = Arc::new(MemoryTrail::default());
+    let runtime = AuditRuntime::new(trail);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    for (login, at_ms, balance) in [
+        (94168, now_ms - 2_000, 20.0),
+        (94169, now_ms - 1_500, 500.0),
+        (94168, now_ms - 1_000, 20.5),
+    ] {
+        runtime
+            .try_record(AuditEvent::new(
+                veyra_service::audit::AuditKind::BalanceObserved,
+                serde_json::json!({
+                    "login": login,
+                    "server": "IFCMarkets-Real",
+                    "atMs": at_ms,
+                    "balance": balance
+                }),
+            ))
+            .await;
+    }
+    let app = test::init_service(create_app(
+        test_state(Some(broker)).with_audit(Some(runtime)),
+    ))
+    .await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/account/balance-history?days=30")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["source"], "broker_balance");
+    assert!(body["currency"].is_null());
+    assert_eq!(body["account"]["login"], 94168);
+    assert_eq!(body["points"].as_array().expect("points").len(), 2);
+    assert_eq!(body["points"][0]["balance"], 20.0);
+    assert_eq!(body["points"][1]["balance"], 20.5);
+    assert_eq!(body["firstObservedAtMs"], now_ms - 2_000);
+    assert_eq!(body["lastObservedAtMs"], now_ms - 1_000);
+    assert_eq!(body["sampled"], false);
+    assert_eq!(body["fresh"], true);
+    assert!(
+        link.recent_commands(10).is_empty(),
+        "read must not queue EA commands"
+    );
+}
+
+#[actix_web::test]
+async fn balance_history_handles_disabled_waiting_invalid_and_failed_reads() {
+    let app = test::init_service(create_app(test_state(Some(ea_broker())))).await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/account/balance-history")
+            .to_request(),
+    )
+    .await;
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["status"], "disabled");
+    assert!(body["points"].as_array().expect("points").is_empty());
+
+    let app = test::init_service(create_app(
+        test_state(Some(ea_broker()))
+            .with_audit(Some(AuditRuntime::new(Arc::new(MemoryTrail::default())))),
+    ))
+    .await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/account/balance-history")
+            .to_request(),
+    )
+    .await;
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["status"], "waiting_for_account");
+    assert!(body["account"].is_null());
+
+    for days in ["0", "366", "bad"] {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/account/balance-history?days={days}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+    }
+
+    let broker = ea_broker();
+    broker.ea_link().expect("EA link").record(snapshot());
+    let app = test::init_service(create_app(
+        test_state(Some(broker)).with_audit(Some(AuditRuntime::new(Arc::new(BrokenTrail)))),
+    ))
+    .await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/account/balance-history")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), 503);
+}
+
+#[actix_web::test]
 async fn status_reports_autopilot_configuration() {
     let settings = veyra_service::trading::AutopilotSettings::from_source(|name| match name {
         "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),

@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   performance: vi.fn(),
   sessions: vi.fn(),
   candles: vi.fn(),
+  balanceHistory: vi.fn(),
   metrics: vi.fn(),
   events: vi.fn(),
   logs: vi.fn(),
@@ -33,6 +34,7 @@ vi.mock('../lib/api', () => ({
     metrics: mocks.metrics,
     events: mocks.events,
     logs: mocks.logs,
+    balanceHistory: mocks.balanceHistory,
     updatePolicy: mocks.updatePolicy,
   },
 }))
@@ -143,6 +145,19 @@ beforeEach(() => {
       { time: 1, open: 1.1, high: 1.11, low: 1.09, close: 1.1, volume: 5 },
       { time: 2, open: 1.1, high: 1.12, low: 1.1, close: 1.115, volume: 6 },
     ],
+  })
+  mocks.balanceHistory.mockResolvedValue({
+    status: 'waiting_for_account',
+    source: 'broker_balance',
+    account: null,
+    days: 30,
+    retentionDays: 365,
+    currency: null,
+    points: [],
+    firstObservedAtMs: null,
+    lastObservedAtMs: null,
+    sampled: false,
+    fresh: false,
   })
   mocks.metrics.mockResolvedValue({ service: 'veyra', version: '0.1.0', counters: { 'event.proposal_evaluated': 3 }, feedLatest: 12 })
   mocks.events.mockImplementation(() => new Promise(() => undefined))

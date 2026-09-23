@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod audit;
+pub mod balance;
 pub mod broker;
 pub mod calendar;
 pub mod config;

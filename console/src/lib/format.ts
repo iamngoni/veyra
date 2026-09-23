@@ -80,10 +80,10 @@ export function payloadSummary(event: FeedEvent): string {
 /// commands the loop issues every cycle. Decisions, orders, and lifecycle
 /// events always show.
 export function isRoutine(event: FeedEvent): boolean {
-  if (event.kind === 'broker_snapshot') return true
+  if (event.kind === 'broker_snapshot' || event.kind === 'balance_observed') return true
   if (event.kind === 'command_queued' || event.kind === 'command_completed') {
     const kind = String(event.payload?.kind ?? '')
-    return kind === 'account_snapshot' || kind === 'rates' || kind === 'ping'
+    return ['account_snapshot', 'rates', 'ping', 'symbol_spec', 'order_history'].includes(kind)
   }
   return false
 }

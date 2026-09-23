@@ -17,6 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::balance::BalancePoint;
+
 /// Event categories written to the trail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditKind {
@@ -28,6 +30,8 @@ pub enum AuditKind {
     CommandFailed,
     /// A validated broker snapshot was retained.
     BrokerSnapshot,
+    /// A validated, broker-reported account balance was observed.
+    BalanceObserved,
     /// The service process started with auditing enabled.
     ServiceStarted,
     /// Reconciliation found orders Veyra does not own.
@@ -57,6 +61,7 @@ impl AuditKind {
             Self::CommandCompleted => "command_completed",
             Self::CommandFailed => "command_failed",
             Self::BrokerSnapshot => "broker_snapshot",
+            Self::BalanceObserved => "balance_observed",
             Self::ServiceStarted => "service_started",
             Self::ReconciliationDrift => "reconciliation_drift",
             Self::ProposalEvaluated => "proposal_evaluated",
@@ -157,6 +162,21 @@ pub trait AuditTrail: Send + Sync + fmt::Debug + 'static {
     /// # Errors
     /// Returns [`AuditError`] when the store is unavailable.
     async fn recent(&self, limit: u32) -> Result<Vec<AuditRow>, AuditError>;
+
+    /// Reads actual balance observations for exactly one account, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`AuditError`] when the store is unavailable.
+    async fn balance_history(
+        &self,
+        _login: u64,
+        _server: &str,
+        _since_ms: u64,
+    ) -> Result<Vec<BalancePoint>, AuditError> {
+        Err(AuditError::Storage {
+            reason: "balance history is unavailable".to_owned(),
+        })
+    }
 
     /// Deletes events older than `keep_days`, returning how many rows went.
     /// Zero keeps everything.
@@ -434,12 +454,81 @@ impl AuditTrail for MemoryTrail {
             })
             .collect())
     }
+
+    async fn balance_history(
+        &self,
+        login: u64,
+        server: &str,
+        since_ms: u64,
+    ) -> Result<Vec<BalancePoint>, AuditError> {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut points: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind() == AuditKind::BalanceObserved)
+            .filter(|event| event.payload()["login"].as_u64() == Some(login))
+            .filter(|event| event.payload()["server"].as_str() == Some(server))
+            .filter_map(|event| {
+                let at_ms = event.payload()["atMs"].as_u64()?;
+                let balance = event.payload()["balance"].as_f64()?;
+                (at_ms >= since_ms && balance.is_finite())
+                    .then_some(BalancePoint { at_ms, balance })
+            })
+            .collect();
+        points.sort_by_key(|point| point.at_ms);
+        Ok(points)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[actix_web::test]
+    async fn balance_history_is_account_scoped_chronological_and_preserves_deficits() {
+        let trail = MemoryTrail::default();
+        for (login, at_ms, balance) in [
+            (10, 300, -2.5),
+            (11, 200, 500.0),
+            (10, 100, 4.0),
+            (10, 200, 0.0),
+        ] {
+            trail
+                .record(AuditEvent::new(
+                    AuditKind::BalanceObserved,
+                    json!({"login": login, "server": "Broker-Real", "atMs": at_ms, "balance": balance}),
+                ))
+                .await
+                .expect("record");
+        }
+        let points = trail
+            .balance_history(10, "Broker-Real", 0)
+            .await
+            .expect("history");
+        assert_eq!(
+            points.iter().map(|point| point.at_ms).collect::<Vec<_>>(),
+            vec![100, 200, 300]
+        );
+        assert_eq!(
+            points.iter().map(|point| point.balance).collect::<Vec<_>>(),
+            vec![4.0, 0.0, -2.5]
+        );
+        assert_eq!(
+            trail.balance_history(10, "Other", 0).await.expect("other"),
+            Vec::new()
+        );
+        assert_eq!(
+            trail
+                .balance_history(10, "Broker-Real", 201)
+                .await
+                .expect("window")
+                .len(),
+            1
+        );
+    }
 
     /// Storage that always fails, to prove writes never propagate.
     #[derive(Debug)]
