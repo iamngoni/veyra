@@ -4,7 +4,7 @@
  * promise is left pending so the polling loops stay quiet in the test.
  */
 
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -18,7 +18,10 @@ const mocks = vi.hoisted(() => ({
   metrics: vi.fn(),
   events: vi.fn(),
   logs: vi.fn(),
+  audit: vi.fn(),
+  config: vi.fn(),
   updatePolicy: vi.fn(),
+  updateConfig: vi.fn(),
 }))
 
 vi.mock('../lib/api', () => ({
@@ -34,8 +37,11 @@ vi.mock('../lib/api', () => ({
     metrics: mocks.metrics,
     events: mocks.events,
     logs: mocks.logs,
+    audit: mocks.audit,
+    config: mocks.config,
     balanceHistory: mocks.balanceHistory,
     updatePolicy: mocks.updatePolicy,
+    updateConfig: mocks.updateConfig,
   },
 }))
 
@@ -162,7 +168,16 @@ beforeEach(() => {
   mocks.metrics.mockResolvedValue({ service: 'veyra', version: '0.1.0', counters: { 'event.proposal_evaluated': 3 }, feedLatest: 12 })
   mocks.events.mockImplementation(() => new Promise(() => undefined))
   mocks.logs.mockResolvedValue({ logs: [], latest: 0 })
+  mocks.audit.mockResolvedValue({ status: 'ok', provider: 'postgres', events: [] })
+  mocks.config.mockResolvedValue({
+    settings: {
+      VEYRA_TRADING_ENABLED: { value: 'true', overridden: false },
+      VEYRA_AUTOPILOT_INTERVAL_SECS: { value: '60', overridden: false },
+    },
+    live_sections: ['trading'],
+  })
   mocks.updatePolicy.mockReset()
+  mocks.updateConfig.mockReset()
 })
 
 describe('Dashboard', () => {
@@ -187,7 +202,7 @@ describe('Dashboard', () => {
 
     // Overview is the landing tab.
     expect(screen.getByText('Positions')).toBeTruthy()
-    expect(screen.getByText('Autopilot')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Autopilot' })).toBeTruthy()
     expect(screen.getByText('Market')).toBeTruthy()
 
     openTab('Activity')
@@ -199,6 +214,81 @@ describe('Dashboard', () => {
     openTab('Diagnostics')
     expect(screen.getByText('Metrics')).toBeTruthy()
     expect(screen.getByText('Agent log')).toBeTruthy()
+
+    openTab('Trace')
+    expect(screen.getAllByText('Trace').length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('opens the market view and routes the overview digest to Activity', async () => {
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+
+    openTab('Market')
+    expect(screen.getAllByRole('heading', { name: 'Market' }).length).toBeGreaterThanOrEqual(1)
+
+    openTab('Overview')
+    fireEvent.click(screen.getByRole('button', { name: 'View all' }))
+    expect(screen.getAllByRole('heading', { name: 'Activity' }).length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('shows diagnostic metadata and applies live settings through the route', async () => {
+    mocks.updateConfig.mockResolvedValue({ changed: ['VEYRA_TRADING_ENABLED'], settings: {} })
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+
+    openTab('Diagnostics')
+    expect(screen.getAllByText('development').length).toBeGreaterThanOrEqual(1)
+    expect(screen.getAllByText('postgres').length).toBeGreaterThanOrEqual(1)
+
+    openTab('Settings')
+    expect(await screen.findByText('Live settings')).toBeTruthy()
+    fireEvent.change(screen.getByDisplayValue('true'), { target: { value: 'false' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    await screen.findByText('applied')
+    expect(mocks.updateConfig).toHaveBeenCalledWith({ VEYRA_TRADING_ENABLED: 'false' })
+  })
+
+  it('surfaces live-settings rejections from the route callback', async () => {
+    mocks.updateConfig.mockRejectedValue(new Error('setting rejected'))
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+    openTab('Settings')
+    await screen.findByText('Live settings')
+    fireEvent.change(screen.getByDisplayValue('true'), { target: { value: 'false' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('setting rejected')
+  })
+
+  it('marks the judge degraded after a failed usage update', async () => {
+    mocks.updatePolicy.mockResolvedValue({})
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+    const initialStatus = await mocks.status.mock.results[0].value
+    mocks.status.mockResolvedValue({
+      ...initialStatus,
+      jev_usage: { ...initialStatus.jev_usage, calls: initialStatus.jev_usage.calls + 1, failures: initialStatus.jev_usage.failures + 1 },
+    })
+
+    fireEvent.click(screen.getByRole('switch', { name: 'Kill switch' }))
+    fireEvent.click(screen.getByText('Confirm'))
+    expect(await screen.findByText(/judge is not answering — new decisions are paused/)).toBeTruthy()
+
+    mocks.status.mockResolvedValue({
+      ...initialStatus,
+      jev_usage: { ...initialStatus.jev_usage, calls: initialStatus.jev_usage.calls + 2, failures: initialStatus.jev_usage.failures + 1 },
+    })
+    fireEvent.click(screen.getByRole('switch', { name: 'Trade without the judge' }))
+    fireEvent.click(screen.getByText('Confirm'))
+    await waitFor(() => expect(screen.queryByText(/new decisions are paused/)).toBeNull())
+  })
+
+  it('keeps a non-Error policy rejection readable', async () => {
+    mocks.updatePolicy.mockRejectedValue('policy transport failed')
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+    fireEvent.click(screen.getByRole('switch', { name: 'Kill switch' }))
+    fireEvent.click(screen.getByText('Confirm'))
+    expect(await screen.findByText('policy transport failed')).toBeTruthy()
   })
 
   it('applies policy edits through the control surface', async () => {

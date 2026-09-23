@@ -63,8 +63,8 @@ fn ea_broker() -> BrokerRuntime {
 
 fn snapshot() -> AccountSnapshot {
     AccountSnapshot::new(
-        AccountLogin::parse(94168).expect("login must validate"),
-        ServerName::parse("IFCMarkets-Real").expect("server must validate"),
+        AccountLogin::parse(123456).expect("login must validate"),
+        ServerName::parse("Broker-Test").expect("server must validate"),
         Symbol::parse("EURUSD").expect("symbol must validate"),
         true,
         true,
@@ -155,16 +155,16 @@ async fn balance_history_only_returns_real_points_for_the_active_account() {
         .expect("clock")
         .as_millis() as u64;
     for (login, at_ms, balance) in [
-        (94168, now_ms - 2_000, 20.0),
-        (94169, now_ms - 1_500, 500.0),
-        (94168, now_ms - 1_000, 20.5),
+        (123456, now_ms - 2_000, 20.0),
+        (123457, now_ms - 1_500, 500.0),
+        (123456, now_ms - 1_000, 20.5),
     ] {
         runtime
             .try_record(AuditEvent::new(
                 veyra_service::audit::AuditKind::BalanceObserved,
                 serde_json::json!({
                     "login": login,
-                    "server": "IFCMarkets-Real",
+                    "server": "Broker-Test",
                     "atMs": at_ms,
                     "balance": balance
                 }),
@@ -194,7 +194,7 @@ async fn balance_history_only_returns_real_points_for_the_active_account() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["source"], "broker_balance");
     assert!(body["currency"].is_null());
-    assert_eq!(body["account"]["login"], 94168);
+    assert_eq!(body["account"]["login"], 123456);
     assert_eq!(body["points"].as_array().expect("points").len(), 2);
     assert_eq!(body["points"][0]["balance"], 20.0);
     assert_eq!(body["points"][1]["balance"], 20.5);

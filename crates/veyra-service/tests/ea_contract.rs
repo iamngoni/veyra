@@ -30,8 +30,8 @@ fn body(kind: &str) -> Value {
         "t": kind,
         "v": 1,
         "token": TOKEN,
-        "acct": 94168,
-        "server": "IFCMarkets-Real",
+        "acct": 123456,
+        "server": "Broker-Test",
         "symbol": "EURUSD",
         "connected": true,
         "tradeAllowed": true,
@@ -74,8 +74,8 @@ async fn hello_is_answered_with_ping_and_records_snapshot() {
 
     let report = link.report().await;
     let snapshot = report.snapshot.expect("snapshot must be recorded");
-    assert_eq!(snapshot.login().value(), 94168);
-    assert_eq!(snapshot.server().as_str(), "IFCMarkets-Real");
+    assert_eq!(snapshot.login().value(), 123456);
+    assert_eq!(snapshot.server().as_str(), "Broker-Test");
     assert_eq!(snapshot.symbol().as_str(), "EURUSD");
     assert!(snapshot.connected());
     assert!(snapshot.trade_allowed());
@@ -101,7 +101,7 @@ async fn valid_heartbeat_balance_is_persisted_without_changing_the_reply() {
     let trail = Arc::new(MemoryTrail::default());
     link.set_audit(Arc::new(AuditRuntime::new(trail.clone())));
     let mut payload = body("hello");
-    payload["balance"] = json!(36.39);
+    payload["balance"] = json!(42.5);
     let (status, response) = post(link, payload).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response["t"], "ping");
@@ -120,8 +120,8 @@ async fn valid_heartbeat_balance_is_persisted_without_changing_the_reply() {
         .iter()
         .find(|event| event.kind() == AuditKind::BalanceObserved)
         .expect("validated balance was recorded");
-    assert_eq!(observation.payload()["balance"], 36.39);
-    assert_eq!(observation.payload()["login"], 94168);
+    assert_eq!(observation.payload()["balance"], 42.5);
+    assert_eq!(observation.payload()["login"], 123456);
 }
 
 #[actix_web::test]

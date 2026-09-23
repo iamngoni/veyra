@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import type { ChangeEvent } from 'react'
 import type { ReactNode } from 'react'
 
@@ -76,10 +76,10 @@ export function Panel({
 }) {
   return (
     <section
-      className={`flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-[var(--color-line)] bg-[var(--color-surface-1)] ${className}`}
+      className={`console-panel flex min-h-0 min-w-0 flex-col overflow-hidden rounded-[6px] border border-[var(--color-line)] bg-[var(--color-surface-1)] ${className}`}
     >
       <header className="flex items-center justify-between gap-3 border-b border-[var(--color-line)] bg-[var(--color-surface-2)]/40 px-3.5 py-2.5">
-        <h2 className="label text-[var(--color-ink-muted)]">{title}</h2>
+        <h2 className="panel-title">{title}</h2>
         {detail ? <div className="text-[11px] text-[var(--color-ink-faint)]">{detail}</div> : null}
       </header>
       <div className="min-h-0 flex-1 overflow-auto">{children}</div>
@@ -179,6 +179,7 @@ export function Tabs({
                 : 'text-[var(--color-ink-faint)] hover:text-[var(--color-ink-muted)]'
             }`}
           >
+            <TabIcon id={tab.id} />
             {tab.label}
             {tab.badge ? (
               <span className="readout rounded bg-[var(--color-surface-2)] px-1 text-[10px] text-[var(--color-ink-faint)]">
@@ -189,6 +190,23 @@ export function Tabs({
         )
       })}
     </div>
+  )
+}
+
+function TabIcon({ id }: { id: string }) {
+  const paths: Record<string, string> = {
+    overview: 'M3 10.5 10 4l7 6.5v6.5H3z M7 17v-4h6v4',
+    market: 'M3 15.5 7.5 10l3 2.5L17 5',
+    activity: 'M3 12h3l2-7 4 14 2-7h3',
+    risk: 'M10 3 16 5v4c0 4.2-2.5 7.1-6 9-3.5-1.9-6-4.8-6-9V5z',
+    trace: 'M5 3h10v14H5z M8 7h4 M8 10h4 M8 13h3',
+    diagnostics: 'M3 12h3l2-6 4 12 2-6h3',
+    settings: 'M10 3v2 M10 15v2 M3 10h2 M15 10h2 M5 5l1.5 1.5 M13.5 13.5 15 15 M15 5l-1.5 1.5 M6.5 13.5 5 15 M10 7a3 3 0 1 0 0 6 3 3 0 0 0 0-6z',
+  }
+  return (
+    <svg className="nav-icon" viewBox="0 0 20 20" aria-hidden="true">
+      <path d={paths[id] ?? paths.overview} />
+    </svg>
   )
 }
 
@@ -308,9 +326,9 @@ export function HeroMetrics({ account, error }: { account?: Account; error?: str
     },
   ]
   return (
-    <div className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-[var(--color-line)] bg-[var(--color-line)] lg:grid-cols-4">
+    <div className="hero-metrics grid grid-cols-2 gap-px overflow-hidden rounded-[6px] border border-[var(--color-line)] bg-[var(--color-line)] lg:grid-cols-4">
       {cells.map((cell) => (
-        <div key={cell.label} className="bg-[var(--color-surface-1)] px-4 py-3">
+        <div key={cell.label} className="hero-metric bg-[var(--color-surface-1)] px-4 py-3">
           <div className="label">{cell.label}</div>
           <div className={`readout mt-1.5 text-xl leading-none font-medium ${cell.tone ?? 'text-[var(--color-ink)]'}`}>
             {cell.value ?? (error ? <span className="text-sm text-[var(--color-bad)]">unavailable</span> : <Skeleton className="h-5 w-24" />)}
@@ -359,7 +377,7 @@ export function SafetyControls({
 
   return (
     <Panel
-      title="Controls"
+      title="Risk controls"
       detail={error ? <span className="text-[var(--color-bad)]">{error}</span> : undefined}
     >
       <div className="flex flex-col gap-px bg-[var(--color-line)]">
@@ -368,7 +386,7 @@ export function SafetyControls({
           description={
             halted
               ? 'Engaged. Every new intent is refused; open positions are untouched.'
-              : 'Refuse every new intent immediately. Open positions are left alone.'
+              : 'Blocks new orders; open positions stay open.'
           }
           checked={halted}
           tone="bad"
@@ -383,8 +401,8 @@ export function SafetyControls({
           label="Trade without the judge"
           description={
             withoutJev
-              ? 'Override active. A judge outage no longer pauses new decisions — the model decides alone.'
-              : 'Default: if the judge cannot answer, the tick is abandoned and nothing is proposed.'
+              ? 'Override active. Trading can continue if the judge cannot answer.'
+              : 'Allows trading only when the judge can answer.'
           }
           checked={withoutJev}
           tone="warn"
@@ -503,20 +521,24 @@ function Switch({
 
 export function StatusPills({ status }: { status?: Status }) {
   if (!status) {
-    return <Pill tone="off" label="service" value="connecting…" />
+    return <div className="status-strip"><span className="status-state is-off"><i /><span>connecting…</span></span></div>
   }
+  const posture = systemPosture(status)
+  const indicator = (label: string, value: string, tone: string) => (
+    <span className={`status-state ${tone}`}><i /><span>{label}</span> <span>{value}</span></span>
+  )
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <Pill tone={status.broker_connected ? 'ok' : 'bad'} label="terminal" value={status.broker_connected ? 'live' : 'stale'} />
-      <Pill tone={status.ea_live_orders ? 'ok' : 'off'} label="EA" value={status.ea_live_orders ? 'armed' : 'disarmed'} />
-      <Pill tone={status.trading_enabled ? 'warn' : 'off'} label="trading" value={status.trading_enabled ? 'enabled' : 'disabled'} />
-      <Pill
-        tone={status.autopilot?.enabled ? 'info' : 'off'}
-        label="autopilot"
-        value={status.autopilot?.enabled ? `${status.autopilot.interval_secs}s · ${status.autopilot.timeframe}` : 'off'}
-      />
-      <Pill tone={status.persistence ? 'ok' : 'off'} label="audit" value={status.persistence ?? 'off'} />
-      <Pill tone="off" label="env" value={status.environment} />
+    <div className="status-strip">
+      <span className={`status-state is-${posture.tone}`} title={posture.tone === 'ok' ? undefined : posture.detail}>
+        <i />
+        <span>{posture.label}</span>
+        {posture.tone !== 'ok' ? <span className="status-posture-detail">· {posture.detail}</span> : null}
+      </span>
+      {indicator('Terminal', status.broker_connected ? 'connected' : 'stale', status.broker_connected ? 'is-ok' : 'is-bad')}
+      {indicator('EA', status.ea_live_orders ? 'armed' : 'disarmed', status.ea_live_orders ? 'is-ok' : 'is-off')}
+      {indicator('Trading', status.trading_enabled ? 'enabled' : 'disabled', status.trading_enabled ? 'is-warn' : 'is-off')}
+      {indicator('Autopilot', status.autopilot?.enabled ? `${status.autopilot.interval_secs}s · ${status.autopilot.timeframe}` : 'off', status.autopilot?.enabled ? 'is-ok' : 'is-off')}
+      <span className="sr-only"><span>{status.persistence ?? 'off'}</span> <span>{status.environment}</span> <span>v{status.version}</span></span>
     </div>
   )
 }
@@ -602,6 +624,7 @@ function formatMove(position: Position): string {
 
 export function PositionsPanel({ account }: { account?: Account }) {
   const positions = account?.positions ?? []
+  const [expandedTicket, setExpandedTicket] = useState<number | null>(null)
   return (
     <Panel
       title="Positions"
@@ -611,27 +634,25 @@ export function PositionsPanel({ account }: { account?: Account }) {
         <div className="p-3 text-xs text-[var(--color-ink-faint)]">Flat — no open orders.</div>
       ) : (
         <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">
+          <table className="positions-table w-full text-left">
+            <thead className="position-table-head">
               <tr className="border-b border-[var(--color-line)]/80">
-                <th className="px-3 py-1.5 font-medium">Ticket</th>
-                <th className="px-2 py-1.5 font-medium">Symbol</th>
+                <th className="px-3 py-1.5 font-medium">Symbol</th>
                 <th className="px-2 py-1.5 font-medium">Side</th>
                 <th className="px-2 py-1.5 font-medium">Lots</th>
                 <th className="px-2 py-1.5 font-medium">Entry</th>
                 <th className="px-2 py-1.5 font-medium">Current</th>
                 <th className="px-2 py-1.5 font-medium">SL</th>
                 <th className="px-2 py-1.5 font-medium">TP</th>
-                <th className="px-2 py-1.5 font-medium">Swap</th>
                 <th className="px-2 py-1.5 font-medium">P/L</th>
-                <th className="px-3 py-1.5 font-medium">Owner</th>
+                <th className="px-3 py-1.5 font-medium"><span className="sr-only">Details</span></th>
               </tr>
             </thead>
-            <tbody className="font-mono tabular-nums">
+            <tbody className="tabular-nums">
               {positions.map((position: Position) => (
-                <tr key={position.ticket} className="border-b border-[var(--color-line)]/40">
-                  <td className="px-3 py-1.5 text-[var(--color-ink)]">{position.ticket}</td>
-                  <td className="px-2 py-1.5 font-semibold text-[var(--color-ink)]">{position.symbol}</td>
+                <Fragment key={position.ticket}>
+                <tr className="border-b border-[var(--color-line)]/40">
+                  <td className="px-3 py-1.5 font-semibold text-[var(--color-ink)]">{position.symbol}</td>
                   <td className={`px-2 py-1.5 ${position.kind === 'buy' ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}`}>
                     {position.kind}
                   </td>
@@ -657,25 +678,28 @@ export function PositionsPanel({ account }: { account?: Account }) {
                       '—'
                     )}
                   </td>
-                  <td className="px-2 py-1.5 text-[var(--color-bad)]/80">{position.sl > 0 ? position.sl : '—'}</td>
-                  <td className="px-2 py-1.5 text-[var(--color-ok)]/80">{position.tp > 0 ? position.tp : '—'}</td>
-                  <td className={`px-2 py-1.5 ${position.swap != null && position.swap < 0 ? 'text-[var(--color-bad)]/80' : 'text-[var(--color-ok)]/80'}`}>
-                    {position.swap == null
-                      ? '—'
-                      : `${position.swap >= 0 ? '+' : ''}${position.swap.toFixed(2)}`}
-                  </td>
+                  <td className="px-2 py-1.5 text-[var(--color-bad)]">{position.sl > 0 ? position.sl : '—'}</td>
+                  <td className="px-2 py-1.5 text-[var(--color-ok)]">{position.tp > 0 ? position.tp : '—'}</td>
                   <td className={`px-2 py-1.5 ${position.profit >= 0 ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}`}>
                     {position.profit >= 0 ? '+' : ''}
                     {position.profit.toFixed(2)}
                   </td>
-                  <td className="px-3 py-1.5">
-                    {position.magic === VEYRA_MAGIC ? (
-                      <span className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-300">veyra</span>
-                    ) : (
-                      <span className="rounded bg-[var(--color-surface-3)]/40 px-1.5 py-0.5 text-[10px] text-[var(--color-ink-muted)]">manual</span>
-                    )}
+                  <td className="px-3 py-1.5 text-right">
+                    <button type="button" className="position-details-toggle" aria-label={`Details for ${position.symbol}`} aria-expanded={expandedTicket === position.ticket} aria-controls={`position-${position.ticket}`} onClick={() => setExpandedTicket(expandedTicket === position.ticket ? null : position.ticket)}>•••</button>
                   </td>
                 </tr>
+                {expandedTicket === position.ticket ? (
+                  <tr id={`position-${position.ticket}`}>
+                    <td colSpan={9}>
+                      <div className="position-details-row">
+                        <span>Ticket <b>{position.ticket}</b></span>
+                        <span>Swap <b>{position.swap == null ? '—' : `${position.swap >= 0 ? '+' : ''}${position.swap.toFixed(2)}`}</b></span>
+                        <span>Owner <b>{position.magic === VEYRA_MAGIC ? 'veyra' : 'manual'}</b></span>
+                      </div>
+                    </td>
+                  </tr>
+                ) : null}
+                </Fragment>
               ))}
             </tbody>
           </table>
@@ -699,7 +723,7 @@ export function PerformancePanel({
     value == null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(2)}`
   return (
     <Panel
-      title="Performance"
+      title="30-day performance"
       detail={
         performance
           ? `last ${performance.days}d · ${performance.total} closed${performance.truncated ? ' · truncated' : ''}`
@@ -708,7 +732,7 @@ export function PerformancePanel({
             : 'waiting…'
       }
     >
-      <div className="grid grid-cols-2 gap-x-4 gap-y-3 p-3 sm:grid-cols-3">
+      <div className="performance-headlines">
         <Field
           label="Win rate"
           value={report && report.trades > 0 ? `${report.win_rate_percent.toFixed(1)}%` : '—'}
@@ -719,40 +743,33 @@ export function PerformancePanel({
           }
         />
         <Field
-          label="Record"
-          value={
-            report && report.trades > 0
-              ? `${report.wins}W · ${report.losses}L${report.breakeven > 0 ? ` · ${report.breakeven}F` : ''}`
-              : '—'
-          }
-        />
-        <Field
           label="Net P/L"
           value={performance ? money(report?.net_profit) : '—'}
           tone={report && report.net_profit >= 0 ? 'text-[var(--color-ok)]' : report ? 'text-[var(--color-bad)]' : undefined}
         />
-        <Field
-          label="Profit factor"
-          value={report?.profit_factor != null ? report.profit_factor.toFixed(2) : '—'}
-        />
-        <Field label="Avg win" value={money(report?.average_win)} />
-        <Field
-          label="Avg loss"
-          value={report?.average_loss != null ? `-${report.average_loss.toFixed(2)}` : '—'}
-        />
+        <Field label="Closed trades" value={report && report.trades > 0 ? String(report.trades) : '—'} />
       </div>
-      {report && report.by_symbol.length > 0 ? (
-        <div className="flex flex-wrap gap-x-4 gap-y-1 border-t border-[var(--color-line)]/80 px-3 py-2 font-mono text-[11px] text-[var(--color-ink-muted)]">
-          {report.by_symbol.map((entry) => (
-            <span key={entry.symbol}>
-              {entry.symbol} {entry.wins}/{entry.trades}{' '}
-              <span className={entry.net_profit >= 0 ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}>
-                {money(entry.net_profit)}
-              </span>
-            </span>
-          ))}
+      <details className="performance-details">
+        <summary>View detailed performance</summary>
+        <div className="performance-detail-grid">
+          <Field label="Record" value={report && report.trades > 0 ? `${report.wins}W · ${report.losses}L${report.breakeven > 0 ? ` · ${report.breakeven}F` : ''}` : '—'} />
+          <Field label="Profit factor" value={report?.profit_factor != null ? report.profit_factor.toFixed(2) : '—'} />
+          <Field label="Avg win" value={money(report?.average_win)} />
+          <Field label="Avg loss" value={report?.average_loss != null ? `-${report.average_loss.toFixed(2)}` : '—'} />
+          <Field label="Expectancy" value={money(report?.expectancy)} />
+          <Field label="Best / worst" value={report?.best_trade != null && report.worst_trade != null ? `${money(report.best_trade)} / ${money(report.worst_trade)}` : '—'} />
         </div>
-      ) : null}
+        {report && report.by_symbol.length > 0 ? (
+          <div className="performance-symbols">
+            {report.by_symbol.map((entry) => (
+              <span key={entry.symbol}>
+                {entry.symbol} {entry.wins}/{entry.trades}{' '}
+                <span className={entry.net_profit >= 0 ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}>{money(entry.net_profit)}</span>
+              </span>
+            ))}
+          </div>
+        ) : null}
+      </details>
     </Panel>
   )
 }
@@ -784,6 +801,7 @@ export function BalanceHistoryPanel({
   account?: Account
   error?: string
 }) {
+  const [rangeDays, setRangeDays] = useState<1 | 7 | 30>(30)
   const sameAccount = Boolean(
     history?.account &&
       account?.login != null &&
@@ -792,7 +810,11 @@ export function BalanceHistoryPanel({
       history.account.server === account.server,
   )
   const current = sameAccount ? history : undefined
-  const points = current?.points ?? []
+  const allPoints = current?.points ?? []
+  const rangeAnchor = Date.now()
+  const points = rangeAnchor
+    ? allPoints.filter((point) => point.atMs >= rangeAnchor - rangeDays * 86_400_000)
+    : []
   const first = points[0]
   const last = points.at(-1)
   const spanMs = first && last ? Math.max(last.atMs - first.atMs, 1) : 1
@@ -833,21 +855,23 @@ export function BalanceHistoryPanel({
             ? 'Waiting for the current account.'
             : !sameAccount && history?.account
               ? 'Waiting for this account’s history.'
-              : 'History starts with the next broker reading.'
+              : current && allPoints.length > 0 && points.length === 0
+                ? 'No observations in this period.'
+                : 'History starts with the next broker reading.'
 
   return (
     <Panel
-      title="Account balance"
+      title="Balance over time"
       detail={
-        error ? (
-          <span className="text-[var(--color-bad)]">unavailable</span>
-        ) : current && points.length > 0 ? (
-          <span>
-            {current.days}d · {current.sampled ? 'sampled' : 'observed'}
+        <div className="balance-panel-detail">
+          {error ? <span className="text-[var(--color-bad)]">unavailable</span> : null}
+          {current?.sampled ? <span title="Points are sampled broker observations; gaps remain visible.">Sampled</span> : null}
+          <span className="balance-range-controls" aria-label="Balance history range">
+            {[1, 7, 30].map((days) => (
+              <button key={days} type="button" aria-pressed={rangeDays === days} onClick={() => setRangeDays(days as 1 | 7 | 30)}>{days}D</button>
+            ))}
           </span>
-        ) : (
-          'broker history'
-        )
+        </div>
       }
       className="balance-history-panel"
     >
@@ -861,28 +885,19 @@ export function BalanceHistoryPanel({
       ) : (
         <figure className="balance-history-figure" aria-label="Broker-observed account balance over time">
           <div className="balance-history-summary">
-            <div>
-              <span className="label">Latest balance</span>
-              <strong className="readout">{historyValue(last?.balance ?? NaN)}</strong>
+            <div className="balance-summary-line">
+              <strong className="readout" aria-label="Latest balance">{historyValue(last?.balance ?? NaN)}</strong>
               {changeText ? <span className={`balance-history-change ${change! > 0 ? 'is-positive' : change! < 0 ? 'is-negative' : ''}`}>Balance change {changeText}</span> : null}
-            </div>
-            <div className="balance-history-range">
-              <span>{first ? historyTime(first.atMs) : '—'}</span>
-              <span>{last ? historyTime(last.atMs) : '—'}</span>
             </div>
           </div>
           <div className="balance-history-chart-wrap">
-            <svg className="balance-history-chart" viewBox={`0 0 ${plotWidth} ${plotHeight}`} role="img">
+            <svg className="balance-history-chart" viewBox={`0 0 ${plotWidth} ${plotHeight}`} preserveAspectRatio="none" role="img">
               <title>Observed account balance history</title>
               {[0, 0.5, 1].map((fraction) => {
                 const y = plotHeight * fraction
-                const value = high - range * fraction
                 return (
                   <g key={fraction}>
                     <line x1="0" x2={plotWidth} y1={y} y2={y} className="chart-grid-line" />
-                    <text x="0" y={Math.max(12, y - 5)} className="chart-axis-label">
-                      {historyValue(value)}
-                    </text>
                   </g>
                 )
               })}
@@ -897,11 +912,13 @@ export function BalanceHistoryPanel({
               ))}
               {chartPoints.length > 1 && last ? <circle cx={chartPoints.at(-1)?.x} cy={chartPoints.at(-1)?.y} r="4" className="balance-history-dot" /> : null}
             </svg>
+            <div className="chart-y-axis">
+              {[0, 0.5, 1].map((fraction) => <span key={fraction}>{historyValue(high - range * fraction)}</span>)}
+            </div>
           </div>
-          <figcaption>
-            <span>{points.length === 1 ? '1 broker observation' : `${points.length} broker observations`}</span>
-            <span>{error ? 'last known · refresh failed' : current?.fresh ? 'fresh' : 'last known'}</span>
-          </figcaption>
+          {points.length > 0 ? <div className="chart-x-axis">{points.length === 1 ? <span>{historyTime(first!.atMs)}</span> : [0, 0.5, 1].map((fraction) => <span key={fraction}>{historyTime((first?.atMs ?? 0) + spanMs * fraction)}</span>)}</div> : null}
+          {current?.sampled ? <span className="sr-only">Points are sampled broker observations; gaps remain visible.</span> : null}
+          {error || !current?.fresh ? <figcaption><span>{error ? 'last known · refresh failed' : 'last known'}</span></figcaption> : null}
         </figure>
       )}
     </Panel>
@@ -1063,13 +1080,44 @@ export function AutopilotPanel({
   budget,
   jevUsage,
   decisions,
+  compact = false,
+  lastDecisionAt,
 }: {
   status?: Status['autopilot']
   budget?: Status['model_budget']
   jevUsage?: Status['jev_usage']
   decisions?: Status['decisions']
+  compact?: boolean
+  lastDecisionAt?: number
 }) {
   const on = status?.enabled === true
+  if (compact) {
+    return (
+      <Panel title="Autopilot" detail={<span className={`autopilot-state ${on ? 'is-ok' : decisions?.consecutiveFailures ? 'is-bad' : 'is-off'}`}><i /> {on ? 'Running' : decisions?.consecutiveFailures ? 'Error' : 'Off'}</span>} className="autopilot-summary-panel">
+        <div className="autopilot-summary">
+          <Field label="Cadence" value={on && status ? `${status.interval_secs} seconds · ${status.timeframe}` : '—'} />
+          <Field label="Last decision" value={lastDecisionAt ? clockTime(lastDecisionAt) : 'No recent decision.'} />
+          <Field label="Status" value={decisions?.lastFailure ?? (on ? 'Enabled' : 'Autopilot is off.')} />
+        </div>
+        <details className="autopilot-details">
+          <summary>View autopilot details</summary>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-3 p-3">
+            <Field label="Window" value={on && status ? `${status.bars} bars` : '—'} />
+            <Field label="Model tier" value={status?.tier ?? '—'} />
+            <Field label="Judgements" value={status?.jev ?? '—'} />
+            <Field label="Symbols" value={status && status.symbols.length > 0 ? status.symbols.join(' · ') : 'chart symbol'} />
+            <Field label="Stops" value={status && (status.breakeven_r > 0 || status.trail_r > 0) ? [status.breakeven_r > 0 ? `BE ${status.breakeven_r}R` : null, status.trail_r > 0 ? `trail ${status.trail_r}R` : null].filter(Boolean).join(' · ') : 'bracket only'} />
+            <Field label="Profit harvest" value={status?.profit_harvest ? `${status.profit_harvest.arm_r}R arm · ${status.profit_harvest.trail_r}R trail · ${status.profit_harvest.min_profit.toFixed(2)} floor` : 'off'} />
+            <Field label="Model chain" value={status?.model_chain?.length ? status.model_chain.join(' → ') : status?.model_fallbacks?.length ? `fallbacks: ${status.model_fallbacks.join(' → ')}` : 'none — a provider outage stops the loop'} />
+            <Field label="Last LLM" value={decisions?.lastModel ?? 'not called yet'} />
+            <Field label="Last answer" value={decisions?.lastSuccessfulModel ?? 'none yet'} />
+            <Field label="Model calls" value={budget ? `${budget.hourCalls}/${budget.hourLimit || '∞'} h · ${budget.dayCalls}/${budget.dayLimit || '∞'} d` : '—'} />
+            <Field label="JEV usage" value={jevUsage && jevUsage.calls > 0 ? `${jevUsage.calls} calls · ${compactTokens(jevUsage.inputTokens + jevUsage.outputTokens)} tok${jevUsage.failures > 0 ? ` · ${jevUsage.failures} failed` : ''}` : '—'} />
+          </div>
+        </details>
+      </Panel>
+    )
+  }
   return (
     <Panel title="Autopilot" detail={on ? 'deciding on cadence' : 'disabled'}>
       <div className="grid grid-cols-2 gap-x-4 gap-y-3 p-3">
@@ -1530,7 +1578,7 @@ export function RiskPanel({
 
 /* ---------- metrics ---------- */
 
-export function MetricsPanel({ metrics, error }: { metrics?: Metrics; error?: string }) {
+export function MetricsPanel({ metrics, error, status }: { metrics?: Metrics; error?: string; status?: Status }) {
   const counters = metrics
     ? Object.entries(metrics.counters)
         .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
@@ -1541,6 +1589,13 @@ export function MetricsPanel({ metrics, error }: { metrics?: Metrics; error?: st
       title="Metrics"
       detail={metrics ? `feed #${metrics.feedLatest}` : error ? <span className="text-[var(--color-bad)]">{error}</span> : '…'}
     >
+      {status ? (
+        <div className="diagnostics-meta">
+          <Field label="Version" value={status.version} />
+          <Field label="Environment" value={status.environment} />
+          <Field label="Audit" value={status.persistence ?? 'off'} />
+        </div>
+      ) : null}
       {counters.length === 0 ? (
         <div className="p-3 text-xs text-[var(--color-ink-faint)]">No counters yet.</div>
       ) : (
@@ -1744,6 +1799,88 @@ export function ActivityFeed({
         onPrevious={paged.previous}
         onNext={paged.next}
       />
+    </Panel>
+  )
+}
+
+function activityTitle(event: FeedEvent): string {
+  if (event.kind === 'proposal_evaluated') {
+    const outcome = typeof event.payload?.outcome === 'string' ? event.payload.outcome : ''
+    if (outcome === 'no_trade') return 'No trade'
+    if (outcome === 'held') return 'Trade held'
+    if (outcome === 'queued') return 'Trade queued'
+    if (outcome === 'approved_dry_run') return 'Approved · dry run'
+    if (outcome === 'rejected') return 'Trade rejected'
+    if (outcome === 'unavailable') return 'Decision unavailable'
+    if (outcome === 'break_even') return 'Break-even queued'
+    if (outcome === 'break_even_rejected') return 'Break-even rejected'
+    if (outcome === 'close_queued') return 'Close queued'
+    if (outcome === 'close_rejected') return 'Close rejected'
+    if (outcome === 'trailing_stop' || outcome === 'profit_harvest_stop' || outcome === 'stop_queued') return 'Stop adjustment queued'
+    if (outcome === 'stop_rejected') return 'Stop adjustment rejected'
+  }
+  if (event.kind === 'position_closed') return 'Position closed'
+  if (event.kind === 'failure') return 'Decision failed'
+  return event.kind
+    .split('_')
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
+}
+
+function activityDetail(event: FeedEvent): string | undefined {
+  if (event.kind === 'position_closed') return payloadSummary(event)
+  if (event.kind === 'proposal_evaluated' || event.kind === 'failure' || event.kind === 'command_failed') {
+    const detail = event.payload?.reason ?? event.payload?.rationale
+    return typeof detail === 'string' ? detail : undefined
+  }
+  return undefined
+}
+
+/** Three-row overview digest; the Activity tab remains the full drill-down. */
+export function RecentActivityPreview({
+  events,
+  connected,
+  onViewAll,
+}: {
+  events: FeedEvent[]
+  connected: boolean
+  onViewAll: () => void
+}) {
+  const rows = events
+    .filter((event) => !isRoutine(event) && event.kind !== 'agent_turn' && event.kind !== 'agent_tool_called')
+    .slice(0, 3)
+  return (
+    <Panel
+      title="Recent activity"
+      detail={
+        <span className="activity-preview-detail">
+          {!connected ? <span className="activity-preview-connection">Reconnecting…</span> : null}
+          <button type="button" className="panel-link" onClick={onViewAll}>View all</button>
+        </span>
+      }
+      className="activity-preview-panel"
+    >
+      {rows.length === 0 ? (
+        <div className="activity-preview-empty">{connected ? 'No recent activity.' : 'Reconnecting…'}</div>
+      ) : (
+        <ul className="activity-preview-list">
+          {rows.map((event) => {
+            const outcome = typeof event.payload?.outcome === 'string' ? event.payload.outcome : undefined
+            const tone = event.kind === 'failure' || event.kind === 'command_failed' || outcome?.endsWith('rejected') || outcome === 'unavailable' ? 'is-bad' : outcome === 'no_trade' || outcome === 'approved_dry_run' ? 'is-muted' : outcome === 'held' || outcome === 'close_queued' ? 'is-warn' : 'is-ok'
+            const detail = activityDetail(event)
+            return (
+              <li key={event.seq} className="activity-preview-row">
+                <time dateTime={new Date(event.at_ms).toISOString()}>{clockTime(event.at_ms)}</time>
+                <span className={`activity-preview-dot ${tone}`} aria-hidden="true" />
+                <div>
+                  <strong>{activityTitle(event)}</strong>
+                  {detail ? <p>{detail}</p> : null}
+                </div>
+              </li>
+            )
+          })}
+        </ul>
+      )}
     </Panel>
   )
 }

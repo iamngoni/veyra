@@ -100,8 +100,8 @@ describe('api', () => {
     await api.events(7, 30_000)
 
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      '/api/events',
-      '/api/events?after=7&wait_ms=30000',
+      '/api/events?limit=200',
+      '/api/events?after=7&wait_ms=30000&limit=200',
     ])
   })
 
@@ -143,6 +143,18 @@ describe('api', () => {
     )
     await expect(api.updatePolicy({ maxOpenOrders: 1001 })).rejects.toThrow(
       'maxOpenOrders: too large',
+    )
+  })
+
+  it('surfaces every rejected field when a patch has multiple validation errors', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        jsonResponse({ rejected: [{ field: 'maxOpenOrders', reason: 'too large' }, { field: 'sessionUtc', reason: 'invalid window' }] }, 400),
+      ),
+    )
+    await expect(api.updateConfig({ maxOpenOrders: 1001, sessionUtc: 'bad' })).rejects.toThrow(
+      'maxOpenOrders: too large; sessionUtc: invalid window',
     )
   })
 

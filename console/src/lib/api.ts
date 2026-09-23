@@ -418,8 +418,8 @@ export const api = {
   balanceHistory: (days = 30) => get<BalanceHistory>(`/account/balance-history?days=${days}`),
   performance: (days = 30) => get<Performance>(`/performance?days=${days}`),
   sessions: () => get<MarketSessions>('/market/sessions'),
-  events: (after: number | undefined, waitMs = 15000) =>
-    get<Feed>(after === undefined ? '/events' : `/events?after=${after}&wait_ms=${waitMs}`),
+  events: (after: number | undefined, waitMs = 15000, limit = 200) =>
+    get<Feed>(after === undefined ? `/events?limit=${limit}` : `/events?after=${after}&wait_ms=${waitMs}&limit=${limit}`),
   logs: (after: number | undefined, level: LogLevel, limit = 300) =>
     get<LogTail>(`/logs?limit=${limit}&level=${level}${after === undefined ? '' : `&after=${after}`}`),
   /** Durable trail, newest first. Survives restarts, unlike the log ring. */

@@ -15,7 +15,7 @@ import {
   MetricsPanel,
   PerformancePanel,
   PositionsPanel,
-  PostureBanner,
+  RecentActivityPreview,
   RiskPanel,
   SafetyControls,
   StatusPills,
@@ -34,6 +34,7 @@ export const Route = createFileRoute('/')({ component: Dashboard })
  */
 const TABS = [
   { id: 'overview', label: 'Overview' },
+  { id: 'market', label: 'Market' },
   { id: 'activity', label: 'Activity' },
   { id: 'risk', label: 'Risk' },
   { id: 'trace', label: 'Trace' },
@@ -63,6 +64,7 @@ export function Dashboard() {
   const [traceKind, setTraceKind] = useState('all')
   const { theme, toggle } = useTheme()
   const [tab, setTab] = useState<TabId>('overview')
+  const lastDecisionAt = events.find((event) => event.kind === 'proposal_evaluated')?.at_ms
 
   // Judge health is not reported directly, so it is inferred from the failure
   // counter moving between polls. Cumulative totals alone cannot say whether
@@ -117,43 +119,27 @@ export function Dashboard() {
         </div>
         <div className="console-topbar-meta">
           <StatusPills status={status} />
-          <span className="console-version readout">v{status?.version ?? '…'}</span>
         </div>
         <ThemeToggle theme={theme} onToggle={toggle} />
       </header>
 
       <div className="console-body">
         <aside className="console-sidebar" aria-label="Console navigation">
-          <div className="console-sidebar-heading">Workspace</div>
           <Tabs tabs={TABS} active={tab} onSelect={(id) => setTab(id as TabId)} />
-          <div className="console-sidebar-footer">
-            <span className={`console-sidebar-dot ${status?.broker_connected ? 'is-live' : ''}`} aria-hidden="true" />
-            <div>
-              <span className="label">Account</span>
-              <strong>{account?.server ?? 'Waiting for terminal'}</strong>
-              <small>{account?.login ? `#${account.login}` : 'No account reported'}</small>
-            </div>
-          </div>
         </aside>
 
         <main className="console-main">
           <div className="console-page-heading">
-            <div>
-              <h1>{TABS.find((item) => item.id === tab)?.label ?? 'Overview'}</h1>
-            </div>
-            <PostureBanner status={status} />
+            <h1>{TABS.find((item) => item.id === tab)?.label ?? 'Overview'}</h1>
           </div>
-
-          <HeroMetrics account={account} error={accountError} />
 
           {tab === 'overview' ? (
             <div className="overview-layout">
-              <BalanceHistoryPanel history={balanceHistory} account={account} error={balanceHistoryError} />
-              <SafetyControls policy={status?.risk_policy} jevHealthy={jevHealthy} onApply={applyPatch} />
               <div className="overview-primary">
+                <HeroMetrics account={account} error={accountError} />
+                <BalanceHistoryPanel history={balanceHistory} account={account} error={balanceHistoryError} />
                 <PositionsPanel account={account} />
                 <PerformancePanel performance={performance} error={performanceError} />
-                <MarketPanel series={series} sessions={sessions} account={account} error={marketError} />
               </div>
               <aside className="overview-rail">
                 <AutopilotPanel
@@ -161,9 +147,18 @@ export function Dashboard() {
                   budget={status?.model_budget}
                   jevUsage={status?.jev_usage}
                   decisions={status?.decisions}
+                  compact
+                  lastDecisionAt={lastDecisionAt}
                 />
-                <ActivityFeed events={events} connected={connected} focus={focus} onFocusChange={setFocus} />
+                <RecentActivityPreview events={events} connected={connected} onViewAll={() => setTab('activity')} />
+                <SafetyControls policy={status?.risk_policy} jevHealthy={jevHealthy} onApply={applyPatch} />
               </aside>
+            </div>
+          ) : null}
+
+          {tab === 'market' ? (
+            <div className="single-tab-layout">
+              <MarketPanel series={series} sessions={sessions} account={account} error={marketError} />
             </div>
           ) : null}
 
@@ -200,7 +195,7 @@ export function Dashboard() {
 
           {tab === 'diagnostics' ? (
             <div className="flex flex-col gap-4">
-              <MetricsPanel metrics={metrics} error={metricsError} />
+              <MetricsPanel metrics={metrics} status={status} error={metricsError} />
               <LogsPanel logs={logs} error={logsError} level={logLevel} onLevelChange={setLogLevel} />
             </div>
           ) : null}

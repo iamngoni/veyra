@@ -657,6 +657,64 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn live_feed_eviction_preserves_cursor_order_and_durable_events() {
+        let trail = Arc::new(MemoryTrail::default());
+        let runtime = AuditRuntime::new(trail.clone());
+        let total = FEED_CAPACITY + 3;
+        for marker in 1..=total {
+            runtime
+                .try_record(AuditEvent::new(
+                    AuditKind::BalanceObserved,
+                    json!({"marker": marker}),
+                ))
+                .await;
+        }
+        assert_eq!(runtime.feed_latest(), total as u64);
+        assert_eq!(trail.len(), total, "feed eviction must not prune storage");
+        let retained = runtime.feed_after(0, total, Duration::ZERO).await;
+        assert_eq!(retained.len(), FEED_CAPACITY);
+        assert_eq!(retained.first().expect("first retained").seq, 4);
+        assert_eq!(retained.last().expect("last retained").seq, total as u64);
+        assert!(
+            retained
+                .windows(2)
+                .all(|pair| pair[1].seq == pair[0].seq + 1)
+        );
+        for event in &retained {
+            assert_eq!(event.payload["marker"], event.seq);
+        }
+        let page = runtime.feed_after(0, 2, Duration::ZERO).await;
+        assert_eq!(
+            page.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        let next = runtime.feed_after(5, 2, Duration::ZERO).await;
+        assert_eq!(
+            next.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![6, 7]
+        );
+        assert!(
+            runtime
+                .feed_after(total as u64, 2, Duration::ZERO)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[actix_web::test]
+    async fn quiet_live_feed_returns_after_its_bounded_wait() {
+        let runtime = AuditRuntime::new(Arc::new(MemoryTrail::default()));
+        let events = actix_web::rt::time::timeout(
+            Duration::from_secs(1),
+            runtime.feed_after(0, 10, Duration::from_millis(10)),
+        )
+        .await
+        .expect("quiet feed must finish its wait");
+        assert!(events.is_empty());
+        assert_eq!(runtime.feed_latest(), 0);
+    }
+
+    #[actix_web::test]
     async fn failing_storage_never_propagates() {
         let runtime = AuditRuntime::new(Arc::new(BrokenTrail));
         runtime

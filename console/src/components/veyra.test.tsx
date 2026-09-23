@@ -40,6 +40,7 @@ import {
   Pill,
   PositionsPanel,
   PostureBanner,
+  RecentActivityPreview,
   RiskPanel,
   SafetyControls,
   StatusPills,
@@ -175,6 +176,23 @@ const events: FeedEvent[] = [
   },
 ]
 
+const sampledHistoryForTest: BalanceHistory = {
+  status: 'ok',
+  source: 'broker_balance',
+  account: { login: 123456, server: 'ICMarketsSC-MT4' },
+  days: 30,
+  retentionDays: 365,
+  currency: null,
+  points: [
+    { atMs: Date.now() - 86_400_000, balance: 1000 },
+    { atMs: Date.now(), balance: 1004.5 },
+  ],
+  firstObservedAtMs: Date.now() - 86_400_000,
+  lastObservedAtMs: Date.now(),
+  sampled: true,
+  fresh: true,
+}
+
 describe('Pill and StatusPills', () => {
   it('renders a connecting state without data', () => {
     render(<StatusPills />)
@@ -199,6 +217,7 @@ describe('Pill and StatusPills', () => {
     expect(screen.getByText('stale')).toBeTruthy()
     expect(screen.getByText('disarmed')).toBeTruthy()
     expect(screen.getByText('off')).toBeTruthy()
+    expect(screen.getByText(/terminal is not reporting/)).toBeTruthy()
   })
 
   it('renders arbitrary pill tones', () => {
@@ -319,6 +338,7 @@ describe('AccountPanel', () => {
 })
 
 describe('BalanceHistoryPanel', () => {
+  const historyNow = Date.now()
   const history: BalanceHistory = {
     status: 'ok',
     source: 'broker_balance',
@@ -327,11 +347,11 @@ describe('BalanceHistoryPanel', () => {
     retentionDays: 365,
     currency: null,
     points: [
-      { atMs: 1_700_000_000_000, balance: 1000 },
-      { atMs: 1_700_086_400_000, balance: 1004.5 },
+      { atMs: historyNow - 86_400_000, balance: 1000 },
+      { atMs: historyNow, balance: 1004.5 },
     ],
-    firstObservedAtMs: 1_700_000_000_000,
-    lastObservedAtMs: 1_700_086_400_000,
+    firstObservedAtMs: historyNow - 86_400_000,
+    lastObservedAtMs: historyNow,
     sampled: true,
     fresh: true,
   }
@@ -339,7 +359,6 @@ describe('BalanceHistoryPanel', () => {
   it('renders observed balance points without inventing a return metric', () => {
     render(<BalanceHistoryPanel history={history} account={account} />)
     expect(screen.getByText('1004.50')).toBeTruthy()
-    expect(screen.getByText('2 broker observations')).toBeTruthy()
     expect(screen.queryByText(/%/)).toBeNull()
   })
 
@@ -351,8 +370,29 @@ describe('BalanceHistoryPanel', () => {
 
   it('keeps a one-point history honest', () => {
     render(<BalanceHistoryPanel history={{ ...history, points: [history.points[0]] }} account={account} />)
-    expect(screen.getByText('1 broker observation')).toBeTruthy()
+    expect(screen.getByRole('figure', { name: 'Broker-observed account balance over time' })).toBeTruthy()
+    expect(screen.getByText(historyTimeForTest(history.points[0].atMs))).toBeTruthy()
     expect(screen.queryByText('No broker balance observations yet.')).toBeNull()
+  })
+
+  it('filters observed points when a shorter range is selected', () => {
+    const now = Date.now()
+    render(<BalanceHistoryPanel history={{ ...history, points: [{ atMs: now - 2 * 86_400_000, balance: 1000 }, { atMs: now, balance: 1004.5 }] }} account={account} />)
+    fireEvent.click(screen.getByRole('button', { name: '1D' }))
+    expect(screen.queryByText('Balance change +4.50')).toBeNull()
+  })
+
+  it('uses the current time when deciding whether a history is stale', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-23T12:00:00Z'))
+    try {
+      const staleAt = Date.parse('2026-08-14T12:00:00Z')
+      render(<BalanceHistoryPanel history={{ ...history, points: [{ atMs: staleAt, balance: 1000 }] }} account={account} />)
+      expect(screen.getByText('No observations in this period.')).toBeTruthy()
+      expect(document.querySelector('.balance-history-chart')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('shows a negative observed balance without calling the change profit', () => {
@@ -370,12 +410,24 @@ describe('BalanceHistoryPanel', () => {
         { atMs: Date.parse('2026-09-23T12:00:00Z'), balance: 21 },
       ],
     }
-    render(<BalanceHistoryPanel history={dated} account={account} error="refresh failed" />)
-    const range = document.querySelector('.balance-history-range')
-    expect(range?.textContent).toContain('Sep 20')
-    expect(range?.textContent).toContain('Sep 23')
-    expect(screen.getByText('last known · refresh failed')).toBeTruthy()
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-23T12:00:00Z'))
+    try {
+      render(<BalanceHistoryPanel history={dated} account={account} error="refresh failed" />)
+      const ticks = document.querySelector('.chart-x-axis')?.textContent ?? ''
+      expect(ticks).toContain('Sep 20')
+      expect(ticks).toContain('Sep 23')
+      expect(screen.getByText('last known · refresh failed')).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
   })
+
+  function historyTimeForTest(ms: number): string {
+    return new Date(ms).toLocaleString([], {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+    })
+  }
 
   it('names disabled and waiting history without drawing a series', () => {
     const empty = { ...history, account: null, points: [], firstObservedAtMs: null, lastObservedAtMs: null }
@@ -385,6 +437,106 @@ describe('BalanceHistoryPanel', () => {
     rerender(<BalanceHistoryPanel history={{ ...empty, status: 'waiting_for_account' }} account={account} />)
     expect(screen.getByText('Waiting for the broker account.')).toBeTruthy()
     expect(document.querySelector('.balance-history-chart')).toBeNull()
+  })
+})
+
+describe('overview summaries', () => {
+  it('keeps autopilot compact while exposing full details on demand', () => {
+    render(<AutopilotPanel status={autopilot} budget={status.model_budget} jevUsage={status.jev_usage} decisions={status.decisions} compact lastDecisionAt={1_700_000_000_000} />)
+    expect(screen.getByText('Running')).toBeTruthy()
+    expect(screen.queryByText('No recent decision.')).toBeNull()
+    expect(screen.getByText(/^\d\d:\d\d:\d\d$/)).toBeTruthy()
+    fireEvent.click(screen.getByText('View autopilot details'))
+    expect(screen.getByText('Model chain')).toBeTruthy()
+  })
+
+  it('summarises recent activity and routes View all to the full feed', () => {
+    const onViewAll = vi.fn()
+    render(<RecentActivityPreview events={events} connected onViewAll={onViewAll} />)
+    expect(screen.getByText('Trade held')).toBeTruthy()
+    fireEvent.click(screen.getByText('View all'))
+    expect(onViewAll).toHaveBeenCalledOnce()
+  })
+
+  it('uses concise titles and safe details for decision outcomes and failures', () => {
+    const { rerender } = render(
+      <RecentActivityPreview
+        events={[
+          { seq: 11, at_ms: 1_700_000_011_000, kind: 'proposal_evaluated', payload: { outcome: 'no_trade', reason: 'spread too wide' } },
+          { seq: 12, at_ms: 1_700_000_012_000, kind: 'proposal_evaluated', payload: { outcome: 'queued', side: 'buy', volume: 0.1 } },
+          { seq: 13, at_ms: 1_700_000_013_000, kind: 'proposal_evaluated', payload: { outcome: 'approved_dry_run', side: 'sell' } },
+        ]}
+        connected
+        onViewAll={() => undefined}
+      />,
+    )
+    expect(screen.getByText('No trade')).toBeTruthy()
+    expect(screen.getByText('Trade queued')).toBeTruthy()
+    expect(screen.getByText('Approved · dry run')).toBeTruthy()
+    expect(screen.getByText(/spread too wide/)).toBeTruthy()
+
+    rerender(
+      <RecentActivityPreview
+        events={[
+          { seq: 14, at_ms: 1_700_000_014_000, kind: 'failure', payload: { reason: 'provider timeout' } },
+          { seq: 15, at_ms: 1_700_000_015_000, kind: 'command_failed', payload: { reason: 'broker rejected order' } },
+          { seq: 16, at_ms: 1_700_000_016_000, kind: 'position_closed', payload: { ticket: 8, symbol: 'EURUSD', kind: 'sell', profit: -2.5 } },
+        ]}
+        connected
+        onViewAll={() => undefined}
+      />,
+    )
+    expect(screen.getByText('Decision failed')).toBeTruthy()
+    expect(screen.getByText('provider timeout')).toBeTruthy()
+    expect(screen.getByText('broker rejected order')).toBeTruthy()
+    expect(screen.getByText('Position closed')).toBeTruthy()
+
+    const mappedOutcomes = [
+      ['rejected', 'Trade rejected'],
+      ['unavailable', 'Decision unavailable'],
+      ['break_even', 'Break-even queued'],
+      ['break_even_rejected', 'Break-even rejected'],
+      ['close_queued', 'Close queued'],
+      ['close_rejected', 'Close rejected'],
+      ['trailing_stop', 'Stop adjustment queued'],
+      ['profit_harvest_stop', 'Stop adjustment queued'],
+      ['stop_queued', 'Stop adjustment queued'],
+      ['stop_rejected', 'Stop adjustment rejected'],
+    ] as const
+    for (const [index, [outcome, title]] of mappedOutcomes.entries()) {
+      rerender(
+        <RecentActivityPreview
+          events={[{ seq: 20 + index, at_ms: 1_700_000_020_000 + index, kind: 'proposal_evaluated', payload: { outcome } }]}
+          connected
+          onViewAll={() => undefined}
+        />,
+      )
+      expect(screen.getByText(title)).toBeTruthy()
+    }
+  })
+
+  it('keeps intermediate model events out of the activity digest', () => {
+    render(
+      <RecentActivityPreview
+        events={[{ seq: 9, at_ms: 1_700_000_003_000, kind: 'agent_turn', payload: { prompt: 'private prompt' } }, ...events]}
+        connected
+        onViewAll={() => undefined}
+      />,
+    )
+    expect(screen.queryByText('Agent turn')).toBeNull()
+    expect(screen.queryByText('Decision step completed.')).toBeNull()
+    expect(screen.getByText('Trade held')).toBeTruthy()
+  })
+
+  it('marks cached activity while the event stream reconnects', () => {
+    render(<RecentActivityPreview events={[events[1]]} connected={false} onViewAll={() => undefined} />)
+    expect(screen.getAllByText('Reconnecting…').length).toBeGreaterThan(0)
+    expect(screen.getByText('Trade held')).toBeTruthy()
+  })
+
+  it('states when there is no recent activity', () => {
+    render(<RecentActivityPreview events={[]} connected={false} onViewAll={() => undefined} />)
+    expect(screen.getAllByText('Reconnecting…').length).toBeGreaterThan(0)
   })
 })
 
@@ -418,18 +570,31 @@ describe('PositionsPanel', () => {
         }}
       />,
     )
-    expect(screen.getByText('10650805')).toBeTruthy()
     expect(screen.getByText('EURUSD')).toBeTruthy()
     expect(screen.getByText('USDJPY')).toBeTruthy()
     expect(screen.getByText('XAUUSD')).toBeTruthy()
-    expect(screen.getByText('-0.11')).toBeTruthy()
-    expect(screen.getByText('+0.02')).toBeTruthy()
-    // One missing swap, plus a current price none of these fixtures carry.
-    expect(screen.getAllByText('—').length).toBe(4)
-    expect(screen.getByText('veyra')).toBeTruthy()
-    expect(screen.getAllByText('manual').length).toBe(2)
     expect(screen.getByText('truncated')).toBeTruthy()
     expect(screen.getByText('+4.00')).toBeTruthy()
+
+    fireEvent.click(screen.getByLabelText('Details for EURUSD'))
+    expect(screen.getByText('10650805')).toBeTruthy()
+    expect(screen.getByText('veyra')).toBeTruthy()
+    fireEvent.click(screen.getByLabelText('Details for USDJPY'))
+    expect(screen.getByText('42')).toBeTruthy()
+    expect(screen.getAllByText('manual').length).toBeGreaterThanOrEqual(1)
+    fireEvent.click(screen.getByLabelText('Details for XAUUSD'))
+    expect(screen.getByText('43')).toBeTruthy()
+    expect(screen.getByText('+0.02')).toBeTruthy()
+  })
+
+  it('opens the per-position disclosure for operational metadata', () => {
+    render(<PositionsPanel account={account} />)
+    const summary = screen.getByLabelText('Details for EURUSD')
+    fireEvent.click(summary)
+    expect(summary.getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByText('Ticket')).toBeTruthy()
+    expect(screen.getByText('Swap')).toBeTruthy()
+    expect(screen.getByText('Owner')).toBeTruthy()
   })
 
   it('reports the live price and signs the move against the side', () => {
@@ -828,6 +993,27 @@ describe('AutopilotPanel', () => {
       />,
     )
     expect(screen.getByText('0.2R arm · 0.2R trail · 0.50 floor')).toBeTruthy()
+  })
+
+  it('shows fallback models and a compact error state with full details available', () => {
+    render(
+      <AutopilotPanel
+        status={{ ...autopilot, enabled: false, model_chain: [], model_fallbacks: ['backup/model'] }}
+        decisions={{ ...status.decisions!, consecutiveFailures: 2, lastFailure: 'provider timeout' }}
+        compact
+      />,
+    )
+    expect(screen.getByText('Error')).toBeTruthy()
+    expect(screen.getByText('provider timeout')).toBeTruthy()
+    fireEvent.click(screen.getByText('View autopilot details'))
+    expect(screen.getByText('fallbacks: backup/model')).toBeTruthy()
+  })
+
+  it('exposes the sampled-history disclosure while keeping the plot honest', () => {
+    const sampled = { ...sampledHistoryForTest, sampled: true }
+    render(<BalanceHistoryPanel history={sampled} account={account} />)
+    expect(screen.getByText(/sampled broker observations/)).toBeTruthy()
+    expect(screen.getByRole('figure', { name: 'Broker-observed account balance over time' })).toBeTruthy()
   })
 })
 
@@ -1557,6 +1743,11 @@ describe('LiveSettingsPanel', () => {
     expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_TRAIL_R: '1.5' })
   })
 
+  it('shows the loading state before the config response arrives', () => {
+    render(<LiveSettingsPanel />)
+    expect(screen.getByText('Loading…')).toBeTruthy()
+  })
+
   it('keeps the draft on screen when the service refuses it', async () => {
     const onApply = vi
       .fn()
@@ -1581,6 +1772,31 @@ describe('LiveSettingsPanel', () => {
     fireEvent.click(screen.getByTitle('Clear this override and return to the deployed value'))
 
     expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_PROFIT_HARVEST: null })
+  })
+
+  it('leaves a failed override revert visible', async () => {
+    const onApply = vi.fn().mockResolvedValue('cannot revert')
+    render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+    fireEvent.click(screen.getByTitle('Clear this override and return to the deployed value'))
+    expect((await screen.findByRole('alert')).textContent).toContain('cannot revert')
+    expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_PROFIT_HARVEST: null })
+  })
+
+  it('discards a changed draft without sending it', () => {
+    const onApply = vi.fn()
+    render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+    fireEvent.change(document.querySelector('[data-field="VEYRA_AUTOPILOT_TRAIL_R"]')!, {
+      target: { value: '1.5' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Discard' }))
+    expect(onApply).not.toHaveBeenCalled()
+    expect(document.querySelector<HTMLInputElement>('[data-field="VEYRA_AUTOPILOT_TRAIL_R"]')!.value).toBe('')
+  })
+
+  it('keeps a disabled revert control inert without an apply handler', () => {
+    render(<LiveSettingsPanel settings={settings} />)
+    fireEvent.click(screen.getByTitle('Clear this override and return to the deployed value'))
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 
   it('marks only the values an operator has moved', () => {

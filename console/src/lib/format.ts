@@ -10,15 +10,15 @@ import type { CommandRecord, FeedEvent } from './api'
 
 /** Kind → badge classes for the activity feed. Unknown kinds fall back to slate. */
 export const kindTone: Record<string, string> = {
-  proposal_evaluated: 'text-violet-300 bg-violet-500/10',
-  agent_tool_called: 'text-fuchsia-300 bg-fuchsia-500/10',
+  proposal_evaluated: 'text-[var(--color-info)] bg-[var(--color-info-dim)]',
+  agent_tool_called: 'text-[var(--color-warn)] bg-[var(--color-warn)]/10',
   agent_turn: 'text-[var(--color-info)] bg-[var(--color-info-dim)]',
   failure: 'text-[var(--color-bad)] bg-[var(--color-bad-dim)]',
   command_queued: 'text-[var(--color-info)] bg-[var(--color-info)]/10',
   command_completed: 'text-[var(--color-ok)] bg-[var(--color-ok)]/10',
   command_failed: 'text-[var(--color-bad)] bg-[var(--color-bad)]/10',
   broker_snapshot: 'text-[var(--color-ink-muted)] bg-[var(--color-surface-3)]/30',
-  position_closed: 'text-cyan-300 bg-cyan-500/10',
+  position_closed: 'text-[var(--color-ok)] bg-[var(--color-ok)]/10',
   service_started: 'text-[var(--color-warn)] bg-[var(--color-warn)]/10',
   reconciliation_drift: 'text-[var(--color-bad)] bg-[var(--color-bad)]/15',
 }
@@ -26,7 +26,7 @@ export const kindTone: Record<string, string> = {
 /** Proposal/review outcome → text colour. Unknown outcomes keep the default. */
 export const outcomeTone: Record<string, string> = {
   queued: 'text-[var(--color-ok)]',
-  approved_dry_run: 'text-cyan-300',
+  approved_dry_run: 'text-[var(--color-info)]',
   no_trade: 'text-[var(--color-ink-muted)]',
   held: 'text-[var(--color-info)]',
   break_even: 'text-[var(--color-ok)]',

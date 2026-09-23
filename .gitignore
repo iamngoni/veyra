@@ -27,3 +27,4 @@ node_modules/.mf/
 # Scratch workspace for conversation artifacts (not shipped)
 work/
 .playwright-cli/
+/output/playwright/

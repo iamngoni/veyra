@@ -1207,8 +1207,8 @@ mod tests {
 
     use super::{
         CloseOrderRequest, CommandRequest, EaAck, EaLink, EaReply, EaToken, ModifyOrderRequest,
-        ORDER_MAGIC, OrderCheckPayload, OrderRequest, RatesPayload, RatesRequest,
-        closed_managed_positions, hex_preview, payload_for,
+        ORDER_MAGIC, OrderCheckPayload, OrderExecutionPayload, OrderRequest, RatesPayload,
+        RatesRequest, closed_managed_positions, completed_summary, hex_preview, payload_for,
     };
     use crate::broker::Symbol as BrokerSymbol;
     use crate::broker::{
@@ -1246,6 +1246,53 @@ mod tests {
     }
 
     #[test]
+    fn completed_command_summaries_keep_only_bounded_outcome_fields() {
+        use serde_json::json;
+
+        assert_eq!(completed_summary(&CommandPayload::Ping), json!({}));
+        for (passed, retcode, margin) in [(true, 0, 2.5), (false, 134, 0.0)] {
+            let payload = CommandPayload::OrderCheck(OrderCheckPayload {
+                passed,
+                retcode,
+                margin,
+                comment: "terminal detail omitted from feed".to_owned(),
+            });
+            assert_eq!(
+                completed_summary(&payload),
+                json!({"passed": passed, "retcode": retcode, "margin": margin})
+            );
+        }
+        for (executed, retcode, ticket, price) in [(true, 0, 42, 1.25), (false, 134, 0, 0.0)] {
+            let outcome = OrderExecutionPayload {
+                executed,
+                retcode,
+                ticket,
+                price,
+                comment: "terminal detail omitted from feed".to_owned(),
+            };
+            for payload in [
+                CommandPayload::OpenOrder(outcome.clone()),
+                CommandPayload::CloseOrder(outcome.clone()),
+                CommandPayload::ModifyOrder(outcome),
+            ] {
+                assert_eq!(
+                    completed_summary(&payload),
+                    json!({"executed": executed, "retcode": retcode, "ticket": ticket})
+                );
+            }
+        }
+        let rates = CommandPayload::Rates(RatesPayload {
+            symbol: "EURUSD".to_owned(),
+            timeframe_minutes: 240,
+            candles: vec![candle(1_000), candle(15_400)],
+        });
+        assert_eq!(
+            completed_summary(&rates),
+            json!({"symbol": "EURUSD", "timeframeMinutes": 240, "candles": 2})
+        );
+    }
+
+    #[test]
     fn balance_observations_are_validated_scoped_and_sampled() {
         use crate::audit::{AuditKind, AuditRuntime, MemoryTrail};
         use crate::broker::{AccountLogin, AccountSnapshot, ServerName, Symbol};
@@ -1261,7 +1308,7 @@ mod tests {
         let snapshot = |login, connected| {
             AccountSnapshot::new(
                 AccountLogin::parse(login).expect("login"),
-                ServerName::parse("IFCMarkets-Real").expect("server"),
+                ServerName::parse("Broker-Test").expect("server"),
                 Symbol::parse("EURUSD").expect("symbol"),
                 connected,
                 true,
@@ -1270,38 +1317,38 @@ mod tests {
             )
         };
         let first = link
-            .balance_observation(&snapshot(94168, true), Some(20.0))
+            .balance_observation(&snapshot(123456, true), Some(20.0))
             .expect("first value");
         assert_eq!(first.1.kind(), AuditKind::BalanceObserved);
-        assert_eq!(first.1.payload()["login"], 94168);
-        assert_eq!(first.1.payload()["server"], "IFCMarkets-Real");
+        assert_eq!(first.1.payload()["login"], 123456);
+        assert_eq!(first.1.payload()["server"], "Broker-Test");
         assert_eq!(first.1.payload()["balance"], 20.0);
         assert!(
-            link.balance_observation(&snapshot(94168, true), Some(20.0))
+            link.balance_observation(&snapshot(123456, true), Some(20.0))
                 .is_none()
         );
         assert!(
-            link.balance_observation(&snapshot(94168, true), None)
+            link.balance_observation(&snapshot(123456, true), None)
                 .is_none()
         );
         assert!(
-            link.balance_observation(&snapshot(94168, true), Some(-1.0))
+            link.balance_observation(&snapshot(123456, true), Some(-1.0))
                 .is_some()
         );
         assert!(
-            link.balance_observation(&snapshot(94168, true), Some(f64::NAN))
+            link.balance_observation(&snapshot(123456, true), Some(f64::NAN))
                 .is_none()
         );
         assert!(
-            link.balance_observation(&snapshot(94168, false), Some(21.0))
+            link.balance_observation(&snapshot(123456, false), Some(21.0))
                 .is_none()
         );
         assert!(
-            link.balance_observation(&snapshot(94168, true), Some(0.0))
+            link.balance_observation(&snapshot(123456, true), Some(0.0))
                 .is_some()
         );
         assert!(
-            link.balance_observation(&snapshot(94169, true), Some(0.0))
+            link.balance_observation(&snapshot(123457, true), Some(0.0))
                 .is_some()
         );
     }
@@ -1732,8 +1779,8 @@ mod tests {
             let mut body = serde_json::json!({
                 "t": "hb",
                 "token": "test-token-1234567890",
-                "acct": 94168,
-                "server": "IFCMarkets-Real",
+                "acct": 123456,
+                "server": "Broker-Test",
                 "symbol": "EURUSD",
                 "connected": true,
                 "tradeAllowed": true,
