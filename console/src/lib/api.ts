@@ -22,6 +22,8 @@ export type AutopilotStatus = {
   trail_r: number
   /** Ordered fallback models for the tier in use; empty when none are set. */
   model_fallbacks?: string[]
+  /** Full ordered chain, including the primary model first. */
+  model_chain?: string[]
   /** Deterministic early-profit ratchet; null when disabled. */
   profit_harvest?: {
     arm_r: number
@@ -61,6 +63,10 @@ export type Status = {
     consecutiveFailures: number
     lastFailure: string | null
     lastFailureAt: number | null
+    /** Most recent model candidate requested, including a failed fallback. */
+    lastModel?: string | null
+    /** Most recent model candidate that returned a structured answer. */
+    lastSuccessfulModel?: string | null
   } | null
 }
 

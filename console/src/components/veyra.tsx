@@ -224,9 +224,12 @@ export function systemPosture(status?: Status): {
   // is ever decided. Two in a row rules out one transient provider hiccup.
   const failures = status.decisions?.consecutiveFailures ?? 0
   if (failures >= 2) {
+    const lastModel = status.decisions?.lastModel
+      ? ` · last LLM ${status.decisions.lastModel}`
+      : ''
     return {
       label: 'NOT DECIDING',
-      detail: `${failures} decisions in a row failed — ${status.decisions?.lastFailure ?? 'no reason reported'}`,
+      detail: `${failures} decisions in a row failed${lastModel} — ${status.decisions?.lastFailure ?? 'no reason reported'}`,
       tone: 'bad',
     }
   }
@@ -907,10 +910,12 @@ export function AutopilotPanel({
   status,
   budget,
   jevUsage,
+  decisions,
 }: {
   status?: Status['autopilot']
   budget?: Status['model_budget']
   jevUsage?: Status['jev_usage']
+  decisions?: Status['decisions']
 }) {
   const on = status?.enabled === true
   return (
@@ -944,13 +949,25 @@ export function AutopilotPanel({
           }
         />
         <Field
-          label="Model fallbacks"
+          label="Model chain"
           value={
-            status?.model_fallbacks?.length
-              ? status.model_fallbacks.join(' → ')
+            status?.model_chain?.length
+              ? status.model_chain.join(' → ')
+              : status?.model_fallbacks?.length
+                ? `fallbacks: ${status.model_fallbacks.join(' → ')}`
               : 'none — a provider outage stops the loop'
           }
-          tone={status?.model_fallbacks?.length ? undefined : 'text-[var(--color-warn)]'}
+          tone={status?.model_chain?.length || status?.model_fallbacks?.length ? undefined : 'text-[var(--color-warn)]'}
+        />
+        <Field
+          label="Last LLM"
+          value={decisions?.lastModel ?? 'not called yet'}
+          tone={decisions?.lastModel ? undefined : 'text-[var(--color-ink-faint)]'}
+        />
+        <Field
+          label="Last answer"
+          value={decisions?.lastSuccessfulModel ?? 'none yet'}
+          tone={decisions?.lastSuccessfulModel ? undefined : 'text-[var(--color-ink-faint)]'}
         />
         <Field
           label="Model calls"

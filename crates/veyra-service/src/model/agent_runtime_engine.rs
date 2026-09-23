@@ -6,6 +6,7 @@
 //! from library defaults (which are dated).
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use agent_runtime::{
     Agent as RuntimeAgent, AgentProviderKind, Llm, ModelTiers, ProviderError, ResponseFormat,
@@ -26,6 +27,10 @@ pub struct AgentRuntimeEngine {
     /// knows the primary, so the chain is kept here and the model is passed
     /// explicitly on each attempt.
     tiers: TierModels,
+    /// Last candidate requested, including one that failed.
+    last_attempted_model: Arc<Mutex<Option<String>>>,
+    /// Last candidate that returned a structured answer.
+    last_successful_model: Arc<Mutex<Option<String>>>,
 }
 
 impl fmt::Debug for AgentRuntimeEngine {
@@ -126,7 +131,26 @@ impl AgentRuntimeEngine {
             llm,
             provider: settings.provider(),
             tiers: settings.tiers().clone(),
+            last_attempted_model: Arc::new(Mutex::new(None)),
+            last_successful_model: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Records the latest model candidate without allowing telemetry failure
+    /// to affect the decision path.
+    fn remember(slot: &Mutex<Option<String>>, model: &str) {
+        match slot.lock() {
+            Ok(mut value) => *value = Some(model.to_owned()),
+            Err(poisoned) => *poisoned.into_inner() = Some(model.to_owned()),
+        }
+    }
+
+    /// Reads a telemetry value while recovering from a poisoned lock.
+    fn remembered(slot: &Mutex<Option<String>>) -> Option<String> {
+        match slot.lock() {
+            Ok(value) => value.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 }
 
@@ -139,7 +163,7 @@ impl AgentRuntimeEngine {
 /// never reached, so the same failure would repeat on every candidate and the
 /// runtime's own retry policy is the right layer to handle it.
 fn worth_failing_over(error: &anyhow::Error) -> bool {
-    match error.downcast_ref::<ProviderError>() {
+    match provider_error(error) {
         Some(ProviderError::Transport { .. }) => false,
         // A classified provider refusal: credits, rate limit, overload, an
         // unexpected status, or a response with nothing usable in it.
@@ -150,10 +174,44 @@ fn worth_failing_over(error: &anyhow::Error) -> bool {
     }
 }
 
+/// Finds the classified provider error beneath any context added by the
+/// runtime library.
+fn provider_error(error: &anyhow::Error) -> Option<&ProviderError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderError>())
+}
+
+/// Converts a provider failure into a bounded, non-sensitive diagnostic.
+///
+/// Provider bodies can contain account identifiers, routing details, or large
+/// nested JSON payloads. The candidate model and category are enough to
+/// explain failover on the Veyra surface; the raw body must not cross that
+/// boundary.
+fn safe_failure_reason(error: &anyhow::Error) -> String {
+    match provider_error(error) {
+        Some(ProviderError::RateLimited { .. }) => "rate_limited".to_owned(),
+        Some(ProviderError::InsufficientCredits { .. }) => "insufficient_credits".to_owned(),
+        Some(ProviderError::Overloaded { .. }) => "overloaded".to_owned(),
+        Some(ProviderError::Status { status, .. }) => format!("provider_rejected ({status})"),
+        Some(ProviderError::Transport { .. }) => "transport".to_owned(),
+        Some(ProviderError::EmptyResponse { .. }) => "empty_response".to_owned(),
+        None => "invalid_response".to_owned(),
+    }
+}
+
 #[async_trait]
 impl DecisionEngine for AgentRuntimeEngine {
     fn provider(&self) -> ModelProvider {
         self.provider
+    }
+
+    fn last_attempted_model(&self) -> Option<String> {
+        Self::remembered(&self.last_attempted_model)
+    }
+
+    fn last_successful_model(&self) -> Option<String> {
+        Self::remembered(&self.last_successful_model)
     }
 
     async fn answer(&self, request: DecisionRequest) -> Result<DecisionAnswer, ModelError> {
@@ -161,6 +219,7 @@ impl DecisionEngine for AgentRuntimeEngine {
         let mut failures: Vec<String> = Vec::new();
 
         for (position, model) in candidates.iter().enumerate() {
+            Self::remember(&self.last_attempted_model, model);
             let agent = InlineAgent {
                 instructions: request.instructions.clone(),
                 model: model.clone(),
@@ -174,6 +233,7 @@ impl DecisionEngine for AgentRuntimeEngine {
                 .await
             {
                 Ok(value) => {
+                    Self::remember(&self.last_successful_model, model);
                     if position > 0 {
                         tracing::warn!(
                             tier = %request.tier,
@@ -185,7 +245,7 @@ impl DecisionEngine for AgentRuntimeEngine {
                     return Ok(DecisionAnswer { value });
                 }
                 Err(error) => {
-                    let reason = format!("{error:#}");
+                    let reason = safe_failure_reason(&error);
                     let last = position + 1 == candidates.len();
                     if last || !worth_failing_over(&error) {
                         failures.push(format!("{model}: {reason}"));
@@ -573,6 +633,14 @@ mod tests {
             vec!["vendor/balanced", "vendor/second"],
             "the primary is tried first, then exactly one fallback"
         );
+        assert_eq!(
+            engine.last_attempted_model().as_deref(),
+            Some("vendor/second")
+        );
+        assert_eq!(
+            engine.last_successful_model().as_deref(),
+            Some("vendor/second")
+        );
     }
 
     // Exhausting the chain must report every model that refused, so the log
@@ -603,7 +671,20 @@ mod tests {
         for model in ["vendor/balanced", "vendor/second", "vendor/third"] {
             assert!(reason.contains(model), "{model} must appear in: {reason}");
         }
+        assert!(reason.contains("insufficient_credits"));
+        assert!(
+            !reason.contains("Insufficient credits"),
+            "provider response bodies must not cross the model error boundary: {reason}"
+        );
         assert_eq!(models_requested(&mock).len(), 3, "the chain is not re-run");
+        assert_eq!(
+            engine.last_attempted_model().as_deref(),
+            Some("vendor/third")
+        );
+        assert!(
+            engine.last_successful_model().is_none(),
+            "an exhausted chain must not report a successful model"
+        );
     }
 
     // A tier without fallbacks must keep its old single-shot behaviour, so the

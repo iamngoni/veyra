@@ -181,6 +181,7 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
             "breakeven_r": settings.breakeven_r(),
             "trail_r": settings.trail_r(),
             "profit_harvest": profit_harvest,
+            "model_chain": tier_chain.clone().unwrap_or_default(),
             "model_fallbacks": tier_chain
                 .as_ref()
                 .map(|chain| chain.iter().skip(1).cloned().collect::<Vec<_>>())
@@ -241,6 +242,12 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
                 "consecutiveFailures": decisions.consecutive_failures(),
                 "lastFailure": reason,
                 "lastFailureAt": at,
+                "lastModel": state
+                    .model()
+                    .and_then(|runtime| runtime.last_attempted_model()),
+                "lastSuccessfulModel": state
+                    .model()
+                    .and_then(|runtime| runtime.last_successful_model()),
             })
         },
     })

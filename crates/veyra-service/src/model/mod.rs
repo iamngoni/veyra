@@ -141,6 +141,19 @@ pub trait DecisionEngine: Send + Sync + fmt::Debug + 'static {
     /// Provider identifier for status output and logs.
     fn provider(&self) -> ModelProvider;
 
+    /// The most recent model candidate that was actually requested.
+    ///
+    /// This includes a candidate that failed, which lets an operator tell
+    /// whether the configured fallback chain was reached during an outage.
+    fn last_attempted_model(&self) -> Option<String> {
+        None
+    }
+
+    /// The most recent model candidate that returned a structured answer.
+    fn last_successful_model(&self) -> Option<String> {
+        None
+    }
+
     /// Runs one structured request and returns the parsed answer.
     ///
     /// # Errors
@@ -187,6 +200,16 @@ impl ModelRuntime {
     /// Provider identifier of the active implementation.
     pub fn provider(&self) -> ModelProvider {
         self.provider
+    }
+
+    /// The most recent model candidate that was actually requested.
+    pub fn last_attempted_model(&self) -> Option<String> {
+        self.engine.last_attempted_model()
+    }
+
+    /// The most recent model candidate that returned a structured answer.
+    pub fn last_successful_model(&self) -> Option<String> {
+        self.engine.last_successful_model()
     }
 
     /// Domain-level engine contract used by the decision layer.

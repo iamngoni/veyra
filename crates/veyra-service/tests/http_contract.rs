@@ -211,6 +211,8 @@ async fn status_reports_model_provider() {
     assert!(response.status().is_success());
     let body: serde_json::Value = test::read_body_json(response).await;
     assert_eq!(body["model_provider"], "openrouter");
+    assert!(body["decisions"]["lastModel"].is_null());
+    assert!(body["decisions"]["lastSuccessfulModel"].is_null());
     assert_eq!(body["model_budget"]["hourLimit"], 0, "unlimited by default");
     assert_eq!(body["model_budget"]["hourCalls"], 0);
     assert_eq!(body["model_budget"]["dayCalls"], 0);

@@ -50,6 +50,13 @@ VEYRA_AUTOPILOT_ENABLED=false
 Do not start the tunnel profile during initial verification. The old machine
 continues to own the named tunnel until final cutover.
 
+Model fallback identifiers are read from `VEYRA_MODEL_FALLBACKS` at startup.
+They must be available to the OpenRouter account's allowed-provider policy and
+support the structured-response path; a syntactically valid model id is not a
+runtime proof. The console's live settings overlay takes precedence over `.env`
+when an operator has edited the model section, so clear that override or apply
+the new chain through the console before recreating the container.
+
 ## Build and restore
 
 Start only the fresh database, restore the verified custom archive, then start

@@ -142,6 +142,7 @@ export function Dashboard() {
               status={status?.autopilot}
               budget={status?.model_budget}
               jevUsage={status?.jev_usage}
+              decisions={status?.decisions}
             />
           </div>
           <div className="flex min-w-0 flex-col gap-4">

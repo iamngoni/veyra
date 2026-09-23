@@ -276,6 +276,14 @@ impl DecisionEngine for BudgetedEngine {
         self.inner.provider()
     }
 
+    fn last_attempted_model(&self) -> Option<String> {
+        self.inner.last_attempted_model()
+    }
+
+    fn last_successful_model(&self) -> Option<String> {
+        self.inner.last_successful_model()
+    }
+
     async fn answer(&self, request: DecisionRequest) -> Result<DecisionAnswer, ModelError> {
         self.tracker
             .admit()

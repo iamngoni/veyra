@@ -13,11 +13,15 @@ use crate::logs::{LogBuffer, LogLayer};
 fn build_filter(
     source: impl FnOnce() -> Result<String, std::env::VarError>,
 ) -> Result<EnvFilter, Box<dyn std::error::Error>> {
-    match source() {
-        Ok(value) => Ok(EnvFilter::try_new(value)?),
-        Err(std::env::VarError::NotPresent) => Ok(EnvFilter::new("info")),
-        Err(error) => Err(error.into()),
-    }
+    let filter = match source() {
+        Ok(value) => EnvFilter::try_new(value)?,
+        Err(std::env::VarError::NotPresent) => EnvFilter::new("info"),
+        Err(error) => return Err(error.into()),
+    };
+    // `agent-runtime` includes upstream response bodies in warning fields.
+    // Veyra emits its own bounded model diagnostics, so never let those raw
+    // dependency events reach stderr or the console log buffer.
+    Ok(filter.add_directive("agent_runtime=error".parse()?))
 }
 
 /// Installs JSON logging exactly once and tees events into `logs` for the

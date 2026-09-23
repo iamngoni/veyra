@@ -60,6 +60,12 @@ const autopilot: NonNullable<Status['autopilot']> = {
   jev: 'auto',
   breakeven_r: 1,
   trail_r: 1,
+  model_chain: [
+    'deepseek/deepseek-v4.1-flash',
+    'z-ai/glm-5.3-flash',
+    'xiaomi/mimo-v2.6-flash',
+    'z-ai/glm-4.7-flash',
+  ],
 }
 
 const status: Status = {
@@ -675,6 +681,11 @@ describe('AutopilotPanel', () => {
     expect(screen.getByText('BE 1R · trail 1R')).toBeTruthy()
     expect(screen.getByText('5/120 h · 5/2000 d')).toBeTruthy()
     expect(screen.getByText('EURUSD')).toBeTruthy()
+    expect(
+      screen.getByText(
+        'deepseek/deepseek-v4.1-flash → z-ai/glm-5.3-flash → xiaomi/mimo-v2.6-flash → z-ai/glm-4.7-flash',
+      ),
+    ).toBeTruthy()
     expect(screen.getByText('12 calls · 5.5k tok')).toBeTruthy()
   })
 
@@ -687,6 +698,29 @@ describe('AutopilotPanel', () => {
       />,
     )
     expect(screen.getByText('3 calls · 500 tok · 2 failed')).toBeTruthy()
+  })
+
+  it('renders the last LLM model when decision telemetry is available', () => {
+    render(
+      <AutopilotPanel
+        status={autopilot}
+        decisions={{
+          ...status.decisions!,
+          lastModel: 'openai/gpt-5.6-mini',
+          lastSuccessfulModel: 'openai/gpt-4.1-mini',
+        }}
+      />,
+    )
+
+    expect(screen.getByText('openai/gpt-5.6-mini')).toBeTruthy()
+    expect(screen.getByText('openai/gpt-4.1-mini')).toBeTruthy()
+  })
+
+  it('keeps the last LLM field graceful when model telemetry is missing', () => {
+    render(<AutopilotPanel status={autopilot} decisions={status.decisions} />)
+
+    expect(screen.getByText('not called yet')).toBeTruthy()
+    expect(screen.getByText('none yet')).toBeTruthy()
   })
 
   it('renders a multi-symbol rotation and the chart-symbol fallback', () => {
@@ -899,10 +933,12 @@ describe('systemPosture', () => {
         consecutiveFailures: 4,
         lastFailure: 'openrouter call returned 400: Thinking mode does not support this tool_choice',
         lastFailureAt: 1_700_000_000,
+        lastModel: 'openai/gpt-5.6-mini',
       },
     }
     expect(systemPosture(refusing).label).toBe('NOT DECIDING')
     expect(systemPosture(refusing).tone).toBe('bad')
+    expect(systemPosture(refusing).detail).toContain('last LLM openai/gpt-5.6-mini')
     expect(systemPosture(refusing).detail).toContain('Thinking mode')
 
     // The reason can be missing; the banner says so rather than guessing.
