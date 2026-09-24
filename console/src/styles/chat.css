@@ -96,17 +96,15 @@
 .assistant-suggestions button:hover { border-color: var(--color-line-strong); background: var(--color-hover); }
 .assistant-suggestions span { color: var(--color-ink-faint); }
 
-.assistant-message { min-width: 0; margin: 0 0 24px; }
-.assistant-message.is-user {
-  width: fit-content;
-  max-width: 90%;
-  margin-left: auto;
-  padding: 10px 13px;
-  border: 1px solid var(--color-line-strong);
-  border-radius: var(--radius-md);
-  background: var(--color-fill);
-}
-.assistant-message-label { margin-bottom: 6px; color: var(--color-ink); font-size: var(--text-sm); font-weight: var(--weight-semibold); }
+/* A comment thread, not a chat bubble: every turn is a full-width row with a
+   clear author, a quiet timestamp, and a hairline between entries — the same
+   language as every other list in the console. */
+.assistant-message { min-width: 0; padding: 14px 0; border-top: 1px solid var(--color-line-soft); }
+.assistant-message:first-child { padding-top: 0; border-top: 0; }
+.assistant-message-meta { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.assistant-message-author { color: var(--color-ink); font-size: var(--text-sm); font-weight: var(--weight-semibold); }
+.assistant-message.is-user .assistant-message-author { color: var(--color-ink-muted); font-weight: var(--weight-medium); }
+.assistant-message-time { color: var(--color-ink-faint); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
 .assistant-answer { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.65; }
 .assistant-markdown { white-space: normal; }
 .assistant-markdown > :first-child { margin-top: 0; }
@@ -139,8 +137,8 @@
 .assistant-table-scroll tr:last-child td { border-bottom: 0; }
 .assistant-message.is-error .assistant-answer { color: var(--color-bad); }
 .assistant-status { margin: 7px 0 0; color: var(--color-ink-muted); font-size: 12px; }
-.assistant-steps { display: grid; gap: 6px; margin: 0 0 14px; padding: 0; list-style: none; }
-.assistant-steps li { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; align-items: baseline; gap: 8px; color: var(--color-ink-muted); font-size: 11px; }
+.assistant-steps { display: grid; gap: 4px; margin: 0 0 10px; padding: 0; list-style: none; }
+.assistant-steps li { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; align-items: baseline; gap: 8px; color: var(--color-ink-muted); font-size: 11px; line-height: 1.4; }
 .assistant-steps li.is-unavailable { color: var(--color-bad); }
 .assistant-step-icon { width: 12px; flex: none; color: var(--color-ok); font-weight: 700; }
 .assistant-steps li.is-unavailable .assistant-step-icon { color: var(--color-bad); }

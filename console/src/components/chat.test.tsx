@@ -176,6 +176,189 @@ it('does not render raw HTML, executable links, or remote images from model outp
   expect(document.body.querySelector('.assistant-answer pre code')?.textContent).toBe('<script>shown as code</script>\n')
 })
 
+it('closes from the header button and restores focus to the launcher', async () => {
+  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+    callback(0)
+    return 0
+  })
+  vi.mocked(streamAssistant).mockImplementation(async () => {})
+  render(<AssistantChat />)
+  const launcher = screen.getByRole('button', { name: 'Ask Veyra' })
+  fireEvent.click(launcher)
+  fireEvent.click(screen.getByRole('button', { name: 'Close assistant' }))
+  expect(screen.queryByRole('heading', { name: 'Ask Veyra' })).toBeNull()
+  expect(document.activeElement).toBe(launcher)
+})
+
+it('closes when the (visually hidden) launcher itself is activated while open', async () => {
+  vi.mocked(streamAssistant).mockImplementation(async () => {})
+  const { container } = render(<AssistantChat />)
+  const launcher = screen.getByRole('button', { name: 'Ask Veyra' })
+  fireEvent.click(launcher)
+  expect(screen.getByRole('heading', { name: 'Ask Veyra' })).toBeTruthy()
+  // The launcher stays mounted (with the `hidden` attribute) while open, so it
+  // is reachable by direct node lookup even though it drops out of the a11y
+  // tree; this is how the same toggle would fire if it were re-clicked.
+  fireEvent.click(container.querySelector('.assistant-launcher')!)
+  expect(screen.queryByRole('heading', { name: 'Ask Veyra' })).toBeNull()
+})
+
+it('closes on Escape and stops an in-flight question, marking its step not completed', async () => {
+  let finish: () => void = () => {}
+  vi.mocked(streamAssistant).mockImplementation(async (_question, _history, onEvent) => {
+    onEvent({ event: 'tool_start', call_id: 'p', tool: 'positions', label: 'Reading positions' })
+    await new Promise<void>((resolve) => { finish = resolve })
+  })
+  render(<AssistantChat />)
+  fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Read positions' } })
+  fireEvent.click(screen.getByRole('button', { name: /Send/ }))
+  fireEvent.keyDown(screen.getByRole('complementary', { name: 'Veyra assistant' }), { key: 'Escape' })
+  expect(screen.queryByRole('heading', { name: 'Ask Veyra' })).toBeNull()
+  finish()
+})
+
+it('ignores stray non-Escape keys in the drawer', async () => {
+  vi.mocked(streamAssistant).mockImplementation(async () => {})
+  render(<AssistantChat />)
+  fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
+  fireEvent.keyDown(screen.getByRole('complementary', { name: 'Veyra assistant' }), { key: 'Enter' })
+  expect(screen.getByRole('heading', { name: 'Ask Veyra' })).toBeTruthy()
+})
+
+it('shows an interim status label while the assistant works', async () => {
+  vi.mocked(streamAssistant).mockImplementation(async (_question, _history, onEvent) => {
+    onEvent({ event: 'status', label: 'Thinking about the account' })
+    onEvent({ event: 'answer', text: 'Done.' })
+  })
+  render(<AssistantChat />)
+  fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
+  fireEvent.click(screen.getByRole('button', { name: /What changed recently/ }))
+  expect(await screen.findByText('Done.')).toBeTruthy()
+})
+
+it('ignores an empty question and a second one while one is already pending', async () => {
+  let finish: () => void = () => {}
+  vi.mocked(streamAssistant).mockImplementation(async () => {
+    await new Promise<void>((resolve) => { finish = resolve })
+  })
+  render(<AssistantChat />)
+  fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
+  const textarea = screen.getByRole('textbox')
+  // The Enter shortcut is not gated by the disabled submit button, so it can
+  // reach `send` directly with a blank draft.
+  fireEvent.change(textarea, { target: { value: '   ' } })
+  fireEvent.keyDown(textarea, { key: 'Enter' })
+  expect(streamAssistant).not.toHaveBeenCalled()
+
+  fireEvent.change(textarea, { target: { value: 'First question' } })
+  fireEvent.click(screen.getByRole('button', { name: /Send/ }))
+  expect(streamAssistant).toHaveBeenCalledOnce()
+  fireEvent.change(textarea, { target: { value: 'Second question' } })
+  fireEvent.keyDown(textarea, { key: 'Enter' })
+  expect(streamAssistant).toHaveBeenCalledOnce()
+  finish()
+})
+
+it('sends on Enter but keeps Shift+Enter and IME composition as plain newlines', async () => {
+  vi.mocked(streamAssistant).mockImplementation(async () => {})
+  render(<AssistantChat />)
+  fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
+  const textarea = screen.getByRole('textbox')
+  fireEvent.change(textarea, { target: { value: 'Shift newline' } })
+  fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: true })
+  expect(streamAssistant).not.toHaveBeenCalled()
+  fireEvent.keyDown(textarea, { key: 'Enter', isComposing: true })
+  expect(streamAssistant).not.toHaveBeenCalled()
+  fireEvent.keyDown(textarea, { key: 'Enter' })
+  expect(streamAssistant).toHaveBeenCalledOnce()
+})
+
+it('bounds history to the six most recent finished, non-error turns with text', async () => {
+  vi.mocked(streamAssistant).mockImplementation(async (_question, _history, onEvent) => {
+    onEvent({ event: 'answer', text: `Answer ${_history.length}` })
+  })
+  render(<AssistantChat />)
+  fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
+  const textarea = screen.getByRole('textbox')
+  for (let index = 0; index < 4; index++) {
+    fireEvent.change(textarea, { target: { value: `Question ${index}` } })
+    fireEvent.click(screen.getByRole('button', { name: /Send/ }))
+    await screen.findByText(`Answer ${index * 2}`)
+  }
+  const lastCall = vi.mocked(streamAssistant).mock.calls.at(-1)!
+  const [, history] = lastCall
+  expect(history).toHaveLength(6)
+  expect(history.at(-1)).toEqual({ role: 'assistant', content: 'Answer 4' })
+  expect(history.every((turn) => turn.content)).toBe(true)
+})
+
+it('tells the operator plainly when the stream ends without an answer', async () => {
+  vi.mocked(streamAssistant).mockImplementation(async () => {})
+  render(<AssistantChat />)
+  fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
+  fireEvent.click(screen.getByRole('button', { name: /What changed recently/ }))
+  expect(await screen.findByText('The connection ended before the assistant answered. Try again.')).toBeTruthy()
+})
+
+it('reports a network failure by message, and a non-Error rejection plainly', async () => {
+  vi.mocked(streamAssistant)
+    .mockRejectedValueOnce(new Error('network unreachable'))
+    .mockRejectedValueOnce('opaque failure')
+  render(<AssistantChat />)
+  fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
+  fireEvent.click(screen.getByRole('button', { name: /What changed recently/ }))
+  expect(await screen.findByText('network unreachable')).toBeTruthy()
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Ask again' } })
+  fireEvent.click(screen.getByRole('button', { name: /Send/ }))
+  expect(await screen.findByText('The assistant could not answer.')).toBeTruthy()
+})
+
+it('scrolls instantly instead of smoothly when the operator prefers reduced motion', async () => {
+  const scrollIntoView = vi.fn()
+  Element.prototype.scrollIntoView = scrollIntoView
+  vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }))
+  vi.mocked(streamAssistant).mockImplementation(async (_question, _history, onEvent) => {
+    onEvent({ event: 'answer', text: 'Reduced motion answer.' })
+  })
+  render(<AssistantChat />)
+  fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
+  fireEvent.click(screen.getByRole('button', { name: /What changed recently/ }))
+  await screen.findByText('Reduced motion answer.')
+  expect(scrollIntoView).toHaveBeenCalledWith({ block: 'end', behavior: 'instant' })
+})
+
+it('renders an image with no alt text as nothing rather than a broken request', async () => {
+  vi.mocked(streamAssistant).mockImplementation(async (_question, _history, onEvent) => {
+    onEvent({ event: 'answer', text: '![](https://example.com/track.png)\n\nAfter the image.' })
+  })
+  render(<AssistantChat />)
+  fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
+  fireEvent.click(screen.getByRole('button', { name: /What changed recently/ }))
+  await screen.findByText('After the image.')
+  expect(document.body.querySelector('.assistant-answer img')).toBeNull()
+})
+
+it('matches a repeated tool call by tool name once its call id is already spent', async () => {
+  vi.mocked(streamAssistant).mockImplementation(async (_question, _history, onEvent) => {
+    // Two starts with no call_id at all: the second result must bind to the
+    // second (still-open) start, not re-match the first, already-closed one.
+    onEvent({ event: 'tool_start', tool: 'positions', label: 'Reading positions (1)' })
+    onEvent({ event: 'tool_result', tool: 'positions', available: true, count: 1 })
+    onEvent({ event: 'tool_start', tool: 'positions', label: 'Reading positions (2)' })
+    onEvent({ event: 'tool_result', tool: 'positions', available: true, count: 2 })
+    onEvent({ event: 'answer', text: 'Matched by tool name.' })
+  })
+  render(<AssistantChat />)
+  fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
+  fireEvent.click(screen.getByRole('button', { name: /What changed recently/ }))
+  await screen.findByText('Matched by tool name.')
+  const rows = within(screen.getByRole('list', { name: 'Read-only tool activity' })).getAllByRole('listitem')
+  expect(rows).toHaveLength(2)
+  expect(within(rows[0]).getByText('1 record')).toBeTruthy()
+  expect(within(rows[1]).getByText('2 records')).toBeTruthy()
+})
+
 it('keeps assistant error messages unformatted', async () => {
   vi.mocked(streamAssistant).mockImplementation(async (_question, _history, onEvent) => {
     onEvent({ event: 'error', reason: '**Literal failure** <img src=x>' })

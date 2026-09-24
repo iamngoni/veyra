@@ -208,4 +208,123 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn open_text_rejects_unsupported_version_and_missing_ciphertext() {
+        let vault = vault();
+        let error = vault
+            .open_text(&json!({"version": 2, "ciphertext": "AAAA"}))
+            .expect_err("unsupported version must fail closed");
+        assert!(error.contains("unsupported credential state version"));
+
+        let error = vault
+            .open_text(&json!({"version": 1}))
+            .expect_err("missing ciphertext must fail closed");
+        assert!(error.contains("credential state is malformed"));
+
+        let error = vault
+            .open_text(&json!({"version": 1, "ciphertext": 7}))
+            .expect_err("non-string ciphertext must fail closed");
+        assert!(error.contains("credential state is malformed"));
+    }
+
+    /// Guards the four `VEYRA_CONSOLE_*` environment tests below so they never
+    /// interleave: `from_env` reads real process state, and this binary runs
+    /// unit tests from every module in the crate on shared threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clear_env() {
+        // SAFETY: serialized by `ENV_LOCK`, and no other test in this crate
+        // reads or writes these two variable names.
+        unsafe {
+            std::env::remove_var(KEY_ENV);
+            std::env::remove_var(TOKEN_ENV);
+        }
+    }
+
+    #[test]
+    fn from_env_is_absent_when_unconfigured() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        clear_env();
+        assert!(
+            CredentialVault::from_env()
+                .expect("absent config is not an error")
+                .is_none()
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn from_env_rejects_partial_or_short_configuration() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        clear_env();
+
+        // SAFETY: serialized by `ENV_LOCK`; unique variable names in this crate.
+        unsafe {
+            std::env::set_var(KEY_ENV, STANDARD.encode([7_u8; 32]));
+        }
+        let error =
+            CredentialVault::from_env().expect_err("token-less configuration must fail closed");
+        assert!(error.contains(TOKEN_ENV));
+
+        clear_env();
+        // SAFETY: serialized by `ENV_LOCK`; unique variable names in this crate.
+        unsafe {
+            std::env::set_var(TOKEN_ENV, "short-token");
+            std::env::set_var(KEY_ENV, STANDARD.encode([7_u8; 32]));
+        }
+        let error = CredentialVault::from_env().expect_err("a short admin token must fail closed");
+        assert!(error.contains("at least 32 characters"));
+
+        clear_env();
+    }
+
+    #[test]
+    fn from_env_rejects_malformed_or_wrong_length_keys() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        clear_env();
+
+        // SAFETY: serialized by `ENV_LOCK`; unique variable names in this crate.
+        unsafe {
+            std::env::set_var(TOKEN_ENV, TEST_ADMIN_TOKEN);
+            std::env::set_var(KEY_ENV, "not-base64!!");
+        }
+        let error = CredentialVault::from_env().expect_err("invalid base64 must fail closed");
+        assert!(error.contains("base64-encoded 32-byte key"));
+
+        clear_env();
+        // SAFETY: serialized by `ENV_LOCK`; unique variable names in this crate.
+        unsafe {
+            std::env::set_var(TOKEN_ENV, TEST_ADMIN_TOKEN);
+            std::env::set_var(KEY_ENV, STANDARD.encode([7_u8; 16]));
+        }
+        let error =
+            CredentialVault::from_env().expect_err("a key that is not 32 bytes must fail closed");
+        assert!(error.contains("base64-encoded 32-byte key"));
+
+        clear_env();
+    }
+
+    #[test]
+    fn from_env_builds_an_authenticating_vault_from_valid_configuration() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        clear_env();
+
+        // SAFETY: serialized by `ENV_LOCK`; unique variable names in this crate.
+        unsafe {
+            std::env::set_var(TOKEN_ENV, TEST_ADMIN_TOKEN);
+            std::env::set_var(KEY_ENV, STANDARD.encode([7_u8; 32]));
+        }
+        let vault = CredentialVault::from_env()
+            .expect("valid configuration must parse")
+            .expect("both variables set must build a vault");
+        assert!(vault.authenticates(TEST_ADMIN_TOKEN));
+        assert!(!vault.authenticates("wrong-token-that-is-also-long-enough-hah"));
+
+        let key = ApiKey::parse("sensitive-provider-key").expect("valid test key");
+        let stored = vault.seal(&key).expect("encrypt");
+        assert_eq!(vault.open(&stored).expect("decrypt"), Some(key));
+
+        clear_env();
+    }
 }

@@ -19,6 +19,7 @@ import type {
   FeedEvent,
   LogRecord,
   MarketSessions,
+  ModelCooldown,
   Status,
 } from '../lib/api'
 import { VEYRA_MAGIC } from '../lib/api'
@@ -30,6 +31,7 @@ import {
   CommandsPanel,
   LogsPanel,
   MetricsPanel,
+  ModelRoutePanel,
   Pager,
   RiskPanel,
   SessionPanel,
@@ -471,6 +473,113 @@ describe('AutopilotPanel', () => {
     rerender(<AutopilotPanel />)
     expect(screen.queryByText('Off', { selector: '.tab-state' })).toBeNull()
     expect(container.querySelectorAll('.skeleton').length).toBeGreaterThan(10)
+  })
+})
+
+describe('ModelRoutePanel', () => {
+  it('renders nothing for a service that does not report its route', () => {
+    const { container } = render(<ModelRoutePanel status={{ ...status, model_route: undefined }} />)
+    expect(container.textContent).toBe('')
+  })
+
+  it('states an empty route plainly, defaulting an unreported cooldown list to none', () => {
+    render(<ModelRoutePanel status={{ ...status, model_route: [], model_cooldowns: undefined }} />)
+    expect(screen.getByText('No model configured')).toBeTruthy()
+  })
+
+  it('numbers the route, marks the answering model, and benches a candidate with its reason and a future retry clock', () => {
+    const now = Date.now()
+    const route = ['z-ai/glm-5.3-flash', 'deepseek/deepseek-v4.1-flash', 'chatgpt:gpt-5.1-codex']
+    const cooldowns: ModelCooldown[] = [
+      { provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash', reason: 'rate_limited', untilMs: now + 5 * 60_000, failures: 2 },
+    ]
+    render(
+      <ModelRoutePanel
+        status={{
+          ...status,
+          model_route: route,
+          model_cooldowns: cooldowns,
+          decisions: { ...status.decisions!, lastSuccessfulModel: 'z-ai/glm-5.3-flash' },
+        }}
+      />,
+    )
+    const rows = within(screen.getByRole('list')).getAllByRole('listitem')
+    expect(rows).toHaveLength(3)
+    expect(within(rows[0]).getByText('1')).toBeTruthy()
+    expect(within(rows[0]).getByText('z-ai/glm-5.3-flash')).toBeTruthy()
+    expect(within(rows[0]).getByText('Answering')).toBeTruthy()
+    expect(within(rows[1]).getByText('2')).toBeTruthy()
+    expect(within(rows[1]).getByText('Rate limited')).toBeTruthy()
+    expect(within(rows[1]).getByText(/^retry \d{2}:\d{2}$/)).toBeTruthy()
+    expect(within(rows[1]).getByTitle('2 failed in a row')).toBeTruthy()
+    expect(within(rows[1]).queryByText('Answering')).toBeNull()
+    // The ChatGPT subscription's candidate reads by its `chatgpt:` label, not
+    // the bare model id, and is not itself benched.
+    expect(within(rows[2]).getByText('chatgpt:gpt-5.1-codex')).toBeTruthy()
+    expect(within(rows[2]).queryByText('Answering')).toBeNull()
+  })
+
+  it('marks a due retry and falls back to sentence case for an unlisted reason', () => {
+    const now = Date.now()
+    const cooldowns: ModelCooldown[] = [
+      { provider: 'openrouter', model: 'z-ai/glm-5.3-flash', reason: 'quota_exhausted_oddly', untilMs: now - 1_000, failures: 1 },
+    ]
+    render(<ModelRoutePanel status={{ ...status, model_route: ['z-ai/glm-5.3-flash'], model_cooldowns: cooldowns }} />)
+    expect(screen.getByText('Quota exhausted oddly')).toBeTruthy()
+    expect(screen.getByText('retry due')).toBeTruthy()
+  })
+
+  it('lists a cooldown outside the current route separately, unnumbered', () => {
+    const cooldowns: ModelCooldown[] = [
+      { provider: 'codex', model: 'gpt-5.1-codex', reason: 'overloaded', untilMs: Date.now() + 60_000, failures: 1 },
+    ]
+    render(<ModelRoutePanel status={{ ...status, model_route: ['z-ai/glm-5.3-flash'], model_cooldowns: cooldowns }} />)
+    const rows = within(screen.getByRole('list')).getAllByRole('listitem')
+    expect(rows).toHaveLength(2)
+    expect(rows[0].textContent).toContain('z-ai/glm-5.3-flash')
+    expect(within(rows[1]).getByText('chatgpt:gpt-5.1-codex')).toBeTruthy()
+    expect(within(rows[1]).getByText('Overloaded')).toBeTruthy()
+    expect(rows[1].querySelector('.tab-route-position')?.textContent).toBe('')
+  })
+
+  it('retries every benched model, disables the action meanwhile, and surfaces a failure', async () => {
+    const pending = deferred<string | undefined>()
+    const onRetryAll = vi.fn().mockReturnValue(pending.promise)
+    const cooldowns: ModelCooldown[] = [
+      { provider: 'openrouter', model: 'z-ai/glm-5.3-flash', reason: 'overloaded', untilMs: Date.now() + 60_000, failures: 1 },
+    ]
+    render(
+      <ModelRoutePanel
+        status={{ ...status, model_route: ['z-ai/glm-5.3-flash'], model_cooldowns: cooldowns }}
+        onRetryAll={onRetryAll}
+      />,
+    )
+    const retry = screen.getByRole('button', { name: 'Retry all' })
+    fireEvent.click(retry)
+    expect(onRetryAll).toHaveBeenCalledOnce()
+    expect(screen.getByRole('button', { name: 'Retrying…' }).hasAttribute('disabled')).toBe(true)
+
+    await act(async () => pending.resolve('Retry failed: service unavailable'))
+    expect(screen.getByRole('alert').textContent).toBe('Retry failed: service unavailable')
+    expect(screen.getByRole('button', { name: 'Retry all' })).toBeTruthy()
+  })
+
+  it('hides the retry action without a benched model or a handler', () => {
+    const { rerender } = render(
+      <ModelRoutePanel status={{ ...status, model_route: ['a'], model_cooldowns: [] }} onRetryAll={vi.fn()} />,
+    )
+    expect(screen.queryByRole('button', { name: /Retry/ })).toBeNull()
+
+    rerender(
+      <ModelRoutePanel
+        status={{
+          ...status,
+          model_route: ['a'],
+          model_cooldowns: [{ provider: 'openrouter', model: 'a', reason: 'overloaded', untilMs: Date.now(), failures: 1 }],
+        }}
+      />,
+    )
+    expect(screen.queryByRole('button', { name: /Retry/ })).toBeNull()
   })
 })
 

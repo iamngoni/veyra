@@ -94,7 +94,8 @@ impl Store {
     pub async fn list(&self, limit: u32) -> Result<Vec<AuditRow>, AuditError> {
         let rows = sqlx::query(
             "select id::text as id, at::text as at, kind, payload \
-             from audit_events order by at desc, id desc limit $1",
+             from audit_events \
+             order by audit_events.at desc, audit_events.id desc limit $1",
         )
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
@@ -174,7 +175,7 @@ impl AuditTrail for Store {
             "select id::text as id, at::text as at, kind, payload \
              from audit_events \
              where kind in ('proposal_evaluated', 'position_closed', 'command_failed') \
-             order by at desc, id desc limit $1",
+             order by audit_events.at desc, audit_events.id desc limit $1",
         )
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
@@ -301,7 +302,10 @@ fn filtered_query(query: &AuditQuery) -> QueryBuilder<'static, Postgres> {
         builder.push_bind(until as f64 / 1_000.0);
         builder.push("::double precision)");
     }
-    builder.push(" order by at desc, id desc limit ");
+    // Qualifying these columns keeps PostgreSQL from resolving `at` and `id`
+    // to the text aliases in the SELECT list, which would bypass the native
+    // timestamp index and sort every candidate row.
+    builder.push(" order by audit_events.at desc, audit_events.id desc limit ");
     builder.push_bind(i64::from(query.limit()));
     builder
 }
@@ -332,7 +336,7 @@ mod tests {
              to_char(at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as at, \
              kind, payload \
              from audit_events where kind = any($1::text[]) \
-             order by at desc, id desc limit $2"
+             order by audit_events.at desc, audit_events.id desc limit $2"
         );
 
         let full = AuditQuery::new(
@@ -361,7 +365,7 @@ mod tests {
             assert!(sql.contains(clause), "missing `{clause}` in {sql}");
         }
         assert!(
-            sql.ends_with(" order by at desc, id desc limit $9"),
+            sql.ends_with(" order by audit_events.at desc, audit_events.id desc limit $9"),
             "{sql}"
         );
         assert!(

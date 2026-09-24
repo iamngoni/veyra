@@ -20,6 +20,14 @@ type Message = {
   status?: string
   done?: boolean
   error?: boolean
+  /** When the turn started, for the quiet timestamp beside its author. */
+  at: number
+}
+
+/** Quiet wall-clock label beside an author, e.g. `10:42 AM` — never a date; the
+ *  whole conversation is one tab's session. */
+function messageClock(atMs: number): string {
+  return new Date(atMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
 }
 
 const SUGGESTIONS = ['What positions am I holding?', 'Why are we holding them?', 'What changed recently?']
@@ -142,11 +150,12 @@ export function AssistantChat() {
       .map((message) => ({ role: message.role, content: message.text }))
     const userId = nextId.current++
     const answerId = nextId.current++
+    const at = Date.now()
     setDraft('')
     setMessages((current) => [
       ...current,
-      { id: userId, role: 'user', text: question, done: true },
-      { id: answerId, role: 'assistant', text: '', steps: [], status: 'Starting…' },
+      { id: userId, role: 'user', text: question, done: true, at },
+      { id: answerId, role: 'assistant', text: '', steps: [], status: 'Starting…', at },
     ])
     setPendingId(answerId)
     const abort = new AbortController()
@@ -235,7 +244,12 @@ export function AssistantChat() {
             ) : null}
             {messages.map((message) => (
               <article key={message.id} className={`assistant-message is-${message.role}${message.error ? ' is-error' : ''}`}>
-                {message.role === 'assistant' ? <div className="assistant-message-label">Veyra</div> : null}
+                <div className="assistant-message-meta">
+                  <span className="assistant-message-author">{message.role === 'assistant' ? 'Veyra' : 'You'}</span>
+                  <time className="assistant-message-time" dateTime={new Date(message.at).toISOString()}>
+                    {messageClock(message.at)}
+                  </time>
+                </div>
                 {message.steps && message.steps.length > 0 ? (
                   <ol className="assistant-steps" aria-label="Read-only tool activity">
                     {message.steps.map((step, index) => {

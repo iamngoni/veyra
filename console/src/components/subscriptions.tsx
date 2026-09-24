@@ -3,10 +3,11 @@
 import { useEffect, useId, useRef, useState } from 'react'
 
 import { subscriptions, type SubscriptionProvider, type SubscriptionStatus } from '../lib/api'
+import { Dot, type Tone } from './ui'
 
-const PROVIDERS: Array<{ id: SubscriptionProvider; name: string; via: string; mark: string }> = [
-  { id: 'codex', name: 'ChatGPT', via: 'via Codex', mark: '◎' },
-  { id: 'claude_code', name: 'Claude', via: 'via Claude Code', mark: '✳' },
+const PROVIDERS: Array<{ id: SubscriptionProvider; name: string; via: string }> = [
+  { id: 'codex', name: 'ChatGPT', via: 'via Codex' },
+  { id: 'claude_code', name: 'Claude', via: 'via Claude Code' },
 ]
 
 type Flow = { provider: SubscriptionProvider; authorizeUrl: string }
@@ -125,24 +126,28 @@ export function SubscriptionConnections({ enabled, selectedProvider, onRefresh }
 
   return (
     <section className="tab-subscriptions" aria-label="Subscription connections">
-      <div className="tab-subscriptions-heading">
-        <div>
-          <h4>Subscription connections</h4>
-          <p>Use a ChatGPT or Claude account with access to Codex or Claude Code. Connect first, then choose its provider and model IDs below.</p>
-        </div>
-      </div>
-      <div className="tab-subscriptions-grid">
-        {PROVIDERS.map(({ id, name, via, mark }) => {
+      <h4>Subscription connections</h4>
+      <ol className="tab-list tab-subscriptions-list">
+        {PROVIDERS.map(({ id, name, via }) => {
           const connection = status?.subscriptions[id]
+          const connected = !!connection?.connected && !statusFailed && !checking
+          const tone: Tone = checking ? 'idle' : statusFailed ? 'bad' : connection?.connected ? 'ok' : 'idle'
+          const stateText = checking
+            ? 'Checking…'
+            : statusFailed
+              ? 'Unavailable'
+              : connection?.connected
+                ? (selectedProvider === id ? 'Selected' : 'Connected')
+                : 'Not connected'
           return (
-            <div className="tab-subscription" key={id}>
-              <span className="tab-subscription-mark" aria-hidden="true">{mark}</span>
-              <div className="tab-subscription-main">
+            <li className="tab-row tab-subscription-row" key={id}>
+              <span className="tab-subscription-name">
                 <strong>{name}</strong>
-                <span>{via}</span>
-              </div>
-              <span className={`tab-subscription-state${connection?.connected && !statusFailed && !checking ? ' is-connected' : ''}`}>
-                {checking ? 'Checking…' : statusFailed ? 'Unavailable' : connection?.connected ? selectedProvider === id ? 'Selected' : 'Connected' : 'Not connected'}
+                <span className="tab-subscription-via">{via}</span>
+              </span>
+              <span className={`tab-subscription-state${connected ? ' is-connected' : ''}`}>
+                <Dot tone={tone} />
+                {stateText}
               </span>
               <div className="tab-subscription-action">
                 <button type="button" aria-label={`${connection?.connected ? 'Reconnect' : 'Connect'} ${name}`} disabled={!enabled || busy || checking || statusFailed || !!flow} onClick={() => void start(id)}>
@@ -150,10 +155,10 @@ export function SubscriptionConnections({ enabled, selectedProvider, onRefresh }
                 </button>
                 {connection?.connected ? <button type="button" aria-label={`Disconnect ${name}`} disabled={!enabled || busy || checking || statusFailed || !!flow} onClick={() => void remove(id)}>{action?.provider === id && action.kind === 'remove' ? 'Disconnecting…' : 'Disconnect'}</button> : null}
               </div>
-            </div>
+            </li>
           )
         })}
-      </div>
+      </ol>
       {statusFailed ? <p className="tab-subscriptions-message" role="status">Connection status is unavailable. <button type="button" className="tab-link" disabled={checking || busy} onClick={() => void refresh()}>Retry</button></p> : null}
       {enabled ? (
         <div className="tab-subscriptions-token">

@@ -26,24 +26,32 @@
   .tab-provider-credential-fields { grid-template-columns: 1fr; }
 }
 
-.tab-subscriptions { grid-column: 2; padding: 17px; border: 1px solid var(--color-line); border-radius: 8px; background: var(--color-surface-1); }
-.tab-subscriptions-heading { display: flex; justify-content: space-between; align-items: start; gap: 16px; }
-.tab-subscriptions-heading h4 { margin: 0; color: var(--color-ink); font-size: 14px; font-weight: 650; }
-.tab-subscriptions-heading p { max-width: 55ch; margin: 5px 0 0; color: var(--color-ink-muted); font-size: 12px; line-height: 1.45; }
-.tab-subscriptions-tag { flex: 0 0 auto; color: var(--color-ink-faint); font-size: 10px; font-weight: 650; letter-spacing: .08em; }
-.tab-subscriptions-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 17px; }
-.tab-subscription { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 4px 10px; min-width: 0; padding: 12px; border: 1px solid var(--color-line); border-radius: 7px; background: var(--color-surface-2); }
-.tab-subscription-mark { display: grid; place-items: center; width: 27px; height: 27px; border: 1px solid var(--color-line-strong); border-radius: 7px; color: var(--color-ink); font-size: 17px; }
-.tab-subscription-main { display: grid; gap: 2px; min-width: 0; }
-.tab-subscription-main strong { color: var(--color-ink); font-size: 13px; font-weight: 650; }
-.tab-subscription-main span { color: var(--color-ink-muted); font-size: 11px; }
-.tab-subscription-state { color: var(--color-ink-faint); font-size: 11px; white-space: nowrap; }
+.tab-subscriptions { grid-column: 2; padding: var(--panel-inset); border: 1px solid var(--color-line); border-radius: var(--radius-md); background: var(--color-surface-1); }
+.tab-subscriptions h4 { margin: 0; color: var(--color-ink); font-size: 13px; font-weight: var(--weight-semibold); }
+.tab-subscriptions-list.tab-list { margin: 4px 0 0; padding: 0; }
+/* One compact Linear-style row per connection: name, its provider, a status
+   dot and word, and the action, all on one line. */
+.tab-subscription-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 6px 16px;
+  min-height: 40px;
+}
+.tab-subscription-name { display: flex; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden; }
+.tab-subscription-name strong { overflow: hidden; color: var(--color-ink); font-size: 13px; font-weight: var(--weight-medium); text-overflow: ellipsis; white-space: nowrap; }
+.tab-subscription-via { flex: none; color: var(--color-ink-faint); font-size: 11px; }
+.tab-subscription-state { display: inline-flex; align-items: center; gap: 6px; color: var(--color-ink-muted); font-size: 12px; white-space: nowrap; }
 .tab-subscription-state.is-connected { color: var(--color-ok); }
-.tab-subscription-action { display: flex; flex-wrap: wrap; gap: 8px; grid-column: 2 / -1; margin-top: 7px; }
+.tab-subscription-action { display: flex; flex-wrap: nowrap; gap: 8px; justify-self: end; }
 .tab-subscription-action button, .tab-subscriptions-flow-actions button { padding: 5px 0; border: 0; background: none; color: var(--color-ink); font-size: 11px; font-weight: 650; cursor: pointer; }
 .tab-subscription-action button + button, .tab-subscriptions-flow-actions button + button { color: var(--color-ink-muted); }
 .tab-subscription-action button:hover:not(:disabled), .tab-subscriptions-flow-actions button:hover:not(:disabled) { text-decoration: underline; }
 .tab-subscription-action button:disabled, .tab-subscriptions-flow-actions button:disabled { opacity: .5; cursor: default; }
+@media (max-width: 520px) {
+  .tab-subscription-row { grid-template-columns: minmax(0, 1fr) auto; row-gap: 4px; }
+  .tab-subscription-action { grid-column: 1 / -1; justify-self: start; }
+}
 .tab-subscriptions-token { display: grid; gap: 5px; margin-top: 18px; color: var(--color-ink-muted); font-size: 11px; }
 .tab-subscriptions-token > span:last-child { color: var(--color-ink-faint); }
 .tab-subscriptions-token input, .tab-subscriptions-flow input { width: 100%; min-width: 0; min-height: 36px; padding: 7px 9px; border: 1px solid var(--color-line-strong); border-radius: 6px; background: var(--color-surface-2); color: var(--color-ink); font-size: 13px; }
@@ -59,7 +67,6 @@
 .tab-subscriptions-flow a { width: fit-content; padding: 7px 10px; border: 1px solid var(--color-line-strong); border-radius: 5px; text-decoration: none; }
 .tab-subscriptions-flow a:hover { background: var(--color-surface-2); }
 @media (max-width: 960px) { .tab-subscriptions, .tab-provider-credential { grid-column: 1; } }
-@media (max-width: 680px) { .tab-subscriptions-grid { grid-template-columns: 1fr; } .tab-subscriptions-tag { display: none; } }
 @media (max-width: 660px) {
   .tab-provider-credential, .tab-subscriptions { padding: 13px; }
   .tab-provider-credential-fields input, .tab-subscriptions input { font-size: 16px; }

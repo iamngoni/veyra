@@ -1711,7 +1711,9 @@ mod tests {
 
     use super::*;
     use crate::app::create_app;
-    use crate::audit::MemoryTrail;
+    use crate::audit::{
+        AuditError, AuditProvider, AuditRow, AuditRuntime, AuditTrail, MemoryTrail,
+    };
     use crate::broker::{
         AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName, SymbolSpecRequest,
     };
@@ -2768,7 +2770,129 @@ mod tests {
         );
     }
 
+    #[actix_web::test]
+    async fn account_snapshot_requires_a_command_channel() {
+        let app = test::init_service(create_app(build_state(None, false))).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/commands/account_snapshot")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 503);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "command_channel_unavailable");
+    }
+
+    #[actix_web::test]
+    async fn account_state_requires_a_broker() {
+        let app = test::init_service(create_app(build_state(None, false))).await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/account").to_request()).await;
+        assert_eq!(response.status(), 503);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "broker_unavailable");
+    }
+
+    #[actix_web::test]
+    async fn market_spec_reports_a_missing_default_symbol() {
+        let app = test::init_service(create_app(build_state(
+            Some(StubFeed { fail: false }),
+            false,
+        )))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/market/spec").to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 409);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "symbol_unavailable");
+    }
+
+    #[actix_web::test]
+    async fn execute_intent_reports_a_risk_rejection() {
+        // The default policy allows no instrument at all, so any draft is
+        // rejected before the broker or command channel are ever touched.
+        let state = build_state(None, true);
+        state.set_trading_enabled(true);
+        let app = test::init_service(create_app(state)).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/intents/execute")
+                .set_json(serde_json::json!({
+                    "symbol": "EURUSD",
+                    "side": "buy",
+                    "order_type": "market",
+                    "volume": 0.01
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["decision"], "rejected");
+        assert_eq!(body["code"], "symbol_not_allowed");
+    }
+
+    #[actix_web::test]
+    async fn queue_staged_close_reports_channel_unavailable() {
+        let state = build_state(None, false);
+        state.set_trading_enabled(true);
+        assert_eq!(
+            queue_staged_close(&state, 123).await,
+            StagedClose::ChannelUnavailable
+        );
+    }
+
+    /// Audit trail whose reads always fail, to exercise the degraded path of
+    /// routes that read through it.
+    #[derive(Debug)]
+    struct RefusingTrail;
+
+    #[async_trait]
+    impl AuditTrail for RefusingTrail {
+        fn provider(&self) -> AuditProvider {
+            AuditProvider::Postgres
+        }
+
+        async fn record(&self, _event: crate::audit::AuditEvent) -> Result<(), AuditError> {
+            Err(AuditError::Storage {
+                reason: "down".to_owned(),
+            })
+        }
+
+        async fn recent(&self, _limit: u32) -> Result<Vec<AuditRow>, AuditError> {
+            Err(AuditError::Storage {
+                reason: "down".to_owned(),
+            })
+        }
+
+        async fn prune(&self, _keep_days: u32) -> Result<u64, AuditError> {
+            Err(AuditError::Storage {
+                reason: "down".to_owned(),
+            })
+        }
+    }
+
+    #[actix_web::test]
+    async fn audit_log_reports_unavailable_storage() {
+        let state =
+            build_state(None, false).with_audit(Some(AuditRuntime::new(Arc::new(RefusingTrail))));
+        let app = test::init_service(create_app(state)).await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/audit").to_request()).await;
+        assert_eq!(response.status(), 503);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["status"], "unavailable");
+    }
+
     mod model_routes {
+        use std::sync::Arc;
+
         use actix_web::test;
         use serde_json::{Value, json};
 
@@ -2780,6 +2904,8 @@ mod tests {
             Admission, CooldownFailure, CooldownReason, CooldownRegistry, ModelProvider,
         };
         use crate::runtime_config::test_support::model_overlay;
+        use crate::state::RuntimeState;
+        use crate::state::test_support::FailingState;
         use crate::subscription_auth::SubscriptionProvider;
 
         fn cool(registry: &CooldownRegistry, provider: ModelProvider, model: &str) {
@@ -3010,6 +3136,375 @@ mod tests {
                     .model()
                     .is_some_and(|model| model.prefers_subscription()),
                 "the preference survives a credential change"
+            );
+        }
+
+        #[actix_web::test]
+        async fn model_subscriptions_reports_connection_and_labels() {
+            let (state, _store) = app(CooldownRegistry::new(), &[SubscriptionProvider::Codex]);
+            let app_service = test::init_service(create_app(state)).await;
+            let response = test::call_service(
+                &app_service,
+                test::TestRequest::get()
+                    .uri("/model/subscriptions")
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 200);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["subscriptions"]["codex"]["connected"], true);
+            assert_eq!(body["subscriptions"]["codex"]["account_label"], "operator");
+            assert_eq!(body["subscriptions"]["claude_code"]["connected"], false);
+            assert_eq!(
+                body["subscriptions"]["claude_code"]["account_label"],
+                Value::Null
+            );
+        }
+
+        #[actix_web::test]
+        async fn starting_a_subscription_requires_a_token_and_a_known_provider() {
+            let (state, _store) = app(CooldownRegistry::new(), &[]);
+            let app_service = test::init_service(create_app(state)).await;
+
+            let refused = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/subscriptions/start")
+                    .set_json(json!({"provider": "codex"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(refused.status(), 401);
+
+            let bad_provider = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/subscriptions/start")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .set_json(json!({"provider": "unknown"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(bad_provider.status(), 400);
+            assert_eq!(
+                test::read_body_json::<Value, _>(bad_provider).await["error"],
+                "unsupported_subscription_provider"
+            );
+
+            let started = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/subscriptions/start")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .set_json(json!({"provider": "codex"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(started.status(), 200);
+            let body: Value = test::read_body_json(started).await;
+            assert_eq!(body["provider"], "codex");
+            assert!(
+                body["authorize_url"]
+                    .as_str()
+                    .expect("authorize_url")
+                    .contains("code_challenge=")
+            );
+            assert!(!body["state"].as_str().expect("state").is_empty());
+        }
+
+        #[actix_web::test]
+        async fn completing_a_subscription_validates_before_contacting_the_provider() {
+            let (state, _store) = app(CooldownRegistry::new(), &[]);
+            let app_service = test::init_service(create_app(state)).await;
+
+            let refused = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/subscriptions/complete")
+                    .set_json(json!({"provider": "codex", "callback_value": "abc#xyz"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(refused.status(), 401);
+
+            let bad_provider = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/subscriptions/complete")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .set_json(json!({"provider": "unknown", "callback_value": "abc#xyz"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(bad_provider.status(), 400);
+            assert_eq!(
+                test::read_body_json::<Value, _>(bad_provider).await["error"],
+                "unsupported_subscription_provider"
+            );
+
+            let bad_callback = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/subscriptions/complete")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .set_json(json!({"provider": "codex", "callback_value": "   "}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(bad_callback.status(), 400);
+            assert_eq!(
+                test::read_body_json::<Value, _>(bad_callback).await["error"],
+                "invalid_subscription_callback"
+            );
+
+            // A well-formed callback with no pending flow (or the wrong CSRF
+            // state) is refused before any network call is ever made.
+            let no_pending = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/subscriptions/complete")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .set_json(json!({"provider": "codex", "callback_value": "abc#xyz"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(no_pending.status(), 400);
+            assert_eq!(
+                test::read_body_json::<Value, _>(no_pending).await["error"],
+                "invalid_subscription_state"
+            );
+        }
+
+        #[actix_web::test]
+        async fn deleting_an_unknown_subscription_provider_is_rejected() {
+            let (state, _store) = app(CooldownRegistry::new(), &[]);
+            let app_service = test::init_service(create_app(state)).await;
+            let response = test::call_service(
+                &app_service,
+                test::TestRequest::delete()
+                    .uri("/model/subscriptions/unknown")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 400);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"], "unsupported_subscription_provider");
+        }
+
+        #[actix_web::test]
+        async fn deleting_the_active_codex_subscription_disables_the_model() {
+            let (state, _store) = app(CooldownRegistry::new(), &[SubscriptionProvider::Codex]);
+            model_overlay(
+                state.runtime_config(),
+                &[
+                    ("VEYRA_MODEL_PROVIDER", "codex"),
+                    ("VEYRA_MODEL_FAST", "gpt-6-luna"),
+                    ("VEYRA_MODEL_BALANCED", "gpt-6-luna"),
+                    ("VEYRA_MODEL_REASONING", "gpt-6-luna"),
+                    ("VEYRA_MODEL_FALLBACKS", ""),
+                ],
+            );
+            crate::runtime_config::rebuild_model(&state)
+                .expect("the connected subscription builds");
+            assert!(state.model().is_some());
+
+            let app_service = test::init_service(create_app(state.clone())).await;
+            let response = test::call_service(
+                &app_service,
+                test::TestRequest::delete()
+                    .uri("/model/subscriptions/codex")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 200);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body, json!({"deleted": true, "provider": "codex"}));
+            assert!(
+                state.model().is_none(),
+                "the model that depended on the deleted subscription is disabled"
+            );
+        }
+
+        #[actix_web::test]
+        async fn a_storage_failure_refuses_to_delete_a_subscription() {
+            let (state, _store) = app(CooldownRegistry::new(), &[SubscriptionProvider::Codex]);
+            let state = state.with_runtime_state(RuntimeState::new(Some(Arc::new(FailingState))));
+            let app_service = test::init_service(create_app(state)).await;
+            let response = test::call_service(
+                &app_service,
+                test::TestRequest::delete()
+                    .uri("/model/subscriptions/codex")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 503);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"], "credential_storage_failed");
+        }
+
+        #[actix_web::test]
+        async fn setting_a_model_credential_validates_before_persisting() {
+            let (state, _store) = app(CooldownRegistry::new(), &[]);
+            let app_service = test::init_service(create_app(state)).await;
+
+            let refused = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/credential")
+                    .set_json(json!({"key": "irrelevant"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(refused.status(), 401);
+
+            let too_long = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/credential")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .set_json(json!({"key": "x".repeat(4_097)}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(too_long.status(), 400);
+            assert_eq!(
+                test::read_body_json::<Value, _>(too_long).await["error"],
+                "invalid_model_key"
+            );
+
+            let too_short = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/credential")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .set_json(json!({"key": "short"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(too_short.status(), 400);
+            assert_eq!(
+                test::read_body_json::<Value, _>(too_short).await["error"],
+                "invalid_model_key"
+            );
+        }
+
+        #[actix_web::test]
+        async fn deleting_a_model_credential_requires_a_token_and_persists() {
+            let (state, _store) = app(CooldownRegistry::new(), &[SubscriptionProvider::Codex]);
+            model_overlay(
+                state.runtime_config(),
+                &[
+                    ("VEYRA_MODEL_PROVIDER", "codex"),
+                    ("VEYRA_MODEL_FAST", "gpt-6-luna"),
+                    ("VEYRA_MODEL_BALANCED", "gpt-6-luna"),
+                    ("VEYRA_MODEL_REASONING", "gpt-6-luna"),
+                    ("VEYRA_MODEL_FALLBACKS", ""),
+                ],
+            );
+            crate::runtime_config::rebuild_model(&state).expect("model builds");
+            let app_service = test::init_service(create_app(state.clone())).await;
+
+            let refused = test::call_service(
+                &app_service,
+                test::TestRequest::delete()
+                    .uri("/model/credential")
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(refused.status(), 401);
+
+            let response = test::call_service(
+                &app_service,
+                test::TestRequest::delete()
+                    .uri("/model/credential")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 200);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["saved"], true);
+            assert_eq!(body["active"], true);
+            assert!(state.model().is_some());
+        }
+
+        #[actix_web::test]
+        async fn a_storage_failure_refuses_to_save_a_model_credential() {
+            let (state, _store) = app(CooldownRegistry::new(), &[]);
+            let state = state.with_runtime_state(RuntimeState::new(Some(Arc::new(FailingState))));
+            let app_service = test::init_service(create_app(state)).await;
+            let response = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/credential")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .set_json(json!({"key": "a-fresh-key-1234567890"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 503);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"], "credential_storage_failed");
+        }
+
+        #[actix_web::test]
+        async fn a_credential_change_with_broken_model_settings_disables_the_model() {
+            let (state, _store) = app(CooldownRegistry::new(), &[]);
+            // Every model field parses except a required tier, so validation
+            // fails only once the fresh credential is already in the overlay.
+            model_overlay(state.runtime_config(), &[("VEYRA_MODEL_FAST", "")]);
+            let app_service = test::init_service(create_app(state.clone())).await;
+            let response = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/model/credential")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .set_json(json!({"key": "a-fresh-key-1234567890"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 202);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["saved"], true);
+            assert_eq!(body["active"], false);
+            assert_eq!(body["reason"], "model_settings_incomplete");
+            assert!(state.model().is_none());
+        }
+
+        #[actix_web::test]
+        async fn a_config_patch_that_fails_to_apply_still_keeps_the_saved_overlay() {
+            let (state, _store) = app(CooldownRegistry::new(), &[]);
+            let app_service = test::init_service(create_app(state.clone())).await;
+            let response = test::call_service(
+                &app_service,
+                test::TestRequest::post()
+                    .uri("/config")
+                    .set_json(json!({
+                        "VEYRA_MODEL_PROVIDER": "codex",
+                        "VEYRA_MODEL_FAST": "gpt-6-luna",
+                        "VEYRA_MODEL_BALANCED": "gpt-6-luna",
+                        "VEYRA_MODEL_REASONING": "gpt-6-luna",
+                        "VEYRA_MODEL_FALLBACKS": ""
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 500);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"], "settings_saved_but_not_applied");
+            assert!(
+                body["reason"]
+                    .as_str()
+                    .expect("reason")
+                    .contains("connect the selected subscription first")
+            );
+            // The overlay itself is retained even though the swap failed.
+            assert_eq!(
+                state.runtime_config().effective()["VEYRA_MODEL_PROVIDER"]["value"],
+                "codex"
             );
         }
     }

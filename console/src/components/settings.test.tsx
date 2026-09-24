@@ -4,7 +4,7 @@
  * reading of a value, apply, revert and discard.
  */
 
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { subscriptions, type LiveSetting } from '../lib/api'
@@ -304,5 +304,133 @@ describe('LiveSettingsPanel', () => {
     render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} />)
     expect(screen.getAllByRole('button', { name: 'Revert' })).toHaveLength(1)
     expect(screen.getByRole('button', { name: 'Revert' }).getAttribute('title')).toBe('Return to the deployed value')
+  })
+
+  describe('API credential panel', () => {
+    function jsonResponse(body: unknown, status = 200): Response {
+      return { ok: status >= 200 && status < 300, status, json: async () => body } as unknown as Response
+    }
+
+    /** Scoped to the credential card: its "Operator token" field is not the only one on screen. */
+    function credentialPanel(): HTMLElement {
+      return document.querySelector('.tab-provider-credential') as HTMLElement
+    }
+
+    afterEach(() => vi.unstubAllGlobals())
+
+    it('reports credential status: unavailable, unset, environment-sourced, and console-saved', () => {
+      const { rerender } = render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore />)
+      expect(screen.getByText('Credential status unavailable')).toBeTruthy()
+
+      rerender(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore secretStatus={{ set: false, source: null, hint: null }} />)
+      expect(screen.getByText('No key configured')).toBeTruthy()
+
+      rerender(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore secretStatus={{ set: true, source: 'environment', hint: '9f2a' }} />)
+      expect(screen.getByText('Environment key ····9f2a')).toBeTruthy()
+      expect(screen.queryByRole('button', { name: 'Remove saved key' })).toBeNull()
+
+      rerender(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore secretStatus={{ set: true, source: 'console', hint: '9f2a' }} />)
+      expect(screen.getByText('Saved key ····9f2a')).toBeTruthy()
+      expect(screen.getByRole('button', { name: 'Remove saved key' })).toBeTruthy()
+    })
+
+    it('saves a key, confirms the model is active, clears the fields, and refreshes', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        jsonResponse({ saved: true, active: true, secret: { set: true, source: 'console', hint: 'ab12' } }),
+      )
+      vi.stubGlobal('fetch', fetchMock)
+      const onRefresh = vi.fn()
+      render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore onRefresh={onRefresh} />)
+      const panel = within(credentialPanel())
+
+      fireEvent.change(panel.getByLabelText('API key'), { target: { value: 'sk-live-key' } })
+      fireEvent.change(panel.getByLabelText('Operator token'), { target: { value: 'operator-token' } })
+      fireEvent.click(panel.getByRole('button', { name: 'Save key' }))
+
+      expect(await panel.findByText('Credential saved and model active.')).toBeTruthy()
+      expect((panel.getByLabelText('API key') as HTMLInputElement).value).toBe('')
+      expect((panel.getByLabelText('Operator token') as HTMLInputElement).value).toBe('')
+      expect(onRefresh).toHaveBeenCalledOnce()
+      expect(fetchMock).toHaveBeenCalledWith('/api/model/credential', expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ 'x-veyra-admin-token': 'operator-token' }),
+        body: JSON.stringify({ key: 'sk-live-key' }),
+      }))
+    })
+
+    it('explains a saved key that leaves the model unconfigured, with and without a reason', async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(jsonResponse({ saved: true, active: false, reason: 'insufficient_credits', secret: { set: true, source: 'console', hint: 'ab12' } }))
+        .mockResolvedValueOnce(jsonResponse({ saved: true, active: false, secret: { set: true, source: 'console', hint: 'ab12' } }))
+      vi.stubGlobal('fetch', fetchMock)
+      render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore />)
+      const panel = within(credentialPanel())
+
+      fireEvent.change(panel.getByLabelText('API key'), { target: { value: 'sk-live-key' } })
+      fireEvent.change(panel.getByLabelText('Operator token'), { target: { value: 'operator-token' } })
+      fireEvent.click(panel.getByRole('button', { name: 'Save key' }))
+      expect(await panel.findByText('Saved. insufficient credits.')).toBeTruthy()
+
+      fireEvent.change(panel.getByLabelText('API key'), { target: { value: 'sk-live-key-2' } })
+      fireEvent.change(panel.getByLabelText('Operator token'), { target: { value: 'operator-token' } })
+      fireEvent.click(panel.getByRole('button', { name: 'Save key' }))
+      expect(await panel.findByText('Credential saved; model is not configured yet.')).toBeTruthy()
+    })
+
+    it('disables Save key while a save is in flight, then removes a saved key by DELETE', async () => {
+      const pending = deferred<Response>()
+      const fetchMock = vi.fn().mockReturnValueOnce(pending.promise)
+      vi.stubGlobal('fetch', fetchMock)
+      render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore secretStatus={{ set: true, source: 'console', hint: 'ab12' }} />)
+      const panel = within(credentialPanel())
+
+      fireEvent.change(panel.getByLabelText('API key'), { target: { value: 'sk-live-key' } })
+      fireEvent.change(panel.getByLabelText('Operator token'), { target: { value: 'operator-token' } })
+      const save = panel.getByRole('button', { name: 'Save key' }) as HTMLButtonElement
+      fireEvent.click(save)
+      expect(save.disabled).toBe(true)
+      expect((panel.getByLabelText('API key') as HTMLInputElement).disabled).toBe(true)
+      await act(async () => pending.resolve(jsonResponse({ saved: true, active: true, secret: { set: true, source: 'console', hint: 'ab12' } })))
+      await panel.findByText('Credential saved and model active.')
+      // No longer busy: the field is enabled again (it reads disabled only
+      // because saving cleared it, which the Save button's own guard covers).
+      expect((panel.getByLabelText('API key') as HTMLInputElement).disabled).toBe(false)
+
+      fetchMock.mockResolvedValueOnce(jsonResponse({ saved: true, active: false, secret: { set: false, source: null, hint: null } }))
+      fireEvent.change(panel.getByLabelText('Operator token'), { target: { value: 'operator-token' } })
+      fireEvent.click(panel.getByRole('button', { name: 'Remove saved key' }))
+      expect(await panel.findByText('Saved key removed.')).toBeTruthy()
+      expect(fetchMock).toHaveBeenLastCalledWith('/api/model/credential', expect.objectContaining({ method: 'DELETE' }))
+    })
+
+    it('surfaces a rejected credential update by message, and a bodyless failure by status', async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(jsonResponse({ reason: 'token rejected' }, 401))
+        .mockResolvedValueOnce({ ok: false, status: 500, json: async () => { throw new Error('not json') } } as unknown as Response)
+      vi.stubGlobal('fetch', fetchMock)
+      render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore />)
+      const panel = within(credentialPanel())
+
+      fireEvent.change(panel.getByLabelText('API key'), { target: { value: 'sk-live-key' } })
+      fireEvent.change(panel.getByLabelText('Operator token'), { target: { value: 'operator-token' } })
+      fireEvent.click(panel.getByRole('button', { name: 'Save key' }))
+      expect(await panel.findByText('token rejected')).toBeTruthy()
+
+      fireEvent.change(panel.getByLabelText('API key'), { target: { value: 'sk-live-key' } })
+      fireEvent.change(panel.getByLabelText('Operator token'), { target: { value: 'operator-token' } })
+      fireEvent.click(panel.getByRole('button', { name: 'Save key' }))
+      expect(await panel.findByText('Credential update failed (500)')).toBeTruthy()
+    })
+
+    it('will not save without both a key and a token', () => {
+      const fetchMock = vi.fn()
+      vi.stubGlobal('fetch', fetchMock)
+      render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore />)
+      const panel = within(credentialPanel())
+      expect((panel.getByRole('button', { name: 'Save key' }) as HTMLButtonElement).disabled).toBe(true)
+      fireEvent.change(panel.getByLabelText('API key'), { target: { value: 'sk-live-key' } })
+      expect((panel.getByRole('button', { name: 'Save key' }) as HTMLButtonElement).disabled).toBe(true)
+      expect(fetchMock).not.toHaveBeenCalled()
+    })
   })
 })
