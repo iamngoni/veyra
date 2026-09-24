@@ -13,6 +13,9 @@
 *.sqlite-wal
 *.db
 
+# Local tool logs (for example MCP servers started in this directory)
+*.log
+
 # Editor and OS artifacts
 .DS_Store
 .idea/
