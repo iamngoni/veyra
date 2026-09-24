@@ -4,6 +4,7 @@
  */
 
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import Markdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
@@ -53,7 +54,11 @@ const MARKDOWN_COMPONENTS: Components = {
   ),
 }
 
-/** Floating launcher plus a non-modal right-side drawer with live tool trace. */
+/**
+ * Launcher for the view's header plus a non-modal right-side drawer with a
+ * live tool trace. The drawer renders at the document root so no header or
+ * scroll container can clip or stack over it.
+ */
 export function AssistantChat() {
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState('')
@@ -197,7 +202,7 @@ export function AssistantChat() {
         <span className="assistant-launcher-mark" aria-hidden="true">✳</span>
         <span>Ask Veyra</span>
       </button>
-      {open ? (
+      {open ? createPortal(
         <aside
           id="veyra-assistant"
           className="assistant-drawer"
@@ -295,7 +300,8 @@ export function AssistantChat() {
               )}
             </div>
           </form>
-        </aside>
+        </aside>,
+        document.body,
       ) : null}
     </>
   )

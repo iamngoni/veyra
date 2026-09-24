@@ -1,8 +1,10 @@
 /* Overview main column: headline cards (kpi-), open positions (pos-) and the
  * 30-day performance summary (perf-). Owned by components/overview.tsx.
  *
- * Layout decisions follow the width each block actually gets, not the
- * viewport, so they hold wherever the dashboard places the column. */
+ * Every block keeps the panel inset (16px) on both sides, so figures, column
+ * heads and panel titles share one left edge. Layout decisions follow the
+ * width each block actually gets, not the viewport, so they hold wherever
+ * the dashboard places the column. */
 
 /* ---------- headline cards ---------- */
 
@@ -13,39 +15,40 @@
 .kpi-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0;
   margin: 0;
-  border: 1px solid var(--color-line);
-  border-radius: 8px;
-  background: var(--color-surface-1);
   overflow: hidden;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  background: var(--color-panel);
+  box-shadow: var(--shadow-panel);
 }
 
 .kpi-card {
   display: flex;
   min-width: 0;
-  min-height: 100px;
   flex-direction: column;
   justify-content: center;
-  padding: 14px 18px;
+  padding: var(--space-3) var(--panel-inset);
 }
 
-.kpi-card + .kpi-card { border-left: 1px solid var(--color-line); }
+.kpi-card + .kpi-card {
+  border-left: 1px solid var(--color-line-soft);
+}
 
 .kpi-label {
   color: var(--color-ink-muted);
-  font-size: 12px;
-  line-height: 20px;
+  font-size: var(--text-sm);
+  line-height: 16px;
 }
 
 .kpi-value {
   overflow: hidden;
-  margin: 5px 0 0;
+  margin: var(--space-1) 0 0;
   color: var(--color-ink);
-  font-size: 24px;
-  font-weight: 500;
-  letter-spacing: -0.005em;
-  line-height: 32px;
+  font-size: 22px;
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-display);
+  line-height: 28px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -55,19 +58,21 @@
   vertical-align: middle;
 }
 
-.kpi-unavailable {
-  font-size: 14px;
-  font-weight: 400;
+.kpi-unavailable,
+.perf-unavailable {
+  font-size: var(--text-base);
+  font-weight: var(--weight-regular);
+  letter-spacing: 0;
 }
 
 /* Reserves its line when empty so the four cards stay level. */
 .kpi-sub {
   overflow: hidden;
-  min-height: 20px;
+  min-height: 16px;
   margin: 2px 0 0;
   color: var(--color-ink-muted);
-  font-size: 12px;
-  line-height: 20px;
+  font-size: var(--text-sm);
+  line-height: 16px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -76,40 +81,44 @@
   .kpi-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .kpi-card:nth-child(3) { border-left: 0; }
-  .kpi-card:nth-child(n + 3) { border-top: 1px solid var(--color-line); }
+
+  .kpi-card:nth-child(3) {
+    border-left: 0;
+  }
+
+  .kpi-card:nth-child(n + 3) {
+    border-top: 1px solid var(--color-line-soft);
+  }
 }
 
 @container (max-width: 420px) {
   .kpi-card {
-    min-height: 88px;
-    padding: 12px 14px;
-  }
-
-  .kpi-label {
-    font-size: 12px;
+    padding: var(--space-3);
   }
 
   .kpi-value {
-    font-size: 22px;
-    line-height: 28px;
-  }
-
-  .kpi-sub {
-    font-size: 13px;
+    font-size: var(--text-xl);
+    line-height: 24px;
   }
 }
 
 /* ---------- open positions ---------- */
 
-/* The table keeps its columns and scrolls inside the panel on narrow
-   screens; squeezing prices into wrapped cells would be harder to read. */
+/* The table keeps its columns and scrolls sideways inside the panel on
+   narrow screens; squeezing prices into wrapped cells would be harder to
+   read. Rules and row fills run the panel's full width; the first and last
+   cells carry the inset. */
 .pos-scroll {
   /* Contains the absolutely positioned screen-reader header text, which
      would otherwise widen the whole document on narrow screens. */
   position: relative;
   overflow-x: auto;
-  padding: 0 18px 10px;
+  /* Keeps the last row's fill off the panel's rounded corners. */
+  padding-bottom: var(--space-1);
+}
+
+.pos-scroll:focus-visible {
+  outline-offset: -2px;
 }
 
 /* Column shares follow the design at full width; the automatic layout lets
@@ -118,52 +127,81 @@
   width: 100%;
   min-width: 660px;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: var(--text-base);
 }
 
-.pos-col-symbol { width: 10.7%; }
-.pos-col-side { width: 9.5%; }
-.pos-col-lots { width: 10.1%; }
-.pos-col-entry { width: 9.4%; }
-.pos-col-current { width: 10.9%; }
-.pos-col-sl { width: 10%; }
-.pos-col-tp { width: 10%; }
-.pos-col-pl { width: 12.5%; }
+.pos-col-symbol { width: 11.5%; }
+.pos-col-side { width: 8.5%; }
+.pos-col-lots { width: 8%; }
+.pos-col-entry { width: 10.5%; }
+.pos-col-current { width: 10.5%; }
+.pos-col-sl { width: 10.5%; }
+.pos-col-tp { width: 10.5%; }
+.pos-col-pl { width: 12%; }
 .pos-col-harvest { width: 13%; }
-.pos-col-actions { width: 3.9%; }
+.pos-col-actions { width: 5%; }
 
+.pos-table th,
+.pos-table td {
+  padding: 0 var(--space-2);
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.pos-table :is(th, td):first-child {
+  padding-left: var(--panel-inset);
+}
+
+/* Prices and amounts right-aligned, so decimals stack. */
+.pos-table :is(th, td):nth-child(n + 3):nth-child(-n + 8) {
+  text-align: right;
+}
+
+/* P/L is the last right-aligned figure; the harvest state that follows it
+   starts on its own left edge. */
+.pos-table :is(th, td):nth-child(8) {
+  padding-right: var(--space-6);
+}
+
+/* The rule is a shadow, not a border: a collapsed border stays behind when
+   the fitted overview pins the heads over a scrolling body. */
 .pos-table th {
   height: 32px;
-  padding: 0 4px 6px;
-  border-bottom: 1px solid var(--color-line);
-  color: var(--color-ink-muted);
-  font-size: 11px;
-  font-weight: 500;
+  color: var(--color-ink-faint);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
   text-align: left;
-  vertical-align: middle;
-  white-space: nowrap;
+  box-shadow: inset 0 -1px 0 var(--color-line-soft);
 }
 
 .pos-table td {
-  height: 47px;
-  padding: 0 4px;
-  color: var(--color-ink);
-  font-weight: 500;
-  vertical-align: middle;
-  white-space: nowrap;
+  height: 36px;
 }
-
-.pos-table td.tone-ok { color: var(--color-ok); }
-.pos-table td.tone-bad { color: var(--color-bad); }
 
 .pos-row:not(:first-child) > td {
   border-top: 1px solid var(--color-line-soft);
 }
 
+.pos-row {
+  transition: background-color var(--duration-fast) var(--ease-out);
+}
+
+.pos-row:hover,
+.pos-row:focus-within,
+.pos-row.is-expanded,
+.pos-row.is-expanded + .pos-detail {
+  background: var(--color-hover);
+}
+
+.pos-table td:first-child {
+  font-weight: var(--weight-medium);
+}
+
 .pos-harvest {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-2);
+  color: var(--color-ink-muted);
 }
 
 .pos-harvest .dot {
@@ -172,42 +210,64 @@
 }
 
 .pos-table td.pos-actions {
-  padding: 0;
-  text-align: center;
+  padding: 0 var(--space-3) 0 0;
+  text-align: right;
 }
 
+/* The disclosure appears with its row (hover or keyboard focus) and stays
+   while that row is open. Touch screens have no hover, so it always shows. */
 .pos-more {
-  width: 32px;
-  height: 32px;
+  width: var(--control-sm);
+  height: var(--control-sm);
   vertical-align: middle;
+  opacity: 0;
+}
+
+.pos-row:hover .pos-more,
+.pos-row:focus-within .pos-more,
+.pos-more[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.pos-more .icon {
+  transition: transform var(--duration) var(--ease-out);
 }
 
 .pos-more[aria-expanded="true"] {
-  background: var(--color-surface-2);
   color: var(--color-ink);
+}
+
+.pos-more[aria-expanded="true"] .icon {
+  transform: rotate(180deg);
+}
+
+@media (hover: none) {
+  .pos-more {
+    opacity: 1;
+  }
 }
 
 .pos-table .pos-detail > td {
   height: auto;
-  padding: 0 4px 14px;
+  padding: 0 var(--panel-inset) 10px;
 }
 
 .pos-detail-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px 28px;
+  gap: var(--space-1) var(--space-6);
   margin: 0;
-  font-size: 13px;
+  font-size: var(--text-sm);
+  line-height: 18px;
 }
 
 .pos-detail-list > div {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .pos-detail-list dt {
-  color: var(--color-ink-muted);
-  font-weight: 400;
+  color: var(--color-ink-faint);
 }
 
 .pos-detail-list dd {
@@ -218,27 +278,29 @@
 .pos-loading {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 8px 18px 20px;
+  gap: var(--space-3);
+  padding: var(--space-1) var(--panel-inset) var(--panel-inset);
+}
+
+.pos-panel .panel-empty {
+  padding-top: 0;
 }
 
 .pos-truncated,
 .perf-truncated {
-  font-size: 13px;
+  font-size: var(--text-sm);
 }
 
 /* ---------- 30-day performance ---------- */
 
 .perf-body {
   container-type: inline-size;
-  /* The figures sit closer under the title than a table header does. */
-  margin-top: 0;
-  padding: 0 18px 16px;
+  padding: 0 var(--panel-inset) 14px;
 }
 
 .perf-grid {
-  display: grid;
   --perf-gap: clamp(24px, 5cqw, 56px);
+  display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   column-gap: var(--perf-gap);
   margin: 0;
@@ -247,34 +309,33 @@
 .perf-stat {
   position: relative;
   min-width: 0;
-  padding: 0 4px;
 }
 
-/* Hairline centred in the gap, inset from the block's top and bottom. */
+/* Hairline centred in the gap, the height of the figures. */
 .perf-stat + .perf-stat::before {
   position: absolute;
   top: 2px;
   bottom: 2px;
   left: calc(var(--perf-gap) / -2);
   width: 1px;
-  background: var(--color-line);
+  background: var(--color-line-soft);
   content: "";
 }
 
 .perf-label {
   color: var(--color-ink-muted);
-  font-size: 12px;
-  line-height: 20px;
+  font-size: var(--text-sm);
+  line-height: 16px;
 }
 
 .perf-value {
   overflow: hidden;
-  margin: 4px 0 0;
+  margin: 2px 0 0;
   color: var(--color-ink);
-  font-size: 23px;
-  font-weight: 500;
-  letter-spacing: -0.005em;
-  line-height: 32px;
+  font-size: var(--text-xl);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-tight);
+  line-height: 24px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -284,18 +345,13 @@
   vertical-align: middle;
 }
 
-.perf-unavailable {
-  font-size: 14px;
-  font-weight: 400;
-}
-
 .perf-sub {
   overflow: hidden;
-  min-height: 20px;
-  margin: 1px 0 0;
+  min-height: 16px;
+  margin: 0;
   color: var(--color-ink-muted);
-  font-size: 12px;
-  line-height: 20px;
+  font-size: var(--text-sm);
+  line-height: 16px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -313,12 +369,12 @@
       "label value"
       "sub value";
     align-items: center;
-    column-gap: 16px;
-    padding: 12px 0;
+    column-gap: var(--space-4);
+    padding: 10px 0;
   }
 
   .perf-stat:first-child {
-    padding-top: 2px;
+    padding-top: 0;
   }
 
   .perf-stat:last-child {
@@ -326,38 +382,29 @@
   }
 
   .perf-stat + .perf-stat {
-    border-top: 1px solid var(--color-line);
+    border-top: 1px solid var(--color-line-soft);
   }
 
   .perf-stat + .perf-stat::before {
     display: none;
   }
 
-  .perf-label { grid-area: label; }
+  .perf-label {
+    grid-area: label;
+  }
 
   .perf-value {
     grid-area: value;
     margin: 0;
-    font-size: 22px;
     text-align: right;
   }
 
   .perf-sub {
     grid-area: sub;
     min-height: 0;
-    margin: 2px 0 0;
-    font-size: 13px;
   }
 
   .perf-sub:empty {
     display: none;
   }
 }
-
-.pos-row { transition: background-color 140ms var(--ease-out); }
-.pos-row:focus-within, .pos-row:hover { background: var(--color-surface-2); }
-.pos-table :is(th, td):nth-child(n + 3):nth-child(-n + 8) { text-align: right; padding-right: 12px; }
-.pos-table td:first-child { font-weight: 600; }
-.pos-scroll:focus-visible { outline-offset: -3px; }
-.pos-detail-list { padding: 12px 8px 0; }
-.pos-panel .panel-empty { margin: 0; padding-top: 6px; padding-bottom: 24px; }

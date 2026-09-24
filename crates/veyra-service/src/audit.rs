@@ -7,6 +7,11 @@
 //! [`AuditRuntime::try_record`] logs failures instead of blocking a command —
 //! while a configured-but-unusable database fails startup, so a missing trail
 //! is never mistaken for an empty one.
+//!
+//! Reads are bounded: [`AuditQuery`] is a validated filter (kinds, symbol,
+//! ticket, command ids, outcome, time window, row cap) whose semantics are
+//! defined once by [`AuditQuery::matches`]. Storage may answer it with native
+//! SQL, but every implementation must return the same rows, newest first.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -16,6 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::balance::BalancePoint;
 
@@ -54,6 +61,29 @@ pub enum AuditKind {
 }
 
 impl AuditKind {
+    /// Every category, in declaration order.
+    pub const ALL: [Self; 14] = [
+        Self::CommandQueued,
+        Self::CommandCompleted,
+        Self::CommandFailed,
+        Self::BrokerSnapshot,
+        Self::BalanceObserved,
+        Self::ServiceStarted,
+        Self::ReconciliationDrift,
+        Self::ProposalEvaluated,
+        Self::PositionClosed,
+        Self::AgentToolCalled,
+        Self::AgentTurn,
+        Self::Failure,
+        Self::RiskPolicyUpdated,
+        Self::RuntimeConfigUpdated,
+    ];
+
+    /// Parses a stable wire name; unknown names are rejected.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == value)
+    }
+
     /// Stable wire and column name.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -104,7 +134,9 @@ impl AuditEvent {
 pub struct AuditRow {
     /// Row identity.
     pub id: String,
-    /// Database timestamp, formatted by PostgreSQL.
+    /// Storage timestamp. [`AuditTrail::recent`] rows carry the store's own
+    /// text form (PostgreSQL `timestamptz::text`); [`AuditTrail::query`] rows
+    /// carry RFC 3339 UTC with milliseconds (see [`format_trail_time`]).
     pub at: String,
     /// Event category.
     pub kind: String,
@@ -145,6 +177,319 @@ pub enum AuditError {
     },
 }
 
+/// Largest page one filtered trail query may request.
+pub const MAX_QUERY_ROWS: u32 = 200;
+
+/// Largest set of command ids one filtered trail query may match.
+pub const MAX_QUERY_COMMAND_IDS: usize = 64;
+
+/// Longest `outcome` value a filter accepts.
+const MAX_OUTCOME_CHARS: usize = 64;
+
+/// Rows the generic [`AuditTrail::query`] fallback scans before filtering.
+const QUERY_SCAN_ROWS: u32 = 10_000;
+
+/// Why a trail filter was refused before it reached storage.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid audit query `{field}`: {reason}")]
+pub struct AuditQueryError {
+    /// Filter field that failed validation.
+    pub field: &'static str,
+    /// Why the value was rejected.
+    pub reason: &'static str,
+}
+
+fn query_error(field: &'static str, reason: &'static str) -> AuditQueryError {
+    AuditQueryError { field, reason }
+}
+
+/// Validated, bounded filter over the durable audit trail.
+///
+/// Every filter narrows the result (they combine with AND). `symbol` compares
+/// ASCII case-insensitively with `payload.symbol`; `ticket` matches either
+/// `payload.ticket` or `payload.result.ticket` (a completed open command
+/// reports the new position's ticket there); `command_ids` matches
+/// `payload.command_id`; the window is half-open, `since <= at < until`.
+/// Results are newest first and never exceed [`AuditQuery::limit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditQuery {
+    kinds: Vec<AuditKind>,
+    symbol: Option<String>,
+    ticket: Option<i64>,
+    command_ids: Vec<String>,
+    outcome: Option<String>,
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    limit: u32,
+}
+
+impl AuditQuery {
+    /// Starts a filter over `kinds` returning at most `limit` rows.
+    ///
+    /// # Errors
+    /// Returns [`AuditQueryError`] when no kind is given or `limit` is outside
+    /// `1..=`[`MAX_QUERY_ROWS`].
+    pub fn new(kinds: &[AuditKind], limit: u32) -> Result<Self, AuditQueryError> {
+        if kinds.is_empty() {
+            return Err(query_error("kinds", "must name at least one event kind"));
+        }
+        if limit == 0 || limit > MAX_QUERY_ROWS {
+            return Err(query_error("limit", "must be from 1 through 200"));
+        }
+        let mut unique = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            if !unique.contains(kind) {
+                unique.push(*kind);
+            }
+        }
+        Ok(Self {
+            kinds: unique,
+            symbol: None,
+            ticket: None,
+            command_ids: Vec::new(),
+            outcome: None,
+            since_ms: None,
+            until_ms: None,
+            limit,
+        })
+    }
+
+    /// Restricts rows to one instrument, compared ASCII case-insensitively.
+    ///
+    /// # Errors
+    /// Returns [`AuditQueryError`] when the symbol is not a valid instrument.
+    pub fn with_symbol(mut self, symbol: &str) -> Result<Self, AuditQueryError> {
+        let symbol = crate::broker::Symbol::parse(symbol).map_err(|_| {
+            query_error(
+                "symbol",
+                "must be 1-24 characters of letters, digits, '.', '_', '#', '+' or '-'",
+            )
+        })?;
+        self.symbol = Some(symbol.as_str().to_ascii_uppercase());
+        Ok(self)
+    }
+
+    /// Restricts rows to one venue ticket.
+    ///
+    /// # Errors
+    /// Returns [`AuditQueryError`] when the ticket is not positive.
+    pub fn with_ticket(mut self, ticket: i64) -> Result<Self, AuditQueryError> {
+        if ticket <= 0 {
+            return Err(query_error("ticket", "must be a positive integer"));
+        }
+        self.ticket = Some(ticket);
+        Ok(self)
+    }
+
+    /// Restricts rows to events that carry one of `ids` as `command_id`.
+    ///
+    /// # Errors
+    /// Returns [`AuditQueryError`] when the set is empty, larger than
+    /// [`MAX_QUERY_COMMAND_IDS`], or contains a non-UUID value.
+    pub fn with_command_ids(mut self, ids: &[String]) -> Result<Self, AuditQueryError> {
+        if ids.is_empty() || ids.len() > MAX_QUERY_COMMAND_IDS {
+            return Err(query_error("command_ids", "must list 1 through 64 ids"));
+        }
+        let mut canonical = Vec::with_capacity(ids.len());
+        for id in ids {
+            let id = uuid::Uuid::parse_str(id.trim())
+                .map_err(|_| query_error("command_ids", "every id must be a UUID"))?
+                .to_string();
+            if !canonical.contains(&id) {
+                canonical.push(id);
+            }
+        }
+        self.command_ids = canonical;
+        Ok(self)
+    }
+
+    /// Restricts rows to one recorded `payload.outcome`.
+    ///
+    /// # Errors
+    /// Returns [`AuditQueryError`] when the outcome is empty, too long, or not
+    /// a lowercase identifier.
+    pub fn with_outcome(mut self, outcome: &str) -> Result<Self, AuditQueryError> {
+        let valid = !outcome.is_empty()
+            && outcome.chars().count() <= MAX_OUTCOME_CHARS
+            && outcome
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !valid {
+            return Err(query_error(
+                "outcome",
+                "must be 1-64 characters of lowercase letters, digits or '_'",
+            ));
+        }
+        self.outcome = Some(outcome.to_owned());
+        Ok(self)
+    }
+
+    /// Restricts rows to the half-open window `since_ms <= at < until_ms`
+    /// (Unix milliseconds); either bound may be open.
+    ///
+    /// # Errors
+    /// Returns [`AuditQueryError`] when a bound is negative or the window is
+    /// empty.
+    pub fn with_window(
+        mut self,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+    ) -> Result<Self, AuditQueryError> {
+        if since_ms.is_some_and(|since| since < 0) || until_ms.is_some_and(|until| until < 0) {
+            return Err(query_error(
+                "window",
+                "bounds must not precede the Unix epoch",
+            ));
+        }
+        if let (Some(since), Some(until)) = (since_ms, until_ms)
+            && since >= until
+        {
+            return Err(query_error("window", "since must be before until"));
+        }
+        self.since_ms = since_ms;
+        self.until_ms = until_ms;
+        Ok(self)
+    }
+
+    /// Event kinds to include, without duplicates.
+    pub fn kinds(&self) -> &[AuditKind] {
+        &self.kinds
+    }
+
+    /// Upper-cased instrument filter.
+    pub fn symbol(&self) -> Option<&str> {
+        self.symbol.as_deref()
+    }
+
+    /// Venue ticket filter.
+    pub fn ticket(&self) -> Option<i64> {
+        self.ticket
+    }
+
+    /// Canonical (lowercase, hyphenated) command ids; empty means no filter.
+    pub fn command_ids(&self) -> &[String] {
+        &self.command_ids
+    }
+
+    /// Recorded outcome filter.
+    pub fn outcome(&self) -> Option<&str> {
+        self.outcome.as_deref()
+    }
+
+    /// Inclusive lower bound, Unix milliseconds.
+    pub fn since_ms(&self) -> Option<i64> {
+        self.since_ms
+    }
+
+    /// Exclusive upper bound, Unix milliseconds.
+    pub fn until_ms(&self) -> Option<i64> {
+        self.until_ms
+    }
+
+    /// Maximum rows returned.
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// The single definition of which rows a filter selects. `at_ms` is the
+    /// row's storage time; a row whose time is unknown never satisfies a
+    /// time bound, so an unparseable timestamp cannot leak into a window.
+    pub fn matches(&self, at_ms: Option<i64>, kind: &str, payload: &Value) -> bool {
+        if !self
+            .kinds
+            .iter()
+            .any(|candidate| candidate.as_str() == kind)
+        {
+            return false;
+        }
+        if let Some(symbol) = &self.symbol
+            && payload
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_uppercase)
+                .as_deref()
+                != Some(symbol.as_str())
+        {
+            return false;
+        }
+        if let Some(ticket) = self.ticket {
+            let matches_ticket = |value: Option<&Value>| {
+                value.is_some_and(|value| {
+                    value.as_i64() == Some(ticket)
+                        || value.as_str() == Some(ticket.to_string().as_str())
+                })
+            };
+            if !matches_ticket(payload.get("ticket"))
+                && !matches_ticket(
+                    payload
+                        .get("result")
+                        .and_then(|result| result.get("ticket")),
+                )
+            {
+                return false;
+            }
+        }
+        if !self.command_ids.is_empty()
+            && !payload
+                .get("command_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| self.command_ids.iter().any(|candidate| candidate == id))
+        {
+            return false;
+        }
+        if let Some(outcome) = &self.outcome
+            && payload.get("outcome").and_then(Value::as_str) != Some(outcome.as_str())
+        {
+            return false;
+        }
+        if self.since_ms.is_some() || self.until_ms.is_some() {
+            let Some(at_ms) = at_ms else {
+                return false;
+            };
+            if self.since_ms.is_some_and(|since| at_ms < since)
+                || self.until_ms.is_some_and(|until| at_ms >= until)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Formats a storage instant as RFC 3339 UTC with milliseconds, the form
+/// [`AuditTrail::query`] rows carry (for example `2026-09-24T06:46:09.120Z`).
+pub fn format_trail_time(at: OffsetDateTime) -> String {
+    let at = at.to_offset(UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.millisecond()
+    )
+}
+
+/// Parses a stored row time into Unix milliseconds.
+///
+/// Accepts RFC 3339 and PostgreSQL's `timestamptz::text` form
+/// (`2026-09-24 06:46:09.123456+00`); anything else is `None`.
+pub fn parse_trail_time(at: &str) -> Option<i64> {
+    let mut text = at.trim().replacen(' ', "T", 1);
+    // PostgreSQL prints whole-hour offsets as `+HH`; RFC 3339 needs `+HH:MM`.
+    if let Some(sign) = text.rfind(['+', '-'])
+        && sign > 10
+        && text.len() - sign == 3
+        && text[sign + 1..].chars().all(|c| c.is_ascii_digit())
+    {
+        text.push_str(":00");
+    }
+    let parsed = OffsetDateTime::parse(&text, &Rfc3339).ok()?;
+    i64::try_from(parsed.unix_timestamp_nanos() / 1_000_000).ok()
+}
+
 /// Narrow contract every audit storage implements.
 #[async_trait]
 pub trait AuditTrail: Send + Sync + fmt::Debug + 'static {
@@ -180,6 +525,25 @@ pub trait AuditTrail: Send + Sync + fmt::Debug + 'static {
                 )
             })
             .take(limit as usize)
+            .collect())
+    }
+
+    /// Returns rows selected by a validated filter, newest first, at most
+    /// [`AuditQuery::limit`]. Rows carry RFC 3339 UTC times when the store
+    /// can produce them.
+    ///
+    /// The default scans the newest 10,000 rows and applies
+    /// [`AuditQuery::matches`], so every store shares one semantics; stores
+    /// with a query language override it with an equivalent statement.
+    ///
+    /// # Errors
+    /// Returns [`AuditError`] when the trail cannot be read.
+    async fn query(&self, query: &AuditQuery) -> Result<Vec<AuditRow>, AuditError> {
+        let rows = self.recent(QUERY_SCAN_ROWS).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| query.matches(parse_trail_time(&row.at), &row.kind, &row.payload))
+            .take(query.limit() as usize)
             .collect())
     }
 
@@ -412,9 +776,34 @@ impl AuditRuntime {
 ///
 /// Useful for tests and local experiments only: nothing in the production path
 /// selects it, so a missing database is never mistaken for a durable one.
+/// Every entry keeps its record time so filtered reads honour the same time
+/// window semantics as PostgreSQL.
 #[derive(Debug, Default)]
 pub struct MemoryTrail {
-    events: std::sync::Mutex<Vec<AuditEvent>>,
+    events: std::sync::Mutex<Vec<MemoryEntry>>,
+}
+
+/// One retained entry: insertion order, record time, and the event.
+#[derive(Debug, Clone)]
+struct MemoryEntry {
+    seq: usize,
+    at: OffsetDateTime,
+    event: AuditEvent,
+}
+
+impl MemoryEntry {
+    fn row(&self) -> AuditRow {
+        AuditRow {
+            id: format!("memory-{}", self.seq),
+            at: format_trail_time(self.at),
+            kind: self.event.kind().as_str().to_owned(),
+            payload: self.event.payload().clone(),
+        }
+    }
+
+    fn at_ms(&self) -> Option<i64> {
+        i64::try_from(self.at.unix_timestamp_nanos() / 1_000_000).ok()
+    }
 }
 
 impl MemoryTrail {
@@ -432,8 +821,31 @@ impl MemoryTrail {
     pub fn events(&self) -> Vec<AuditEvent> {
         self.events
             .lock()
-            .map(|events| events.clone())
+            .map(|events| events.iter().map(|entry| entry.event.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// Appends one event with an explicit record time, for replaying a
+    /// journal or building time-dependent fixtures.
+    pub fn record_at(&self, at: OffsetDateTime, event: AuditEvent) {
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seq = events.len();
+        events.push(MemoryEntry { seq, at, event });
+    }
+
+    /// Entries newest first: record time descending, then insertion order
+    /// descending, mirroring PostgreSQL's `order by at desc, id desc`.
+    fn newest_first(&self) -> Vec<MemoryEntry> {
+        let mut entries = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        entries.sort_by(|left, right| right.at.cmp(&left.at).then(right.seq.cmp(&left.seq)));
+        entries
     }
 }
 
@@ -444,11 +856,7 @@ impl AuditTrail for MemoryTrail {
     }
 
     async fn record(&self, event: AuditEvent) -> Result<(), AuditError> {
-        let mut events = match self.events.lock() {
-            Ok(events) => events,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        events.push(event);
+        self.record_at(OffsetDateTime::now_utc(), event);
         Ok(())
     }
 
@@ -458,20 +866,27 @@ impl AuditTrail for MemoryTrail {
     }
 
     async fn recent(&self, limit: u32) -> Result<Vec<AuditRow>, AuditError> {
-        let events = match self.events.lock() {
-            Ok(events) => events,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        Ok(events
+        Ok(self
+            .newest_first()
             .iter()
-            .rev()
             .take(limit as usize)
-            .map(|event| AuditRow {
-                id: "row".to_owned(),
-                at: "now".to_owned(),
-                kind: event.kind().as_str().to_owned(),
-                payload: event.payload().clone(),
+            .map(MemoryEntry::row)
+            .collect())
+    }
+
+    async fn query(&self, query: &AuditQuery) -> Result<Vec<AuditRow>, AuditError> {
+        Ok(self
+            .newest_first()
+            .iter()
+            .filter(|entry| {
+                query.matches(
+                    entry.at_ms(),
+                    entry.event.kind().as_str(),
+                    entry.event.payload(),
+                )
             })
+            .take(query.limit() as usize)
+            .map(MemoryEntry::row)
             .collect())
     }
 
@@ -481,10 +896,7 @@ impl AuditTrail for MemoryTrail {
         server: &str,
         since_ms: u64,
     ) -> Result<Vec<BalancePoint>, AuditError> {
-        let events = self
-            .events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let events = self.events();
         let mut points: Vec<_> = events
             .iter()
             .filter(|event| event.kind() == AuditKind::BalanceObserved)
@@ -695,6 +1107,365 @@ mod tests {
         let rows = trail.recent_decisions(35).await.expect("read decisions");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].payload["outcome"], "held");
+    }
+
+    fn instant(text: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(text, &Rfc3339).expect("fixture time")
+    }
+
+    fn ms(text: &str) -> i64 {
+        i64::try_from(instant(text).unix_timestamp_nanos() / 1_000_000).expect("range")
+    }
+
+    const OPEN: &str = "5a3f5c1e-2b1d-4a57-9d27-9b0d2f7e8a10";
+    const CLOSE: &str = "7c5a7e3a-4d3f-4c79-9f49-9d2f4a9a0c32";
+
+    /// A trade lifecycle recorded out of order, plus noise.
+    fn lifecycle(trail: &MemoryTrail) {
+        for (at, kind, payload) in [
+            (
+                "2025-03-12T06:46:10Z",
+                AuditKind::PositionClosed,
+                json!({"ticket": 42, "symbol": "USDJPY"}),
+            ),
+            (
+                "2025-03-11T21:00:00Z",
+                AuditKind::ProposalEvaluated,
+                json!({"outcome": "queued", "symbol": "usdjpy", "command_id": OPEN}),
+            ),
+            (
+                "2025-03-11T21:00:05Z",
+                AuditKind::CommandCompleted,
+                json!({"kind": "open_order", "command_id": OPEN, "result": {"ticket": 42}}),
+            ),
+            (
+                "2025-03-12T02:00:00Z",
+                AuditKind::ProposalEvaluated,
+                json!({"outcome": "held", "symbol": "USDJPY", "ticket": "42"}),
+            ),
+            (
+                "2025-03-12T06:40:00Z",
+                AuditKind::ProposalEvaluated,
+                json!({"outcome": "close_queued", "symbol": "USDJPY", "ticket": 42, "command_id": CLOSE}),
+            ),
+            (
+                "2025-03-12T06:41:00Z",
+                AuditKind::ProposalEvaluated,
+                json!({"outcome": "rejected", "symbol": "EURUSD"}),
+            ),
+            (
+                "2025-03-12T06:42:00Z",
+                AuditKind::BrokerSnapshot,
+                json!({"orders": 0}),
+            ),
+        ] {
+            trail.record_at(instant(at), AuditEvent::new(kind, payload));
+        }
+    }
+
+    #[test]
+    fn audit_kinds_round_trip_their_wire_names() {
+        for kind in AuditKind::ALL {
+            assert_eq!(AuditKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(AuditKind::parse("order_placed"), None);
+    }
+
+    #[test]
+    fn query_filters_are_validated_before_storage() {
+        let kinds = [AuditKind::ProposalEvaluated];
+        assert!(AuditQuery::new(&[], 10).is_err());
+        assert!(AuditQuery::new(&kinds, 0).is_err());
+        assert!(AuditQuery::new(&kinds, MAX_QUERY_ROWS + 1).is_err());
+        let base = AuditQuery::new(
+            &[AuditKind::ProposalEvaluated, AuditKind::ProposalEvaluated],
+            MAX_QUERY_ROWS,
+        )
+        .expect("valid");
+        assert_eq!(base.kinds(), &kinds, "duplicate kinds collapse");
+        assert_eq!(base.limit(), 200);
+        assert!(base.clone().with_symbol("bad symbol").is_err());
+        assert!(base.clone().with_ticket(0).is_err());
+        assert!(base.clone().with_command_ids(&[]).is_err());
+        assert!(base.clone().with_command_ids(&["nope".to_owned()]).is_err());
+        let too_many: Vec<String> = (0..=MAX_QUERY_COMMAND_IDS)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+        assert!(base.clone().with_command_ids(&too_many).is_err());
+        assert!(base.clone().with_outcome("").is_err());
+        assert!(base.clone().with_outcome("Held").is_err());
+        assert!(base.clone().with_outcome(&"x".repeat(65)).is_err());
+        assert!(base.clone().with_window(Some(-1), None).is_err());
+        assert!(base.clone().with_window(None, Some(-1)).is_err());
+        let error = base
+            .clone()
+            .with_window(Some(5), Some(5))
+            .expect_err("empty window");
+        assert_eq!(
+            error.to_string(),
+            "invalid audit query `window`: since must be before until"
+        );
+
+        let full = base
+            .with_symbol(" usdjpy ")
+            .and_then(|query| query.with_ticket(42))
+            .and_then(|query| query.with_command_ids(&[OPEN.to_uppercase(), OPEN.to_owned()]))
+            .and_then(|query| query.with_outcome("held"))
+            .and_then(|query| query.with_window(Some(1), Some(2)))
+            .expect("every filter");
+        assert_eq!(full.symbol(), Some("USDJPY"));
+        assert_eq!(full.ticket(), Some(42));
+        assert_eq!(
+            full.command_ids(),
+            &[OPEN.to_owned()],
+            "canonical, deduplicated"
+        );
+        assert_eq!(full.outcome(), Some("held"));
+        assert_eq!((full.since_ms(), full.until_ms()), (Some(1), Some(2)));
+    }
+
+    #[test]
+    fn matches_defines_every_filter() {
+        let kinds = [AuditKind::ProposalEvaluated, AuditKind::CommandCompleted];
+        let query = |configure: fn(AuditQuery) -> Result<AuditQuery, AuditQueryError>| {
+            configure(AuditQuery::new(&kinds, 10).expect("base")).expect("filter")
+        };
+        let held = json!({"outcome": "held", "symbol": "usdJPY", "ticket": 42, "command_id": OPEN});
+        let fill = json!({"result": {"ticket": "42"}, "command_id": CLOSE});
+        let any = query(Ok);
+        assert!(any.matches(None, "proposal_evaluated", &held));
+        assert!(!any.matches(None, "broker_snapshot", &held), "kind filter");
+
+        let symbol = query(|query| query.with_symbol("USDJPY"));
+        assert!(symbol.matches(None, "proposal_evaluated", &held));
+        assert!(!symbol.matches(None, "proposal_evaluated", &fill));
+
+        let ticket = query(|query| query.with_ticket(42));
+        assert!(ticket.matches(None, "proposal_evaluated", &held));
+        assert!(
+            ticket.matches(None, "command_completed", &fill),
+            "result.ticket as text"
+        );
+        assert!(!ticket.matches(None, "proposal_evaluated", &json!({"ticket": 7})));
+
+        let ids = query(|query| query.with_command_ids(&[CLOSE.to_owned()]));
+        assert!(ids.matches(None, "command_completed", &fill));
+        assert!(!ids.matches(None, "proposal_evaluated", &held));
+
+        let outcome = query(|query| query.with_outcome("held"));
+        assert!(outcome.matches(None, "proposal_evaluated", &held));
+        assert!(!outcome.matches(None, "command_completed", &fill));
+
+        let window = query(|query| query.with_window(Some(100), Some(200)));
+        assert!(
+            window.matches(Some(100), "proposal_evaluated", &held),
+            "since is inclusive"
+        );
+        assert!(
+            !window.matches(Some(200), "proposal_evaluated", &held),
+            "until is exclusive"
+        );
+        assert!(!window.matches(Some(99), "proposal_evaluated", &held));
+        assert!(
+            !window.matches(None, "proposal_evaluated", &held),
+            "unknown times never match a window"
+        );
+        let open_ended = query(|query| query.with_window(Some(100), None));
+        assert!(open_ended.matches(Some(i64::MAX), "proposal_evaluated", &held));
+    }
+
+    #[test]
+    fn trail_times_round_trip_rfc3339_and_postgres_text() {
+        let at = instant("2025-03-12T06:46:09.120Z");
+        assert_eq!(format_trail_time(at), "2025-03-12T06:46:09.120Z");
+        let expected = Some(ms("2025-03-12T06:46:09.120Z"));
+        assert_eq!(parse_trail_time("2025-03-12T06:46:09.120Z"), expected);
+        assert_eq!(parse_trail_time("2025-03-12 06:46:09.12+00"), expected);
+        assert_eq!(parse_trail_time("2025-03-12 08:46:09.12+02"), expected);
+        assert_eq!(parse_trail_time("2025-03-12 12:16:09.12+05:30"), expected);
+        assert_eq!(parse_trail_time("2025-03-12 03:46:09.12-03"), expected);
+        assert_eq!(parse_trail_time("now"), None);
+        assert_eq!(parse_trail_time(""), None);
+    }
+
+    #[actix_web::test]
+    async fn memory_query_orders_filters_and_limits_like_postgres() {
+        let trail = MemoryTrail::default();
+        lifecycle(&trail);
+        let decisions = [AuditKind::ProposalEvaluated, AuditKind::PositionClosed];
+        let rows = trail
+            .query(&AuditQuery::new(&decisions, 10).expect("query"))
+            .await
+            .expect("rows");
+        assert_eq!(
+            rows.iter().map(|row| row.at.as_str()).collect::<Vec<_>>(),
+            vec![
+                "2025-03-12T06:46:10.000Z",
+                "2025-03-12T06:41:00.000Z",
+                "2025-03-12T06:40:00.000Z",
+                "2025-03-12T02:00:00.000Z",
+                "2025-03-11T21:00:00.000Z",
+            ],
+            "newest first by record time, not insertion"
+        );
+        assert!(rows.iter().all(|row| row.id.starts_with("memory-")));
+
+        let limited = trail
+            .query(&AuditQuery::new(&decisions, 2).expect("query"))
+            .await
+            .expect("rows");
+        assert_eq!(limited.len(), 2);
+
+        let ticket = AuditQuery::new(
+            &[
+                AuditKind::ProposalEvaluated,
+                AuditKind::PositionClosed,
+                AuditKind::CommandCompleted,
+            ],
+            10,
+        )
+        .and_then(|query| query.with_ticket(42))
+        .expect("query");
+        let rows = trail.query(&ticket).await.expect("rows");
+        assert_eq!(rows.len(), 4, "ticket as number, as text, and in result");
+
+        let symbol = AuditQuery::new(&decisions, 10)
+            .and_then(|query| query.with_symbol("USDJPY"))
+            .expect("query");
+        assert_eq!(trail.query(&symbol).await.expect("rows").len(), 4);
+
+        let window = AuditQuery::new(&decisions, 10)
+            .and_then(|query| {
+                query.with_window(
+                    Some(ms("2025-03-12T00:00:00Z")),
+                    Some(ms("2025-03-12T06:41:00Z")),
+                )
+            })
+            .expect("query");
+        let rows = trail.query(&window).await.expect("rows");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.payload["outcome"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["close_queued", "held"]
+        );
+
+        let linked = AuditQuery::new(
+            &[AuditKind::ProposalEvaluated, AuditKind::CommandCompleted],
+            10,
+        )
+        .and_then(|query| query.with_command_ids(&[OPEN.to_owned()]))
+        .expect("query");
+        assert_eq!(trail.query(&linked).await.expect("rows").len(), 2);
+
+        let none = AuditQuery::new(&decisions, 10)
+            .and_then(|query| query.with_outcome("break_even"))
+            .expect("query");
+        assert!(trail.query(&none).await.expect("rows").is_empty());
+
+        let recent = trail.recent(2).await.expect("recent");
+        assert_eq!(
+            recent[0].kind, "position_closed",
+            "recent is newest first too"
+        );
+        assert_eq!(recent[1].kind, "broker_snapshot");
+    }
+
+    /// A store that only knows `recent`, returning PostgreSQL-formatted times,
+    /// to prove the default query applies the same semantics.
+    #[derive(Debug, Default)]
+    struct TextTrail {
+        inner: MemoryTrail,
+    }
+
+    #[async_trait]
+    impl AuditTrail for TextTrail {
+        fn provider(&self) -> AuditProvider {
+            AuditProvider::Postgres
+        }
+
+        async fn record(&self, event: AuditEvent) -> Result<(), AuditError> {
+            self.inner.record(event).await
+        }
+
+        async fn recent(&self, limit: u32) -> Result<Vec<AuditRow>, AuditError> {
+            let mut rows = self.inner.recent(limit).await?;
+            for row in &mut rows {
+                // `2025-03-12T06:46:10.000Z` -> `2025-03-12 08:46:10+02`.
+                let at_ms = parse_trail_time(&row.at).expect("memory time");
+                let local =
+                    OffsetDateTime::from_unix_timestamp_nanos(i128::from(at_ms) * 1_000_000)
+                        .expect("time")
+                        .to_offset(UtcOffset::from_hms(2, 0, 0).expect("offset"));
+                row.at = format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}+02",
+                    local.year(),
+                    u8::from(local.month()),
+                    local.day(),
+                    local.hour(),
+                    local.minute(),
+                    local.second()
+                );
+            }
+            rows.push(AuditRow {
+                id: "garbled".to_owned(),
+                at: "yesterday-ish".to_owned(),
+                kind: "proposal_evaluated".to_owned(),
+                payload: json!({"outcome": "held", "ticket": 43}),
+            });
+            Ok(rows)
+        }
+
+        async fn prune(&self, _keep_days: u32) -> Result<u64, AuditError> {
+            Ok(0)
+        }
+    }
+
+    #[actix_web::test]
+    async fn default_query_matches_the_memory_semantics() {
+        let text = TextTrail::default();
+        lifecycle(&text.inner);
+        let memory = MemoryTrail::default();
+        lifecycle(&memory);
+        let queries = [
+            AuditQuery::new(
+                &[AuditKind::ProposalEvaluated, AuditKind::PositionClosed],
+                10,
+            )
+            .and_then(|query| query.with_ticket(42)),
+            AuditQuery::new(&[AuditKind::ProposalEvaluated], 10).and_then(|query| {
+                query.with_window(
+                    Some(ms("2025-03-12T00:00:00Z")),
+                    Some(ms("2025-03-12T06:41:00Z")),
+                )
+            }),
+            AuditQuery::new(&[AuditKind::ProposalEvaluated], 1),
+        ];
+        for query in queries {
+            let query = query.expect("query");
+            let from_text = text.query(&query).await.expect("default query");
+            let from_memory = memory.query(&query).await.expect("memory query");
+            assert_eq!(
+                from_text.iter().map(|row| &row.payload).collect::<Vec<_>>(),
+                from_memory
+                    .iter()
+                    .map(|row| &row.payload)
+                    .collect::<Vec<_>>(),
+                "{query:?}"
+            );
+        }
+        // Without a window the unparseable row is still a candidate.
+        let unbounded = AuditQuery::new(&[AuditKind::ProposalEvaluated], 10)
+            .and_then(|query| query.with_outcome("held"))
+            .expect("query");
+        assert_eq!(text.query(&unbounded).await.expect("rows").len(), 2);
+        assert!(BrokenTrail.query(&unbounded).await.is_err());
+        assert_eq!(text.provider(), AuditProvider::Postgres);
+        assert_eq!(text.prune(1).await.expect("prune"), 0);
+        text.record(AuditEvent::new(AuditKind::ServiceStarted, json!({})))
+            .await
+            .expect("record");
+        assert_eq!(text.inner.len(), 8);
     }
 
     #[actix_web::test]

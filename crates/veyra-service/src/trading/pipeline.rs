@@ -37,7 +37,7 @@ pub fn proposal_format() -> AnswerFormat {
             "properties": {
                 "action": {"type": "string", "enum": ["none", "open"]},
                 "rationale": {
-                    "type": ["string", "null"],
+                    "type": "string",
                     "maxLength": 280,
                     "description": "Short operator-facing explanation of the decision: why this instrument and direction, or why nothing qualifies. Always include it."
                 },
@@ -53,11 +53,11 @@ pub fn proposal_format() -> AnswerFormat {
                             "enum": ["market", "limit", "stop"],
                             "description": "market executes immediately; omit `price` entirely for market orders"
                         },
-                        "price": {"type": ["number", "null"]},
+                        "price": { "type": "number", "description": "entry price for limit and stop orders; omit for market orders" },
                         "volume": {"type": "number", "exclusiveMinimum": 0},
-                        "stop_loss": {"type": ["number", "null"]},
-                        "take_profit": {"type": ["number", "null"]},
-                        "comment": {"type": ["string", "null"]}
+                        "stop_loss": { "type": "number", "description": "absolute stop-loss price" },
+                        "take_profit": { "type": "number", "description": "absolute take-profit price" },
+                        "comment": { "type": "string", "description": "optional short note; omit when there is nothing to add" }
                     }
                 }
             }

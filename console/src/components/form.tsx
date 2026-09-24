@@ -1,7 +1,8 @@
 /**
  * Form and list primitives shared by the working tabs and the settings view:
- * the quiet text button, a control's labelled head, the labelled text input
- * and the placeholder rows shown while a list's first poll is in flight.
+ * the button, a control's labelled head, the labelled text input and the
+ * placeholder rows shown while a list's first poll is in flight. Styled in
+ * the forms section of styles.css.
  */
 
 import { useId } from 'react'
@@ -23,7 +24,7 @@ export function SkeletonRows() {
   )
 }
 
-/** Quiet text button; `ok` marks the one action that commits a change. */
+/** Secondary button; `tone="ok"` marks the one primary action that commits a change. */
 export function Button({
   children,
   tone,

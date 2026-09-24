@@ -52,6 +52,8 @@ pub fn create_app(
         .service(crate::control::start_model_subscription)
         .service(crate::control::complete_model_subscription)
         .service(crate::control::delete_model_subscription)
+        .service(crate::control::model_cooldowns)
+        .service(crate::control::clear_model_cooldowns)
         .service(crate::control::event_feed)
         .service(crate::control::account_state)
         .service(crate::control::balance_history)

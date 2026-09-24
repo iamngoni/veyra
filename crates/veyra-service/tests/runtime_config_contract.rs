@@ -186,3 +186,37 @@ async fn an_empty_patch_is_refused() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "empty_patch");
 }
+
+// The owner asked for the ChatGPT preference to be switchable from the
+// Settings UI, so both values travel the ordinary live-settings path.
+#[actix_web::test]
+async fn the_chatgpt_preference_is_editable_from_the_console() {
+    let state = state(false);
+    let (status, body) = patch(
+        &state,
+        json!({
+            "VEYRA_MODEL_PREFER_SUBSCRIPTION": false,
+            "VEYRA_MODEL_CHATGPT_MODEL": "gpt-5.6-terra"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["settings"]["VEYRA_MODEL_PREFER_SUBSCRIPTION"],
+        json!({"value": "false", "overridden": true})
+    );
+    assert_eq!(
+        body["settings"]["VEYRA_MODEL_CHATGPT_MODEL"],
+        json!({"value": "gpt-5.6-terra", "overridden": true})
+    );
+
+    let (status, body) = patch(&state, json!({"VEYRA_MODEL_PREFER_SUBSCRIPTION": "maybe"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["rejected"][0]["field"],
+        "VEYRA_MODEL_PREFER_SUBSCRIPTION"
+    );
+    let (status, body) = patch(&state, json!({"VEYRA_MODEL_CHATGPT_MODEL": "gpt 6"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["rejected"][0]["field"], "VEYRA_MODEL_CHATGPT_MODEL");
+}

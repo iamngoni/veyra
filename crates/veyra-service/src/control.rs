@@ -340,10 +340,55 @@ pub async fn complete_model_subscription(
             });
         if let Err(reason) = applied {
             state.set_model(None);
+            chatgpt_connection_changed(&state, provider, "ChatGPT subscription connected");
             return HttpResponse::Accepted().json(json!({"connected": true, "active": false, "provider": provider.as_str(), "account_label": label, "reason": reason}));
         }
+    } else {
+        rebuild_for_chatgpt_preference(&state, provider);
     }
+    chatgpt_connection_changed(&state, provider, "ChatGPT subscription connected");
     HttpResponse::Ok().json(json!({"connected": true, "active": active_subscription_selected(&state, provider), "provider": provider.as_str(), "account_label": label}))
+}
+
+/// Rebuilds the model route after the ChatGPT subscription connects or
+/// disconnects while another provider is selected, so the subscription-first
+/// preference follows the connection. Claude Code never takes part.
+fn rebuild_for_chatgpt_preference(
+    state: &AppState,
+    provider: crate::subscription_auth::SubscriptionProvider,
+) {
+    if provider != crate::subscription_auth::SubscriptionProvider::Codex {
+        return;
+    }
+    // Only an API provider can put the subscription in front of its chain; a
+    // selected subscription runtime is left exactly as it is.
+    let api_provider = crate::model::ModelSettings::from_source(state.runtime_config().source())
+        .ok()
+        .flatten()
+        .is_some_and(|settings| {
+            !matches!(
+                settings.provider(),
+                crate::model::ModelProvider::Codex | crate::model::ModelProvider::ClaudeCode
+            )
+        });
+    if !api_provider {
+        return;
+    }
+    if let Err(reason) = crate::runtime_config::rebuild_model(state) {
+        tracing::warn!(%reason, "model route was not rebuilt after a ChatGPT subscription change");
+    }
+}
+
+/// A ChatGPT connection change invalidates every cooldown: the route itself
+/// is different now.
+fn chatgpt_connection_changed(
+    state: &AppState,
+    provider: crate::subscription_auth::SubscriptionProvider,
+    cause: &str,
+) {
+    if provider == crate::subscription_auth::SubscriptionProvider::Codex {
+        state.model_cooldowns().clear(cause);
+    }
 }
 
 /// Removes a stored subscription credential.
@@ -373,8 +418,29 @@ pub async fn delete_model_subscription(
     let deleted = state.subscription_auth().remove_credential(provider);
     if active_subscription_selected(&state, provider) {
         state.set_model(None);
+    } else {
+        rebuild_for_chatgpt_preference(&state, provider);
     }
+    chatgpt_connection_changed(&state, provider, "ChatGPT subscription disconnected");
     HttpResponse::Ok().json(json!({"deleted": deleted, "provider": provider.as_str()}))
+}
+
+/// Returns the model cooldowns now in force, soonest retry first.
+#[get("/model/cooldowns")]
+pub async fn model_cooldowns(state: Data<AppState>) -> HttpResponse {
+    HttpResponse::Ok().json(json!({"model_cooldowns": state.model_cooldowns().snapshot()}))
+}
+
+/// Clears every model cooldown so the next call tries each candidate again,
+/// for an operator who has just fixed the cause (topped up credits, allowed a
+/// provider). Returns the now-empty list.
+#[post("/model/cooldowns/clear")]
+pub async fn clear_model_cooldowns(state: Data<AppState>) -> HttpResponse {
+    let cleared = state.model_cooldowns().clear("operator request");
+    HttpResponse::Ok().json(json!({
+        "cleared": cleared,
+        "model_cooldowns": state.model_cooldowns().snapshot()
+    }))
 }
 
 fn credential_rejection(request: &HttpRequest, state: &AppState) -> Option<HttpResponse> {
@@ -430,6 +496,9 @@ async fn persist_model_credential(
         }
         Err(_) => Err("model_settings_incomplete"),
     };
+    // A different credential can reach models the old one could not (or pay
+    // for them), so nothing the old key learned is evidence any more.
+    state.model_cooldowns().clear("model credential changed");
     if let Err(reason) = applied {
         // A saved key must never leave an engine with a superseded credential
         // running. The operator can complete settings and re-enable it.
@@ -2697,5 +2766,251 @@ mod tests {
                 .expect("reason")
                 .contains("terminal")
         );
+    }
+
+    mod model_routes {
+        use actix_web::test;
+        use serde_json::{Value, json};
+
+        use crate::app::create_app;
+        use crate::credential::TEST_ADMIN_TOKEN;
+        use crate::model::cooldown::test_clock::ManualClock;
+        use crate::model::subscription_engine::test_support::app;
+        use crate::model::{
+            Admission, CooldownFailure, CooldownReason, CooldownRegistry, ModelProvider,
+        };
+        use crate::runtime_config::test_support::model_overlay;
+        use crate::subscription_auth::SubscriptionProvider;
+
+        fn cool(registry: &CooldownRegistry, provider: ModelProvider, model: &str) {
+            if let Admission::Ready(ticket) = registry.admit(provider, model) {
+                ticket.fail(CooldownFailure::new(CooldownReason::InsufficientCredits));
+            }
+        }
+
+        fn preferred_state(clock: &ManualClock) -> crate::AppState {
+            let (state, _store) = app(
+                CooldownRegistry::with_clock(clock.clock()),
+                &[SubscriptionProvider::Codex],
+            );
+            model_overlay(state.runtime_config(), &[]);
+            crate::runtime_config::rebuild_model(&state).expect("model builds");
+            state
+        }
+
+        #[actix_web::test]
+        async fn status_reports_the_route_and_cooldowns_in_force() {
+            let clock = ManualClock::new();
+            let state = preferred_state(&clock);
+            cool(state.model_cooldowns(), ModelProvider::Codex, "gpt-6-luna");
+            let app = test::init_service(create_app(state)).await;
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri("/status").to_request())
+                    .await;
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(
+                body["model_route"],
+                json!([
+                    "chatgpt:gpt-6-luna",
+                    "deepseek/deepseek-v4.1-flash",
+                    "z-ai/glm-5.3-flash"
+                ])
+            );
+            assert_eq!(body["model_provider"], "openrouter");
+            assert_eq!(
+                body["model_cooldowns"],
+                json!([{
+                    "provider": "codex",
+                    "model": "gpt-6-luna",
+                    "reason": "insufficient_credits",
+                    "untilMs": 1_767_225_600_000_u64 + 30 * 60 * 1_000,
+                    "failures": 1
+                }])
+            );
+            assert_eq!(body["decisions"]["lastModel"], Value::Null);
+        }
+
+        #[actix_web::test]
+        async fn cooldowns_can_be_listed_and_cleared_by_the_operator() {
+            let clock = ManualClock::new();
+            let state = preferred_state(&clock);
+            cool(
+                state.model_cooldowns(),
+                ModelProvider::OpenRouter,
+                "z-ai/glm-5.3-flash",
+            );
+            cool(state.model_cooldowns(), ModelProvider::Codex, "gpt-6-luna");
+            let app = test::init_service(create_app(state.clone())).await;
+
+            let listed: Value = test::read_body_json(
+                test::call_service(
+                    &app,
+                    test::TestRequest::get()
+                        .uri("/model/cooldowns")
+                        .to_request(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(listed["model_cooldowns"].as_array().map(Vec::len), Some(2));
+
+            let cleared: Value = test::read_body_json(
+                test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri("/model/cooldowns/clear")
+                        .to_request(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(cleared, json!({"cleared": 2, "model_cooldowns": []}));
+            assert!(state.model_cooldowns().is_empty());
+        }
+
+        #[actix_web::test]
+        async fn disconnecting_chatgpt_rebuilds_the_route_and_clears_cooldowns() {
+            let clock = ManualClock::new();
+            let state = preferred_state(&clock);
+            assert!(
+                state
+                    .model()
+                    .is_some_and(|model| model.prefers_subscription())
+            );
+            cool(
+                state.model_cooldowns(),
+                ModelProvider::OpenRouter,
+                "z-ai/glm-5.3-flash",
+            );
+            let app = test::init_service(create_app(state.clone())).await;
+
+            let refused = test::call_service(
+                &app,
+                test::TestRequest::delete()
+                    .uri("/model/subscriptions/codex")
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(refused.status(), 401, "the operator token is required");
+            assert_eq!(state.model_cooldowns().len(), 1);
+
+            let response = test::call_service(
+                &app,
+                test::TestRequest::delete()
+                    .uri("/model/subscriptions/codex")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 200);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body, json!({"deleted": true, "provider": "codex"}));
+            let model = state.model().expect("the configured provider remains");
+            assert!(!model.prefers_subscription());
+            assert_eq!(
+                model.route(crate::model::ModelTier::Balanced),
+                ["deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3-flash"]
+            );
+            assert!(state.model_cooldowns().is_empty());
+        }
+
+        #[actix_web::test]
+        async fn claude_code_disconnects_leave_the_chatgpt_route_and_cooldowns_alone() {
+            let clock = ManualClock::new();
+            let state = preferred_state(&clock);
+            cool(
+                state.model_cooldowns(),
+                ModelProvider::OpenRouter,
+                "z-ai/glm-5.3-flash",
+            );
+            let before = state.model().expect("configured");
+            let app = test::init_service(create_app(state.clone())).await;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::delete()
+                    .uri("/model/subscriptions/claude_code")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 200);
+            assert_eq!(state.model_cooldowns().len(), 1);
+            assert!(
+                state
+                    .model()
+                    .is_some_and(|model| model.same_instance(&before))
+            );
+        }
+
+        #[actix_web::test]
+        async fn a_chatgpt_change_leaves_a_selected_claude_code_runtime_alone() {
+            let (state, _store) = app(
+                CooldownRegistry::new(),
+                &[
+                    SubscriptionProvider::Codex,
+                    SubscriptionProvider::ClaudeCode,
+                ],
+            );
+            model_overlay(
+                state.runtime_config(),
+                &[
+                    ("VEYRA_MODEL_PROVIDER", "claude_code"),
+                    ("VEYRA_MODEL_FAST", "claude-model"),
+                    ("VEYRA_MODEL_BALANCED", "claude-model"),
+                    ("VEYRA_MODEL_REASONING", "claude-model"),
+                    ("VEYRA_MODEL_FALLBACKS", ""),
+                ],
+            );
+            crate::runtime_config::rebuild_model(&state).expect("model builds");
+            let before = state.model().expect("configured");
+            assert_eq!(before.provider(), ModelProvider::ClaudeCode);
+            let app = test::init_service(create_app(state.clone())).await;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::delete()
+                    .uri("/model/subscriptions/codex")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 200);
+            assert!(
+                state
+                    .model()
+                    .is_some_and(|model| model.same_instance(&before)),
+                "the Claude Code engine is not rebuilt"
+            );
+        }
+
+        #[actix_web::test]
+        async fn a_new_model_credential_clears_cooldowns() {
+            let clock = ManualClock::new();
+            let state = preferred_state(&clock);
+            cool(
+                state.model_cooldowns(),
+                ModelProvider::OpenRouter,
+                "deepseek/deepseek-v4.1-flash",
+            );
+            let app = test::init_service(create_app(state.clone())).await;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/model/credential")
+                    .insert_header(("x-veyra-admin-token", TEST_ADMIN_TOKEN))
+                    .set_json(json!({"key": "a-topped-up-key-123456"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), 200);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["active"], true);
+            assert!(state.model_cooldowns().is_empty());
+            assert!(
+                state
+                    .model()
+                    .is_some_and(|model| model.prefers_subscription()),
+                "the preference survives a credential change"
+            );
+        }
     }
 }

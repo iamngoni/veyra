@@ -8,6 +8,10 @@
 //!
 //! Zero limits mean unlimited, which is also the default: the guard exists to
 //! bound accidents, not to ration normal operation.
+//!
+//! The wrapped route is asked to [`DecisionEngine::preflight`] first, so a
+//! request that no candidate could serve (every one is cooling down) is
+//! refused before it is counted: a cooldown never spends budget.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -18,8 +22,8 @@ use serde_json::Value;
 use async_trait::async_trait;
 
 use crate::model::{
-    DecisionAnswer, DecisionEngine, DecisionRequest, ModelError, ModelProvider, ReadOnlyTool,
-    ToolProgressSink,
+    DecisionAnswer, DecisionEngine, DecisionRequest, ModelError, ModelProvider, ModelTier,
+    ReadOnlyTool, ToolProgressSink,
 };
 
 const HOUR: Duration = Duration::from_secs(3_600);
@@ -287,7 +291,12 @@ impl DecisionEngine for BudgetedEngine {
         self.inner.last_successful_model()
     }
 
+    fn preflight(&self, tier: ModelTier) -> Result<(), ModelError> {
+        self.inner.preflight(tier)
+    }
+
     async fn answer(&self, request: DecisionRequest) -> Result<DecisionAnswer, ModelError> {
+        self.inner.preflight(request.tier)?;
         self.tracker
             .admit()
             .map_err(|refusal| ModelError::Request {
@@ -302,6 +311,7 @@ impl DecisionEngine for BudgetedEngine {
         tools: Vec<Arc<dyn ReadOnlyTool>>,
         progress: &mut dyn ToolProgressSink,
     ) -> Result<DecisionAnswer, ModelError> {
+        self.inner.preflight(request.tier)?;
         self.tracker
             .admit()
             .map_err(|refusal| ModelError::Request {

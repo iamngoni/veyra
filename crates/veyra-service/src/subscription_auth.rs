@@ -4,9 +4,13 @@
 //! opaque to the HTTP layer and must be encrypted by [`crate::credential`]
 //! before persistence. Model transport and refresh are owned by the provider
 //! runtime, so a successful OAuth exchange does not imply live model access.
+//! When the runtime's refresh is rejected by the provider it marks the
+//! subscription as needing to be reconnected, which reports it disconnected
+//! until a new credential is stored.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    fmt,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -59,7 +63,10 @@ impl SubscriptionProvider {
 }
 
 /// Short-lived state required to complete one PKCE exchange.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the CSRF state, the PKCE verifier, and the authorization
+/// URL (which embeds the state).
+#[derive(Clone)]
 pub struct PendingAuthorization {
     /// Provider being authorized.
     pub provider: SubscriptionProvider,
@@ -74,7 +81,10 @@ pub struct PendingAuthorization {
 }
 
 /// Opaque exchanged subscription credential. Do not serialize this into HTTP responses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` redacts every token and account identifier, reporting only whether
+/// each is present.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SubscriptionCredential {
     /// Provider which issued the tokens.
     pub provider: SubscriptionProvider,
@@ -106,6 +116,45 @@ pub struct SubscriptionCredential {
     pub expires_at_unix: Option<i64>,
 }
 
+/// Presence marker for a redacted `Debug` field.
+fn presence(present: bool) -> &'static str {
+    if present { "<redacted>" } else { "<empty>" }
+}
+
+impl fmt::Debug for PendingAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingAuthorization")
+            .field("provider", &self.provider)
+            .field("state", &presence(!self.state.is_empty()))
+            .field("verifier", &presence(!self.verifier.is_empty()))
+            .field("authorize_url", &presence(!self.authorize_url.is_empty()))
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SubscriptionCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubscriptionCredential")
+            .field("provider", &self.provider)
+            .field("access_token", &presence(!self.access_token.is_empty()))
+            .field("id_token", &presence(!self.id_token.is_empty()))
+            .field("refresh_token", &presence(!self.refresh_token.is_empty()))
+            .field("account_id", &presence(self.account_id.is_some()))
+            .field("account_uuid", &presence(self.account_uuid.is_some()))
+            .field(
+                "organization_uuid",
+                &presence(self.organization_uuid.is_some()),
+            )
+            .field("scopes", &self.scopes)
+            .field("account_label", &presence(self.account_label.is_some()))
+            .field("expires_at_unix", &self.expires_at_unix)
+            .finish()
+    }
+}
+
 impl SubscriptionCredential {
     /// Rejects credentials that cannot be used by the selected provider.
     ///
@@ -130,13 +179,50 @@ impl SubscriptionCredential {
 }
 
 /// In-memory OAuth attempts and exchanged credentials awaiting runtime adoption.
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` lists only which providers are pending, hold a credential, or need
+/// a reconnect — never the flows or credentials themselves.
+#[derive(Clone, Default)]
 pub struct SubscriptionAuthState(Arc<Mutex<SubscriptionAuthInner>>);
 
-#[derive(Debug, Default)]
+impl fmt::Debug for SubscriptionAuthState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("SubscriptionAuthState");
+        match self.0.lock() {
+            Ok(state) => {
+                let sorted = |providers: Vec<SubscriptionProvider>| {
+                    let mut names: Vec<&str> = providers
+                        .into_iter()
+                        .map(SubscriptionProvider::as_str)
+                        .collect();
+                    names.sort_unstable();
+                    names
+                };
+                debug
+                    .field("pending", &sorted(state.pending.keys().copied().collect()))
+                    .field(
+                        "credentials",
+                        &sorted(state.credentials.keys().copied().collect()),
+                    )
+                    .field(
+                        "needs_reconnect",
+                        &sorted(state.needs_reconnect.iter().copied().collect()),
+                    );
+            }
+            Err(_) => {
+                debug.field("state", &"unavailable");
+            }
+        }
+        debug.finish()
+    }
+}
+
+#[derive(Default)]
 struct SubscriptionAuthInner {
     pending: HashMap<SubscriptionProvider, PendingAuthorization>,
     credentials: HashMap<SubscriptionProvider, SubscriptionCredential>,
+    /// Providers whose refresh grant the provider rejected.
+    needs_reconnect: HashSet<SubscriptionProvider>,
 }
 
 impl SubscriptionAuthState {
@@ -170,9 +256,11 @@ impl SubscriptionAuthState {
             .remove(&provider)
             .context("subscription authorization was not started")
     }
-    /// Stores an exchanged credential in memory until durable persistence succeeds.
+    /// Stores an exchanged or refreshed credential in memory until durable
+    /// persistence succeeds. A new credential clears any reconnect marker.
     pub fn set_credential(&self, credential: SubscriptionCredential) {
         if let Ok(mut state) = self.0.lock() {
+            state.needs_reconnect.remove(&credential.provider);
             state.credentials.insert(credential.provider, credential);
         }
     }
@@ -180,22 +268,41 @@ impl SubscriptionAuthState {
     pub fn remove_credential(&self, provider: SubscriptionProvider) -> bool {
         self.0
             .lock()
-            .map(|mut state| state.credentials.remove(&provider).is_some())
+            .map(|mut state| {
+                state.needs_reconnect.remove(&provider);
+                state.credentials.remove(&provider).is_some()
+            })
+            .unwrap_or(false)
+    }
+    /// Records that the provider rejected this subscription's refresh, so it
+    /// reports disconnected until the operator reconnects it.
+    pub fn mark_needs_reconnect(&self, provider: SubscriptionProvider) {
+        if let Ok(mut state) = self.0.lock() {
+            state.needs_reconnect.insert(provider);
+        }
+    }
+    /// Whether a rejected refresh left this subscription needing a reconnect.
+    pub fn needs_reconnect(&self, provider: SubscriptionProvider) -> bool {
+        self.0
+            .lock()
+            .map(|state| state.needs_reconnect.contains(&provider))
             .unwrap_or(false)
     }
     /// Returns a credential for runtime adoption without exposing it over HTTP.
     pub fn credential(&self, provider: SubscriptionProvider) -> Option<SubscriptionCredential> {
         self.0.lock().ok()?.credentials.get(&provider).cloned()
     }
-    /// Returns whether a provider has a credential.
+    /// Returns whether a provider has a usable credential: present, valid
+    /// for the provider, and not marked as needing a reconnect.
     pub fn connected(&self, provider: SubscriptionProvider) -> bool {
         self.0
             .lock()
             .map(|state| {
-                state
-                    .credentials
-                    .get(&provider)
-                    .is_some_and(|credential| credential.validate_for(provider).is_ok())
+                !state.needs_reconnect.contains(&provider)
+                    && state
+                        .credentials
+                        .get(&provider)
+                        .is_some_and(|credential| credential.validate_for(provider).is_ok())
             })
             .unwrap_or(false)
     }
@@ -497,6 +604,93 @@ mod tests {
             auth.take_pending(SubscriptionProvider::Codex, &state)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn debug_output_never_contains_tokens_or_flow_secrets() {
+        let auth = SubscriptionAuthState::new();
+        let pending = prepare(SubscriptionProvider::Codex).expect("flow");
+        let (flow_state, verifier, url) = (
+            pending.state.clone(),
+            pending.verifier.clone(),
+            pending.authorize_url.clone(),
+        );
+        auth.put_pending(pending.clone());
+        let credential = SubscriptionCredential {
+            provider: SubscriptionProvider::Codex,
+            access_token: "access-SECRET-a1".to_owned(),
+            id_token: "id-SECRET-b2".to_owned(),
+            refresh_token: "refresh-SECRET-c3".to_owned(),
+            account_id: Some("account-SECRET-d4".to_owned()),
+            account_uuid: Some("uuid-SECRET-e5".to_owned()),
+            organization_uuid: Some("org-SECRET-f6".to_owned()),
+            scopes: vec!["openid".to_owned()],
+            account_label: Some("operator-SECRET@example.test".to_owned()),
+            expires_at_unix: Some(42),
+        };
+        auth.set_credential(credential.clone());
+        auth.mark_needs_reconnect(SubscriptionProvider::ClaudeCode);
+
+        let outputs = [
+            format!("{credential:?}"),
+            format!("{pending:?}"),
+            format!("{auth:?}"),
+            format!("{auth:#?}"),
+        ];
+        for output in &outputs {
+            assert!(!output.contains("SECRET"), "{output}");
+            for secret in [&flow_state, &verifier, &url] {
+                assert!(!output.contains(secret.as_str()), "{output}");
+            }
+        }
+        assert!(outputs[0].contains("access_token: \"<redacted>\""));
+        assert!(outputs[0].contains("expires_at_unix: Some(42)"));
+        assert!(outputs[1].contains("verifier: \"<redacted>\""));
+        assert_eq!(
+            outputs[2],
+            "SubscriptionAuthState { pending: [\"codex\"], credentials: [\"codex\"], needs_reconnect: [\"claude_code\"] }"
+        );
+        let empty = SubscriptionCredential {
+            id_token: String::new(),
+            account_id: None,
+            ..credential
+        };
+        assert!(format!("{empty:?}").contains("id_token: \"<empty>\""));
+    }
+
+    #[test]
+    fn a_rejected_refresh_disconnects_until_a_new_credential_arrives() {
+        let auth = SubscriptionAuthState::new();
+        let credential = SubscriptionCredential {
+            provider: SubscriptionProvider::Codex,
+            access_token: "access".to_owned(),
+            id_token: String::new(),
+            refresh_token: "refresh".to_owned(),
+            account_id: None,
+            account_uuid: None,
+            organization_uuid: None,
+            scopes: Vec::new(),
+            account_label: Some("operator".to_owned()),
+            expires_at_unix: None,
+        };
+        auth.set_credential(credential.clone());
+        assert!(auth.connected(SubscriptionProvider::Codex));
+
+        auth.mark_needs_reconnect(SubscriptionProvider::Codex);
+        assert!(auth.needs_reconnect(SubscriptionProvider::Codex));
+        assert!(!auth.connected(SubscriptionProvider::Codex));
+        assert!(
+            auth.credential(SubscriptionProvider::Codex).is_some(),
+            "the label stays readable while disconnected"
+        );
+        assert!(!auth.needs_reconnect(SubscriptionProvider::ClaudeCode));
+
+        auth.set_credential(credential);
+        assert!(auth.connected(SubscriptionProvider::Codex));
+
+        auth.mark_needs_reconnect(SubscriptionProvider::Codex);
+        assert!(auth.remove_credential(SubscriptionProvider::Codex));
+        assert!(!auth.needs_reconnect(SubscriptionProvider::Codex));
     }
 
     #[test]

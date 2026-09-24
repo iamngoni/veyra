@@ -100,7 +100,8 @@ describe('AutopilotCard', () => {
 
     const indicator = state(container) as HTMLElement
     expect(indicator.textContent).toBe('Running')
-    expect(indicator.className).toContain('tone-ok')
+    // The dot carries the state; the word stays in the secondary voice.
+    expect(indicator.className).toContain('tone-muted')
     expect(indicator.querySelector('.dot.is-ok')).toBeTruthy()
 
     expect(value('Cadence').textContent).toBe('30 seconds · H4')

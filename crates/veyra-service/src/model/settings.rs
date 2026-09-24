@@ -3,6 +3,11 @@
 //! Secrets stay inside a redacted newtype, and parsing fails closed on partial
 //! configuration so a half-configured provider never reaches request time.
 //!
+//! `VEYRA_MODEL_PREFER_SUBSCRIPTION` and `VEYRA_MODEL_CHATGPT_MODEL` only shape
+//! how a configured provider is routed (ChatGPT subscription first), so on
+//! their own they neither enable model integration nor require a key; they are
+//! still validated whenever they are set.
+//!
 //! Tier models must accept a *forced tool call*: the structured path enforces
 //! the response schema through `tool_choice`, and reasoning modes that reject
 //! it fail with a provider error (for example DeepSeek "thinking mode does not
@@ -16,6 +21,13 @@ use std::net::IpAddr;
 use crate::config::ConfigError;
 use crate::model::{ModelProvider, ModelTier};
 use reqwest::Url;
+
+/// ChatGPT subscription model used when `VEYRA_MODEL_CHATGPT_MODEL` is empty.
+pub const DEFAULT_CHATGPT_MODEL: &str = "gpt-6-luna";
+
+/// Z.AI's OpenAI-compatible endpoint, used unless `VEYRA_MODEL_BASE_URL`
+/// overrides it.
+pub const ZAI_DEFAULT_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 
 /// Model API key that never appears in `Debug` output.
 #[derive(Clone, PartialEq, Eq)]
@@ -123,6 +135,8 @@ pub struct ModelSettings {
     app_hidden: bool,
     compel_structured_answer: bool,
     budget: crate::model::BudgetPolicy,
+    prefer_subscription: bool,
+    chatgpt_model: String,
 }
 
 impl ModelSettings {
@@ -164,13 +178,37 @@ impl ModelSettings {
         let fast_fallbacks_raw = optional(&mut source, "VEYRA_MODEL_FAST_FALLBACKS");
         let balanced_fallbacks_raw = optional(&mut source, "VEYRA_MODEL_BALANCED_FALLBACKS");
         let reasoning_fallbacks_raw = optional(&mut source, "VEYRA_MODEL_REASONING_FALLBACKS");
+        let prefer_raw = optional(&mut source, "VEYRA_MODEL_PREFER_SUBSCRIPTION");
+        let chatgpt_raw = optional(&mut source, "VEYRA_MODEL_CHATGPT_MODEL");
+
+        // Validated up front so a malformed value is refused even while the
+        // model section is otherwise empty; neither enables the section.
+        let prefer_subscription = match prefer_raw.as_str() {
+            "" | "true" => true,
+            "false" => false,
+            _ => {
+                return Err(ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_MODEL_PREFER_SUBSCRIPTION",
+                    reason: "must be `true` or `false`",
+                });
+            }
+        };
+        let chatgpt_model = if chatgpt_raw.is_empty() {
+            DEFAULT_CHATGPT_MODEL.to_owned()
+        } else {
+            validate_model_identifier(
+                ModelProvider::Codex,
+                "VEYRA_MODEL_CHATGPT_MODEL",
+                &chatgpt_raw,
+            )?
+        };
 
         let provider = if provider_raw.is_empty() {
             ModelProvider::OpenRouter
         } else {
             ModelProvider::parse(&provider_raw).ok_or(ConfigError::InvalidEnvironmentVariable {
                 name: "VEYRA_MODEL_PROVIDER",
-                reason: "unsupported provider; supported values: codex, claude_code, openai, anthropic, openrouter, groq, deepseek, xai, mistral, kimi, ollama, custom",
+                reason: "unsupported provider; supported values: codex, claude_code, openai, anthropic, openrouter, groq, deepseek, xai, mistral, kimi, zai, ollama, custom",
             })?
         };
 
@@ -325,6 +363,8 @@ impl ModelSettings {
             app_hidden,
             compel_structured_answer,
             budget,
+            prefer_subscription,
+            chatgpt_model,
         }))
     }
 
@@ -343,6 +383,13 @@ impl ModelSettings {
     /// Optional OpenAI-compatible base URL override.
     pub fn base_url(&self) -> Option<&str> {
         self.base_url.as_deref()
+    }
+
+    /// Whether the provider is told it must return the schema. Always false
+    /// for Z.AI, which accepts only `tool_choice: "auto"`; otherwise
+    /// [`ModelSettings::compel_structured_answer`].
+    pub fn compels_structured_answer_on_wire(&self) -> bool {
+        self.provider != ModelProvider::Zai && self.compel_structured_answer
     }
 
     /// Configured model per tier.
@@ -377,6 +424,31 @@ impl ModelSettings {
     /// Call budget applied to the active engine.
     pub fn budget(&self) -> &crate::model::BudgetPolicy {
         &self.budget
+    }
+
+    /// Whether a connected ChatGPT subscription is tried before the
+    /// configured provider. Defaults to true.
+    pub fn prefer_subscription(&self) -> bool {
+        self.prefer_subscription
+    }
+
+    /// Model sent to the ChatGPT subscription for every tier; never one of
+    /// the configured API tier models.
+    pub fn chatgpt_model(&self) -> &str {
+        &self.chatgpt_model
+    }
+
+    /// Whether both settings route the same candidates through the same
+    /// provider and credential. Cosmetic and budget settings are ignored:
+    /// changing them does not change what a cooldown says about a model.
+    pub fn same_route(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.api_key == other.api_key
+            && self.base_url == other.base_url
+            && self.tiers == other.tiers
+            && self.compel_structured_answer == other.compel_structured_answer
+            && self.prefer_subscription == other.prefer_subscription
+            && self.chatgpt_model == other.chatgpt_model
     }
 }
 
@@ -711,6 +783,7 @@ mod tests {
             ("xai", ModelProvider::Xai),
             ("mistral", ModelProvider::Mistral),
             ("kimi", ModelProvider::Kimi),
+            ("zai", ModelProvider::Zai),
             ("ollama", ModelProvider::Ollama),
             ("custom", ModelProvider::Custom),
         ] {
@@ -722,6 +795,8 @@ mod tests {
             assert_eq!(provider.as_str(), raw);
         }
         assert_eq!(ModelProvider::parse("moonshot"), Some(ModelProvider::Kimi));
+        assert_eq!(ModelProvider::parse("z-ai"), Some(ModelProvider::Zai));
+        assert_eq!(ModelProvider::parse("Zhipu"), Some(ModelProvider::Zai));
         assert_eq!(
             ModelProvider::parse("claude"),
             Some(ModelProvider::Anthropic)
@@ -766,6 +841,48 @@ mod tests {
             settings.tiers().fallbacks(ModelTier::Balanced),
             ["deepseek-reasoner"]
         );
+    }
+
+    #[test]
+    fn zai_uses_native_ids_requires_a_key_and_never_compels() {
+        let settings = ModelSettings::from_source(source(&full(&[
+            ("VEYRA_MODEL_PROVIDER", "zai"),
+            ("VEYRA_MODEL_FAST", "glm-5.3-flash"),
+            ("VEYRA_MODEL_BALANCED", "glm-5.3"),
+            ("VEYRA_MODEL_REASONING", "glm-5.3"),
+            ("VEYRA_MODEL_FALLBACKS", "glm-5.3-flash, glm-4.7-flash"),
+            ("VEYRA_MODEL_COMPEL_STRUCTURED", "true"),
+        ])))
+        .expect("native ids need no vendor prefix")
+        .expect("configured");
+        assert_eq!(settings.provider(), ModelProvider::Zai);
+        assert_eq!(settings.base_url(), None, "the engine applies the default");
+        assert_eq!(
+            settings.tiers().fallbacks(ModelTier::Balanced),
+            ["glm-5.3-flash", "glm-4.7-flash"]
+        );
+        assert!(settings.compel_structured_answer());
+        assert!(
+            !settings.compels_structured_answer_on_wire(),
+            "Z.AI accepts only an automatic tool choice"
+        );
+        let openrouter = ModelSettings::from_source(source(&full(&[])))
+            .expect("parses")
+            .expect("configured");
+        assert!(openrouter.compels_structured_answer_on_wire());
+
+        let keyless = ModelSettings::from_source(source(&[
+            ("VEYRA_MODEL_PROVIDER", "zai"),
+            ("VEYRA_MODEL_FAST", "glm-5.3-flash"),
+            ("VEYRA_MODEL_BALANCED", "glm-5.3"),
+            ("VEYRA_MODEL_REASONING", "glm-5.3"),
+        ]));
+        assert!(matches!(
+            keyless,
+            Err(ConfigError::MissingEnvironmentVariable {
+                name: "VEYRA_MODEL_API_KEY"
+            })
+        ));
     }
 
     #[test]
@@ -936,6 +1053,85 @@ mod tests {
             forgiving.tiers().fallbacks(ModelTier::Fast),
             ["z-ai/glm-5.3-flash"]
         );
+    }
+
+    #[test]
+    fn the_chatgpt_preference_defaults_on_with_its_own_model() {
+        let settings = ModelSettings::from_source(source(&full(&[])))
+            .expect("settings parse")
+            .expect("configured");
+        assert!(settings.prefer_subscription());
+        assert_eq!(settings.chatgpt_model(), DEFAULT_CHATGPT_MODEL);
+
+        let settings = ModelSettings::from_source(source(&full(&[
+            ("VEYRA_MODEL_PREFER_SUBSCRIPTION", "false"),
+            ("VEYRA_MODEL_CHATGPT_MODEL", "gpt-5.6-terra"),
+        ])))
+        .expect("settings parse")
+        .expect("configured");
+        assert!(!settings.prefer_subscription());
+        assert_eq!(
+            settings.chatgpt_model(),
+            "gpt-5.6-terra",
+            "a native ChatGPT id needs no vendor prefix"
+        );
+
+        for (name, value) in [
+            ("VEYRA_MODEL_PREFER_SUBSCRIPTION", "yes"),
+            ("VEYRA_MODEL_CHATGPT_MODEL", "gpt 6"),
+        ] {
+            let error = ModelSettings::from_source(source(&full(&[(name, value)])))
+                .expect_err("malformed values are refused");
+            assert!(
+                matches!(error, ConfigError::InvalidEnvironmentVariable { name: rejected, .. } if rejected == name),
+                "{name}: {error:?}"
+            );
+            // Refused even without a model section.
+            let error = ModelSettings::from_source(source(&[(name, value)]))
+                .expect_err("refused without a section too");
+            assert!(matches!(
+                error,
+                ConfigError::InvalidEnvironmentVariable { .. }
+            ));
+        }
+
+        // Alone, the routing settings neither enable the model nor need a key.
+        assert_eq!(
+            ModelSettings::from_source(source(&[
+                ("VEYRA_MODEL_PREFER_SUBSCRIPTION", "true"),
+                ("VEYRA_MODEL_CHATGPT_MODEL", "gpt-6-luna"),
+            ]))
+            .expect("parses"),
+            None
+        );
+    }
+
+    #[test]
+    fn same_route_ignores_cosmetic_and_budget_settings() {
+        let parse = |overrides: &[(&'static str, &str)]| {
+            ModelSettings::from_source(source(&full(overrides)))
+                .expect("settings parse")
+                .expect("configured")
+        };
+        let base = parse(&[]);
+        for cosmetic in [
+            parse(&[("VEYRA_MODEL_MAX_CALLS_PER_HOUR", "10")]),
+            parse(&[("VEYRA_MODEL_HTTP_REFERER", "https://example.test")]),
+            parse(&[("VEYRA_MODEL_APP_HIDDEN", "true")]),
+        ] {
+            assert!(base.same_route(&cosmetic));
+        }
+        for routed in [
+            parse(&[("VEYRA_MODEL_PROVIDER", "deepseek")]),
+            parse(&[("VEYRA_MODEL_API_KEY", "another-key-123456")]),
+            parse(&[("VEYRA_MODEL_BASE_URL", "https://example.test/v1")]),
+            parse(&[("VEYRA_MODEL_FALLBACKS", "z-ai/glm-5.3-flash")]),
+            parse(&[("VEYRA_MODEL_COMPEL_STRUCTURED", "false")]),
+            parse(&[("VEYRA_MODEL_PREFER_SUBSCRIPTION", "false")]),
+            parse(&[("VEYRA_MODEL_CHATGPT_MODEL", "gpt-5.6-terra")]),
+        ] {
+            assert!(!base.same_route(&routed), "{routed:?}");
+        }
     }
 
     #[test]

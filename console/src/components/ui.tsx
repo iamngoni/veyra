@@ -7,8 +7,8 @@
  * matching class names; nothing here branches on theme.
  */
 
-import { useId } from 'react'
-import type { ReactNode } from 'react'
+import { useId, useState } from 'react'
+import type { CSSProperties, ReactNode, SyntheticEvent } from 'react'
 
 export type Tone = 'ok' | 'warn' | 'bad' | 'idle' | 'off'
 
@@ -48,7 +48,14 @@ export function Panel({
       <header className={`panel-head${divided ? ' is-divided' : ''}`}>
         <Heading className="panel-title">
           {title}
-          {count !== undefined ? <span className="panel-count"> ({count})</span> : null}
+          {count !== undefined ? (
+            // Drawn as a bare number in a chip (see .panel-count); the text
+            // keeps the parentheses so the heading still reads "Open
+            // positions (3)" to assistive technology and in plain text.
+            <span className="panel-count" data-count={count}>
+              {' '}({count})
+            </span>
+          ) : null}
         </Heading>
         {actions ? <div className="panel-actions">{actions}</div> : null}
       </header>
@@ -67,9 +74,10 @@ export function Skeleton({ width = 64, height = 16 }: { width?: number | string;
 }
 
 /**
- * Two-state switch with the state spelled out. It only *requests* a change;
- * callers own confirmation, because a mis-click here can change what the
- * service is allowed to do with real money.
+ * Two-state switch: the track fills with the tone while on and the knob sits
+ * on that side. It only *requests* a change; callers own confirmation,
+ * because a mis-click here can change what the service is allowed to do with
+ * real money.
  */
 export function Toggle({
   checked,
@@ -97,22 +105,46 @@ export function Toggle({
       className={`toggle is-${tone}`}
     >
       <span className="toggle-knob" aria-hidden="true" />
-      <span className="toggle-word" aria-hidden="true">
-        {checked ? 'ON' : 'OFF'}
-      </span>
     </button>
   )
 }
+
+/** Widest a tip grows (see .hint-tip) and the gap it keeps from the window's edges. */
+const TIP_WIDTH = 280
+const TIP_EDGE = 16
+/** Where a tip starts, relative to its mark, when nothing is in the way. */
+const TIP_START = -10
+/** Room a tip needs above its mark: a few lines, plus the view's own header. */
+const TIP_ROOM = 150
 
 /**
  * An info mark whose explanation appears on hover or keyboard focus, styled
  * with the console's tokens instead of the browser's delayed native tooltip.
  * The text is also the mark's accessible description.
  */
-export function Hint({ text, label, size = 15 }: { text: string; label: string; size?: number }) {
+export function Hint({ text, label, size = 14 }: { text: string; label: string; size?: number }) {
   const id = useId()
+  // A tip opens where it has room: it starts just left of its mark but slides
+  // back inside the window near either edge, and near the top it opens below
+  // the mark instead of under the view's header. Decided as it opens, so it
+  // follows scrolling and resizing.
+  const [place, setPlace] = useState<{ x: number; below: boolean }>()
+  const open = (event: SyntheticEvent<HTMLElement>) => {
+    const hint = event.currentTarget
+    const mark = hint.getBoundingClientRect()
+    // Measured when the tip is already showing; otherwise its widest.
+    const shown = (hint.lastElementChild as HTMLElement).offsetWidth
+    const width = shown || Math.min(TIP_WIDTH, window.innerWidth - 3 * TIP_EDGE)
+    const x = Math.max(TIP_EDGE - mark.left, Math.min(TIP_START, window.innerWidth - TIP_EDGE - width - mark.left))
+    setPlace({ x: Math.round(x), below: mark.top < TIP_ROOM })
+  }
   return (
-    <span className="hint">
+    <span
+      className={`hint${place?.below ? ' is-below' : ''}`}
+      style={place ? ({ '--tip-x': `${place.x}px` } as CSSProperties) : undefined}
+      onMouseEnter={open}
+      onFocus={open}
+    >
       <button type="button" className="hint-mark" aria-label={`About ${label}`} aria-describedby={id}>
         <Icon name="info" size={size} />
       </button>
@@ -167,7 +199,7 @@ export type IconName =
   | 'info'
   | 'check'
 
-/** 20×20 outline icons drawn on a 24 grid, stroked with the current colour. */
+/** Outline icons drawn on a 24 grid (16px by default), stroked with the current colour. */
 const ICONS: Record<IconName, ReactNode> = {
   // The six views share one family: outlines only, inside a 16–18 unit box.
   overview: (

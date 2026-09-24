@@ -2,18 +2,21 @@
 //!
 //! Thin glue between the audit boundary and the `audit_events` table: connect
 //! with bounded pooling and timeouts, run the embedded migrations, append
-//! events, and read the newest rows. Behaviour depends on a running server, so
-//! this module is exercised by `tests/store_live.rs` and the smoke script
-//! rather than the deterministic suite (see `.cargo/config.toml`).
+//! events, read the newest rows, and answer filtered reads with one
+//! parameterised statement that mirrors `AuditQuery::matches`. Behaviour
+//! depends on a running server, so this module is exercised by
+//! `tests/store_live.rs` and the smoke script rather than the deterministic
+//! suite (see `.cargo/config.toml`); only the generated SQL text is checked
+//! offline.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
-use crate::audit::{AuditError, AuditEvent, AuditProvider, AuditRow, AuditTrail};
+use crate::audit::{AuditError, AuditEvent, AuditProvider, AuditQuery, AuditRow, AuditTrail};
 use crate::balance::BalancePoint;
 use crate::state::{StateError, StateStore};
 
@@ -188,6 +191,23 @@ impl AuditTrail for Store {
             .collect())
     }
 
+    async fn query(&self, query: &AuditQuery) -> Result<Vec<AuditRow>, AuditError> {
+        let rows = filtered_query(query)
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| storage_error("select filtered", &error))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AuditRow {
+                id: row.get("id"),
+                at: row.get("at"),
+                kind: row.get("kind"),
+                payload: row.get::<Value, _>("payload"),
+            })
+            .collect())
+    }
+
     async fn balance_history(
         &self,
         login: u64,
@@ -227,6 +247,65 @@ impl AuditTrail for Store {
     }
 }
 
+/// Builds the one parameterised statement behind [`AuditTrail::query`].
+///
+/// Only validated values are bound (never spliced), and each optional filter
+/// adds its clause only when present, so the planner sees a concrete shape.
+/// The predicates mirror [`AuditQuery::matches`]: upper-cased symbol equality,
+/// ticket on `payload.ticket` or `payload.result.ticket`, command-id set
+/// membership, exact outcome, and the half-open `since <= at < until` window.
+/// Times are returned as RFC 3339 UTC with milliseconds.
+fn filtered_query(query: &AuditQuery) -> QueryBuilder<'static, Postgres> {
+    let mut builder = QueryBuilder::new(
+        "select id::text as id, \
+         to_char(at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as at, \
+         kind, payload \
+         from audit_events where kind = any(",
+    );
+    builder.push_bind(
+        query
+            .kinds()
+            .iter()
+            .map(|kind| kind.as_str().to_owned())
+            .collect::<Vec<_>>(),
+    );
+    builder.push("::text[])");
+    if let Some(symbol) = query.symbol() {
+        builder.push(" and upper(payload->>'symbol') = ");
+        builder.push_bind(symbol.to_owned());
+    }
+    if let Some(ticket) = query.ticket() {
+        builder.push(" and (payload->>'ticket' = ");
+        builder.push_bind(ticket.to_string());
+        builder.push(" or payload->'result'->>'ticket' = ");
+        builder.push_bind(ticket.to_string());
+        builder.push(")");
+    }
+    if !query.command_ids().is_empty() {
+        builder.push(" and payload->>'command_id' = any(");
+        builder.push_bind(query.command_ids().to_vec());
+        builder.push("::text[])");
+    }
+    if let Some(outcome) = query.outcome() {
+        builder.push(" and payload->>'outcome' = ");
+        builder.push_bind(outcome.to_owned());
+    }
+    // Unix milliseconds stay exact as float8 seconds far beyond any real date.
+    if let Some(since) = query.since_ms() {
+        builder.push(" and at >= to_timestamp(");
+        builder.push_bind(since as f64 / 1_000.0);
+        builder.push("::double precision)");
+    }
+    if let Some(until) = query.until_ms() {
+        builder.push(" and at < to_timestamp(");
+        builder.push_bind(until as f64 / 1_000.0);
+        builder.push("::double precision)");
+    }
+    builder.push(" order by at desc, id desc limit ");
+    builder.push_bind(i64::from(query.limit()));
+    builder
+}
+
 fn storage_error(action: &str, error: &impl std::fmt::Display) -> AuditError {
     AuditError::Storage {
         reason: format!("{action} failed: {error}"),
@@ -236,5 +315,58 @@ fn storage_error(action: &str, error: &impl std::fmt::Display) -> AuditError {
 fn state_error(action: &str, error: &impl std::fmt::Display) -> StateError {
     StateError::Storage {
         reason: format!("{action} failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::AuditKind;
+
+    #[test]
+    fn filtered_query_binds_every_value_and_adds_only_present_clauses() {
+        let minimal = AuditQuery::new(&[AuditKind::ProposalEvaluated], 20).expect("query");
+        assert_eq!(
+            filtered_query(&minimal).sql(),
+            "select id::text as id, \
+             to_char(at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as at, \
+             kind, payload \
+             from audit_events where kind = any($1::text[]) \
+             order by at desc, id desc limit $2"
+        );
+
+        let full = AuditQuery::new(
+            &[AuditKind::ProposalEvaluated, AuditKind::PositionClosed],
+            50,
+        )
+        .and_then(|query| query.with_symbol("usdjpy"))
+        .and_then(|query| query.with_ticket(10_654_130))
+        .and_then(|query| {
+            query.with_command_ids(&["5a3f5c1e-2b1d-4a57-9d27-9b0d2f7e8a10".to_owned()])
+        })
+        .and_then(|query| query.with_outcome("held"))
+        .and_then(|query| query.with_window(Some(1_000), Some(2_000)))
+        .expect("query");
+        let builder = filtered_query(&full);
+        let sql = builder.sql();
+        for clause in [
+            "where kind = any($1::text[])",
+            " and upper(payload->>'symbol') = $2",
+            " and (payload->>'ticket' = $3 or payload->'result'->>'ticket' = $4)",
+            " and payload->>'command_id' = any($5::text[])",
+            " and payload->>'outcome' = $6",
+            " and at >= to_timestamp($7::double precision)",
+            " and at < to_timestamp($8::double precision)",
+        ] {
+            assert!(sql.contains(clause), "missing `{clause}` in {sql}");
+        }
+        assert!(
+            sql.ends_with(" order by at desc, id desc limit $9"),
+            "{sql}"
+        );
+        assert!(
+            !sql.contains("USDJPY") && !sql.contains("10654130") && !sql.contains("held"),
+            "values are bound, never spliced: {sql}"
+        );
     }
 }

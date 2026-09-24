@@ -59,6 +59,8 @@ const SETTING_GROUPS: Array<{ title: string; prefixes: string[]; names: string[]
     prefixes: ['MODEL_'],
     names: [
       'VEYRA_MODEL_PROVIDER',
+      'VEYRA_MODEL_PREFER_SUBSCRIPTION',
+      'VEYRA_MODEL_CHATGPT_MODEL',
       'VEYRA_MODEL_FAST',
       'VEYRA_MODEL_BALANCED',
       'VEYRA_MODEL_REASONING',
@@ -160,6 +162,9 @@ const SETTING_HELP: Record<string, string> = {
     'Most model calls allowed per hour; beyond it, calls are refused until the window resets. Empty or 0 means unlimited.',
   VEYRA_MODEL_MAX_CALLS_PER_DAY:
     'Most model calls allowed per day; beyond it, calls are refused until the window resets. Empty or 0 means unlimited.',
+  VEYRA_MODEL_PREFER_SUBSCRIPTION:
+    'While a ChatGPT subscription is signed in, every model call tries it first; the provider above takes over when it fails.',
+  VEYRA_MODEL_CHATGPT_MODEL: 'Model used on the ChatGPT subscription for every tier; empty means gpt-6-luna.',
   VEYRA_MODEL_COMPEL_STRUCTURED:
     'Requires the model to answer in the structured format instead of merely offering it. Turn off for reasoning models, which refuse it.',
   VEYRA_MODEL_PROVIDER:
@@ -207,6 +212,7 @@ const SETTING_KINDS: Record<string, SettingKind> = {
   VEYRA_AUTOPILOT_ENABLED: { kind: 'switch', fallback: false },
   VEYRA_AUTOPILOT_PROFIT_HARVEST: { kind: 'switch', fallback: false },
   VEYRA_MODEL_COMPEL_STRUCTURED: { kind: 'switch', fallback: true },
+  VEYRA_MODEL_PREFER_SUBSCRIPTION: { kind: 'switch', fallback: true },
   VEYRA_MODEL_APP_HIDDEN: { kind: 'switch', fallback: false },
   VEYRA_AUTOPILOT_TIMEFRAME: { kind: 'choice', fallback: 'H4', options: TIMEFRAMES },
   VEYRA_AUTOPILOT_TIER: {
@@ -240,6 +246,7 @@ const SETTING_KINDS: Record<string, SettingKind> = {
       { value: 'xai', label: 'xAI' },
       { value: 'mistral', label: 'Mistral' },
       { value: 'kimi', label: 'Moonshot / Kimi' },
+      { value: 'zai', label: 'Z.AI (GLM)' },
       { value: 'ollama', label: 'Ollama' },
       { value: 'custom', label: 'Custom OpenAI-compatible' },
     ],

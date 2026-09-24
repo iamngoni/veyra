@@ -55,12 +55,14 @@ export function AutopilotCard({
   const failing = (decisions?.consecutiveFailures ?? 0) >= FAILING_AFTER
   const decision = events.find((event) => event.kind === 'proposal_evaluated')
 
+  // The dot carries the state; the word stays in the secondary voice unless
+  // the loop needs attention.
   const state: { tone: Tone; text: string; className: string } | undefined = !status
     ? undefined
     : failing
       ? { tone: 'bad', text: 'Not deciding', className: 'tone-bad' }
       : on
-        ? { tone: 'ok', text: 'Running', className: 'tone-ok' }
+        ? { tone: 'ok', text: 'Running', className: 'tone-muted' }
         : { tone: 'off', text: 'Off', className: 'tone-faint' }
 
   let outcome: { title: string; note?: string } | undefined
@@ -282,10 +284,14 @@ export function RecentActivity({
         <ol className="act-list" aria-hidden="true">
           {Array.from({ length: PREVIEW_ROWS }, (_, index) => (
             <li key={index} className="act-row">
-              <Skeleton width={38} height={14} />
-              <span className="act-mark" />
+              <span className="act-time">
+                <Skeleton width={32} height={12} />
+              </span>
+              <span className="act-mark">
+                <Dot tone="off" />
+              </span>
               <div className="act-text">
-                <Skeleton width="70%" height={14} />
+                <Skeleton width="70%" height={12} />
               </div>
             </li>
           ))}
@@ -451,7 +457,7 @@ function RiskSwitch({
       <div className="rc-head">
         <h3 className="rc-title">
           {title}
-          {info ? <Hint text={info} label={title} size={22} /> : null}
+          {info ? <Hint text={info} label={title} size={14} /> : null}
         </h3>
         <Toggle checked={checked} label={title} tone={tone} disabled={disabled} onClick={onRequest} />
       </div>

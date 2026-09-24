@@ -1,19 +1,19 @@
 /* Overview right rail (components/rail.tsx): the autopilot card (ap-), the
  * recent-activity timeline (act-) and the risk switches (rc-).
  *
- * Every card body sits on the same 16px inset as the header rule, so text,
- * row rules and toggles all line up on one left and one right edge. */
+ * Every card body sits on the panel inset, the same 16px as the header
+ * rule, so labels, dots and switches line up on one left and one right
+ * edge. Labels speak in the secondary voice at 12px, values in primary ink
+ * at 13px. */
 
 /* ---------- autopilot ---------- */
 
+/* State in the header: the dot says it, the word names it. */
 .ap-state {
-  position: relative;
-  /* Sit on the title's baseline rather than its centre line. */
-  top: 1px;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  font-size: 11px;
+  gap: 6px;
+  font-size: var(--text-sm);
   line-height: 20px;
   white-space: nowrap;
 }
@@ -23,28 +23,23 @@
   height: 6px;
 }
 
+/* Properties: a label column and a value column, no rules between. */
 .ap-rows {
-  margin: 0 16px;
-  padding: 0 0 14px;
+  margin: 0;
+  padding: var(--space-2) var(--panel-inset) var(--space-3);
 }
 
 .ap-row {
   display: grid;
-  grid-template-columns: 88px minmax(0, 1fr);
-  column-gap: 8px;
+  grid-template-columns: 92px minmax(0, 1fr);
   align-items: baseline;
-  padding: 12px 0 9px;
-  border-top: 1px solid var(--color-line);
-}
-
-.ap-row:first-child {
-  padding-top: 16px;
-  border-top: 0;
+  column-gap: var(--space-3);
+  padding: var(--space-1) 0;
 }
 
 .ap-row dt {
   color: var(--color-ink-muted);
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 20px;
 }
 
@@ -54,17 +49,17 @@
   flex-direction: column;
   margin: 0;
   color: var(--color-ink);
-  font-size: 12px;
+  font-size: var(--text-base);
   line-height: 20px;
 }
 
 .ap-note {
   display: -webkit-box;
-  margin-top: 2px;
   overflow: hidden;
   color: var(--color-ink-muted);
-  font-size: 13px;
+  font-size: var(--text-sm);
   line-height: 18px;
+  overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   line-clamp: 2;
@@ -74,14 +69,14 @@
 
 .act-reconnecting {
   color: var(--color-warn);
-  font-size: 13px;
+  font-size: var(--text-sm);
 }
 
 .act-list {
   /* Offsets for the row fit are measured against the list itself. */
   position: relative;
-  margin: 0 16px;
-  padding: 0 0 10px;
+  margin: 0;
+  padding: 6px var(--panel-inset) var(--space-2);
   list-style: none;
 }
 
@@ -94,30 +89,29 @@
   visibility: hidden;
 }
 
+/* A timeline: the state dot on a thin rule, what happened, and when on the
+   right in the tertiary voice. */
 .act-row {
   display: grid;
-  /* Time, the timeline rule, the state dot, then the text. */
-  grid-template-columns: 42px 24px minmax(0, 1fr);
-  padding: 13px 0;
-  border-top: 1px solid var(--color-line);
-}
-
-.act-row:first-child {
-  border-top: 0;
+  grid-template-areas: "mark text time";
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  column-gap: 10px;
+  padding: 6px 0;
 }
 
 .act-time {
-
-  color: var(--color-ink-muted);
-  font-size: 12px;
-  line-height: 22px;
+  grid-area: time;
+  color: var(--color-ink-faint);
+  font-size: var(--text-sm);
+  line-height: 20px;
 }
 
 .act-mark {
+  position: relative;
   display: flex;
-  height: 22px;
-  align-items: center;
-  padding-left: 7px;
+  grid-area: mark;
+  justify-content: center;
+  padding-top: 7px;
 }
 
 .act-mark .dot {
@@ -125,48 +119,58 @@
   height: 6px;
 }
 
-.act-text {
-  min-width: 0;
+/* The rule runs from this dot to the next shown one, with a little air
+   either side; the last shown row has none. */
+.act-row:has(+ .act-row:not(.is-clipped)) .act-mark::after {
+  position: absolute;
+  top: 17px;
+  bottom: -15px;
+  left: calc(50% - 0.5px);
+  width: 1px;
+  background: var(--color-line);
+  content: "";
 }
 
-.act-title {
+.act-text {
+  min-width: 0;
+  grid-area: text;
+}
+
+.act-title,
+.act-detail {
   margin: 0;
   overflow: hidden;
-  color: var(--color-ink);
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 22px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.act-title {
+  color: var(--color-ink);
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  line-height: 20px;
+}
+
 .act-detail {
-  display: -webkit-box;
-  margin: 2px 0 0;
-  overflow: hidden;
   color: var(--color-ink-muted);
-  font-size: 11px;
-  line-height: 19px;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
+  font-size: var(--text-sm);
+  line-height: 18px;
 }
 
 .act-empty {
-  margin: 0;
-  padding: 18px 16px 20px;
+  padding-top: var(--space-3);
 }
 
 /* ---------- risk controls ---------- */
 
 .rc-list {
-  margin: 0 16px;
-  padding: 0 0 12px;
+  margin: 0 var(--panel-inset);
+  padding: var(--space-1) 0 var(--space-2);
 }
 
 .rc-row {
-  padding: 14px 0;
-  border-top: 1px solid var(--color-line);
+  padding: 10px 0;
+  border-top: 1px solid var(--color-line-soft);
 }
 
 .rc-row:first-child {
@@ -175,9 +179,10 @@
 
 .rc-head {
   display: flex;
+  min-height: 20px;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .rc-title {
@@ -187,34 +192,35 @@
   gap: 6px;
   margin: 0;
   color: var(--color-ink);
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 22px;
-}
-
-.rc-title .hint-mark {
-  color: var(--color-ink-muted);
-}
-
-.rc-title .hint-mark .icon {
-  stroke-width: 1.4;
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  line-height: 20px;
 }
 
 .rc-desc {
-  margin: 5px 0 0;
+  margin: 2px 0 0;
   color: var(--color-ink-muted);
-  font-size: 12px;
-  line-height: 19px;
+  font-size: var(--text-sm);
+  line-height: 18px;
   text-wrap: pretty;
 }
 
-.rc-warning {
-  margin: 8px 0 0;
-  color: var(--color-warn);
-  font-size: 13px;
+.rc-warning,
+.rc-error {
+  margin: 6px 0 0;
+  font-size: var(--text-sm);
   line-height: 18px;
 }
 
+.rc-warning {
+  color: var(--color-warn);
+}
+
+.rc-error {
+  color: var(--color-bad);
+}
+
+/* The question and its two answers, inline under the switch. */
 .rc-confirm {
   display: flex;
   /* On a narrow rail the buttons drop below the question rather than
@@ -222,29 +228,39 @@
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 4px 6px;
-  margin-top: 12px;
-  padding: 4px 4px 4px 10px;
-  border-radius: 6px;
-  background: var(--color-surface-2);
+  gap: var(--space-1) 6px;
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-1) var(--space-1) 10px;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  background: var(--color-fill);
   color: var(--color-ink);
-  font-size: 13px;
+  font-size: var(--text-sm);
   line-height: 18px;
+  animation: rc-confirm-in var(--duration) var(--ease-out);
+}
+
+@keyframes rc-confirm-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
 }
 
 .rc-confirm-actions {
   display: flex;
   flex: 0 0 auto;
-  gap: 2px;
+  gap: var(--space-1);
   margin-left: auto;
 }
 
 .rc-cancel,
 .rc-apply {
-  min-height: 32px;
-  padding: 0 6px;
-  border-radius: 4px;
-  font-size: 13px;
+  height: var(--control-sm);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-xs);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
   line-height: 18px;
   white-space: nowrap;
 }
@@ -254,17 +270,15 @@
 }
 
 .rc-cancel:hover:not(:disabled) {
-  background: var(--color-surface-3);
+  background: var(--color-active);
   color: var(--color-ink);
 }
 
 .rc-apply {
   /* Wide enough for "Applying…", so the row does not reflow mid-request. */
-  min-width: 84px;
-  padding: 0 8px;
+  min-width: 76px;
   /* Panel fill as ink reads on both the pale dark-theme and deep light-theme hues. */
-  color: var(--color-surface-1);
-  font-weight: 500;
+  color: var(--color-panel);
   text-align: center;
 }
 
@@ -276,21 +290,11 @@
   background: var(--color-warn);
 }
 
+.rc-apply:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
 .rc-cancel:disabled,
 .rc-apply:disabled {
   opacity: 0.6;
 }
-
-.rc-error {
-  margin: 8px 0 0;
-  color: var(--color-bad);
-  font-size: 13px;
-  line-height: 18px;
-}
-
-.ap-state { padding: 0 6px; border: 1px solid var(--color-line); border-radius: 4px; }
-.ap-row { border-color: var(--color-line-soft); }
-.ap-note { overflow-wrap: anywhere; }
-.rc-title .hint-mark .icon { width: 15px !important; height: 15px !important; }
-.rc-confirm { border: 1px solid var(--color-line-strong); }
-.act-title { overflow-wrap: anywhere; }

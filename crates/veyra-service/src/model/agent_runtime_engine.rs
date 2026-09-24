@@ -4,9 +4,13 @@
 //! never imports the dependency. Providers are chosen through
 //! `AgentProviderKind`; models come from explicitly configured tiers, never
 //! from library defaults (which are dated).
+//!
+//! Each attempt targets one explicit candidate; the ordered chain, failover,
+//! and per-model cooldowns are decided by [`crate::model::route`], so this
+//! engine behaves exactly like every other leg of a composite route.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use agent_runtime::{
     Agent as RuntimeAgent, AgentProviderKind, ChatMessage, EventSink, Llm, ModelTiers,
@@ -16,6 +20,8 @@ use agent_runtime::{
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::model::cooldown::{CooldownFailure, CooldownReason, CooldownRegistry};
+use crate::model::route::{self, AttemptError, Call, CandidateTransport, Leg, Telemetry};
 use crate::model::settings::{ModelSettings, TierModels};
 use crate::model::{
     DecisionAnswer, DecisionEngine, DecisionRequest, ModelError, ModelProvider, ModelTier,
@@ -35,10 +41,11 @@ pub struct AgentRuntimeEngine {
     /// knows the primary, so the chain is kept here and the model is passed
     /// explicitly on each attempt.
     tiers: TierModels,
-    /// Last candidate requested, including one that failed.
-    last_attempted_model: Arc<Mutex<Option<String>>>,
-    /// Last candidate that returned a structured answer.
-    last_successful_model: Arc<Mutex<Option<String>>>,
+    /// Last candidate requested and last one that answered.
+    telemetry: Telemetry,
+    /// Per-candidate cooldowns; shared with the application when built by
+    /// the runtime so they survive engine rebuilds.
+    cooldowns: CooldownRegistry,
 }
 
 impl fmt::Debug for AgentRuntimeEngine {
@@ -129,6 +136,19 @@ pub(crate) fn runtime_definition(definition: ReadOnlyToolDefinition) -> ToolDefi
     }
 }
 
+/// Builds the allowlisted tool registry for one tool-session attempt.
+pub(crate) fn runtime_registry(tools: &[Arc<dyn ReadOnlyTool>]) -> ToolRegistry<()> {
+    let mut registry = ToolRegistry::new();
+    for tool in tools {
+        let definition = runtime_definition(tool.definition());
+        registry.register(RuntimeReadOnlyTool {
+            tool: tool.clone(),
+            definition,
+        });
+    }
+    registry
+}
+
 impl RuntimeAgent for InlineAgent {
     fn instructions(&self) -> String {
         self.instructions.clone()
@@ -173,6 +193,9 @@ impl AgentRuntimeEngine {
             ModelProvider::Xai => AgentProviderKind::Xai,
             ModelProvider::Mistral => AgentProviderKind::Mistral,
             ModelProvider::Kimi => AgentProviderKind::Kimi,
+            // Z.AI speaks the OpenAI wire format, so it rides the compatible
+            // client under its own name with its documented default endpoint.
+            ModelProvider::Zai => AgentProviderKind::Custom("zai".to_owned()),
             ModelProvider::Ollama => AgentProviderKind::Ollama,
             ModelProvider::Custom => AgentProviderKind::Custom("custom".to_owned()),
         };
@@ -186,6 +209,8 @@ impl AgentRuntimeEngine {
 
         if let Some(base_url) = settings.base_url() {
             builder = builder.base_url(base_url);
+        } else if settings.provider() == ModelProvider::Zai {
+            builder = builder.base_url(crate::model::settings::ZAI_DEFAULT_BASE_URL);
         }
 
         builder = builder
@@ -198,7 +223,9 @@ impl AgentRuntimeEngine {
             // A reasoning model refuses a compelled tool choice outright, so
             // this is the difference between the loop working and every
             // request failing — not a preference about answer strictness.
-            .structured_strategy(if settings.compel_structured_answer() {
+            // Z.AI rejects any `tool_choice` other than "auto", so it is
+            // never compelled whatever VEYRA_MODEL_COMPEL_STRUCTURED says.
+            .structured_strategy(if settings.compels_structured_answer_on_wire() {
                 agent_runtime::StructuredStrategy::ForcedTool
             } else {
                 agent_runtime::StructuredStrategy::AutoTool
@@ -231,47 +258,60 @@ impl AgentRuntimeEngine {
             llm,
             provider: settings.provider(),
             tiers: settings.tiers().clone(),
-            last_attempted_model: Arc::new(Mutex::new(None)),
-            last_successful_model: Arc::new(Mutex::new(None)),
+            telemetry: Telemetry::default(),
+            cooldowns: CooldownRegistry::new(),
         })
     }
 
-    /// Records the latest model candidate without allowing telemetry failure
-    /// to affect the decision path.
-    fn remember(slot: &Mutex<Option<String>>, model: &str) {
-        match slot.lock() {
-            Ok(mut value) => *value = Some(model.to_owned()),
-            Err(poisoned) => *poisoned.into_inner() = Some(model.to_owned()),
-        }
+    /// Uses a shared cooldown registry instead of a private one, so cooldowns
+    /// survive engine rebuilds.
+    #[must_use]
+    pub fn with_cooldowns(mut self, cooldowns: CooldownRegistry) -> Self {
+        self.cooldowns = cooldowns;
+        self
     }
 
-    /// Reads a telemetry value while recovering from a poisoned lock.
-    fn remembered(slot: &Mutex<Option<String>>) -> Option<String> {
-        match slot.lock() {
-            Ok(value) => value.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+    fn legs(&self, tier: ModelTier) -> [Leg<'_>; 1] {
+        [Leg {
+            transport: self,
+            models: self.tiers.chain(tier),
+        }]
     }
 }
 
-/// Whether another model is worth trying after this failure.
+/// Classifies a failed attempt: whether another model is worth trying, and
+/// for how long this one should cool down.
 ///
 /// The question is never "was this request valid" but "could a different model
 /// answer it". An exhausted balance, a rate limit, an overloaded upstream, or a
-/// flat rejection are all properties of the model that was asked, so the next
-/// candidate gets a turn. A transport fault is the exception: the provider was
-/// never reached, so the same failure would repeat on every candidate and the
-/// runtime's own retry policy is the right layer to handle it.
-fn worth_failing_over(error: &anyhow::Error) -> bool {
-    match provider_error(error) {
-        Some(ProviderError::Transport { .. }) => false,
-        // A classified provider refusal: credits, rate limit, overload, an
-        // unexpected status, or a response with nothing usable in it.
-        Some(_) => true,
-        // Not a provider error at all — most often the answer came back but
-        // did not satisfy the schema. Another model may well comply.
-        None => true,
-    }
+/// flat rejection are all properties of the model that was asked, so it cools
+/// down and the next candidate gets a turn. A transport fault is the
+/// exception: the provider was never reached, so the same failure would repeat
+/// on every candidate this host serves. The route holds the whole host briefly
+/// and moves on to a different host, if there is one.
+///
+/// Rate-limit hints come from the provider error body; `agent-runtime` does not
+/// surface response headers.
+fn classify(error: &anyhow::Error) -> AttemptError {
+    let reason = safe_failure_reason(error);
+    let failure = match provider_error(error) {
+        Some(ProviderError::Transport { .. }) => return AttemptError::transport(reason),
+        Some(ProviderError::RateLimited { retry_after, .. }) => {
+            CooldownFailure::rate_limited(*retry_after)
+        }
+        Some(ProviderError::InsufficientCredits { .. }) => {
+            CooldownFailure::new(CooldownReason::InsufficientCredits)
+        }
+        Some(ProviderError::Overloaded { .. }) => CooldownFailure::new(CooldownReason::Overloaded),
+        Some(ProviderError::Status { status, .. }) => CooldownFailure::from_status(*status, None),
+        // An empty answer, or not a provider error at all — most often the
+        // answer came back but did not satisfy the schema. Another model may
+        // well comply.
+        Some(ProviderError::EmptyResponse { .. }) | None => {
+            CooldownFailure::new(CooldownReason::InvalidResponse)
+        }
+    };
+    AttemptError::cooldown(reason, failure)
 }
 
 /// Finds the classified provider error beneath any context added by the
@@ -291,12 +331,120 @@ fn provider_error(error: &anyhow::Error) -> Option<&ProviderError> {
 fn safe_failure_reason(error: &anyhow::Error) -> String {
     match provider_error(error) {
         Some(ProviderError::RateLimited { .. }) => "rate_limited".to_owned(),
-        Some(ProviderError::InsufficientCredits { .. }) => "insufficient_credits".to_owned(),
+        Some(ProviderError::InsufficientCredits { body, .. }) => match credit_source(body) {
+            Some(source) => format!("insufficient_credits ({source})"),
+            None => "insufficient_credits".to_owned(),
+        },
         Some(ProviderError::Overloaded { .. }) => "overloaded".to_owned(),
         Some(ProviderError::Status { status, .. }) => format!("provider_rejected ({status})"),
         Some(ProviderError::Transport { .. }) => "transport".to_owned(),
         Some(ProviderError::EmptyResponse { .. }) => "empty_response".to_owned(),
         None => "invalid_response".to_owned(),
+    }
+}
+
+/// Names whose balance ran out, from OpenRouter's structured 402 metadata.
+///
+/// OpenRouter distinguishes an empty balance at the upstream provider behind
+/// a bring-your-own-key route (`is_byok` plus `provider_name`) from its own
+/// account credits (`limit_source: "openrouter_credits"`). Only those fields
+/// are read — never the message or the upstream's raw body — and the provider
+/// name must look like a name, so nothing else from the body can cross into
+/// status output or logs.
+fn credit_source(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let metadata = value.pointer("/error/metadata")?;
+    if metadata.get("is_byok").and_then(serde_json::Value::as_bool) == Some(true) {
+        let name = metadata
+            .get("provider_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| looks_like_a_name(name));
+        return Some(match name {
+            Some(name) => format!("{name} balance, BYOK"),
+            None => "provider balance, BYOK".to_owned(),
+        });
+    }
+    (metadata
+        .get("limit_source")
+        .and_then(serde_json::Value::as_str)
+        == Some("openrouter_credits"))
+    .then(|| "OpenRouter credits".to_owned())
+}
+
+/// A short provider display name: letters, digits, spaces, `.`, `-`, `_`.
+fn looks_like_a_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name.chars().count() <= 40
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || " .-_".contains(character))
+}
+
+#[async_trait]
+impl CandidateTransport for AgentRuntimeEngine {
+    fn candidate_provider(&self) -> ModelProvider {
+        self.provider
+    }
+
+    async fn attempt(
+        &self,
+        model: &str,
+        request: &DecisionRequest,
+        call: &mut Call<'_>,
+    ) -> Result<DecisionAnswer, AttemptError> {
+        match call {
+            Call::Structured => {
+                let agent = InlineAgent {
+                    instructions: request.instructions.clone(),
+                    model: model.to_owned(),
+                };
+                let format =
+                    ResponseFormat::new(request.format.name.clone(), request.format.schema.clone());
+                self.llm
+                    .run_structured_with_format(&agent, request.input.clone(), format)
+                    .await
+                    .map(|value| DecisionAnswer { value })
+                    .map_err(|error| classify(&error))
+            }
+            Call::Tools { tools, progress } => {
+                let registry = runtime_registry(tools);
+                let mut runtime_progress = RuntimeProgress {
+                    sink: &mut **progress,
+                };
+                let history = [ChatMessage::user(request.input.clone())];
+                let outcome = self
+                    .llm
+                    .execute_tool_session(
+                        agent_runtime::ToolSessionRequest {
+                            model,
+                            decision_system_prompt: &request.instructions,
+                            followup_system_prompt: &request.instructions,
+                            history: &history,
+                            tool_registry: &registry,
+                            tool_context: (),
+                            max_tool_calls: 8,
+                        },
+                        &mut runtime_progress,
+                    )
+                    .await
+                    .map_err(|error| classify(&error))?;
+                let message = match outcome {
+                    ToolSessionOutcome::Direct { message, .. }
+                    | ToolSessionOutcome::ToolBacked { message, .. } => message,
+                };
+                if message.trim().is_empty() {
+                    return Err(AttemptError::cooldown(
+                        "empty_response",
+                        CooldownFailure::new(CooldownReason::InvalidResponse),
+                    ));
+                }
+                Ok(DecisionAnswer {
+                    value: json!({ "answer": message }),
+                })
+            }
+        }
     }
 }
 
@@ -307,11 +455,15 @@ impl DecisionEngine for AgentRuntimeEngine {
     }
 
     fn last_attempted_model(&self) -> Option<String> {
-        Self::remembered(&self.last_attempted_model)
+        self.telemetry.last_attempted()
     }
 
     fn last_successful_model(&self) -> Option<String> {
-        Self::remembered(&self.last_successful_model)
+        self.telemetry.last_successful()
+    }
+
+    fn preflight(&self, tier: ModelTier) -> Result<(), ModelError> {
+        route::preflight(&self.legs(tier), &self.cooldowns)
     }
 
     async fn answer_with_tools(
@@ -323,102 +475,24 @@ impl DecisionEngine for AgentRuntimeEngine {
         if tools.is_empty() {
             return self.answer(request).await;
         }
-
-        let model = self.tiers.resolve(request.tier).to_owned();
-        Self::remember(&self.last_attempted_model, &model);
-        let mut registry = ToolRegistry::new();
-        for tool in tools {
-            let definition = runtime_definition(tool.definition());
-            registry.register(RuntimeReadOnlyTool { tool, definition });
-        }
-
-        let mut runtime_progress = RuntimeProgress { sink: progress };
-        let history = [ChatMessage::user(request.input)];
-        let outcome = self
-            .llm
-            .execute_tool_session(
-                agent_runtime::ToolSessionRequest {
-                    model: &model,
-                    decision_system_prompt: &request.instructions,
-                    followup_system_prompt: &request.instructions,
-                    history: &history,
-                    tool_registry: &registry,
-                    tool_context: (),
-                    max_tool_calls: 8,
-                },
-                &mut runtime_progress,
-            )
-            .await
-            .map_err(|error| ModelError::Request {
-                reason: safe_failure_reason(&error),
-            })?;
-
-        let message = match outcome {
-            ToolSessionOutcome::Direct { message, .. }
-            | ToolSessionOutcome::ToolBacked { message, .. } => message,
+        let legs = self.legs(request.tier);
+        let mut call = Call::Tools {
+            tools: &tools,
+            progress,
         };
-        if message.trim().is_empty() {
-            return Err(ModelError::Request {
-                reason: "provider returned an empty tool-session answer".to_owned(),
-            });
-        }
-        Self::remember(&self.last_successful_model, &model);
-        Ok(DecisionAnswer {
-            value: json!({ "answer": message }),
-        })
+        route::run(&legs, &request, &mut call, &self.cooldowns, &self.telemetry).await
     }
 
     async fn answer(&self, request: DecisionRequest) -> Result<DecisionAnswer, ModelError> {
-        let candidates = self.tiers.chain(request.tier);
-        let mut failures: Vec<String> = Vec::new();
-
-        for (position, model) in candidates.iter().enumerate() {
-            Self::remember(&self.last_attempted_model, model);
-            let agent = InlineAgent {
-                instructions: request.instructions.clone(),
-                model: model.clone(),
-            };
-            let format =
-                ResponseFormat::new(request.format.name.clone(), request.format.schema.clone());
-
-            match self
-                .llm
-                .run_structured_with_format(&agent, request.input.clone(), format)
-                .await
-            {
-                Ok(value) => {
-                    Self::remember(&self.last_successful_model, model);
-                    if position > 0 {
-                        tracing::warn!(
-                            tier = %request.tier,
-                            model = %model,
-                            skipped = position,
-                            "model fallback served the decision"
-                        );
-                    }
-                    return Ok(DecisionAnswer { value });
-                }
-                Err(error) => {
-                    let reason = safe_failure_reason(&error);
-                    let last = position + 1 == candidates.len();
-                    if last || !worth_failing_over(&error) {
-                        failures.push(format!("{model}: {reason}"));
-                        break;
-                    }
-                    tracing::warn!(
-                        tier = %request.tier,
-                        model = %model,
-                        %reason,
-                        "model failed; trying the next fallback"
-                    );
-                    failures.push(format!("{model}: {reason}"));
-                }
-            }
-        }
-
-        Err(ModelError::Request {
-            reason: failures.join(" | "),
-        })
+        let legs = self.legs(request.tier);
+        route::run(
+            &legs,
+            &request,
+            &mut Call::Structured,
+            &self.cooldowns,
+            &self.telemetry,
+        )
+        .await
     }
 }
 
@@ -437,6 +511,7 @@ mod tests {
     use super::*;
     use crate::config::ConfigError;
     use crate::model::AnswerFormat;
+    use crate::model::cooldown::test_clock::ManualClock;
 
     #[derive(Default)]
     struct QueueClient {
@@ -922,5 +997,432 @@ mod tests {
             .await
             .expect_err("no fallback is configured for the fast tier");
         assert_eq!(models_requested(&mock), vec!["vendor/fast"]);
+    }
+
+    fn engine_with(
+        settings: &ModelSettings,
+        mock: &Arc<QueueClient>,
+    ) -> (AgentRuntimeEngine, CooldownRegistry, ManualClock) {
+        let clock = ManualClock::new();
+        let cooldowns = CooldownRegistry::with_clock(clock.clock());
+        let engine =
+            AgentRuntimeEngine::build_with_client(settings, Some(mock.clone() as SharedHttpClient))
+                .expect("engine builds")
+                .with_cooldowns(cooldowns.clone());
+        (engine, cooldowns, clock)
+    }
+
+    #[actix_web::test]
+    async fn a_cooled_primary_is_skipped_without_a_request_until_its_probe() {
+        let mock = Arc::new(QueueClient::default());
+        let (engine, cooldowns, clock) = engine_with(&settings_with_fallbacks(), &mock);
+        mock.push(
+            402,
+            json!({"error": {"message": "Insufficient credits"}}).to_string(),
+        );
+        mock.push(200, structured_response("bias", r#"{"bias":"bullish"}"#));
+        engine
+            .answer(request(ModelTier::Balanced))
+            .await
+            .expect("the fallback answers");
+
+        mock.push(200, structured_response("bias", r#"{"bias":"bearish"}"#));
+        engine
+            .answer(request(ModelTier::Balanced))
+            .await
+            .expect("answers");
+        assert_eq!(
+            models_requested(&mock),
+            ["vendor/balanced", "vendor/second", "vendor/second"],
+            "the cooled primary costs nothing on the next tick"
+        );
+        let entry = &cooldowns.snapshot()[0];
+        assert_eq!(
+            (entry.model.as_str(), entry.reason.as_str(), entry.failures),
+            ("vendor/balanced", "insufficient_credits", 1)
+        );
+
+        // After 30 minutes the primary is probed once; recovering clears it.
+        clock.advance(std::time::Duration::from_secs(30 * 60));
+        mock.push(200, structured_response("bias", r#"{"bias":"bullish"}"#));
+        engine
+            .answer(request(ModelTier::Balanced))
+            .await
+            .expect("the primary recovered");
+        assert_eq!(
+            models_requested(&mock).last().map(String::as_str),
+            Some("vendor/balanced")
+        );
+        assert!(cooldowns.is_empty());
+    }
+
+    // The live GLM outage: OpenRouter's account policy excludes the provider,
+    // which is a property of the model on this account, so it cools on the
+    // long schedule.
+    #[actix_web::test]
+    async fn an_excluded_provider_404_cools_on_the_rejection_schedule() {
+        let mock = Arc::new(QueueClient::default());
+        let (engine, cooldowns, clock) = engine_with(&settings(), &mock);
+        mock.push(
+            404,
+            json!({"message": "No allowed providers are available for the selected model. your account's allowed-providers setting permits only: meta, openai", "code": 404}).to_string(),
+        );
+        let error = engine
+            .answer(request(ModelTier::Fast))
+            .await
+            .expect_err("rejected");
+        assert_eq!(
+            error.to_string(),
+            "model request failed: vendor/fast: provider_rejected (404)"
+        );
+        assert!(
+            !error.to_string().contains("allowed"),
+            "no provider body crosses"
+        );
+        let entry = &cooldowns.snapshot()[0];
+        assert_eq!(entry.reason, "provider_rejected");
+        assert_eq!(
+            entry.until_ms,
+            crate::model::cooldown::epoch_millis(
+                clock.now() + std::time::Duration::from_secs(3_600)
+            )
+        );
+        engine
+            .preflight(ModelTier::Fast)
+            .expect_err("the only candidate is cooling");
+        engine
+            .preflight(ModelTier::Balanced)
+            .expect("another tier's candidate is open");
+    }
+
+    // The live MiMo failure: truncated tool-call arguments with the native
+    // tool-call markup leaked into the content. A real schema failure.
+    #[actix_web::test]
+    async fn truncated_tool_arguments_cool_on_the_invalid_response_schedule() {
+        let mock = Arc::new(QueueClient::default());
+        let (engine, cooldowns, _clock) = engine_with(&settings(), &mock);
+        // The runtime asks a malformed answer twice before giving up.
+        for _ in 0..2 {
+            mock.push(
+                200,
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": "<tool_call><function=bias><parameter=bias>bull",
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": { "name": "bias", "arguments": "{\"bias\":\"bull" }
+                            }]
+                        }
+                    }]
+                })
+                .to_string(),
+            );
+        }
+        let error = engine
+            .answer(request(ModelTier::Fast))
+            .await
+            .expect_err("unusable answer");
+        assert_eq!(
+            error.to_string(),
+            "model request failed: vendor/fast: invalid_response"
+        );
+        assert_eq!(cooldowns.snapshot()[0].reason, "invalid_response");
+    }
+
+    #[actix_web::test]
+    async fn an_exhausted_balance_names_its_source_without_the_body() {
+        let byok =
+            json!({"error": {"message": "Provider returned error", "code": 402, "metadata": {
+                "raw": "{\"error\":{\"message\":\"Insufficient Balance for account 12345\"}}",
+                "provider_name": "DeepSeek", "is_byok": true
+            }}})
+            .to_string();
+        let credits = json!({"error": {"message": "Insufficient credits. This account never purchased credits", "code": 402, "metadata": {
+            "limit_source": "openrouter_credits"
+        }}})
+        .to_string();
+        for (body, expected) in [
+            (byok, "insufficient_credits (DeepSeek balance, BYOK)"),
+            (credits, "insufficient_credits (OpenRouter credits)"),
+        ] {
+            let mock = Arc::new(QueueClient::default());
+            let (engine, cooldowns, _clock) = engine_with(&settings(), &mock);
+            mock.push(402, body);
+            let error = engine
+                .answer(request(ModelTier::Fast))
+                .await
+                .expect_err("no balance");
+            assert_eq!(
+                error.to_string(),
+                format!("model request failed: vendor/fast: {expected}")
+            );
+            assert!(!error.to_string().contains("12345"));
+            assert!(!error.to_string().contains("purchased"));
+            assert_eq!(cooldowns.snapshot()[0].reason, "insufficient_credits");
+        }
+
+        assert_eq!(credit_source("not json"), None);
+        assert_eq!(credit_source(r#"{"error":{"message":"plain"}}"#), None);
+        assert_eq!(
+            credit_source(r#"{"error":{"metadata":{"is_byok":true,"provider_name":"<script>"}}}"#)
+                .as_deref(),
+            Some("provider balance, BYOK"),
+            "a provider name that does not look like one is dropped"
+        );
+        assert_eq!(
+            credit_source(r#"{"error":{"metadata":{"limit_source":"key_limit"}}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_errors_classify_into_route_effects() {
+        use agent_runtime::ProviderError;
+        let wrap = |error: ProviderError| anyhow::Error::new(error).context("runtime context");
+        let limited = classify(&wrap(ProviderError::RateLimited {
+            provider: "openrouter".into(),
+            retry_after: Some(std::time::Duration::from_secs(42)),
+            body: "slow down".into(),
+        }));
+        assert_eq!(limited.reason, "rate_limited");
+        assert_eq!(
+            limited.class,
+            crate::model::route::FailureClass::Cooldown(CooldownFailure::rate_limited(Some(
+                std::time::Duration::from_secs(42)
+            )))
+        );
+        let transport = classify(&wrap(ProviderError::Transport {
+            provider: "openrouter".into(),
+            source: anyhow::anyhow!("connection reset"),
+        }));
+        assert_eq!(transport, AttemptError::transport("transport"));
+        for (error, reason, cooldown) in [
+            (
+                ProviderError::Overloaded {
+                    provider: "p".into(),
+                    body: String::new(),
+                },
+                "overloaded",
+                CooldownReason::Overloaded,
+            ),
+            (
+                ProviderError::Status {
+                    provider: "p".into(),
+                    status: 401,
+                    body: String::new(),
+                },
+                "provider_rejected (401)",
+                CooldownReason::Unauthorized,
+            ),
+            (
+                ProviderError::Status {
+                    provider: "p".into(),
+                    status: 502,
+                    body: String::new(),
+                },
+                "provider_rejected (502)",
+                CooldownReason::Overloaded,
+            ),
+            (
+                ProviderError::EmptyResponse {
+                    provider: "p".into(),
+                },
+                "empty_response",
+                CooldownReason::InvalidResponse,
+            ),
+        ] {
+            assert_eq!(
+                classify(&wrap(error)),
+                AttemptError::cooldown(reason, CooldownFailure::new(cooldown))
+            );
+        }
+    }
+
+    fn zai_settings() -> ModelSettings {
+        ModelSettings::from_source(|name| {
+            Ok(match name {
+                "VEYRA_MODEL_PROVIDER" => "z-ai",
+                "VEYRA_MODEL_API_KEY" => "test-key-12345678",
+                "VEYRA_MODEL_FAST" => "glm-5.3-flash",
+                "VEYRA_MODEL_BALANCED" | "VEYRA_MODEL_REASONING" => "glm-5.3",
+                "VEYRA_MODEL_FALLBACKS" => "glm-5.3-flash",
+                "VEYRA_MODEL_COMPEL_STRUCTURED" => "true",
+                _ => return Err(ConfigError::MissingEnvironmentVariable { name }),
+            }
+            .to_owned())
+        })
+        .expect("native Z.AI ids parse")
+        .expect("configured")
+    }
+
+    #[actix_web::test]
+    async fn zai_uses_its_endpoint_bearer_key_and_an_automatic_tool_choice() {
+        let mock = Arc::new(QueueClient::default());
+        let (engine, _cooldowns, _clock) = engine_with(&zai_settings(), &mock);
+        assert_eq!(
+            engine.llm.provider_kind(),
+            AgentProviderKind::Custom("zai".to_owned())
+        );
+        mock.push(500, "upstream down");
+        mock.push(200, structured_response("bias", r#"{"bias":"bullish"}"#));
+        let answer = engine
+            .answer(request(ModelTier::Balanced))
+            .await
+            .expect("the native fallback answers");
+        assert_eq!(answer.value["bias"], "bullish");
+        assert_eq!(
+            models_requested(&mock),
+            ["glm-5.3", "glm-5.3-flash"],
+            "a 500 is not retried by the runtime and fails over"
+        );
+
+        let requests = mock.requests.lock().expect("mock mutex");
+        let sent = requests.last().expect("a request");
+        assert_eq!(sent.url, "https://api.z.ai/api/paas/v4/chat/completions");
+        assert!(
+            sent.headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("authorization")
+                    && value == "Bearer test-key-12345678"),
+            "bearer key is sent"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&sent.body).expect("JSON body");
+        assert_eq!(
+            body["tool_choice"],
+            json!("auto"),
+            "compel is ignored for Z.AI"
+        );
+    }
+
+    #[actix_web::test]
+    async fn zai_honours_a_base_url_override() {
+        let settings = ModelSettings::from_source(|name| {
+            Ok(match name {
+                "VEYRA_MODEL_PROVIDER" => "zhipu",
+                "VEYRA_MODEL_API_KEY" => "test-key-12345678",
+                "VEYRA_MODEL_BASE_URL" => "https://open.bigmodel.cn/api/paas/v4",
+                "VEYRA_MODEL_FAST" | "VEYRA_MODEL_BALANCED" | "VEYRA_MODEL_REASONING" => "glm-5.3",
+                _ => return Err(ConfigError::MissingEnvironmentVariable { name }),
+            }
+            .to_owned())
+        })
+        .expect("parses")
+        .expect("configured");
+        let mock = Arc::new(QueueClient::default());
+        let (engine, _cooldowns, _clock) = engine_with(&settings, &mock);
+        mock.push(200, structured_response("bias", r#"{"bias":"bearish"}"#));
+        engine
+            .answer(request(ModelTier::Fast))
+            .await
+            .expect("answers");
+        let requests = mock.requests.lock().expect("mock mutex");
+        assert_eq!(
+            requests[0].url,
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+    }
+
+    #[derive(Default)]
+    struct Progress(usize);
+
+    #[async_trait]
+    impl ToolProgressSink for Progress {
+        async fn tool_started(&mut self, _id: &str, _name: &str, _arguments: &serde_json::Value) {
+            self.0 += 1;
+        }
+        async fn tool_completed(
+            &mut self,
+            _id: &str,
+            _name: &str,
+            _result: &serde_json::Value,
+            _available: bool,
+        ) {
+        }
+    }
+
+    struct Observe;
+
+    #[async_trait]
+    impl ReadOnlyTool for Observe {
+        fn definition(&self) -> ReadOnlyToolDefinition {
+            ReadOnlyToolDefinition {
+                name: "observe".to_owned(),
+                description: "Observe.".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({"ready": true}))
+        }
+    }
+
+    fn direct(content: &str) -> String {
+        json!({"choices": [{"message": {"content": content}}]}).to_string()
+    }
+
+    #[actix_web::test]
+    async fn tool_sessions_walk_the_chain_and_skip_cooled_candidates() {
+        let mock = Arc::new(QueueClient::default());
+        let (engine, cooldowns, _clock) = engine_with(&settings_with_fallbacks(), &mock);
+        let mut progress = Progress::default();
+        mock.push(
+            402,
+            json!({"error": {"message": "Insufficient credits"}}).to_string(),
+        );
+        mock.push(200, direct("Everything is ready."));
+        let answer = engine
+            .answer_with_tools(
+                request(ModelTier::Balanced),
+                vec![Arc::new(Observe)],
+                &mut progress,
+            )
+            .await
+            .expect("the fallback serves the session");
+        assert_eq!(answer.value["answer"], "Everything is ready.");
+        assert_eq!(
+            models_requested(&mock),
+            ["vendor/balanced", "vendor/second"]
+        );
+        assert_eq!(cooldowns.len(), 1);
+
+        mock.push(200, direct("   "));
+        mock.push(200, direct("The third candidate answers."));
+        let answer = engine
+            .answer_with_tools(
+                request(ModelTier::Balanced),
+                vec![Arc::new(Observe)],
+                &mut progress,
+            )
+            .await
+            .expect("an empty session answer fails over");
+        assert_eq!(answer.value["answer"], "The third candidate answers.");
+        assert_eq!(
+            models_requested(&mock),
+            [
+                "vendor/balanced",
+                "vendor/second",
+                "vendor/second",
+                "vendor/third"
+            ],
+            "the cooled primary was skipped; the empty answer cooled the second"
+        );
+        let reasons: Vec<String> = cooldowns
+            .snapshot()
+            .into_iter()
+            .map(|entry| format!("{}={}", entry.model, entry.reason))
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                "vendor/second=invalid_response",
+                "vendor/balanced=insufficient_credits"
+            ]
+        );
+        assert_eq!(progress.0, 0, "direct answers run no tools");
     }
 }

@@ -59,6 +59,14 @@ struct StatusResponse {
     /// difference between "nothing worth trading" and "nothing can be decided"
     /// is visible.
     decisions: serde_json::Value,
+    /// Every model candidate in force for the autopilot's tier (balanced
+    /// without an autopilot), in the order they are tried: the ChatGPT
+    /// subscription as `chatgpt:<model>` first while it is preferred and
+    /// connected, then the configured chain. Empty without a model.
+    model_route: Vec<String>,
+    /// Candidates held back by a cooldown, soonest retry first. An `untilMs`
+    /// in the past means a half-open probe is due on the next call.
+    model_cooldowns: Vec<crate::model::CooldownEntry>,
 }
 
 #[get("/health")]
@@ -189,6 +197,15 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         })
     });
     let model_provider = state.model().map(|runtime| runtime.provider().as_str());
+    let route_tier = state
+        .autopilot()
+        .map_or(crate::model::ModelTier::Balanced, |settings| {
+            settings.tier()
+        });
+    let model_route = state
+        .model()
+        .map(|runtime| runtime.route(route_tier))
+        .unwrap_or_default();
     let model_budget = state.model().map(|runtime| {
         let budget = runtime.budget();
         json!({
@@ -250,6 +267,8 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
                     .and_then(|runtime| runtime.last_successful_model()),
             })
         },
+        model_route,
+        model_cooldowns: state.model_cooldowns().snapshot(),
     })
 }
 

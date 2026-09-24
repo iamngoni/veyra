@@ -1,4 +1,7 @@
 @import "tailwindcss";
+/* Inter, self-hosted: the variable build with the optical-size axis, so large
+   figures get the tighter display cut and 11–13px text the open text cut. */
+@import "@fontsource-variable/inter/opsz.css";
 
 /* Area stylesheets, one owner each. Imports must precede every rule. */
 @import "./styles/layout.css";
@@ -8,237 +11,853 @@
 @import "./styles/rail.css";
 @import "./styles/tabs.css";
 
-/* Design tokens.
+/* ==========================================================================
+ * Design system
  *
- * A trading console is read under stress, often at a glance. Surfaces are
- * near-neutral and layered by a single hairline, colour is reserved for state
- * (green gains and healthy links, red losses and faults, amber for the active
- * view), and every number is tabular so columns hold still while values tick.
+ * A trading console is read under stress, often at a glance. The look is
+ * quiet and dense: one neutral ladder of surfaces, hairlines instead of
+ * boxes, three text tiers, a single indigo accent for focus and the primary
+ * action, and colour otherwise reserved for state. Every number is tabular
+ * so columns hold still while values tick.
  *
- * Both themes define the same names, so components never branch on theme: the
- * dark values live in @theme and the light ones override them under
- * [data-theme='light']. Semantic hues are not reused across themes — a green
- * that reads well on near-black is too light on white, so each theme carries
- * its own contrast-checked set.
- */
+ * Surfaces (darkest to lightest in dark; the light theme mirrors the order)
+ *   canvas       app frame and the flush sidebar
+ *   surface      the inset working area, 8px in from the frame, radius 10
+ *   panel        a raised card on the surface (radius 8, hairline border)
+ *   elevated     menus, tooltips, popovers (border + popover shadow)
+ *   fill         opaque step above panel: drill-downs, wells, skeletons
+ *   fill-strong  opaque step above fill: pressed chips, code
+ *   hover/active translucent fills for interactive states, valid on any
+ *                surface (sidebar, content, panel)
+ *   input        text field well
+ *
+ * Lines: translucent so one weight reads the same on every surface.
+ *   line-soft ~5%  rules between rows inside a panel
+ *   line      ~8%  panel and surface outlines, dividers
+ *   line-strong ~13% control outlines, emphasised rules
+ *
+ * Text tiers: ink (primary) · ink-muted (secondary, ~62%) · ink-faint
+ * (tertiary, ~48%, still ≥4.5:1 on panels). Accent text uses accent-text.
+ *
+ * Accent: indigo, one hue in both themes. accent fills the primary button,
+ * focus draws every focus ring, accent-soft tints selection.
+ * State: ok · warn · bad · info (+ *-dim tints) and idle for neutral dots.
+ * Each theme carries its own contrast-checked state set.
+ *
+ * Type (Inter): 11 micro/badges · 12 secondary, labels, table heads ·
+ * 13 base UI · 14 primary values · 15 section titles · 18 · 24 figures.
+ * Weights 400 / 510 / 590. Tracking tightens from 15px up.
+ *
+ * Radii 4 · 6 (controls) · 8 (panels, menus) · 10 (content surface) · full
+ * (chips, switches). Spacing on a 4px grid: 4 8 12 16 20 24 32.
+ * Controls: 24 compact · 28 default · 32 fields and prominent buttons.
+ * Motion: 120ms for colour, 160ms for movement, ease-out; none when the
+ * user asks for reduced motion.
+ *
+ * Legacy names stay as aliases so every area keeps working:
+ *   surface-0 → canvas, surface-1 → panel, surface-2 → fill,
+ *   surface-3 → fill-strong, toggle-line → toggle-track, muted → ink-faint.
+ * ======================================================================== */
+
 @theme {
-  /* Page, raised panel, hover/active fill, stronger fill. */
-  --color-surface-0: #101112;
-  --color-surface-1: #191a1c;
-  --color-surface-2: #222325;
-  --color-surface-3: #2b2d30;
-  /* Panel outline, in-panel row rule, structural divider. */
-  --color-line: #2b2d30;
-  --color-line-soft: #242629;
-  --color-line-strong: #393c40;
-
-  --color-ink: #ededee;
-  --color-ink-muted: #b2b4ba;
-  --color-ink-faint: #898d96;
-
-  --color-ok: #9acb91;
-  --color-ok-dim: #243522;
-  --color-warn: #ddbd7f;
-  --color-warn-dim: #302b22;
-  --color-bad: #e58b82;
-  --color-bad-dim: #3d2624;
-  --color-info: #a9c3d6;
-  --color-info-dim: #25323b;
-  --color-muted: #979ba1;
-  /* Neutral state dot (no trade, idle). */
-  --color-idle: #a5a8b3;
-
-  /* Chart furniture. */
-  --color-chart-grid: #25272a;
-  --color-chart-tag: #9acb91;
-  --color-chart-tag-ink: #11200b;
-
-  /* Toggle pill. */
-  --color-toggle-line: #45484d;
-  --color-toggle-knob: #9ea1aa;
-
   --font-sans:
-    "Avenir Next", "Avenir", "Helvetica Neue", ui-sans-serif, system-ui,
-    -apple-system, "Segoe UI", sans-serif;
+    "Inter Variable", "Inter", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", sans-serif;
   --font-mono:
     "JetBrains Mono", "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+/* Plain custom properties rather than @theme: Tailwind drops theme values
+   nothing references yet, and these must all exist for every area. */
 :root {
   color-scheme: dark;
-  --sidebar-width: 184px;
-  --topbar-height: 58px;
+
+  /* ---------- surfaces ---------- */
+  --color-canvas: #08090a;
+  --color-surface: #0f1012;
+  --color-panel: #151618;
+  --color-elevated: #1c1d20;
+  --color-fill: #1b1c1f;
+  --color-fill-strong: #242529;
+  --color-hover: rgb(255 255 255 / 0.045);
+  --color-active: rgb(255 255 255 / 0.08);
+  --color-input: #111214;
+
+  /* ---------- lines ---------- */
+  --color-line-soft: rgb(255 255 255 / 0.05);
+  --color-line: rgb(255 255 255 / 0.08);
+  --color-line-strong: rgb(255 255 255 / 0.13);
+
+  /* ---------- text ---------- */
+  --color-ink: #eeeff1;
+  --color-ink-muted: #9d9fa6;
+  --color-ink-faint: #7d7f87;
+  --color-ink-on-accent: #ffffff;
+
+  /* ---------- accent ---------- */
+  --color-accent: #5e6ad2;
+  --color-accent-hover: #6b77dd;
+  --color-accent-text: #8f97f0;
+  --color-accent-soft: rgb(94 106 210 / 0.28);
+  --color-focus: #6f7ae0;
+
+  /* ---------- state ---------- */
+  --color-ok: #4cb782;
+  --color-ok-dim: rgb(76 183 130 / 0.14);
+  --color-warn: #e2b04c;
+  --color-warn-dim: rgb(226 176 76 / 0.14);
+  --color-bad: #eb5757;
+  --color-bad-dim: rgb(235 87 87 / 0.14);
+  --color-info: #4ea7fc;
+  --color-info-dim: rgb(78 167 252 / 0.14);
+  /* Neutral state dot (no trade, idle). */
+  --color-idle: #8a8c93;
+
+  /* ---------- chart furniture ---------- */
+  --color-chart-grid: rgb(255 255 255 / 0.05);
+  --color-chart-tag: var(--color-ok);
+  --color-chart-tag-ink: #06140d;
+
+  /* ---------- switch ---------- */
+  --color-toggle-track: #2e3034;
+  --color-toggle-knob: #d6d7db;
+
+  /* ---------- depth ---------- */
+  --shadow-panel: none;
+  --shadow-popover: 0 0 0 1px rgb(0 0 0 / 0.2), 0 8px 24px rgb(0 0 0 / 0.45);
+  --color-scrollbar: rgb(255 255 255 / 0.1);
+  --color-scrollbar-hover: rgb(255 255 255 / 0.18);
+
+  /* ---------- aliases (older names used across the areas) ---------- */
+  --color-surface-0: var(--color-canvas);
+  --color-surface-1: var(--color-panel);
+  --color-surface-2: var(--color-fill);
+  --color-surface-3: var(--color-fill-strong);
+  --color-toggle-line: var(--color-toggle-track);
+  --color-muted: var(--color-ink-faint);
+
+  /* ---------- type ---------- */
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 15px;
+  --text-xl: 18px;
+  --text-2xl: 24px;
+  --weight-regular: 400;
+  --weight-medium: 510;
+  --weight-semibold: 590;
+  --tracking-tight: -0.011em;
+  --tracking-display: -0.022em;
+
+  /* ---------- shape and rhythm ---------- */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-full: 999px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --control-sm: 24px;
+  --control-md: 28px;
+  --control-lg: 32px;
+
+  /* ---------- motion ---------- */
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --duration-fast: 120ms;
+  --duration: 160ms;
+
+  /* ---------- frame ---------- */
+  --sidebar-width: 224px;
+  --frame-inset: 8px;
+  --header-height: 44px;
+  /* Content inset inside the working surface, and inside a panel. */
+  --main-inset: 20px;
+  --panel-inset: 16px;
+  /* Offset for overlays that start below fixed chrome (none on desktop). */
+  --topbar-height: 0px;
 }
 
-[data-theme="light"] {
+:root[data-theme="light"] {
   color-scheme: light;
 
-  --color-surface-0: #f4f5f7;
-  --color-surface-1: #fdfcfb;
-  --color-surface-2: #eef0f2;
-  --color-surface-3: #e5e8eb;
-  --color-line: #e0e3e7;
-  --color-line-soft: #eceef1;
-  --color-line-strong: #d3d7dc;
+  --color-canvas: #f2f2f4;
+  --color-surface: #fbfbfc;
+  --color-panel: #ffffff;
+  --color-elevated: #ffffff;
+  --color-fill: #f3f3f5;
+  --color-fill-strong: #e9e9ed;
+  --color-hover: rgb(17 18 24 / 0.04);
+  --color-active: rgb(17 18 24 / 0.075);
+  --color-input: #ffffff;
 
-  --color-ink: #15171a;
-  --color-ink-muted: #4f555c;
-  --color-ink-faint: #676e78;
+  --color-line-soft: rgb(17 18 24 / 0.06);
+  --color-line: rgb(17 18 24 / 0.09);
+  --color-line-strong: rgb(17 18 24 / 0.15);
+
+  --color-ink: #1b1c20;
+  --color-ink-muted: #5c5f67;
+  --color-ink-faint: #6f727a;
+
+  --color-accent: #5e6ad2;
+  --color-accent-hover: #5260c8;
+  --color-accent-text: #4f5bc4;
+  --color-accent-soft: rgb(94 106 210 / 0.18);
+  --color-focus: #5e6ad2;
 
   /* Darkened so state colour still carries on white. */
-  --color-ok: #2b7d3c;
-  --color-ok-dim: #e3f1e3;
-  --color-warn: #946400;
-  --color-warn-dim: #f6ecd0;
-  --color-bad: #b9392f;
-  --color-bad-dim: #f8e1de;
-  --color-info: #33617e;
-  --color-info-dim: #e1ecf3;
-  --color-muted: #737a82;
-  --color-idle: #9aa0a8;
+  --color-ok: #1a8454;
+  --color-ok-dim: rgb(26 132 84 / 0.1);
+  --color-warn: #9a6500;
+  --color-warn-dim: rgb(154 101 0 / 0.1);
+  --color-bad: #cc3a3a;
+  --color-bad-dim: rgb(204 58 58 / 0.09);
+  --color-info: #2a6fc4;
+  --color-info-dim: rgb(42 111 196 / 0.1);
+  --color-idle: #a0a2a8;
 
-  --color-chart-grid: #eceef1;
-  --color-chart-tag: #2b7d3c;
-  --color-chart-tag-ink: #fdfcfb;
+  --color-chart-grid: rgb(17 18 24 / 0.06);
+  --color-chart-tag-ink: #ffffff;
 
-  --color-toggle-line: #c9cdd3;
-  --color-toggle-knob: #a3a8af;
+  --color-toggle-track: #d9dadf;
+  --color-toggle-knob: #ffffff;
+
+  --shadow-panel: 0 1px 2px rgb(17 18 24 / 0.04);
+  --shadow-popover: 0 0 0 1px rgb(17 18 24 / 0.04), 0 8px 24px rgb(17 18 24 / 0.1), 0 2px 6px rgb(17 18 24 / 0.05);
+  --color-scrollbar: rgb(17 18 24 / 0.14);
+  --color-scrollbar-hover: rgb(17 18 24 / 0.24);
 }
 
-* {
-  box-sizing: border-box;
+/* Cascade: base resets and chrome, then the primitives, sit in layers, so an
+   area stylesheet overrides a primitive with a plain class selector however
+   the files are ordered. Tone and type utilities stay unlayered so they win
+   over an area's own colour. */
+
+@layer base {
+  /* ---------- base ---------- */
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body,
+  #app {
+    min-height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    font-optical-sizing: auto;
+    line-height: 1.5;
+    /* Numbers must not reflow as they tick. */
+    font-variant-numeric: tabular-nums;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+    color: inherit;
+    letter-spacing: inherit;
+  }
+
+  button {
+    cursor: pointer;
+    background: none;
+    border: 0;
+    padding: 0;
+  }
+
+  button:disabled {
+    cursor: default;
+  }
+
+  /* ---------- chrome shared by every area ---------- */
+
+  * {
+    scrollbar-color: var(--color-scrollbar) transparent;
+    scrollbar-width: thin;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    border: 3px solid transparent;
+    border-radius: var(--radius-full);
+    background: var(--color-scrollbar) padding-box;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-scrollbar-hover);
+  }
+
+  ::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  /* One ring everywhere: 2px in the focus colour, following the control's own
+     radius, visible only for keyboard focus. */
+  :focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+
+  button,
+  a,
+  select,
+  input,
+  textarea {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button,
+  a {
+    transition:
+      color var(--duration-fast) var(--ease-out),
+      background-color var(--duration-fast) var(--ease-out),
+      border-color var(--duration-fast) var(--ease-out),
+      box-shadow var(--duration-fast) var(--ease-out),
+      opacity var(--duration-fast) var(--ease-out);
+  }
+
+  button:disabled {
+    opacity: 0.55;
+  }
+
+  ::selection {
+    background: var(--color-accent-soft);
+    color: var(--color-ink);
+  }
 }
 
-html,
-body,
-#app {
-  min-height: 100%;
+@layer components {
+  /* ---------- shared primitives (see components/ui.tsx) ---------- */
+
+  .panel {
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    flex-direction: column;
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-md);
+    background: var(--color-panel);
+    box-shadow: var(--shadow-panel);
+  }
+
+  .panel-head {
+    display: flex;
+    min-height: 40px;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: 10px var(--panel-inset);
+  }
+
+  .panel-head.is-divided {
+    margin: 0 var(--panel-inset);
+    padding: 10px 0;
+    border-bottom: 1px solid var(--color-line-soft);
+  }
+
+  .panel-title {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: var(--space-2);
+    margin: 0;
+    color: var(--color-ink);
+    font-size: var(--text-base);
+    font-weight: var(--weight-semibold);
+    letter-spacing: -0.003em;
+    line-height: 20px;
+  }
+
+  /* A quiet count chip. The element's text is " (3)" for assistive
+     technology; the chip draws only the number, from data-count. */
+  .panel-count {
+    display: inline-flex;
+    min-width: 18px;
+    height: 18px;
+    align-items: center;
+    justify-content: center;
+    padding: 0 5px;
+    border-radius: var(--radius-full);
+    background: var(--color-active);
+    color: var(--color-ink-muted);
+    font-size: 0;
+    line-height: 1;
+  }
+
+  .panel-count::after {
+    content: attr(data-count) / "";
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+  }
+
+  .panel-actions {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--color-ink-muted);
+    font-size: var(--text-sm);
+  }
+
+  .panel-body {
+    min-width: 0;
+    min-height: 0;
+    flex: 1;
+  }
+
+  .panel-link {
+    display: inline-flex;
+    height: var(--control-sm);
+    align-items: center;
+    margin-right: -6px;
+    padding: 0 6px;
+    border-radius: var(--radius-sm);
+    color: var(--color-ink-muted);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+
+  .panel-link:hover {
+    background: var(--color-hover);
+    color: var(--color-ink);
+  }
+
+  .panel-empty {
+    padding: var(--panel-inset);
+    color: var(--color-ink-faint);
+    font-size: var(--text-base);
+  }
+
+  .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--color-idle);
+  }
+
+  .dot.is-ok { background: var(--color-ok); }
+  .dot.is-warn { background: var(--color-warn); }
+  .dot.is-bad { background: var(--color-bad); }
+  .dot.is-idle { background: var(--color-idle); }
+  .dot.is-off { background: var(--color-line-strong); }
+
+  /* Segmented range / timeframe control: pill chips, the chosen one filled. */
+  .segmented {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0;
+  }
+
+  .segmented button {
+    display: inline-flex;
+    min-width: 34px;
+    height: 26px;
+    align-items: center;
+    justify-content: center;
+    padding: 0 10px;
+    border-radius: var(--radius-full);
+    color: var(--color-ink-muted);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .segmented button:hover {
+    background: var(--color-hover);
+    color: var(--color-ink);
+  }
+
+  .segmented button[aria-pressed="true"] {
+    background: var(--color-active);
+    color: var(--color-ink);
+    box-shadow: inset 0 0 0 1px var(--color-line);
+  }
+
+  /* Switch: the track fills with the tone while on; the knob says which side. */
+  .toggle {
+    position: relative;
+    display: inline-flex;
+    width: 32px;
+    height: 18px;
+    flex: 0 0 auto;
+    align-items: center;
+    border-radius: var(--radius-full);
+    background: var(--color-toggle-track);
+    color: var(--color-ink-muted);
+    transition: background-color var(--duration) var(--ease-out);
+  }
+
+  /* A comfortable hit area without a larger visual. */
+  .toggle::after {
+    position: absolute;
+    inset: -8px -6px;
+    content: "";
+  }
+
+  .toggle-knob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--color-toggle-knob);
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+    transition: transform var(--duration) var(--ease-out), background-color var(--duration-fast) ease;
+  }
+
+  .toggle:hover:not(:disabled) {
+    filter: brightness(1.08);
+  }
+
+  .toggle[aria-checked="true"] {
+    background: currentColor;
+  }
+
+  .toggle[aria-checked="true"] .toggle-knob {
+    transform: translateX(14px);
+    background: #fff;
+  }
+
+  .toggle.is-bad[aria-checked="true"] { color: var(--color-bad); }
+  .toggle.is-warn[aria-checked="true"] { color: var(--color-warn); }
+  .toggle.is-ok[aria-checked="true"] { color: var(--color-ok); }
+
+  .toggle:disabled {
+    opacity: 0.45;
+  }
+
+  .icon {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.75;
+  }
+
+  .icon-button {
+    display: inline-flex;
+    width: var(--control-md);
+    height: var(--control-md);
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    color: var(--color-ink-muted);
+  }
+
+  .icon-button:hover {
+    background: var(--color-hover);
+    color: var(--color-ink);
+  }
+
+  /* Info mark with a styled tooltip (see Hint in components/ui.tsx). */
+  .hint {
+    position: relative;
+    display: inline-flex;
+    vertical-align: middle;
+  }
+
+  .hint-mark {
+    display: inline-flex;
+    border-radius: 50%;
+    color: var(--color-ink-faint);
+  }
+
+  .hint-mark:hover,
+  .hint-mark:focus-visible {
+    color: var(--color-ink);
+  }
+
+  @keyframes veyra-tip-in {
+    from {
+      opacity: 0;
+      transform: translateY(2px);
+    }
+  }
+
+  .hint-tip {
+    position: absolute;
+    z-index: 40;
+    bottom: calc(100% + 6px);
+    left: var(--tip-x, -10px);
+    width: max-content;
+    max-width: min(280px, calc(100vw - 48px));
+    padding: 6px 9px;
+    border: 1px solid var(--color-line-strong);
+    border-radius: var(--radius-sm);
+    background: var(--color-elevated);
+    box-shadow: var(--shadow-popover);
+    color: var(--color-ink);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-regular);
+    line-height: 1.45;
+    letter-spacing: 0;
+    text-transform: none;
+    white-space: normal;
+    pointer-events: none;
+    /* Out of layout until shown: a hidden tip must not widen the page. */
+    display: none;
+  }
+
+  .hint:hover .hint-tip,
+  .hint-mark:focus-visible + .hint-tip {
+    display: block;
+    animation: veyra-tip-in var(--duration-fast) var(--ease-out);
+  }
+
+  /* Placed by Hint as it opens: --tip-x keeps it inside the window, and
+     near the top it opens below the mark. */
+  .hint.is-below .hint-tip {
+    top: calc(100% + 6px);
+    bottom: auto;
+  }
+
+  /* Placeholder shown while a poll has not answered yet. Motion is slow on
+     purpose: a fast shimmer on a trading surface reads as activity. */
+  @keyframes veyra-pulse {
+    0%,
+    100% {
+      opacity: 0.5;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+
+  .skeleton {
+    display: inline-block;
+    background: var(--color-active);
+    border-radius: var(--radius-xs);
+    animation: veyra-pulse 2s ease-in-out infinite;
+  }
+
+  /* ---------- forms (see components/form.tsx) ---------- */
+
+  /* Secondary button; `.is-ok` is the one primary action that commits. */
+  .tab-button {
+    display: inline-flex;
+    height: var(--control-md);
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 0 12px;
+    border: 1px solid var(--color-line-strong);
+    border-radius: var(--radius-sm);
+    background: var(--color-panel);
+    box-shadow: var(--shadow-panel);
+    color: var(--color-ink);
+    font-size: var(--text-base);
+    font-weight: var(--weight-medium);
+    white-space: nowrap;
+  }
+
+  .tab-button:hover:not(:disabled) {
+    background: var(--color-fill);
+  }
+
+  .tab-button.is-ok {
+    border-color: transparent;
+    background: var(--color-accent);
+    color: var(--color-ink-on-accent);
+  }
+
+  .tab-button.is-ok:hover:not(:disabled) {
+    background: var(--color-accent-hover);
+  }
+
+  .tab-button:disabled {
+    opacity: 0.45;
+  }
+
+  .tab-link {
+    color: var(--color-ink-muted);
+    font-size: var(--text-base);
+    text-decoration: underline;
+    text-decoration-color: var(--color-line-strong);
+    text-underline-offset: 3px;
+  }
+
+  .tab-link:hover:not(:disabled) {
+    color: var(--color-ink);
+    text-decoration-color: currentColor;
+  }
+
+  .tab-control {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .tab-control.is-span {
+    grid-column: span 2;
+  }
+
+  .tab-control-head {
+    display: flex;
+    min-width: 0;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-3);
+    color: var(--color-ink-muted);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+
+  /* The label and its info mark stay together on the left; a long label
+     shortens rather than pushing the mark or the aside onto another line. */
+  .tab-control-label {
+    display: inline-flex;
+    min-width: 0;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .tab-control-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tab-control-label .hint {
+    flex: 0 0 auto;
+  }
+
+  .tab-control-aside {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: baseline;
+    gap: 10px;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-regular);
+  }
+
+  .tab-input {
+    width: 100%;
+    height: var(--control-lg);
+    padding: 0 10px;
+    border: 1px solid var(--color-line-strong);
+    border-radius: var(--radius-sm);
+    background: var(--color-input);
+    color: var(--color-ink);
+    font-size: var(--text-base);
+    transition: border-color var(--duration-fast) ease, box-shadow var(--duration-fast) ease;
+  }
+
+  .tab-input::placeholder {
+    color: var(--color-ink-faint);
+  }
+
+  .tab-input:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--color-ink) 22%, transparent);
+  }
+
+  /* Fields show focus in the border itself, in the ring colour, 2px in all. */
+  .tab-input:focus-visible {
+    border-color: var(--color-focus);
+    outline: 1px solid var(--color-focus);
+    outline-offset: 0;
+  }
+
+  .tab-input.is-dirty {
+    border-color: var(--color-warn);
+  }
+
+  .tab-input:disabled {
+    opacity: 0.55;
+  }
+
+  .tab-select {
+    position: relative;
+    display: block;
+  }
+
+  .tab-select select {
+    appearance: none;
+    padding-right: 30px;
+    cursor: pointer;
+  }
+
+  .tab-select .icon {
+    position: absolute;
+    top: 50%;
+    right: 9px;
+    color: var(--color-ink-muted);
+    pointer-events: none;
+    transform: translateY(-50%);
+  }
+
+  .skip-link {
+    position: fixed;
+    z-index: 100;
+    top: var(--space-2);
+    left: var(--space-3);
+    padding: 6px 12px;
+    border: 1px solid var(--color-line-strong);
+    border-radius: var(--radius-sm);
+    background: var(--color-elevated);
+    color: var(--color-ink);
+    font-weight: var(--weight-medium);
+    text-decoration: none;
+    transform: translateY(-160%);
+  }
+
+  /* The shadow only once shown: parked above the window it would still cast
+     into the top edge. */
+  .skip-link:focus {
+    box-shadow: var(--shadow-popover);
+    transform: translateY(0);
+  }
+
+
+  @media (max-width: 660px) {
+    /* 16px keeps iOS from zooming the page when a field takes focus. */
+    .tab-input {
+      font-size: 16px;
+    }
+
+    .tab-control.is-span {
+      grid-column: auto;
+    }
+  }
 }
 
-body {
-  margin: 0;
-  background: var(--color-surface-0);
-  color: var(--color-ink);
-  font-family: var(--font-sans);
-  font-size: 13px;
-  line-height: 1.5;
-  /* Numbers must not reflow as they tick. */
-  font-variant-numeric: tabular-nums;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-button,
-input,
-select {
-  font: inherit;
-  color: inherit;
-}
-
-button {
-  cursor: pointer;
-  background: none;
-  border: 0;
-  padding: 0;
-}
-
-button:disabled {
-  cursor: default;
-}
-
-/* ---------- shared primitives (see components/ui.tsx) ---------- */
-
-.panel {
-  display: flex;
-  min-width: 0;
-  min-height: 0;
-  flex-direction: column;
-  border: 1px solid var(--color-line);
-  border-radius: 8px;
-  background: var(--color-surface-1);
-}
-
-.panel-head {
-  display: flex;
-  min-height: 48px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 14px 18px 12px;
-}
-
-.panel-head.is-divided {
-  margin: 0 16px;
-  padding: 14px 2px 12px;
-  border-bottom: 1px solid var(--color-line);
-}
-
-.panel-title {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin: 0;
-  color: var(--color-ink);
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  line-height: 1.2;
-}
-
-.panel-count {
-  color: var(--color-ink-muted);
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: var(--color-surface-2);
-  font-size: 11px;
-  font-weight: 500;
-}
-
-.panel-actions {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 12px;
-  color: var(--color-ink-muted);
-  font-size: 13px;
-}
-
-.panel-body {
-  min-width: 0;
-  min-height: 0;
-  flex: 1;
-}
-
-.panel-link {
-  color: var(--color-ink-muted);
-  font-size: 13px;
-}
-
-.panel-link:hover {
-  color: var(--color-ink);
-}
-
-.panel-empty {
-  padding: 18px;
-  color: var(--color-ink-faint);
-  font-size: 13px;
-}
-
-.dot {
-  display: inline-block;
-  width: 9px;
-  height: 9px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--color-idle);
-}
-
-.dot.is-ok { background: var(--color-ok); }
-.dot.is-warn { background: var(--color-warn); }
-.dot.is-bad { background: var(--color-bad); }
-.dot.is-idle { background: var(--color-idle); }
-.dot.is-off { background: var(--color-line-strong); }
+/* ---------- utilities (unlayered: they override area colours) ---------- */
 
 .tone-ok { color: var(--color-ok); }
 .tone-warn { color: var(--color-warn); }
@@ -246,171 +865,11 @@ button:disabled {
 .tone-muted { color: var(--color-ink-muted); }
 .tone-faint { color: var(--color-ink-faint); }
 
-/* Segmented range / timeframe control. */
-.segmented {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 3px;
-  border: 1px solid var(--color-line-soft);
-  border-radius: 6px;
-  background: var(--color-surface-0);
-}
-
-.segmented button {
-  min-width: 36px;
-  min-height: 26px;
-  padding: 4px 8px;
-  border-radius: 4px;
-  color: var(--color-ink-muted);
-  font-size: 13px;
-  line-height: 1;
-}
-
-.segmented button:hover {
-  color: var(--color-ink);
-}
-
-.segmented button[aria-pressed="true"] {
-  background: var(--color-surface-3);
-  color: var(--color-ink);
-  box-shadow: 0 1px 3px rgb(0 0 0 / 0.12);
-}
-
-/* Toggle pill: knob plus an explicit ON / OFF word. */
-.toggle {
-  position: relative;
-  display: inline-flex;
-  width: 64px;
-  height: 26px;
-  flex: 0 0 auto;
-  align-items: center;
-  border: 1px solid var(--color-toggle-line);
-  border-radius: 999px;
-  background: var(--color-surface-1);
-  color: var(--color-ink-muted);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  transition: border-color 120ms ease, background-color 120ms ease;
-}
-
-.toggle-knob {
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background: var(--color-toggle-knob);
-  transition: transform 140ms ease, background-color 120ms ease;
-}
-
-.toggle-word {
-  position: absolute;
-  right: 10px;
-}
-
-.toggle[aria-checked="true"] {
-  border-color: currentColor;
-}
-
-.toggle[aria-checked="true"] .toggle-knob {
-  transform: translateX(38px);
-  background: currentColor;
-}
-
-.toggle[aria-checked="true"] .toggle-word {
-  right: auto;
-  left: 10px;
-}
-
-.toggle.is-bad[aria-checked="true"] { color: var(--color-bad); }
-.toggle.is-warn[aria-checked="true"] { color: var(--color-warn); }
-.toggle.is-ok[aria-checked="true"] { color: var(--color-ok); }
-
-.toggle:disabled {
-  opacity: 0.45;
-}
-
-.icon {
-  width: 20px;
-  height: 20px;
-  flex: 0 0 auto;
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 1.5;
-}
-
-.icon-button {
-  display: inline-flex;
-  width: 36px;
-  height: 36px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 6px;
-  color: var(--color-ink-muted);
-}
-
-.icon-button:hover {
-  background: var(--color-surface-2);
-  color: var(--color-ink);
-}
-
-/* Info mark with a styled tooltip (see Hint in components/ui.tsx). */
-.hint {
-  position: relative;
-  display: inline-flex;
-  vertical-align: middle;
-}
-
-.hint-mark {
-  display: inline-flex;
-  border-radius: 50%;
-  color: var(--color-ink-faint);
-}
-
-.hint-mark:hover,
-.hint-mark:focus-visible {
-  color: var(--color-ink);
-}
-
-.hint-tip {
-  position: absolute;
-  z-index: 40;
-  bottom: calc(100% + 8px);
-  left: -10px;
-  width: max-content;
-  max-width: min(280px, calc(100vw - 48px));
-  padding: 8px 11px;
-  border: 1px solid var(--color-line-strong);
-  border-radius: 6px;
-  background: var(--color-surface-1);
-  box-shadow: 0 6px 20px rgb(0 0 0 / 0.22);
-  color: var(--color-ink);
-  font-size: 13px;
-  font-weight: 400;
-  line-height: 1.45;
-  letter-spacing: 0;
-  text-transform: none;
-  white-space: normal;
-  pointer-events: none;
-  /* Out of layout until shown: a hidden tip must not widen the page. */
-  display: none;
-}
-
-.hint:hover .hint-tip,
-.hint-mark:focus-visible + .hint-tip {
-  display: block;
-}
-
 /* A quiet caption voice for field labels. */
 .label {
   color: var(--color-ink-muted);
-  font-size: 13px;
-  font-weight: 400;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
 }
 
 /* Live values: tabular so a changing digit never shifts layout. */
@@ -422,23 +881,12 @@ button:disabled {
   font-family: var(--font-mono);
 }
 
-/* Placeholder shown while a poll has not answered yet. Motion is slow on
-   purpose: a fast shimmer on a trading surface reads as activity. */
-@keyframes veyra-pulse {
-  0%,
-  100% {
-    opacity: 0.35;
-  }
-  50% {
-    opacity: 0.7;
-  }
-}
-
-.skeleton {
-  display: inline-block;
-  background: var(--color-surface-3);
-  border-radius: 4px;
-  animation: veyra-pulse 2s ease-in-out infinite;
+@media (pointer: coarse) {
+  .icon-button { width: 44px; height: 44px; }
+  .segmented button { height: 36px; min-width: 40px; }
+  .tab-button { height: 36px; }
+  .tab-input { height: 40px; }
+  .chart-menu-item { min-height: 44px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -453,55 +901,4 @@ button:disabled {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
-}
-
-::-webkit-scrollbar {
-  width: 9px;
-  height: 9px;
-}
-
-::-webkit-scrollbar-thumb {
-  background: var(--color-line-strong);
-  border-radius: 5px;
-}
-
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-/* Keyboard users must be able to see the control they are about to trip. */
-:focus-visible {
-  outline: 2px solid var(--color-info);
-  outline-offset: 2px;
-  border-radius: 4px;
-}
-
-/* Fast, restrained feedback shared by keyboard and pointer controls. */
-button, a, select, input, textarea {
-  -webkit-tap-highlight-color: transparent;
-}
-button, a {
-  transition: color 140ms var(--ease-out), background-color 140ms var(--ease-out), border-color 140ms var(--ease-out);
-}
-button:disabled { opacity: 0.55; }
-button:not(:disabled):active { filter: brightness(0.94); }
-::selection { background: var(--color-warn-dim); color: var(--color-ink); }
-.skip-link {
-  position: fixed;
-  z-index: 100;
-  top: 8px;
-  left: 12px;
-  padding: 8px 14px;
-  border: 1px solid var(--color-line-strong);
-  border-radius: 6px;
-  background: var(--color-surface-1);
-  color: var(--color-ink);
-  text-decoration: none;
-  transform: translateY(-160%);
-}
-.skip-link:focus { transform: translateY(0); }
-@media (pointer: coarse) {
-  .icon-button { width: 44px; height: 44px; }
-  .segmented button { min-height: 36px; min-width: 40px; }
-  .chart-menu-item { min-height: 44px; }
 }

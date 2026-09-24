@@ -3,6 +3,9 @@ import { TanStackRouterDevtoolsPanel } from '@tanstack/react-router-devtools'
 import { TanStackDevtools } from '@tanstack/react-devtools'
 
 import appCss from '../styles.css?url'
+// The Latin cut of the self-hosted Inter (see styles.css), preloaded so the
+// first paint is already set in it rather than swapping from a fallback.
+import interLatin from '@fontsource-variable/inter/files/inter-latin-opsz-normal.woff2?url'
 
 export const Route = createRootRoute({
   head: () => ({
@@ -23,6 +26,13 @@ export const Route = createRootRoute({
         rel: 'icon',
         type: 'image/svg+xml',
         href: '/favicon.svg',
+      },
+      {
+        rel: 'preload',
+        href: interLatin,
+        as: 'font',
+        type: 'font/woff2',
+        crossOrigin: 'anonymous',
       },
       {
         rel: 'stylesheet',

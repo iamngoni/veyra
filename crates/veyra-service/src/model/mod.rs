@@ -6,14 +6,27 @@
 //! (`VEYRA_MODEL_PROVIDER`) and constructed once at startup by
 //! [`ModelRuntime`]. Adding a provider (or Jev) means adding an implementation
 //! plus a selector; callers do not change.
+//!
+//! When a ChatGPT subscription is connected and
+//! `VEYRA_MODEL_PREFER_SUBSCRIPTION` is on, the runtime routes every call to
+//! the subscription first and falls back to the configured provider's chain.
+//! Every candidate on every route is subject to the shared per-model
+//! cooldowns in [`cooldown`]; the call budget wraps the whole route once.
 
 pub mod agent_runtime_engine;
 pub mod budget;
+pub mod cooldown;
+mod preferred;
+pub(crate) mod route;
 pub mod settings;
 pub mod subscription_engine;
 
 pub use agent_runtime_engine::AgentRuntimeEngine;
 pub use budget::{BudgetPolicy, BudgetSnapshot, BudgetTracker, BudgetedEngine};
+pub use cooldown::{
+    Admission, AttemptTicket, CooldownClock, CooldownEntry, CooldownFailure, CooldownReason,
+    CooldownRegistry, Cooling,
+};
 pub use settings::{ApiKey, ModelSettings, TierModels};
 pub use subscription_engine::SubscriptionEngine;
 
@@ -22,6 +35,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+
+use crate::subscription_auth::{SubscriptionAuthState, SubscriptionProvider};
+use preferred::{PreferredEngine, SubscriptionGate};
+
+/// Operator-facing label for a candidate served by the ChatGPT subscription,
+/// so status output can tell it apart from an API model of the same name.
+pub fn chatgpt_label(model: &str) -> String {
+    format!("chatgpt:{model}")
+}
 
 /// Capability tier a caller asks for; configuration resolves it to a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +106,9 @@ pub enum ModelProvider {
     Mistral,
     /// Moonshot/Kimi's OpenAI-compatible API.
     Kimi,
+    /// Z.AI (Zhipu GLM) OpenAI-compatible API. Accepts only an automatic
+    /// tool choice, so structured answers are never compelled.
+    Zai,
     /// A local Ollama OpenAI-compatible API. Its API key is optional.
     Ollama,
     /// One explicitly configured OpenAI-compatible endpoint.
@@ -104,6 +129,7 @@ impl ModelProvider {
             Self::Xai => "xai",
             Self::Mistral => "mistral",
             Self::Kimi => "kimi",
+            Self::Zai => "zai",
             Self::Ollama => "ollama",
             Self::Custom => "custom",
         }
@@ -122,6 +148,7 @@ impl ModelProvider {
             "xai" | "grok" => Some(Self::Xai),
             "mistral" => Some(Self::Mistral),
             "kimi" | "moonshot" => Some(Self::Kimi),
+            "zai" | "z-ai" | "zhipu" => Some(Self::Zai),
             "ollama" => Some(Self::Ollama),
             "custom" | "openai-compatible" | "openai_compatible" => Some(Self::Custom),
             _ => None,
@@ -238,6 +265,20 @@ pub trait DecisionEngine: Send + Sync + fmt::Debug + 'static {
         None
     }
 
+    /// Refuses a request before any cost is incurred when no candidate could
+    /// serve `tier` right now — every one is cooling down.
+    ///
+    /// Callers that meter cost (the call budget) check this first, so an
+    /// all-cooled route neither sends a request nor spends budget. The default
+    /// admits everything.
+    ///
+    /// # Errors
+    /// Returns [`ModelError::Request`] naming the soonest retry time.
+    fn preflight(&self, tier: ModelTier) -> Result<(), ModelError> {
+        let _ = tier;
+        Ok(())
+    }
+
     /// Runs one structured request and returns the parsed answer.
     ///
     /// # Errors
@@ -273,11 +314,38 @@ pub struct ModelRuntime {
     /// which is the difference between "the decision failed" and "the decision
     /// failed on every model configured for it".
     tiers: TierModels,
+    /// Settings this runtime was built from; absent for injected test engines.
+    settings: Option<ModelSettings>,
+    /// The ChatGPT subscription leg in front of the configured chain, when the
+    /// composite was built.
+    preferred: Option<PreferredLeg>,
+    /// ChatGPT connection state observed at build time, recorded only when the
+    /// subscription preference applies. A difference from the live state means
+    /// the route is stale and must be rebuilt.
+    chatgpt_connected_at_build: Option<bool>,
+}
+
+/// The preferred subscription leg as the runtime reports it.
+#[derive(Debug, Clone)]
+struct PreferredLeg {
+    model: String,
+    gate: SubscriptionGate,
+}
+
+/// Route facts decided while building, beyond the engine itself.
+#[derive(Debug, Default)]
+struct RouteShape {
+    preferred: Option<PreferredLeg>,
+    chatgpt_connected_at_build: Option<bool>,
 }
 
 impl ModelRuntime {
     /// Builds the implementation selected by settings, wrapped in the call
     /// budget so a runaway loop cannot silently multiply provider cost.
+    ///
+    /// Without the application state there is no subscription connection to
+    /// prefer and no shared cooldown registry, so this builds the configured
+    /// API chain with a private registry.
     ///
     /// # Errors
     /// Returns [`ModelError::Construction`] when the provider rejects its
@@ -292,27 +360,92 @@ impl ModelRuntime {
             });
         }
         let engine = AgentRuntimeEngine::build(&settings)?;
-        Ok(Self::wrap_engine(&settings, Arc::new(engine)))
+        Ok(Self::wrap_engine(
+            settings,
+            Arc::new(engine),
+            RouteShape::default(),
+        ))
     }
 
     /// Builds an API or connected subscription provider from the same narrow
     /// decision contract, preserving the call budget for both transports.
+    ///
+    /// For an API provider with `VEYRA_MODEL_PREFER_SUBSCRIPTION` on and the
+    /// ChatGPT subscription connected, the engine is the subscription-first
+    /// composite. A subscription leg that cannot be built (for example without
+    /// encrypted storage) is logged and left out rather than disabling the
+    /// configured provider. The Claude Code provider is built exactly as
+    /// configured and never joins a composite.
+    ///
+    /// # Errors
+    /// Returns [`ModelError::Construction`] when the configured provider
+    /// rejects its configuration or a selected subscription is not connected.
     pub fn from_settings_with_app(
         settings: ModelSettings,
         app: &crate::AppState,
     ) -> Result<Self, ModelError> {
-        let engine: Arc<dyn DecisionEngine> = if matches!(
+        if matches!(
             settings.provider(),
             ModelProvider::Codex | ModelProvider::ClaudeCode
         ) {
-            Arc::new(SubscriptionEngine::build(&settings, app)?)
-        } else {
-            Arc::new(AgentRuntimeEngine::build(&settings)?)
+            let engine = Arc::new(SubscriptionEngine::build(&settings, app)?);
+            return Ok(Self::wrap_engine(settings, engine, RouteShape::default()));
+        }
+
+        let api = Arc::new(
+            AgentRuntimeEngine::build(&settings)?.with_cooldowns(app.model_cooldowns().clone()),
+        );
+        if !settings.prefer_subscription() {
+            return Ok(Self::wrap_engine(settings, api, RouteShape::default()));
+        }
+        let connected = app
+            .subscription_auth()
+            .connected(SubscriptionProvider::Codex);
+        let mut shape = RouteShape {
+            preferred: None,
+            chatgpt_connected_at_build: Some(connected),
         };
-        Ok(Self::wrap_engine(&settings, engine))
+        if !connected {
+            return Ok(Self::wrap_engine(settings, api, shape));
+        }
+        let subscription = match SubscriptionEngine::build_chatgpt(settings.chatgpt_model(), app) {
+            Ok(subscription) => Arc::new(subscription),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    provider = settings.provider().as_str(),
+                    "ChatGPT subscription is connected but cannot be used; continuing with the configured provider"
+                );
+                return Ok(Self::wrap_engine(settings, api, shape));
+            }
+        };
+        let gate = SubscriptionGate::chatgpt(app.subscription_auth().clone());
+        let composite = PreferredEngine::new(
+            subscription,
+            settings.chatgpt_model(),
+            gate.clone(),
+            api,
+            settings.tiers().clone(),
+            app.model_cooldowns().clone(),
+        );
+        shape.preferred = Some(PreferredLeg {
+            model: settings.chatgpt_model().to_owned(),
+            gate,
+        });
+        tracing::info!(
+            model = %chatgpt_label(settings.chatgpt_model()),
+            fallback_provider = settings.provider().as_str(),
+            "ChatGPT subscription is the preferred model route"
+        );
+        Ok(Self::wrap_engine(settings, Arc::new(composite), shape))
     }
 
-    fn wrap_engine(settings: &ModelSettings, engine: Arc<dyn DecisionEngine>) -> Self {
+    /// Wraps the route in the call budget exactly once.
+    fn wrap_engine(
+        settings: ModelSettings,
+        engine: Arc<dyn DecisionEngine>,
+        shape: RouteShape,
+    ) -> Self {
         let budget = Arc::new(BudgetTracker::new(*settings.budget()));
         let engine = Arc::new(BudgetedEngine::new(engine, budget.clone()));
         Self {
@@ -320,6 +453,9 @@ impl ModelRuntime {
             engine,
             budget,
             tiers: settings.tiers().clone(),
+            preferred: shape.preferred,
+            chatgpt_connected_at_build: shape.chatgpt_connected_at_build,
+            settings: Some(settings),
         }
     }
 
@@ -362,6 +498,65 @@ impl ModelRuntime {
         self.tiers.chain(tier)
     }
 
+    /// Every candidate currently in force for a tier, in the order they are
+    /// tried, labelled as `/status` reports them: the ChatGPT subscription
+    /// (`chatgpt:<model>`) first while it is preferred and connected, then the
+    /// configured chain. Cooling candidates are included; they are listed
+    /// separately by the cooldown registry.
+    pub fn route(&self, tier: ModelTier) -> Vec<String> {
+        let mut route = Vec::new();
+        if let Some(preferred) = &self.preferred
+            && preferred.gate.ready()
+        {
+            route.push(chatgpt_label(&preferred.model));
+        }
+        let chain = self.tiers.chain(tier);
+        if self.provider == ModelProvider::Codex {
+            route.extend(chain.iter().map(|model| chatgpt_label(model)));
+        } else {
+            route.extend(chain.iter().cloned());
+        }
+        route
+    }
+
+    /// Whether the ChatGPT subscription leg was built into this runtime.
+    pub fn prefers_subscription(&self) -> bool {
+        self.preferred.is_some()
+    }
+
+    /// Settings the runtime was built from, when it was built from settings.
+    pub fn settings(&self) -> Option<&ModelSettings> {
+        self.settings.as_ref()
+    }
+
+    /// Whether the ChatGPT connection has changed since this runtime was
+    /// built while the subscription preference applies — a connect, a
+    /// disconnect, or a refresh that left the subscription needing to be
+    /// reconnected. A stale runtime must be rebuilt to put its route back in
+    /// step with the connection.
+    pub fn subscription_route_stale(&self, auth: &SubscriptionAuthState) -> bool {
+        self.chatgpt_connected_at_build
+            .is_some_and(|at_build| at_build != auth.connected(SubscriptionProvider::Codex))
+    }
+
+    /// Whether two runtimes route the same candidates with the same
+    /// credential, so cooldowns recorded against one remain true of the other.
+    pub fn same_route(&self, other: &Self) -> bool {
+        let same_settings = match (&self.settings, &other.settings) {
+            (Some(left), Some(right)) => left.same_route(right),
+            _ => false,
+        };
+        same_settings
+            && self.preferred.as_ref().map(|leg| &leg.model)
+                == other.preferred.as_ref().map(|leg| &leg.model)
+            && self.chatgpt_connected_at_build == other.chatgpt_connected_at_build
+    }
+
+    /// Whether both handles share the same engine instance.
+    pub fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.engine, &other.engine)
+    }
+
     /// Current call usage against the configured budget.
     pub fn budget(&self) -> BudgetSnapshot {
         self.budget.snapshot()
@@ -388,6 +583,9 @@ impl ModelRuntime {
             engine,
             budget: Arc::new(BudgetTracker::new(BudgetPolicy::default())),
             tiers: TierModels::new("test/fast", "test/balanced", "test/reasoning"),
+            settings: None,
+            preferred: None,
+            chatgpt_connected_at_build: None,
         }
     }
 }
@@ -409,5 +607,231 @@ mod tests {
             assert_eq!(tier.to_string(), name);
         }
         assert_eq!(ModelTier::parse("genius"), None);
+    }
+
+    use crate::config::ConfigError;
+    use crate::model::subscription_engine::test_support::{app, credential};
+
+    const API_ROUTE: [&str; 3] = [
+        "deepseek/deepseek-v4.1-flash",
+        "z-ai/glm-5.3-flash",
+        "xiaomi/mimo-v2.6-flash",
+    ];
+
+    fn settings(overrides: &[(&'static str, &'static str)]) -> ModelSettings {
+        let base: [(&'static str, &'static str); 6] = [
+            ("VEYRA_MODEL_PROVIDER", "openrouter"),
+            ("VEYRA_MODEL_API_KEY", "test-key-12345678"),
+            ("VEYRA_MODEL_FAST", API_ROUTE[0]),
+            ("VEYRA_MODEL_BALANCED", API_ROUTE[0]),
+            ("VEYRA_MODEL_REASONING", API_ROUTE[0]),
+            (
+                "VEYRA_MODEL_FALLBACKS",
+                "z-ai/glm-5.3-flash,xiaomi/mimo-v2.6-flash",
+            ),
+        ];
+        let overrides = overrides.to_vec();
+        ModelSettings::from_source(move |name| {
+            overrides
+                .iter()
+                .chain(base.iter())
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+                .ok_or(ConfigError::MissingEnvironmentVariable { name })
+        })
+        .expect("settings parse")
+        .expect("configured")
+    }
+
+    #[actix_web::test]
+    async fn a_connected_chatgpt_subscription_leads_every_route() {
+        let (state, _store) = app(CooldownRegistry::new(), &[SubscriptionProvider::Codex]);
+        let runtime = ModelRuntime::from_settings_with_app(settings(&[]), &state)
+            .expect("the composite builds");
+        assert!(runtime.prefers_subscription());
+        assert_eq!(runtime.provider(), ModelProvider::OpenRouter);
+        assert_eq!(runtime.engine().provider(), ModelProvider::OpenRouter);
+        for tier in [ModelTier::Fast, ModelTier::Balanced, ModelTier::Reasoning] {
+            let mut expected = vec!["chatgpt:gpt-6-luna".to_owned()];
+            expected.extend(API_ROUTE.iter().map(|model| (*model).to_owned()));
+            assert_eq!(runtime.route(tier), expected, "{tier}");
+            assert_eq!(runtime.chain(tier), API_ROUTE, "the API chain is unchanged");
+        }
+        assert!(!runtime.subscription_route_stale(state.subscription_auth()));
+        assert!(runtime.settings().is_some());
+
+        let custom = ModelRuntime::from_settings_with_app(
+            settings(&[("VEYRA_MODEL_CHATGPT_MODEL", "gpt-5.6-terra")]),
+            &state,
+        )
+        .expect("builds");
+        assert_eq!(custom.route(ModelTier::Fast)[0], "chatgpt:gpt-5.6-terra");
+        assert!(
+            !runtime.same_route(&custom),
+            "a different ChatGPT model is a new route"
+        );
+        assert!(runtime.same_route(&runtime.clone()));
+        assert!(runtime.same_instance(&runtime.clone()));
+        assert!(!runtime.same_instance(&custom));
+    }
+
+    #[actix_web::test]
+    async fn without_preference_connection_or_storage_the_configured_chain_stands() {
+        let (state, _store) = app(CooldownRegistry::new(), &[SubscriptionProvider::Codex]);
+        let off = ModelRuntime::from_settings_with_app(
+            settings(&[("VEYRA_MODEL_PREFER_SUBSCRIPTION", "false")]),
+            &state,
+        )
+        .expect("builds");
+        assert!(!off.prefers_subscription());
+        assert_eq!(off.route(ModelTier::Fast), API_ROUTE);
+        assert!(!off.subscription_route_stale(state.subscription_auth()));
+
+        let (disconnected, _store) = app(CooldownRegistry::new(), &[]);
+        let plain =
+            ModelRuntime::from_settings_with_app(settings(&[]), &disconnected).expect("builds");
+        assert!(!plain.prefers_subscription());
+        assert_eq!(plain.route(ModelTier::Fast), API_ROUTE);
+
+        // Connected, but no encrypted storage: the leg is left out rather
+        // than disabling the configured provider, and it is not retried on
+        // every read.
+        let unstored = crate::AppState::new(
+            crate::model::subscription_engine::test_support::config(),
+            None,
+            None,
+            crate::risk::RiskGate::new(crate::risk::RiskPolicy::default()),
+        );
+        unstored
+            .subscription_auth()
+            .set_credential(credential(SubscriptionProvider::Codex, None));
+        let degraded =
+            ModelRuntime::from_settings_with_app(settings(&[]), &unstored).expect("builds");
+        assert!(!degraded.prefers_subscription());
+        assert!(!degraded.subscription_route_stale(unstored.subscription_auth()));
+
+        let detached = ModelRuntime::from_settings(settings(&[])).expect("builds");
+        assert_eq!(detached.route(ModelTier::Balanced), API_ROUTE);
+        assert!(!detached.subscription_route_stale(state.subscription_auth()));
+    }
+
+    #[actix_web::test]
+    async fn a_codex_provider_is_not_duplicated_and_claude_code_never_joins() {
+        let (state, _store) = app(
+            CooldownRegistry::new(),
+            &[
+                SubscriptionProvider::Codex,
+                SubscriptionProvider::ClaudeCode,
+            ],
+        );
+        let codex = ModelRuntime::from_settings_with_app(
+            settings(&[
+                ("VEYRA_MODEL_PROVIDER", "codex"),
+                ("VEYRA_MODEL_FAST", "gpt-6-luna"),
+                ("VEYRA_MODEL_BALANCED", "gpt-6-luna"),
+                ("VEYRA_MODEL_REASONING", "gpt-6-luna"),
+                ("VEYRA_MODEL_FALLBACKS", ""),
+            ]),
+            &state,
+        )
+        .expect("the selected subscription builds");
+        assert!(!codex.prefers_subscription());
+        assert_eq!(codex.provider(), ModelProvider::Codex);
+        assert_eq!(codex.route(ModelTier::Fast), ["chatgpt:gpt-6-luna"]);
+
+        let claude = ModelRuntime::from_settings_with_app(
+            settings(&[
+                ("VEYRA_MODEL_PROVIDER", "claude_code"),
+                ("VEYRA_MODEL_FAST", "claude-model"),
+                ("VEYRA_MODEL_BALANCED", "claude-model"),
+                ("VEYRA_MODEL_REASONING", "claude-model"),
+                ("VEYRA_MODEL_FALLBACKS", ""),
+            ]),
+            &state,
+        )
+        .expect("the selected subscription builds");
+        assert!(!claude.prefers_subscription());
+        assert_eq!(claude.provider(), ModelProvider::ClaudeCode);
+        assert_eq!(claude.route(ModelTier::Fast), ["claude-model"]);
+        assert!(!claude.subscription_route_stale(state.subscription_auth()));
+
+        assert!(
+            ModelRuntime::from_settings(settings(&[("VEYRA_MODEL_PROVIDER", "codex")])).is_err(),
+            "a subscription needs its encrypted connection"
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_model_route_follows_the_chatgpt_connection() {
+        let (state, _store) = app(CooldownRegistry::new(), &[SubscriptionProvider::Codex]);
+        let runtime = ModelRuntime::from_settings_with_app(settings(&[]), &state).expect("builds");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        runtime
+            .restore_state(&serde_json::json!({
+                "hourStart": now, "hourCalls": 3, "dayStart": now, "dayCalls": 7
+            }))
+            .expect("budget snapshot restores");
+        state.set_model(Some(runtime.clone()));
+        assert!(
+            state
+                .model()
+                .is_some_and(|current| current.same_instance(&runtime))
+        );
+
+        // A rejected refresh: the leg drops out live, and the next read
+        // rebuilds the runtime without it, carrying the call budget across.
+        state
+            .subscription_auth()
+            .mark_needs_reconnect(SubscriptionProvider::Codex);
+        assert_eq!(runtime.route(ModelTier::Fast), API_ROUTE, "gated live");
+        assert!(runtime.subscription_route_stale(state.subscription_auth()));
+        let rebuilt = state.model().expect("still configured");
+        assert!(!rebuilt.same_instance(&runtime));
+        assert!(!rebuilt.prefers_subscription());
+        assert_eq!(rebuilt.budget().hour_calls, 3);
+        assert_eq!(rebuilt.budget().day_calls, 7);
+        assert!(
+            state
+                .model()
+                .is_some_and(|current| current.same_instance(&rebuilt)),
+            "a fresh route is not rebuilt again"
+        );
+
+        // Reconnecting brings the subscription back to the front.
+        state
+            .subscription_auth()
+            .set_credential(credential(SubscriptionProvider::Codex, None));
+        let restored = state.model().expect("configured");
+        assert!(restored.prefers_subscription());
+        assert_eq!(restored.route(ModelTier::Fast)[0], "chatgpt:gpt-6-luna");
+
+        // A disabled model stays disabled whatever the connection does.
+        state.set_model(None);
+        state
+            .subscription_auth()
+            .remove_credential(SubscriptionProvider::Codex);
+        assert!(state.model().is_none());
+
+        // Injected test engines carry no settings and are never rebuilt.
+        let injected = ModelRuntime::with_engine(
+            ModelProvider::OpenRouter,
+            Arc::new(crate::model::budget::BudgetedEngine::new(
+                Arc::new(AgentRuntimeEngine::build(&settings(&[])).expect("builds")),
+                Arc::new(BudgetTracker::new(BudgetPolicy::default())),
+            )),
+        );
+        assert!(!injected.same_route(&restored));
+        assert!(!injected.subscription_route_stale(state.subscription_auth()));
+    }
+
+    #[test]
+    fn chatgpt_labels_and_new_provider_names_are_stable() {
+        assert_eq!(chatgpt_label("gpt-6-luna"), "chatgpt:gpt-6-luna");
+        assert_eq!(ModelProvider::Zai.as_str(), "zai");
+        assert_eq!(ModelProvider::Zai.to_string(), "zai");
+        assert_eq!(ModelProvider::parse("zai"), Some(ModelProvider::Zai));
     }
 }

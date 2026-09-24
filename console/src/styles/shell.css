@@ -1,143 +1,158 @@
-/* Console chrome. The brand anchors the rail; live state belongs to the
- * workspace header. Every status remains reachable at narrow widths. */
-.shell-topbar {
-  position: sticky;
-  top: 0;
-  z-index: 20;
-  display: flex;
-  min-height: var(--topbar-height);
-  flex: 0 0 auto;
-  align-items: center;
-  padding-right: 16px;
-  background: var(--color-surface-0);
-}
-.shell-brand {
-  display: flex;
-  width: var(--sidebar-width);
-  min-width: var(--sidebar-width);
-  align-self: stretch;
-  align-items: center;
-  gap: 10px;
-  padding: 0 20px;
-}
-.shell-brand-mark { width: 22px; height: 22px; fill: var(--color-warn); }
-.shell-wordmark {
-  color: var(--color-ink);
-  font-size: 18px;
-  font-weight: 600;
-  letter-spacing: -0.04em;
-  line-height: 1;
-  white-space: nowrap;
-}
-.shell-workspace {
-  margin-left: 22px;
-  color: var(--color-ink-faint);
-  font-size: 12px;
-  white-space: nowrap;
-}
-.shell-status {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  margin: 0 0 0 auto;
-  padding: 0 0 0 20px;
-  list-style: none;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-.shell-status::-webkit-scrollbar { display: none; }
-.shell-status-item {
-  display: flex;
-  min-height: 26px;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 7px;
-  padding: 0 12px;
-  color: var(--color-ink-muted);
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 1;
-  white-space: nowrap;
-}
-.shell-status-item + .shell-status-item { border-left: 1px solid var(--color-line); }
-.shell-status-item:first-child { padding-left: 0; color: var(--color-ink); }
-.shell-status-item:last-child { padding-right: 0; }
-.shell-status-item .dot { width: 6px; height: 6px; }
-.shell-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; margin-left: 18px; }
-.shell-actions .icon { width: 17px; height: 17px; }
+/* Console chrome (components/shell.tsx). On a desktop window the header, the
+ * views and the status list stack in the flush sidebar; layout.css places
+ * them. Narrow screens get a header row and two sideways strips, and every
+ * status stays reachable. The sidebar speaks in neutral fills: the current
+ * view is marked by a subtle fill and primary text, never an accent. */
 
-.shell-sidebar {
-  position: sticky;
-  top: var(--topbar-height);
+/* ---------- header ---------- */
+.shell-topbar {
   display: flex;
-  height: calc(100dvh - var(--topbar-height));
-  min-height: 0;
-  flex-direction: column;
-  align-self: start;
-  overflow-y: auto;
-  padding: 12px 12px 24px;
-  background: var(--color-surface-0);
+  height: 52px;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  /* The mark lines up with the view icons below it. */
+  padding: 0 12px 0 16px;
+  background: var(--color-canvas);
 }
-.shell-nav { display: flex; flex-direction: column; gap: 3px; scroll-behavior: smooth; }
+.shell-brand { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.shell-brand-mark {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(160deg, var(--color-accent-hover), var(--color-accent));
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.12);
+  color: var(--color-ink-on-accent);
+}
+.shell-brand-mark svg { width: 12px; height: 12px; fill: currentColor; }
+.shell-wordmark {
+  overflow: hidden;
+  color: var(--color-ink);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.012em;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.shell-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; }
+/* The Settings view is always in sight in the sidebar; the gear is for the
+   narrow strip, where it can scroll away. */
+.shell-settings { display: none; }
+
+/* ---------- views ---------- */
+.shell-sidebar { min-height: 0; padding: 4px 8px 0; background: var(--color-canvas); }
+.shell-nav { display: flex; flex-direction: column; gap: 1px; scroll-behavior: smooth; }
 .shell-nav-item {
-  position: relative;
   display: flex;
-  min-height: 36px;
+  height: 30px;
   width: 100%;
   flex: 0 0 auto;
   align-items: center;
   gap: 10px;
-  padding: 0 10px;
-  border-radius: 6px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
   color: var(--color-ink-muted);
-  font-size: 12px;
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
   line-height: 1;
   text-align: left;
   white-space: nowrap;
 }
-.shell-nav-item .icon { width: 16px; height: 16px; color: var(--color-ink-faint); stroke-width: 1.65; }
+.shell-nav-item .icon { width: 16px; height: 16px; }
 @media (hover: hover) {
-  .shell-nav-item:hover { background: var(--color-surface-2); color: var(--color-ink); }
+  .shell-nav-item:hover { background: var(--color-hover); color: var(--color-ink); }
 }
-.shell-nav-item[aria-current="page"] { background: var(--color-surface-2); color: var(--color-ink); font-weight: 600; }
-.shell-nav-item[aria-current="page"] .icon { color: var(--color-warn); }
-.shell-nav-item[aria-current="page"]::after {
-  content: "";
-  width: 4px;
-  height: 4px;
-  margin-left: auto;
-  border-radius: 50%;
-  background: var(--color-warn);
-}
-.shell-nav-item:focus-visible { border-radius: 6px; outline-offset: -2px; }
+.shell-nav-item[aria-current="page"] { background: var(--color-active); color: var(--color-ink); }
+.shell-nav-item:focus-visible { outline-offset: -2px; }
 
-@media (max-width: 1400px) { .shell-workspace { display: none; } }
-@media (max-width: 1180px) {
-  .app { --topbar-height: 92px; }
-  .shell-topbar {
-    display: grid;
-    grid-template-areas: "brand actions" "status status";
-    grid-template-columns: minmax(0, 1fr) auto;
-    padding-right: 0;
-  }
-  .shell-brand { grid-area: brand; height: 52px; }
-  .shell-actions { grid-area: actions; height: 52px; margin: 0; padding-right: 14px; }
-  .shell-status { grid-area: status; min-height: 40px; margin: 0; padding-left: 22px; border-top: 1px solid var(--color-line-soft); }
-  .shell-status-item:last-child { padding-right: 22px; }
+/* ---------- status ---------- */
+.shell-status {
+  min-width: 0;
+  margin: 20px 8px 0;
+  padding: 0;
+  list-style: none;
 }
+/* Section label, drawn rather than written: the list is named for assistive
+   technology by its aria-label. */
+.shell-status::before {
+  display: flex;
+  height: 28px;
+  align-items: center;
+  padding: 0 8px;
+  color: var(--color-ink-faint);
+  content: "Status" / "";
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+.shell-status-item {
+  display: grid;
+  min-height: 26px;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 10px;
+  padding: 3px 8px;
+  color: var(--color-ink-muted);
+  font-size: var(--text-sm);
+  line-height: 20px;
+}
+.shell-status-item > :nth-child(2) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shell-status-item .dot { width: 7px; height: 7px; justify-self: center; }
+/* The verdict leads. */
+.shell-status-item:first-child { color: var(--color-ink); font-weight: var(--weight-semibold); letter-spacing: 0.02em; }
+.shell-status-detail {
+  display: -webkit-box;
+  grid-column: 2;
+  margin-top: 1px;
+  overflow: hidden;
+  color: var(--color-ink-faint);
+  font-weight: var(--weight-regular);
+  letter-spacing: 0;
+  line-height: 16px;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}
+
+/* ---------- narrow: header row and sideways strips ---------- */
 @media (max-width: 860px) {
-  .shell-topbar { position: static; }
-  .shell-sidebar { position: static; height: auto; overflow: visible; padding: 0; }
-  .shell-nav { flex-direction: row; overflow-x: auto; padding: 7px 20px 12px; scroll-padding-inline: 20px; scrollbar-width: none; }
+  .shell-topbar { height: var(--topbar-height); padding: 0 8px 0 16px; }
+  .shell-settings { display: inline-flex; }
+  .shell-status {
+    display: flex;
+    height: 30px;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 16px;
+    margin: 0;
+    padding: 0 16px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .shell-status::-webkit-scrollbar { display: none; }
+  .shell-status::before { display: none; }
+  .shell-status-item { display: flex; min-height: 0; flex: 0 0 auto; gap: 7px; padding: 0; white-space: nowrap; }
+  .shell-status-item .dot { width: 6px; height: 6px; }
+  .shell-status-detail { display: none; }
+  .shell-sidebar { padding: 0; }
+  .shell-nav {
+    flex-direction: row;
+    gap: 2px;
+    overflow-x: auto;
+    padding: 6px 12px 10px;
+    scroll-padding-inline: 12px;
+    scrollbar-width: none;
+  }
   .shell-nav::-webkit-scrollbar { display: none; }
-  .shell-nav-item { min-height: 36px; width: auto; gap: 7px; padding: 0 12px; }
-  .shell-nav-item[aria-current="page"]::after { display: none; }
+  .shell-nav-item { width: auto; height: 32px; gap: 7px; padding: 0 10px; }
 }
-@media (max-width: 660px) {
-  .shell-brand { padding-left: 16px; }
-  .shell-actions { padding-right: 6px; }
-  .shell-status { padding-left: 16px; }
-  .shell-status-item:last-child { padding-right: 16px; }
-  .shell-nav { padding-inline: 12px; scroll-padding-inline: 12px; }
+@media (max-width: 860px) and (pointer: coarse) {
+  .shell-nav-item { height: 40px; }
 }
 @media (prefers-reduced-motion: reduce) { .shell-nav { scroll-behavior: auto; } }

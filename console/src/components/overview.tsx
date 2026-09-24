@@ -188,7 +188,7 @@ function PositionRow({
   const detailId = `pos-detail-${position.ticket}`
   return (
     <>
-      <tr className="pos-row">
+      <tr className={`pos-row${expanded ? ' is-expanded' : ''}`}>
         <td>{position.symbol}</td>
         <td className={position.kind === 'buy' ? 'tone-ok' : 'tone-bad'}>{position.kind === 'buy' ? 'Long' : 'Short'}</td>
         <td>{position.lots.toFixed(2)}</td>
@@ -212,7 +212,7 @@ function PositionRow({
             aria-controls={detailId}
             onClick={onToggle}
           >
-            <Icon name="more" />
+            <Icon name="chevron-down" size={14} />
           </button>
         </td>
       </tr>

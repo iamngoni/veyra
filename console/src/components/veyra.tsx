@@ -21,6 +21,7 @@ import type {
   LogRecord,
   MarketSessions,
   Metrics,
+  ModelCooldown,
   RiskPolicy,
   RiskPolicyPatch,
   Status,
@@ -40,7 +41,7 @@ import {
 } from '../lib/format'
 import { auditTimeMs, clockTime, relativeTime, usePaged } from '../lib/hooks'
 import { Button, Control, SkeletonRows, TextControl } from './form'
-import { Dot, Icon, Panel, Segmented, Skeleton, Toggle, signTone, type Tone } from './ui'
+import { Dot, Hint, Icon, Panel, Segmented, Skeleton, Toggle, signTone, type Tone } from './ui'
 
 /* ---------- local primitives ---------- */
 
@@ -497,6 +498,131 @@ export function AutopilotPanel({
   )
 }
 
+/* ---------- model route ---------- */
+
+/** Why a candidate is benched, in the operator's words. */
+const COOLDOWN_REASONS: Record<string, string> = {
+  insufficient_credits: 'No credits',
+  provider_rejected: 'Rejected by provider',
+  unauthorized: 'Unauthorized',
+  rate_limited: 'Rate limited',
+  overloaded: 'Overloaded',
+  invalid_response: 'Bad answer',
+  unreachable: 'Unreachable',
+}
+
+/**
+ * The route's name for a benched candidate. The ChatGPT subscription serves
+ * its models under a `chatgpt:` label so they read apart from an API model of
+ * the same name; every other provider lists the bare model id.
+ */
+function cooldownLabel(cooldown: ModelCooldown): string {
+  return cooldown.provider === 'codex' ? `chatgpt:${cooldown.model}` : cooldown.model
+}
+
+/** Local wall-clock time of the next probe, e.g. `16:42`. */
+function retryClock(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
+}
+
+function CooldownState({ cooldown, now }: { cooldown: ModelCooldown; now: number }) {
+  return (
+    <span className="tab-route-state" title={`${cooldown.failures} failed in a row`}>
+      <Dot tone="warn" />
+      <span>{COOLDOWN_REASONS[cooldown.reason] ?? sentence(cooldown.reason)}</span>
+      <span className="tab-route-retry">
+        {cooldown.untilMs <= now ? 'retry due' : `retry ${retryClock(cooldown.untilMs)}`}
+      </span>
+    </span>
+  )
+}
+
+/**
+ * The model candidates in the order a decision tries them, which of them are
+ * benched after a failure and until when, and which one answered last.
+ * Hidden entirely for a service that does not report its route.
+ */
+export function ModelRoutePanel({
+  status,
+  onRetryAll,
+}: {
+  status?: Status
+  /** Clears every cooldown; resolves to an error message or undefined on success. */
+  onRetryAll?: () => Promise<string | undefined>
+}) {
+  const [retrying, setRetrying] = useState(false)
+  const [error, setError] = useState<string>()
+  const route = status?.model_route
+  if (!Array.isArray(route)) return null
+
+  const now = Date.now()
+  const cooldowns = status?.model_cooldowns ?? []
+  const benched = new Map(cooldowns.map((cooldown) => [cooldownLabel(cooldown), cooldown]))
+  // A benched candidate outside the current route (another tier's model)
+  // still holds a cooldown, so it is listed after the route, unnumbered.
+  const offRoute = cooldowns.filter((cooldown) => !route.includes(cooldownLabel(cooldown)))
+  const answering = status?.decisions?.lastSuccessfulModel
+
+  const retryAll = async (retry: () => Promise<string | undefined>) => {
+    setRetrying(true)
+    setError(undefined)
+    const failure = await retry()
+    setRetrying(false)
+    setError(failure)
+  }
+
+  return (
+    <Panel
+      title="Model route"
+      className="tab-panel tab-route"
+      actions={
+        cooldowns.length > 0 && onRetryAll ? (
+          <Button onClick={() => void retryAll(onRetryAll)} disabled={retrying}>
+            {retrying ? 'Retrying…' : 'Retry all'}
+          </Button>
+        ) : null
+      }
+    >
+      {error ? (
+        <p className="tab-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+      {route.length === 0 && offRoute.length === 0 ? (
+        <Empty>No model configured</Empty>
+      ) : (
+        <ol className="tab-list tab-route-list">
+          {route.map((candidate, index) => {
+            const cooldown = benched.get(candidate)
+            return (
+              <li key={candidate} className="tab-row tab-route-row">
+                <span className="tab-route-position readout">{index + 1}</span>
+                <span className="tab-route-model mono" title={candidate}>
+                  {candidate}
+                </span>
+                {cooldown ? (
+                  <CooldownState cooldown={cooldown} now={now} />
+                ) : candidate === answering ? (
+                  <span className="tab-route-badge">Answering</span>
+                ) : null}
+              </li>
+            )
+          })}
+          {offRoute.map((cooldown) => (
+            <li key={cooldownLabel(cooldown)} className="tab-row tab-route-row">
+              <span className="tab-route-position" aria-hidden="true" />
+              <span className="tab-route-model mono" title={cooldownLabel(cooldown)}>
+                {cooldownLabel(cooldown)}
+              </span>
+              <CooldownState cooldown={cooldown} now={now} />
+            </li>
+          ))}
+        </ol>
+      )}
+    </Panel>
+  )
+}
+
 /* ---------- risk ---------- */
 
 /** Editable mirror of the live policy; numbers stay strings until save. */
@@ -531,18 +657,78 @@ type NumericDraftKey =
   | 'calendarBlackoutMinutes'
   | 'minStopAtrFraction'
 
-const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer: boolean }> = [
-  { key: 'maxVolumePerOrder', label: 'Max / order (lots)', integer: false },
-  { key: 'maxTotalLots', label: 'Max total (lots)', integer: false },
-  { key: 'maxOpenOrders', label: 'Max open orders', integer: true },
-  { key: 'duplicateWindowSecs', label: 'Duplicate window (s)', integer: true },
-  { key: 'maxRiskPercent', label: 'Max risk (% / trade)', integer: false },
-  { key: 'maxDailyLossPercent', label: 'Daily brake (%)', integer: false },
-  { key: 'maxPeakDrawdownPercent', label: 'Peak brake (%)', integer: false },
-  { key: 'maxNetFactorLots', label: 'Net USD cap (lots)', integer: false },
-  { key: 'calendarBlackoutMinutes', label: 'News blackout (minutes)', integer: true },
-  { key: 'minStopAtrFraction', label: 'Min stop (× ATR)', integer: false },
+const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer: boolean; help: string }> = [
+  {
+    key: 'maxVolumePerOrder',
+    label: 'Max / order (lots)',
+    integer: false,
+    help: 'Largest volume a single order may request, in lots; above 0 and at most 100.',
+  },
+  {
+    key: 'maxTotalLots',
+    label: 'Max total (lots)',
+    integer: false,
+    help: 'Largest total open volume, existing orders plus the new one, in lots.',
+  },
+  {
+    key: 'maxOpenOrders',
+    label: 'Max open orders',
+    integer: true,
+    help: 'Most orders open at the venue at once, 0 through 1000.',
+  },
+  {
+    key: 'duplicateWindowSecs',
+    label: 'Duplicate window (s)',
+    integer: true,
+    help: 'Seconds in which an identical approved order is suppressed; 0 turns suppression off.',
+  },
+  {
+    key: 'maxRiskPercent',
+    label: 'Max risk (% / trade)',
+    integer: false,
+    help: 'Largest share of equity one trade may put at risk, in percent; 0 turns the cap off.',
+  },
+  {
+    key: 'maxDailyLossPercent',
+    label: 'Daily brake (%)',
+    integer: false,
+    help: "Refuses new orders once equity is this many percent below the day's opening equity; 0 is off.",
+  },
+  {
+    key: 'maxPeakDrawdownPercent',
+    label: 'Peak brake (%)',
+    integer: false,
+    help: 'Refuses new orders once equity is this many percent below its highest point; 0 is off.',
+  },
+  {
+    key: 'maxNetFactorLots',
+    label: 'Net USD cap (lots)',
+    integer: false,
+    help: 'Cap on net exposure to the US dollar across positions, in lots; 0 turns it off.',
+  },
+  {
+    key: 'calendarBlackoutMinutes',
+    label: 'News blackout (minutes)',
+    integer: true,
+    help: 'Minutes either side of a high-impact news event in which new orders are refused; 0 is off.',
+  },
+  {
+    key: 'minStopAtrFraction',
+    label: 'Min stop (× ATR)',
+    integer: false,
+    help: 'Smallest stop distance allowed, as a fraction of the average candle range (ATR 14); 0 is off.',
+  },
 ]
+
+/** What the non-numeric policy settings do, shown from their info marks. */
+const POLICY_HELP = {
+  killSwitch: 'Blocks new orders; open positions stay open.',
+  judgeBypass: 'Lets trading continue while the judge cannot answer.',
+  symbols: 'Comma-separated instruments the risk gate approves, 1 to 64. To stop trading, use the kill switch.',
+  weekendSymbols: 'Instruments from Symbols whose market trades through the weekend, such as BTCUSD.',
+  sessionUtc: 'UTC hours in which new orders are allowed, such as 7-21 or 22-6 across midnight; empty is always.',
+  weekendPositions: "What happens to open positions before Friday's close.",
+}
 
 function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
   return {
@@ -605,7 +791,7 @@ function WeekendControl({
 }) {
   const id = useId()
   return (
-    <Control id={id} label="Weekend positions">
+    <Control id={id} label="Weekend positions" help={POLICY_HELP.weekendPositions}>
       <span className="tab-select">
         <select
           id={id}
@@ -620,6 +806,31 @@ function WeekendControl({
         <Icon name="chevron-down" size={16} />
       </span>
     </Control>
+  )
+}
+
+/** A policy flag in the editor: its name and info mark, the switch at the row's end. */
+function PolicySwitch({
+  label,
+  help,
+  checked,
+  tone,
+  onFlip,
+}: {
+  label: string
+  help: string
+  checked: boolean
+  tone: 'bad' | 'warn'
+  onFlip: () => void
+}) {
+  return (
+    <div className="tab-switch is-span">
+      <span className="tab-switch-label">
+        {label}
+        <Hint text={help} label={label} />
+      </span>
+      <Toggle checked={checked} label={label} tone={tone} onClick={onFlip} />
+    </div>
   )
 }
 
@@ -693,25 +904,34 @@ export function RiskPanel({
           </p>
         ) : null}
         <div className="tab-form">
-          <div className="tab-switch is-span">
-            <span>Kill switch</span>
-            <Toggle checked={draft.killSwitch} label="Kill switch" tone="bad" onClick={() => flip('killSwitch')} />
-          </div>
-          <div className="tab-switch is-span">
-            <span>Judge bypass</span>
-            <Toggle
-              checked={draft.allowTradingWithoutJev}
-              label="Judge bypass"
-              tone="warn"
-              onClick={() => flip('allowTradingWithoutJev')}
-            />
-          </div>
-          <TextControl label="Symbols" field="symbols" value={draft.symbols} onChange={handleField} span />
+          <PolicySwitch
+            label="Kill switch"
+            help={POLICY_HELP.killSwitch}
+            checked={draft.killSwitch}
+            tone="bad"
+            onFlip={() => flip('killSwitch')}
+          />
+          <PolicySwitch
+            label="Judge bypass"
+            help={POLICY_HELP.judgeBypass}
+            checked={draft.allowTradingWithoutJev}
+            tone="warn"
+            onFlip={() => flip('allowTradingWithoutJev')}
+          />
+          <TextControl
+            label="Symbols"
+            field="symbols"
+            value={draft.symbols}
+            onChange={handleField}
+            help={POLICY_HELP.symbols}
+            span
+          />
           <TextControl
             label="Weekend symbols"
             field="weekendSymbols"
             value={draft.weekendSymbols}
             onChange={handleField}
+            help={POLICY_HELP.weekendSymbols}
             span
           />
           <TextControl
@@ -719,6 +939,7 @@ export function RiskPanel({
             field="sessionUtc"
             value={draft.sessionUtc}
             onChange={handleField}
+            help={POLICY_HELP.sessionUtc}
             placeholder="Always open"
           />
           <WeekendControl value={draft.weekendPositions} onChange={setWeekend} />
@@ -728,6 +949,7 @@ export function RiskPanel({
               label={field.label}
               field={field.key}
               value={draft[field.key]}
+              help={field.help}
               onChange={handleField}
             />
           ))}
@@ -1005,7 +1227,7 @@ export function ActivityFeed({
 
   return (
     <Panel
-      title="Activity"
+      title="Events"
       className="tab-panel"
       actions={
         <>

@@ -339,6 +339,81 @@ async fn status_reports_model_provider() {
     assert_eq!(body["model_budget"]["hourCalls"], 0);
     assert_eq!(body["model_budget"]["dayCalls"], 0);
     assert_eq!(body["broker_provider"], serde_json::Value::Null);
+    // Without a connected ChatGPT subscription the route is the configured
+    // chain for the default (balanced) tier, and nothing is cooling.
+    assert_eq!(body["model_route"], serde_json::json!(["vendor/balanced"]));
+    assert_eq!(body["model_cooldowns"], serde_json::json!([]));
+}
+
+#[actix_web::test]
+async fn status_without_a_model_reports_an_empty_route() {
+    let app = test::init_service(create_app(test_state(None))).await;
+    let request = test::TestRequest::get().uri("/status").to_request();
+    let body: serde_json::Value =
+        test::read_body_json(test::call_service(&app, request).await).await;
+    assert_eq!(body["model_route"], serde_json::json!([]));
+    assert_eq!(body["model_cooldowns"], serde_json::json!([]));
+}
+
+#[actix_web::test]
+async fn status_lists_model_cooldowns_and_the_operator_can_clear_them() {
+    use std::time::{Duration, UNIX_EPOCH};
+    use veyra_service::model::{
+        Admission, CooldownFailure, CooldownReason, CooldownRegistry, ModelProvider,
+    };
+
+    // A pinned clock keeps `untilMs` exact.
+    let now = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+    let cooldowns = CooldownRegistry::with_clock(Arc::new(move || now));
+    let state = test_state(None).with_model_cooldowns(cooldowns.clone());
+    for (model, reason) in [
+        ("z-ai/glm-5.3-flash", CooldownReason::ProviderRejected),
+        (
+            "deepseek/deepseek-v4.1-flash",
+            CooldownReason::InsufficientCredits,
+        ),
+    ] {
+        match cooldowns.admit(ModelProvider::OpenRouter, model) {
+            Admission::Ready(ticket) => ticket.fail(CooldownFailure::new(reason)),
+            Admission::Cooling(_) => panic!("{model} starts open"),
+        }
+    }
+    let app = test::init_service(create_app(state)).await;
+
+    let request = test::TestRequest::get().uri("/status").to_request();
+    let body: serde_json::Value =
+        test::read_body_json(test::call_service(&app, request).await).await;
+    assert_eq!(
+        body["model_cooldowns"],
+        serde_json::json!([
+            {
+                "provider": "openrouter",
+                "model": "deepseek/deepseek-v4.1-flash",
+                "reason": "insufficient_credits",
+                "untilMs": 1_790_001_800_000_u64,
+                "failures": 1
+            },
+            {
+                "provider": "openrouter",
+                "model": "z-ai/glm-5.3-flash",
+                "reason": "provider_rejected",
+                "untilMs": 1_790_003_600_000_u64,
+                "failures": 1
+            }
+        ])
+    );
+
+    let request = test::TestRequest::post()
+        .uri("/model/cooldowns/clear")
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    assert!(response.status().is_success());
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(
+        body,
+        serde_json::json!({"cleared": 2, "model_cooldowns": []})
+    );
+    assert!(cooldowns.is_empty());
 }
 
 #[actix_web::test]

@@ -19,7 +19,7 @@
   border: 1px solid var(--color-line-strong); border-radius: 6px;
   background: var(--color-surface-1); color: var(--color-ink);
 }
-.tab-provider-credential-fields input:focus-visible { outline: 2px solid var(--color-warn); outline-offset: 1px; }
+.tab-provider-credential-fields input:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 1px; }
 .tab-provider-credential-actions { display: flex; align-items: center; gap: 8px; grid-column: 1 / -1; }
 .tab-provider-credential-message { margin-bottom: 0 !important; color: var(--color-info) !important; }
 @media (max-width: 680px) {
@@ -47,11 +47,11 @@
 .tab-subscriptions-token { display: grid; gap: 5px; margin-top: 18px; color: var(--color-ink-muted); font-size: 11px; }
 .tab-subscriptions-token > span:last-child { color: var(--color-ink-faint); }
 .tab-subscriptions-token input, .tab-subscriptions-flow input { width: 100%; min-width: 0; min-height: 36px; padding: 7px 9px; border: 1px solid var(--color-line-strong); border-radius: 6px; background: var(--color-surface-2); color: var(--color-ink); font-size: 13px; }
-.tab-subscriptions-token input:focus-visible, .tab-subscriptions-flow input:focus-visible { outline: 2px solid var(--color-info); outline-offset: 1px; }
+.tab-subscriptions-token input:focus-visible, .tab-subscriptions-flow input:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 1px; }
 .tab-subscriptions-flow { display: grid; gap: 10px; margin-top: 17px; padding-top: 17px; border-top: 1px solid var(--color-line); }
 .tab-subscriptions-flow strong { color: var(--color-ink); font-size: 13px; }
 .tab-subscriptions-flow p { margin: 0; color: var(--color-ink-muted); font-size: 12px; line-height: 1.45; }
-.tab-subscriptions-flow a { color: var(--color-info); font-size: 12px; font-weight: 650; }
+.tab-subscriptions-flow a { color: var(--color-accent-text); font-size: 12px; font-weight: 650; }
 .tab-subscriptions-flow label { display: grid; gap: 6px; color: var(--color-ink-muted); font-size: 11px; }
 .tab-subscriptions-flow-actions { display: flex; gap: 17px; }
 .tab-subscriptions-message { margin: 12px 0 0; color: var(--color-info); font-size: 12px; }

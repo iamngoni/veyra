@@ -78,6 +78,9 @@ const SETTABLE: &[&str] = &[
     "VEYRA_MODEL_APP_HIDDEN",
     "VEYRA_MODEL_MAX_CALLS_PER_HOUR",
     "VEYRA_MODEL_MAX_CALLS_PER_DAY",
+    // Routing only: a connected ChatGPT subscription first, with its model.
+    "VEYRA_MODEL_PREFER_SUBSCRIPTION",
+    "VEYRA_MODEL_CHATGPT_MODEL",
     // ---- Jev ----
     "VEYRA_JEV_PROVIDER",
     "VEYRA_JEV_BASE_URL",
@@ -452,6 +455,12 @@ pub fn validate(
 
 /// Installs already-validated settings into the running service.
 ///
+/// Model cooldowns are cleared when the new settings route different
+/// candidates (provider, credential, base URL, model lists, structured-answer
+/// mode, or the ChatGPT preference): what a cooldown said about the old route
+/// is no longer evidence about the new one. An edit that leaves the route
+/// alone keeps them, so it cannot be used to reset a cooldown.
+///
 /// # Errors
 /// Returns a description when the model provider refuses to be rebuilt. The
 /// other sections cannot fail at this point: they are plain values.
@@ -459,32 +468,121 @@ pub fn adopt(state: &crate::AppState, staged: StagedSettings) -> Result<(), Stri
     // The model engine is the only section that has to be reconstructed, so it
     // goes first: if the provider refuses the new settings, nothing else has
     // been disturbed yet.
+    let previous = state.model();
     let rebuilt = match staged.model {
         None => None,
-        Some(settings) => {
-            let runtime = crate::model::ModelRuntime::from_settings_with_app(settings, state)
-                .map_err(|error| error.to_string())?;
-            // A rebuilt runtime starts with empty call-budget windows. Carrying
-            // the old counters across means an edit cannot be used — even
-            // accidentally — to reset a cap that exists to bound spend.
-            if let Some(previous) = state.model() {
-                let carried = previous.state_snapshot();
-                if let Err(error) = runtime.restore_state(&carried) {
-                    tracing::warn!(%error, "model call budget could not be carried across a settings change");
-                }
-            }
-            Some(runtime)
-        }
+        Some(settings) => Some(build_model(state, settings, previous.as_ref())?),
     };
+    let route_changed = route_changed(previous.as_ref(), rebuilt.as_ref());
 
     state.set_trading_enabled(staged.trading_enabled);
     state.set_autopilot(staged.autopilot);
     state.set_model(rebuilt);
+    if route_changed {
+        state
+            .model_cooldowns()
+            .clear("model route settings changed");
+    }
     Ok(())
+}
+
+/// Rebuilds only the model runtime from the current overlay — used when the
+/// ChatGPT subscription connects or disconnects, which changes the route
+/// without any setting changing. Trading and autopilot are left untouched.
+///
+/// # Errors
+/// Returns a description when the settings no longer parse or the provider
+/// refuses to be rebuilt; the running model is left in place.
+pub fn rebuild_model(state: &crate::AppState) -> Result<(), String> {
+    let settings = crate::model::ModelSettings::from_source(state.runtime_config().source())
+        .map_err(|error| RejectedEdit::from(error).reason)?;
+    let previous = state.model();
+    let rebuilt = match settings {
+        None => None,
+        Some(settings) => Some(build_model(state, settings, previous.as_ref())?),
+    };
+    state.set_model(rebuilt);
+    Ok(())
+}
+
+/// Builds a runtime and carries the previous call-budget windows across.
+fn build_model(
+    state: &crate::AppState,
+    settings: crate::model::ModelSettings,
+    previous: Option<&crate::model::ModelRuntime>,
+) -> Result<crate::model::ModelRuntime, String> {
+    let runtime = crate::model::ModelRuntime::from_settings_with_app(settings, state)
+        .map_err(|error| error.to_string())?;
+    // A rebuilt runtime starts with empty call-budget windows. Carrying the
+    // old counters across means an edit cannot be used — even accidentally —
+    // to reset a cap that exists to bound spend.
+    if let Some(previous) = previous {
+        let carried = previous.state_snapshot();
+        if let Err(error) = runtime.restore_state(&carried) {
+            tracing::warn!(%error, "model call budget could not be carried across a settings change");
+        }
+    }
+    Ok(runtime)
+}
+
+/// Whether the installed route changes between two runtimes.
+fn route_changed(
+    previous: Option<&crate::model::ModelRuntime>,
+    next: Option<&crate::model::ModelRuntime>,
+) -> bool {
+    match (previous, next) {
+        (None, None) => false,
+        (Some(previous), Some(next)) => !previous.same_route(next),
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Overlay fixtures shared by crate tests.
+
+    use std::collections::BTreeMap;
+
+    use super::RuntimeConfig;
+
+    /// Every model setting pinned in the overlay, so the process environment
+    /// cannot leak into these tests.
+    pub(crate) fn model_overlay(config: &RuntimeConfig, overrides: &[(&str, &str)]) {
+        let mut pinned: BTreeMap<String, String> = [
+            ("VEYRA_MODEL_PROVIDER", "openrouter"),
+            ("VEYRA_MODEL_BASE_URL", ""),
+            ("VEYRA_MODEL_FAST", "deepseek/deepseek-v4.1-flash"),
+            ("VEYRA_MODEL_BALANCED", "deepseek/deepseek-v4.1-flash"),
+            ("VEYRA_MODEL_REASONING", "deepseek/deepseek-v4.1-flash"),
+            ("VEYRA_MODEL_FALLBACKS", "z-ai/glm-5.3-flash"),
+            ("VEYRA_MODEL_FAST_FALLBACKS", ""),
+            ("VEYRA_MODEL_BALANCED_FALLBACKS", ""),
+            ("VEYRA_MODEL_REASONING_FALLBACKS", ""),
+            ("VEYRA_MODEL_COMPEL_STRUCTURED", ""),
+            ("VEYRA_MODEL_HTTP_REFERER", ""),
+            ("VEYRA_MODEL_APP_TITLE", ""),
+            ("VEYRA_MODEL_APP_HIDDEN", ""),
+            ("VEYRA_MODEL_MAX_CALLS_PER_HOUR", ""),
+            ("VEYRA_MODEL_MAX_CALLS_PER_DAY", ""),
+            ("VEYRA_MODEL_PREFER_SUBSCRIPTION", ""),
+            ("VEYRA_MODEL_CHATGPT_MODEL", ""),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+        for (name, value) in overrides {
+            pinned.insert((*name).to_owned(), (*value).to_owned());
+        }
+        config.commit(pinned);
+        config.set_model_key(Some(
+            crate::model::ApiKey::parse("test-key-12345678").expect("valid key"),
+        ));
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::model_overlay;
     use super::*;
     use serde_json::json;
 
@@ -663,5 +761,135 @@ mod tests {
         let restored = RuntimeConfig::new();
         restored.restore(&config.snapshot());
         assert_eq!(restored.snapshot(), config.snapshot());
+    }
+
+    fn cool_one(state: &crate::AppState) {
+        if let crate::model::Admission::Ready(ticket) = state.model_cooldowns().admit(
+            crate::model::ModelProvider::OpenRouter,
+            "z-ai/glm-5.3-flash",
+        ) {
+            ticket.fail(crate::model::CooldownFailure::new(
+                crate::model::CooldownReason::ProviderRejected,
+            ));
+        }
+        assert_eq!(state.model_cooldowns().len(), 1);
+    }
+
+    #[test]
+    fn the_chatgpt_preference_is_live_and_settable() {
+        for name in [
+            "VEYRA_MODEL_PREFER_SUBSCRIPTION",
+            "VEYRA_MODEL_CHATGPT_MODEL",
+        ] {
+            assert!(is_settable(name), "{name}");
+            assert!(
+                RuntimeConfig::new().effective().get(name).is_some(),
+                "{name}"
+            );
+        }
+        let config = RuntimeConfig::new();
+        model_overlay(&config, &[]);
+        let rejected = validate(
+            &config,
+            &[(
+                "VEYRA_MODEL_PREFER_SUBSCRIPTION".to_owned(),
+                "sometimes".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .err()
+        .expect("a malformed switch is refused");
+        assert_eq!(rejected.name, "VEYRA_MODEL_PREFER_SUBSCRIPTION");
+    }
+
+    #[actix_web::test]
+    async fn adopting_a_new_route_clears_cooldowns_but_a_cosmetic_edit_does_not() {
+        use crate::model::subscription_engine::test_support::app;
+        let (state, _store) = app(crate::model::CooldownRegistry::new(), &[]);
+        model_overlay(state.runtime_config(), &[]);
+        adopt(
+            &state,
+            validate(state.runtime_config(), &BTreeMap::new()).expect("valid"),
+        )
+        .expect("adopts");
+        assert!(state.model().is_some());
+        cool_one(&state);
+
+        // Budget and attribution do not change what a cooldown says.
+        let cosmetic: BTreeMap<String, String> = [(
+            "VEYRA_MODEL_MAX_CALLS_PER_HOUR".to_owned(),
+            "500".to_owned(),
+        )]
+        .into_iter()
+        .collect();
+        adopt(
+            &state,
+            validate(state.runtime_config(), &cosmetic).expect("valid"),
+        )
+        .expect("adopts");
+        assert_eq!(
+            state.model_cooldowns().len(),
+            1,
+            "kept across a cosmetic edit"
+        );
+
+        // A different model list is a different route.
+        let routed: BTreeMap<String, String> = [(
+            "VEYRA_MODEL_FALLBACKS".to_owned(),
+            "xiaomi/mimo-v2.6-flash".to_owned(),
+        )]
+        .into_iter()
+        .collect();
+        adopt(
+            &state,
+            validate(state.runtime_config(), &routed).expect("valid"),
+        )
+        .expect("adopts");
+        assert!(state.model_cooldowns().is_empty());
+
+        // Disabling the model is a route change too.
+        cool_one(&state);
+        assert!(route_changed(state.model().as_ref(), None));
+        assert!(!route_changed(None, None));
+    }
+
+    #[actix_web::test]
+    async fn a_model_rebuild_follows_the_chatgpt_connection() {
+        use crate::model::subscription_engine::test_support::{app, credential};
+        use crate::subscription_auth::SubscriptionProvider;
+        let (state, _store) = app(crate::model::CooldownRegistry::new(), &[]);
+        model_overlay(state.runtime_config(), &[]);
+        rebuild_model(&state).expect("rebuilds");
+        let plain = state.model().expect("configured");
+        assert!(!plain.prefers_subscription());
+
+        state
+            .subscription_auth()
+            .set_credential(credential(SubscriptionProvider::Codex, None));
+        rebuild_model(&state).expect("rebuilds");
+        let preferred = state.model().expect("configured");
+        assert!(preferred.prefers_subscription());
+        assert_eq!(
+            preferred.route(crate::model::ModelTier::Fast),
+            [
+                "chatgpt:gpt-6-luna",
+                "deepseek/deepseek-v4.1-flash",
+                "z-ai/glm-5.3-flash"
+            ]
+        );
+
+        // Settings that no longer parse leave the running model alone.
+        state.runtime_config().commit(
+            [("VEYRA_MODEL_FAST".to_owned(), "no-vendor".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(rebuild_model(&state).is_err());
+        assert!(
+            state
+                .model()
+                .is_some_and(|current| current.same_instance(&preferred))
+        );
     }
 }

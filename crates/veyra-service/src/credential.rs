@@ -149,6 +149,23 @@ impl CredentialVault {
     }
 }
 
+/// Operator token accepted by [`test_vault`].
+#[cfg(test)]
+pub(crate) const TEST_ADMIN_TOKEN: &str = "operator-token-with-more-than-32-characters";
+
+/// A vault with a fixed test key, for crate tests that need encrypted state
+/// without reading the process environment.
+#[cfg(test)]
+pub(crate) fn test_vault() -> CredentialVault {
+    match UnboundKey::new(&aead::CHACHA20_POLY1305, &[7_u8; 32]) {
+        Ok(key) => CredentialVault(Arc::new(VaultInner {
+            cipher: LessSafeKey::new(key),
+            admin_token: TEST_ADMIN_TOKEN.to_owned(),
+        })),
+        Err(_) => panic!("test key must be accepted"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

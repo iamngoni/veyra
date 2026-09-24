@@ -19,6 +19,7 @@ import {
   CommandsPanel,
   LogsPanel,
   MetricsPanel,
+  ModelRoutePanel,
   RiskPanel,
   SessionPanel,
   TracePanel,
@@ -124,6 +125,18 @@ export function Dashboard() {
     }
   }
 
+  // Bench no model any longer: every cooldown is cleared and the route is
+  // read again so the panel shows the candidates back in play.
+  const retryModels = async () => {
+    try {
+      await api.clearCooldowns()
+      void refetchStatus()
+      return undefined
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error)
+    }
+  }
+
   // Ranges inside 30 days draw from the 30-day window, which answers sooner and
   // refreshes more often, so the chart and the 30-day summary always agree.
   // Longer ranges need the year-long window.
@@ -160,8 +173,10 @@ export function Dashboard() {
 
         <main className="app-main" id="main-content" tabIndex={-1}>
           <header className="page-header">
-            <h1 className="page-title">{TABS.find((item) => item.id === tab)?.label ?? 'Overview'}</h1>
-            {tab === 'overview' ? <p className="page-description">Your account, activity, and execution controls.</p> : null}
+            <h1 className="page-title">{TABS.find((item) => item.id === tab)?.label}</h1>
+            {/* The assistant's launcher sits in the view's header, beside its
+                name, so it never covers the content below. */}
+            <AssistantChat />
           </header>
 
           {tab === 'overview' ? (
@@ -233,7 +248,10 @@ export function Dashboard() {
                   jevUsage={status?.jev_usage}
                   decisions={status?.decisions}
                 />
-                <MetricsPanel metrics={metrics} status={status} error={metricsError} />
+                <div className="tab-stack">
+                  <ModelRoutePanel status={status} onRetryAll={retryModels} />
+                  <MetricsPanel metrics={metrics} status={status} error={metricsError} />
+                </div>
               </div>
               <LogsPanel logs={logs} error={logsError} level={logLevel} onLevelChange={setLogLevel} />
             </div>
@@ -250,7 +268,6 @@ export function Dashboard() {
           ) : null}
         </main>
       </div>
-      <AssistantChat />
     </div>
   )
 }

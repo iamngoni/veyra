@@ -137,12 +137,12 @@ describe('ChartPanel · performance', () => {
     )
     const { unmount } = renderChart({ trades: growthTrades, balance: 37 })
     expect(svg().getAttribute('width')).toBe('390')
-    expect(svg().getAttribute('height')).toBe('242')
+    expect(svg().getAttribute('height')).toBe('228')
 
     width = 1000
     act(() => observers[0].callback())
     expect(svg().getAttribute('width')).toBe('1000')
-    expect(svg().getAttribute('height')).toBe('294')
+    expect(svg().getAttribute('height')).toBe('280')
 
     unmount()
     expect(observers[0].disconnect).toHaveBeenCalled()
@@ -170,7 +170,7 @@ describe('ChartPanel · performance', () => {
     // Too little room for a readable plot: the default size applies instead.
     height = 100
     act(() => observers[0]())
-    expect(svg().getAttribute('height')).toBe('294')
+    expect(svg().getAttribute('height')).toBe('280')
   })
 
   it('draws a flat line at the balance when nothing closed in the window', () => {

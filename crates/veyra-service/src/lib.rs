@@ -57,8 +57,11 @@ pub struct AppState {
     /// without a restart; every reader takes a snapshot for the duration of a
     /// tick rather than holding the guard across an await.
     autopilot: Arc<std::sync::RwLock<Option<AutopilotSettings>>>,
-    /// Live model integration, rebuilt in place when its settings change.
+    /// Live model integration, rebuilt in place when its settings or the
+    /// ChatGPT subscription connection change.
     model: Arc<std::sync::RwLock<Option<ModelRuntime>>>,
+    /// Per-candidate model cooldowns, shared by every engine rebuild.
+    model_cooldowns: crate::model::CooldownRegistry,
     /// The service half of the execution control, overridable at runtime.
     /// `None` means "as configured at startup".
     trading_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -102,6 +105,7 @@ impl AppState {
             calendar: None,
             autopilot: Arc::new(std::sync::RwLock::new(None)),
             model: Arc::new(std::sync::RwLock::new(model)),
+            model_cooldowns: crate::model::CooldownRegistry::new(),
             trading_enabled,
             runtime_config: crate::runtime_config::RuntimeConfig::new(),
             credential_vault: None,
@@ -174,6 +178,20 @@ impl AppState {
     ) -> Self {
         self.credential_vault = vault;
         self
+    }
+
+    /// Replaces the model cooldown registry, e.g. with one on an injected
+    /// clock. Attach it before building a model runtime: engines capture the
+    /// registry they are built with.
+    pub fn with_model_cooldowns(mut self, cooldowns: crate::model::CooldownRegistry) -> Self {
+        self.model_cooldowns = cooldowns;
+        self
+    }
+
+    /// Per-candidate model cooldowns shared by every engine the service
+    /// builds, so they survive rebuilds.
+    pub fn model_cooldowns(&self) -> &crate::model::CooldownRegistry {
+        &self.model_cooldowns
     }
 
     /// Returns the subscription OAuth state shared by control routes and the provider runtime.
@@ -311,11 +329,62 @@ impl AppState {
 
     /// Returns a snapshot of the active model integration, if one is
     /// configured. Cloned for the same reason as [`AppState::autopilot`].
+    ///
+    /// A runtime whose ChatGPT subscription route no longer matches the live
+    /// connection — it connected, disconnected, or a refresh was rejected
+    /// since the runtime was built — is rebuilt here first, so every caller
+    /// sees a route in step with the connection. The subscription leg is also
+    /// gated live, so a caller holding an older snapshot never reaches a
+    /// disconnected subscription either.
     pub fn model(&self) -> Option<ModelRuntime> {
-        self.model
+        let current = self
+            .model
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .clone();
+        match current {
+            Some(runtime) if runtime.subscription_route_stale(&self.subscription_auth) => {
+                self.rebuild_stale_model(runtime)
+            }
+            other => other,
+        }
+    }
+
+    /// Rebuilds a runtime whose subscription route went stale, carrying the
+    /// call-budget windows across. A failed rebuild keeps the old runtime,
+    /// whose live gate already keeps it off a disconnected subscription.
+    fn rebuild_stale_model(&self, stale: ModelRuntime) -> Option<ModelRuntime> {
+        let Some(settings) = stale.settings().cloned() else {
+            return Some(stale);
+        };
+        let rebuilt = match ModelRuntime::from_settings_with_app(settings, self) {
+            Ok(rebuilt) => rebuilt,
+            Err(error) => {
+                tracing::warn!(%error, "model route could not be rebuilt after a subscription change");
+                return Some(stale);
+            }
+        };
+        if let Err(error) = rebuilt.restore_state(&stale.state_snapshot()) {
+            tracing::warn!(%error, "model call budget could not be carried across a route rebuild");
+        }
+        let mut slot = self
+            .model
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match slot.as_ref() {
+            // Install only over the runtime that went stale; another caller
+            // (or a settings edit) may have replaced it meanwhile.
+            Some(current) if current.same_instance(&stale) => {
+                tracing::info!(
+                    preferred = rebuilt.prefers_subscription(),
+                    "ChatGPT subscription connection changed; model route rebuilt"
+                );
+                *slot = Some(rebuilt.clone());
+                Some(rebuilt)
+            }
+            // Replaced or disabled meanwhile: report what is installed now.
+            other => other.cloned(),
+        }
     }
 
     /// Replaces the live model integration.

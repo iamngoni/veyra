@@ -294,7 +294,7 @@ pub(crate) fn format_for(mode: AgentMode) -> AnswerFormat {
     let mut properties = json!({
         "action": { "type": "string", "enum": actions },
         "rationale": {
-            "type": ["string", "null"],
+            "type": "string",
             "maxLength": 280,
             "description": "Short operator-facing explanation of this step. Always include it."
         },
@@ -346,11 +346,11 @@ fn intent_schema() -> Value {
                 "enum": ["market", "limit", "stop"],
                 "description": "market executes immediately; omit `price` entirely for market orders"
             },
-            "price": { "type": ["number", "null"] },
+            "price": { "type": "number", "description": "entry price for limit and stop orders; omit for market orders" },
             "volume": { "type": "number", "exclusiveMinimum": 0 },
-            "stop_loss": { "type": ["number", "null"] },
-            "take_profit": { "type": ["number", "null"] },
-            "comment": { "type": ["string", "null"] }
+            "stop_loss": { "type": "number", "description": "absolute stop-loss price" },
+            "take_profit": { "type": "number", "description": "absolute take-profit price" },
+            "comment": { "type": "string", "description": "optional short note; omit when there is nothing to add" }
         }
     })
 }
@@ -358,8 +358,8 @@ fn intent_schema() -> Value {
 /// Ticket property for the review schema.
 fn ticket_schema() -> Value {
     json!({
-        "type": ["integer", "null"],
-        "description": "the position to close; required when action is close"
+        "type": "integer",
+        "description": "the position to close; required when action is close, omitted otherwise"
     })
 }
 
@@ -757,6 +757,44 @@ mod tests {
     use crate::risk::{RiskGate, RiskPolicy};
     use crate::trading::intent::Volume;
     use crate::trading::pipeline::PipelineOutcome;
+
+    /// Every type in a schema, depth first.
+    fn schema_types(value: &serde_json::Value, found: &mut Vec<serde_json::Value>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(kind) = map.get("type") {
+                    found.push(kind.clone());
+                }
+                for child in map.values() {
+                    schema_types(child, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                items.iter().for_each(|item| schema_types(item, found))
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn decision_schemas_use_single_types_so_strict_tool_parsers_accept_them() {
+        // Some provider tool parsers (Xiaomi's MiMo endpoint on OpenRouter)
+        // truncate a tool call's arguments when a parameter is a union such
+        // as ["string", "null"]. Optional fields are omitted instead.
+        for schema in [
+            format_for(AgentMode::Proposal).schema,
+            format_for(AgentMode::Review).schema,
+            pipeline::proposal_format().schema,
+        ] {
+            let mut types = Vec::new();
+            schema_types(&schema, &mut types);
+            assert!(!types.is_empty());
+            assert!(
+                types.iter().all(serde_json::Value::is_string),
+                "union type in {schema}"
+            );
+        }
+    }
 
     /// Deterministic engine: pops one scripted answer per call, repeating the
     /// last one once the script runs out.

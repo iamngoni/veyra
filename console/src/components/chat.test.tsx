@@ -123,7 +123,7 @@ it('renders assistant Markdown and GFM tables while keeping the user message pla
       '[Reference](https://example.com/reference)',
     ].join('\n') })
   })
-  const { container } = render(<AssistantChat />)
+  render(<AssistantChat />)
   fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
   fireEvent.change(screen.getByRole('textbox'), { target: { value: '**Keep this literal** <b>question</b>' } })
   fireEvent.click(screen.getByRole('button', { name: /Send/ }))
@@ -142,8 +142,8 @@ it('renders assistant Markdown and GFM tables while keeping the user message pla
   const reference = screen.getByRole('link', { name: 'Reference' })
   expect(reference.getAttribute('href')).toBe('https://example.com/reference')
   expect(reference.getAttribute('rel')).toBe('noopener noreferrer')
-  expect(container.querySelector('.is-user .assistant-answer')?.textContent).toBe('**Keep this literal** <b>question</b>')
-  expect(container.querySelector('.is-user strong, .is-user b')).toBeNull()
+  expect(document.body.querySelector('.is-user .assistant-answer')?.textContent).toBe('**Keep this literal** <b>question</b>')
+  expect(document.body.querySelector('.is-user strong, .is-user b')).toBeNull()
 })
 
 it('does not render raw HTML, executable links, or remote images from model output', async () => {
@@ -164,26 +164,26 @@ it('does not render raw HTML, executable links, or remote images from model outp
       '```',
     ].join('\n') })
   })
-  const { container } = render(<AssistantChat />)
+  render(<AssistantChat />)
   fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
   fireEvent.click(screen.getByRole('button', { name: /What changed recently/ }))
 
   expect(await screen.findByText('Unsafe script')).toBeTruthy()
   expect(screen.getByText('Unsafe data')).toBeTruthy()
   expect(screen.getByText('Image description')).toBeTruthy()
-  expect(container.querySelector('.assistant-answer script, .assistant-answer img, .assistant-answer iframe')).toBeNull()
+  expect(document.body.querySelector('.assistant-answer script, .assistant-answer img, .assistant-answer iframe')).toBeNull()
   expect(screen.queryByRole('link')).toBeNull()
-  expect(container.querySelector('.assistant-answer pre code')?.textContent).toBe('<script>shown as code</script>\n')
+  expect(document.body.querySelector('.assistant-answer pre code')?.textContent).toBe('<script>shown as code</script>\n')
 })
 
 it('keeps assistant error messages unformatted', async () => {
   vi.mocked(streamAssistant).mockImplementation(async (_question, _history, onEvent) => {
     onEvent({ event: 'error', reason: '**Literal failure** <img src=x>' })
   })
-  const { container } = render(<AssistantChat />)
+  render(<AssistantChat />)
   fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
   fireEvent.click(screen.getByRole('button', { name: /What changed recently/ }))
 
   expect(await screen.findByText('**Literal failure** <img src=x>')).toBeTruthy()
-  expect(container.querySelector('.is-error strong, .is-error img')).toBeNull()
+  expect(document.body.querySelector('.is-error strong, .is-error img')).toBeNull()
 })

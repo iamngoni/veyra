@@ -98,7 +98,9 @@ impl Port {
 }
 
 /// Immutable startup settings with a parsed IPv4 or IPv6 socket address.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the database URL, which normally embeds its password.
+#[derive(Clone)]
 pub struct ServiceConfig {
     address: SocketAddr,
     environment: Environment,
@@ -106,6 +108,23 @@ pub struct ServiceConfig {
     reconcile_secs: u64,
     audit_retention_days: u32,
     database_url: Option<String>,
+}
+
+impl std::fmt::Debug for ServiceConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceConfig")
+            .field("address", &self.address)
+            .field("environment", &self.environment)
+            .field("trading_enabled", &self.trading_enabled)
+            .field("reconcile_secs", &self.reconcile_secs)
+            .field("audit_retention_days", &self.audit_retention_days)
+            .field(
+                "database_url",
+                &self.database_url.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl ServiceConfig {

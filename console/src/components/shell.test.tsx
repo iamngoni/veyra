@@ -1,5 +1,5 @@
 /**
- * Render tests for the console chrome: the status strip the operator reads
+ * Render tests for the console chrome: the status list the operator reads
  * first, the theme and settings controls, and the navigation rail.
  */
 
@@ -114,9 +114,27 @@ describe('Topbar status strip', () => {
     expect(screen.getByText(label).className).toBe('')
   })
 
-  it('names the reason in the tooltip', () => {
+  it('names the reason in the tooltip and under the verdict', () => {
     renderTopbar({ ...live, broker_connected: false })
-    expect(item('NO LINK').li.getAttribute('title')).toBe('terminal is not reporting')
+    const posture = item('NO LINK').li
+    expect(posture.getAttribute('title')).toBe('terminal is not reporting')
+    expect(posture.querySelector('.shell-status-detail')?.textContent).toBe('terminal is not reporting')
+  })
+
+  it('writes no reason line while the verdict is healthy', () => {
+    const { container } = render(<Topbar status={live} theme="dark" onToggleTheme={() => {}} onOpenSettings={() => {}} />)
+    expect(container.querySelector('.shell-status-detail')).toBeNull()
+  })
+
+  it('keeps the status list beside the header rather than inside it', () => {
+    renderTopbar(live)
+    const header = screen.getByRole('banner')
+    const list = screen.getByRole('list', { name: 'System status' })
+    expect(header.contains(list)).toBe(false)
+    expect(within(header).getAllByRole('button').map((button) => button.getAttribute('aria-label'))).toEqual([
+      'Switch to light theme',
+      'Settings',
+    ])
   })
 
   it('reports each switch when it is off', () => {
@@ -165,7 +183,10 @@ describe('Topbar controls', () => {
 
   it('opens settings from the gear', () => {
     const { onOpenSettings, onToggleTheme } = renderTopbar(live)
-    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    const gear = screen.getByRole('button', { name: 'Settings' })
+    // Hidden by the stylesheet wherever the Settings view is in the sidebar.
+    expect(gear.className).toBe('icon-button shell-settings')
+    fireEvent.click(gear)
     expect(onOpenSettings).toHaveBeenCalledTimes(1)
     expect(onToggleTheme).not.toHaveBeenCalled()
   })

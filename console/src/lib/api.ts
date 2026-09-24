@@ -68,6 +68,22 @@ export type Status = {
     /** Most recent model candidate that returned a structured answer. */
     lastSuccessfulModel?: string | null
   } | null
+  /** Ordered model candidates currently in force, e.g. `chatgpt:gpt-6-luna` first. */
+  model_route?: string[]
+  /** Candidates benched after a failure, soonest retry first. */
+  model_cooldowns?: ModelCooldown[]
+}
+
+/** A model candidate benched after a failure until `untilMs`. */
+export type ModelCooldown = {
+  provider: string
+  model: string
+  /** `insufficient_credits`, `provider_rejected`, `unauthorized`, `rate_limited`, `overloaded`, `invalid_response` or `unreachable`. */
+  reason: string
+  /** When the next call may probe it again; a past time means the probe is due. */
+  untilMs: number
+  /** Failures in a row, which lengthen the next cooldown. */
+  failures: number
 }
 
 export type RiskPolicy = {
@@ -469,7 +485,12 @@ export async function streamAssistant(
     method: 'POST',
     signal,
     headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
-    body: JSON.stringify({ question, history: boundedAssistantHistory(history) }),
+    // The operator's zone, so "today" and answer times follow their clock.
+    body: JSON.stringify({
+      question,
+      history: boundedAssistantHistory(history),
+      utc_offset_minutes: -new Date().getTimezoneOffset(),
+    }),
   })
   if (!response.ok) {
     const payload = (await response.json().catch(() => null)) as { reason?: string } | null
@@ -579,6 +600,8 @@ export const api = {
   config: () => get<RuntimeConfig>('/config'),
   updateConfig: (patch: RuntimeConfigPatch) =>
     post<{ changed: string[]; settings: Record<string, LiveSetting> }>('/config', patch),
+  /** Returns every benched model to the route at once. */
+  clearCooldowns: () => post<{ cleared: number; model_cooldowns: ModelCooldown[] }>('/model/cooldowns/clear', {}),
 }
 
 export const VEYRA_MAGIC = 77041

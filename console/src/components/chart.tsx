@@ -42,21 +42,23 @@ const TIMEFRAMES: ReadonlyArray<{ value: MarketTimeframe; label: string }> = (
 
 /* ---------- plot geometry (px) ---------- */
 
-/** Panel edge to the plot's left frame. */
-const PAD_LEFT = 18
-/** The value tag's right end to the panel edge. */
-const PAD_RIGHT = 14
-/** Space between the last point and the right axis, bridged by a leader. */
+/** Panel edge to the plot's left edge: the panel inset, so the plot starts under the title. */
+const PAD_LEFT = 16
+/** The value labels' right edge to the panel edge, the same inset. */
+const PAD_RIGHT = 16
+/** Space between the last point and the plot's right edge, bridged by a leader. */
 const LINE_INSET = 8
-/** Right axis to the start of its labels. */
+/** The plot's right edge to the widest value label. */
 const LABEL_GAP = 12
-/** Narrowest label column (axis to panel edge), so the axis holds still across views. */
-const MIN_GUTTER = 71
+/** Narrowest label column (plot edge to panel edge), so the plot holds still across views. */
+const MIN_GUTTER = 64
 /** Height under the plot for the time labels. */
-const AXIS_BAND = 42
-const TICK = 5
-const TAG_HEIGHT = 20
-const TAG_POINT = 6
+const AXIS_BAND = 28
+/** Time labels' baseline below the plot. */
+const X_LABEL_DROP = 18
+const TAG_HEIGHT = 18
+/** The value tag's padding either side of its text. */
+const TAG_PAD = 5
 /** About one time label per this many pixels (fewer on narrow panels). */
 const X_LABEL_SPACING = 90
 const X_LABEL_SPACING_NARROW = 72
@@ -200,10 +202,10 @@ export function barTicks(timesMs: ReadonlyArray<number>, maxCount: number): Arra
   return label(opens(step), step)
 }
 
-/** Approximate advance of 12px Avenir Next digits, for sizing the label column. */
+/** Advance of 11px Inter tabular figures (measured), for sizing the label column and tag. */
 function textWidth(text: string): number {
   let width = 0
-  for (const char of text) width += char === '.' || char === ',' ? 3.4 : 7
+  for (const char of text) width += char === '.' || char === ',' ? 3 : 7.15
   return width
 }
 
@@ -228,6 +230,8 @@ function LinePlot({ spec, width, height }: { spec: PlotSpec; width: number; heig
   const [hover, setHover] = useState<number | null>(null)
   const [keyboard, setKeyboard] = useState(false)
   const instructionsId = useId()
+  // An SVG paint reference needs an id that is also a valid URL fragment.
+  const fillId = `chart-fill-${useId().replace(/[^\w-]/g, '')}`
   const { points, xDomain, decimals } = spec
 
   const values = points.map((point) => point.value)
@@ -242,9 +246,12 @@ function LinePlot({ spec, width, height }: { spec: PlotSpec; width: number; heig
 
   const last = points[points.length - 1]
   const tagText = amount(last.value, decimals)
-  const tagWidth = TAG_POINT + 6 + textWidth(tagText) + 7
+  const tagTextWidth = textWidth(tagText)
   const labelWidth = Math.max(...ticks.map((tick) => textWidth(amount(tick, labelDigits))))
-  const axisX = Math.round(width - Math.max(MIN_GUTTER, Math.max(tagWidth + 1, LABEL_GAP + labelWidth) + PAD_RIGHT)) + 0.5
+  // Value labels and the tag's text share one right edge, the panel inset.
+  const labelRight = width - PAD_RIGHT
+  const gutter = PAD_RIGHT + LABEL_GAP + Math.max(labelWidth, tagTextWidth + TAG_PAD)
+  const axisX = Math.round(width - Math.max(MIN_GUTTER, gutter)) + 0.5
   const bottom = height + 0.5
   const left = PAD_LEFT + 0.5
   const right = axisX - LINE_INSET
@@ -264,6 +271,7 @@ function LinePlot({ spec, width, height }: { spec: PlotSpec; width: number; heig
   const lastX = xs[xs.length - 1]
   const lastY = ys[ys.length - 1]
   const tagY = Math.min(Math.max(lastY, TAG_HEIGHT / 2), height - TAG_HEIGHT / 2)
+  const tagLeft = labelRight - tagTextWidth - TAG_PAD
 
   const spacing = width < NARROW ? X_LABEL_SPACING_NARROW : X_LABEL_SPACING
   const xTicks: Array<{ x: number; label: string }> = []
@@ -328,46 +336,42 @@ function LinePlot({ spec, width, height }: { spec: PlotSpec; width: number; heig
         onTouchMove={(event) => track(event.touches[0].clientX, event.currentTarget)}
         onTouchEnd={() => setHover(null)}
       >
+        <defs>
+          <linearGradient id={fillId} className={`chart-gradient ${tone}`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" className="chart-gradient-top" />
+            <stop offset="1" className="chart-gradient-bottom" />
+          </linearGradient>
+        </defs>
         <g className="chart-grid">
-          <line x1={left} x2={axisX} y1={0.5} y2={0.5} />
-          <line x1={left} x2={left} y1={0.5} y2={bottom} />
-          {yTicks.map((tick) => (
+          {/* A rule just above the baseline would read as a double line. */}
+          {yTicks.filter((tick) => tick.y < bottom - 10).map((tick) => (
             <line key={`y${tick.label}`} x1={left} x2={axisX} y1={tick.y} y2={tick.y} />
           ))}
-          {xTicks.map((tick) => (
-            <line key={`x${tick.x}`} x1={tick.x} x2={tick.x} y1={0.5} y2={bottom} />
-          ))}
         </g>
-        <g className="chart-axis">
-          <line x1={left} x2={axisX} y1={bottom} y2={bottom} />
-          <line x1={axisX} x2={axisX} y1={0.5} y2={bottom} />
-          {yTicks.map((tick) => (
-            <line key={`y${tick.label}`} x1={axisX} x2={axisX + TICK} y1={tick.y} y2={tick.y} />
-          ))}
-          {xTicks.map((tick) => (
-            <line key={`x${tick.x}`} x1={tick.x} x2={tick.x} y1={bottom} y2={bottom + TICK} />
-          ))}
-        </g>
+        <line className="chart-baseline" x1={left} x2={axisX} y1={bottom} y2={bottom} />
         <g className="chart-labels">
           {yTicks
             .filter((tick) => Math.abs(tick.y - tagY) >= TAG_HEIGHT / 2 + 5)
             .map((tick) => (
-              <text key={tick.label} className="chart-ylabel" x={axisX + LABEL_GAP} y={tick.y + 4}>
+              <text key={tick.label} className="chart-ylabel" x={labelRight} y={tick.y + 4} textAnchor="end">
                 {tick.label}
               </text>
             ))}
           {xTicks.map((tick) => (
-            <text key={tick.x} className="chart-xlabel" x={tick.x} y={bottom + 22} textAnchor="middle">
+            <text key={tick.x} className="chart-xlabel" x={tick.x} y={bottom + X_LABEL_DROP} textAnchor="middle">
               {tick.label}
             </text>
           ))}
         </g>
         {points.length > 1 ? (
-          <path className={`chart-line ${tone}`} d={path} />
+          <>
+            <path className="chart-area" d={`${path}V${bottom}H${xs[0].toFixed(1)}Z`} fill={`url(#${fillId})`} />
+            <path className={`chart-line ${tone}`} d={path} />
+          </>
         ) : (
           <circle className={`chart-point ${tone}`} cx={lastX} cy={lastY} r={3} />
         )}
-        <line className={`chart-leader ${tone}`} x1={lastX} x2={axisX} y1={lastY} y2={lastY} />
+        <line className={`chart-leader ${tone}`} x1={lastX} x2={tagLeft} y1={lastY} y2={lastY} />
         {active ? (
           <g className="chart-hover">
             <line className="chart-cross" x1={hoverX} x2={hoverX} y1={0.5} y2={bottom} />
@@ -375,10 +379,10 @@ function LinePlot({ spec, width, height }: { spec: PlotSpec; width: number; heig
           </g>
         ) : null}
         <g className={`chart-tag ${tone}`}>
-          <path
-            d={`M${axisX + 0.5} ${tagY}l${TAG_POINT} ${-TAG_HEIGHT / 2}h${tagWidth - TAG_POINT - 3}q3 0 3 3v${TAG_HEIGHT - 6}q0 3 -3 3h${-(tagWidth - TAG_POINT - 3)}z`}
-          />
-          <text className="chart-tag-text" x={axisX + TAG_POINT + 6.5} y={tagY + 4}>
+          {/* An opaque base under the tint, so grid lines stop at the tag. */}
+          <rect className="chart-tag-base" x={tagLeft} y={tagY - TAG_HEIGHT / 2} width={labelRight + TAG_PAD - tagLeft} height={TAG_HEIGHT} rx={4} />
+          <rect className="chart-tag-tint" x={tagLeft} y={tagY - TAG_HEIGHT / 2} width={labelRight + TAG_PAD - tagLeft} height={TAG_HEIGHT} rx={4} />
+          <text className="chart-tag-text" x={labelRight} y={tagY + 4} textAnchor="end">
             {tagText}
           </text>
         </g>
@@ -721,7 +725,7 @@ export function ChartPanel(props: {
         )}
       </header>
       <div className="chart-stats">
-        {view.state === 'ready' ? view.stats : view.state === 'loading' ? <Skeleton width={300} height={14} /> : null}
+        {view.state === 'ready' ? view.stats : view.state === 'loading' ? <Skeleton width={280} height={12} /> : null}
       </div>
       <div className="chart-plot" ref={ref}>
         {view.state === 'ready' ? (

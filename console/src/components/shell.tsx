@@ -1,6 +1,12 @@
 /**
- * Console chrome: the top bar (wordmark, live status strip, theme and settings)
- * and the left navigation rail.
+ * Console chrome: the header (wordmark, theme and settings), the live status
+ * list and the navigation rail.
+ *
+ * On a desktop window the three stack in the flush sidebar beside the inset
+ * working surface: header, views, then status. On a narrow screen they become
+ * a header row, a sideways status strip and a sideways view strip. The layout
+ * lives in styles/layout.css and styles/shell.css; nothing here branches on
+ * width.
  */
 
 import { useEffect, useRef } from 'react'
@@ -24,7 +30,7 @@ function cadence(secs: number): string {
 }
 
 /**
- * The status strip, verdict first. Only the dot carries state; the words stay
+ * The status list, verdict first. Only the dot carries state; the words stay
  * plain so a row of colours never has to be decoded.
  */
 function indicators(status?: Status): Indicator[] {
@@ -53,7 +59,10 @@ function indicators(status?: Status): Indicator[] {
   ]
 }
 
-/** Full-width header: wordmark, the live status strip, theme and settings. */
+/**
+ * The console header and the live status list. The settings gear only shows
+ * where the Settings view can scroll out of the view strip (narrow screens).
+ */
 export function Topbar({
   status,
   theme,
@@ -67,31 +76,42 @@ export function Topbar({
 }) {
   const themeLabel = theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'
   return (
-    <header className="shell-topbar">
-      <div className="shell-brand">
-        <svg className="shell-brand-mark" viewBox="0 0 24 24" aria-hidden="true">
-          <path d="m3 5 9 15L21 5h-5l-4 7-4-7Z" />
-        </svg>
-        <span className="shell-wordmark">Veyra</span>
-      </div>
-      <span className="shell-workspace">Trading workspace</span>
+    <>
+      <header className="shell-topbar">
+        <div className="shell-brand">
+          <span className="shell-brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="m3 5 9 15L21 5h-5l-4 7-4-7Z" />
+            </svg>
+          </span>
+          <span className="shell-wordmark">Veyra</span>
+        </div>
+        <div className="shell-actions">
+          <button type="button" className="icon-button" aria-label={themeLabel} title={themeLabel} onClick={onToggleTheme}>
+            <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
+          </button>
+          <button
+            type="button"
+            className="icon-button shell-settings"
+            aria-label="Settings"
+            title="Settings"
+            onClick={onOpenSettings}
+          >
+            <Icon name="gear" />
+          </button>
+        </div>
+      </header>
       <ul className="shell-status" aria-label="System status">
         {indicators(status).map((item) => (
           <li key={item.id} className="shell-status-item" title={item.title}>
             <Dot tone={item.tone} />
             <span>{item.label}</span>
+            {/* A fault names its reason in the sidebar, not only on hover. */}
+            {item.title ? <span className="shell-status-detail">{item.title}</span> : null}
           </li>
         ))}
       </ul>
-      <div className="shell-actions">
-        <button type="button" className="icon-button" aria-label={themeLabel} title={themeLabel} onClick={onToggleTheme}>
-          <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
-        </button>
-        <button type="button" className="icon-button" aria-label="Settings" title="Settings" onClick={onOpenSettings}>
-          <Icon name="gear" />
-        </button>
-      </div>
-    </header>
+    </>
   )
 }
 
