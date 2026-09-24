@@ -1,110 +1,146 @@
-import { Fragment, useState } from 'react'
-import type { ChangeEvent } from 'react'
-import type { ReactNode } from 'react'
+/**
+ * The console's working tabs: activity and commands, the risk policy with the
+ * account and market session beside it, the durable trace, diagnostics and
+ * live settings.
+ *
+ * Every panel builds on the shared primitives in `ui.tsx` and reads as the
+ * overview does: a quiet frame, plain labels, hairline-ruled rows and colour
+ * only where it carries state. Styling lives in `styles/tabs.css` under `tab-`
+ * class names.
+ */
+
+import { useId, useState } from 'react'
+import type { ChangeEvent, ReactNode } from 'react'
 
 import type {
   Account,
   AuditPage,
-  BalanceHistory,
-  Candle,
-  CandleSeries,
   CommandRecord,
   FeedEvent,
-  LogLevel,
   LiveSetting,
+  LogLevel,
   LogRecord,
   MarketSessions,
   Metrics,
-  Performance,
-  Position,
   RiskPolicy,
+  RiskPolicyPatch,
+  RuntimeConfigPatch,
   Status,
   WeekendPositions,
 } from '../lib/api'
-import { LOG_LEVELS, VEYRA_MAGIC } from '../lib/api'
-import type { RiskPolicyPatch, RuntimeConfigPatch } from '../lib/api'
+import { LOG_LEVELS } from '../lib/api'
 import {
-  commandTone,
+  activityDetail,
+  activityTitle,
+  activityTone,
+  amount,
   detailRows,
   isRoutine,
-  kindTone,
-  outcomeTone,
   payloadSummary,
+  percent,
+  signedAmount,
 } from '../lib/format'
-import { auditTimeMs, clockTime, money, relativeTime, usePaged } from '../lib/hooks'
+import { auditTimeMs, clockTime, relativeTime, usePaged } from '../lib/hooks'
+import { Dot, Icon, Panel, Segmented, Skeleton, Toggle, signTone, type Tone } from './ui'
 
-/* ---------- primitives ---------- */
+/* ---------- local primitives ---------- */
 
-type Tone = 'ok' | 'warn' | 'bad' | 'off' | 'info'
-
-const toneText: Record<Tone, string> = {
-  ok: 'text-[var(--color-ok)]',
-  warn: 'text-[var(--color-warn)]',
-  bad: 'text-[var(--color-bad)]',
-  off: 'text-[var(--color-ink-faint)]',
-  info: 'text-[var(--color-info)]',
+/** Sentence case for an identifier: `agent_tool_called` → `Agent tool called`. */
+function sentence(text: string): string {
+  const spaced = text.replaceAll('_', ' ')
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1)
 }
 
-const toneDot: Record<Tone, string> = {
-  ok: 'bg-[var(--color-ok)]',
-  warn: 'bg-[var(--color-warn)]',
-  bad: 'bg-[var(--color-bad)]',
-  off: 'bg-[var(--color-line-strong)]',
-  info: 'bg-[var(--color-info)]',
-}
-
-export function Pill({ tone, label, value }: { tone: Tone; label: string; value?: string }) {
+/** A header state: a dot and a word, coloured by what it names. */
+function State({ tone, title, children }: { tone: Tone; title?: string; children: ReactNode }) {
   return (
-    <div className="flex items-center gap-2 rounded-md border border-[var(--color-line)] bg-[var(--color-surface-2)] px-2.5 py-1.5">
-      <span className={`size-1.5 shrink-0 rounded-full ${toneDot[tone]} ${tone === 'ok' ? 'live-dot' : ''}`} />
-      <span className="label">{label}</span>
-      {value ? <span className={`readout text-xs font-medium ${toneText[tone]}`}>{value}</span> : null}
-    </div>
+    <span className={`tab-state is-${tone}`} title={title}>
+      <Dot tone={tone} />
+      {children}
+    </span>
   )
 }
 
-export function Panel({
-  title,
-  detail,
-  children,
-  className = '',
+/** The terse stand-in for a poll that failed before it ever answered. */
+function Unavailable({ error }: { error: string }) {
+  return (
+    <State tone="bad" title={error}>
+      Unavailable
+    </State>
+  )
+}
+
+/**
+ * One label/value row. An undefined value has not arrived yet and holds its
+ * place with a skeleton; a known absence is passed explicitly as `—`.
+ */
+function Field({
+  label,
+  value,
+  tone,
+  wide = false,
 }: {
-  title: string
-  detail?: ReactNode
-  children: ReactNode
-  className?: string
+  label: string
+  value: ReactNode
+  /** Extra class for the value, e.g. `tone-warn`. */
+  tone?: string
+  /** Span every column (long values such as a model chain). */
+  wide?: boolean
 }) {
   return (
-    <section
-      className={`console-panel flex min-h-0 min-w-0 flex-col overflow-hidden rounded-[6px] border border-[var(--color-line)] bg-[var(--color-surface-1)] ${className}`}
-    >
-      <header className="flex items-center justify-between gap-3 border-b border-[var(--color-line)] bg-[var(--color-surface-2)]/40 px-3.5 py-2.5">
-        <h2 className="panel-title">{title}</h2>
-        {detail ? <div className="text-[11px] text-[var(--color-ink-faint)]">{detail}</div> : null}
-      </header>
-      <div className="min-h-0 flex-1 overflow-auto">{children}</div>
-    </section>
-  )
-}
-
-function Field({ label, value, tone }: { label: string; value: ReactNode; tone?: string }) {
-  return (
-    <div className="min-w-0">
-      <div className="label">{label}</div>
-      <div className={`readout mt-0.5 truncate text-[13px] ${tone ?? 'text-[var(--color-ink)]'}`}>{value}</div>
+    <div className={`tab-field${wide ? ' is-wide' : ''}`}>
+      <dt>{label}</dt>
+      <dd className={tone}>{value === undefined ? <Skeleton width={72} /> : value}</dd>
     </div>
   )
 }
 
-/** Placeholder with the same footprint as the value it stands in for. */
-export function Skeleton({ className = 'h-4 w-16' }: { className?: string }) {
-  return <div className={`skeleton ${className}`} aria-hidden="true" />
+function Fields({ columns = 2, children }: { columns?: 1 | 2 | 3; children: ReactNode }) {
+  return <dl className={`tab-fields is-cols-${columns}`}>{children}</dl>
+}
+
+function Empty({ children }: { children: ReactNode }) {
+  return <div className="panel-empty">{children}</div>
+}
+
+/** Placeholder rows while a list's first poll is in flight. */
+function SkeletonRows() {
+  return (
+    <ul className="tab-list" aria-hidden="true">
+      {[0, 1, 2].map((row) => (
+        <li key={row} className="tab-row tab-skeleton-row">
+          <Skeleton width={56} />
+          <Skeleton width="60%" />
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/** Quiet text button; `ok` marks the one action that commits a change. */
+function Button({
+  children,
+  tone,
+  disabled = false,
+  onClick,
+}: {
+  children: ReactNode
+  tone?: 'ok'
+  disabled?: boolean
+  onClick: () => void
+}) {
+  return (
+    <button type="button" className={`tab-button${tone ? ` is-${tone}` : ''}`} disabled={disabled} onClick={onClick}>
+      {children}
+    </button>
+  )
 }
 
 /**
  * Page control for the long lists. It states the visible range rather than
  * only the page number, because "showing 26–50 of 312" answers the question an
- * operator actually has when scanning a feed.
+ * operator actually has when scanning a feed. A list that fits on one page
+ * needs no control at all.
  */
 export function Pager({
   page,
@@ -123,834 +159,115 @@ export function Pager({
   onPrevious: () => void
   onNext: () => void
 }) {
-  if (total === 0) return null
-  const button =
-    'rounded border border-[var(--color-line-strong)] px-2 py-0.5 text-[11px] text-[var(--color-ink-muted)] enabled:hover:border-[var(--color-ink-faint)] disabled:opacity-35'
+  if (pages <= 1) return null
   return (
-    <div className="flex items-center justify-between gap-3 border-t border-[var(--color-line)] px-3 py-1.5">
-      <span className="readout text-[11px] text-[var(--color-ink-faint)]">
+    <div className="tab-pager">
+      <span className="readout">
         {start + 1}–{start + count} of {total}
       </span>
-      <span className="flex items-center gap-1.5">
-        <button type="button" className={button} onClick={onPrevious} disabled={page === 0} aria-label="Previous page">
-          ←
-        </button>
-        <span className="readout text-[11px] text-[var(--color-ink-faint)]">
-          {page + 1}/{pages}
-        </span>
+      <span className="tab-pager-controls">
         <button
           type="button"
-          className={button}
+          className="tab-pager-button is-previous"
+          onClick={onPrevious}
+          disabled={page === 0}
+          aria-label="Previous page"
+        >
+          <Icon name="chevron-down" size={16} />
+        </button>
+        <button
+          type="button"
+          className="tab-pager-button is-next"
           onClick={onNext}
           disabled={page >= pages - 1}
           aria-label="Next page"
         >
-          →
+          <Icon name="chevron-down" size={16} />
         </button>
       </span>
     </div>
   )
 }
 
-/** Sections the dashboard so each view is scannable without scrolling past it. */
-export function Tabs({
-  tabs,
-  active,
-  onSelect,
-}: {
-  tabs: ReadonlyArray<{ id: string; label: string; badge?: number }>
-  active: string
-  onSelect: (id: string) => void
-}) {
+type Paged = {
+  page: number
+  pages: number
+  start: number
+  total: number
+  items: readonly unknown[]
+  next: () => void
+  previous: () => void
+}
+
+function ListPager({ paged }: { paged: Paged }) {
   return (
-    <div role="tablist" className="console-tabs flex flex-wrap gap-1 rounded-lg border border-[var(--color-line)] bg-[var(--color-surface-1)] p-1">
-      {tabs.map((tab) => {
-        const selected = tab.id === active
-        return (
-          <button
-            key={tab.id}
-            type="button"
-            role="tab"
-            aria-selected={selected}
-            onClick={() => onSelect(tab.id)}
-            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12px] font-medium transition-colors ${
-              selected
-                ? 'bg-[var(--color-surface-3)] text-[var(--color-ink)]'
-                : 'text-[var(--color-ink-faint)] hover:text-[var(--color-ink-muted)]'
-            }`}
-          >
-            <TabIcon id={tab.id} />
-            {tab.label}
-            {tab.badge ? (
-              <span className="readout rounded bg-[var(--color-surface-2)] px-1 text-[10px] text-[var(--color-ink-faint)]">
-                {tab.badge}
-              </span>
-            ) : null}
-          </button>
-        )
-      })}
-    </div>
+    <Pager
+      page={paged.page}
+      pages={paged.pages}
+      start={paged.start}
+      count={paged.items.length}
+      total={paged.total}
+      onPrevious={paged.previous}
+      onNext={paged.next}
+    />
   )
 }
 
-function TabIcon({ id }: { id: string }) {
-  const paths: Record<string, string> = {
-    overview: 'M3 10.5 10 4l7 6.5v6.5H3z M7 17v-4h6v4',
-    market: 'M3 15.5 7.5 10l3 2.5L17 5',
-    activity: 'M3 12h3l2-7 4 14 2-7h3',
-    risk: 'M10 3 16 5v4c0 4.2-2.5 7.1-6 9-3.5-1.9-6-4.8-6-9V5z',
-    trace: 'M5 3h10v14H5z M8 7h4 M8 10h4 M8 13h3',
-    diagnostics: 'M3 12h3l2-6 4 12 2-6h3',
-    settings: 'M10 3v2 M10 15v2 M3 10h2 M15 10h2 M5 5l1.5 1.5 M13.5 13.5 15 15 M15 5l-1.5 1.5 M6.5 13.5 5 15 M10 7a3 3 0 1 0 0 6 3 3 0 0 0 0-6z',
-  }
-  return (
-    <svg className="nav-icon" viewBox="0 0 20 20" aria-hidden="true">
-      <path d={paths[id] ?? paths.overview} />
-    </svg>
-  )
+/** Pretty JSON for a drill-down; strings are shown whole rather than quoted. */
+function Raw({ value }: { value: unknown }) {
+  return <pre className="tab-pre">{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre>
 }
 
-export function ThemeToggle({ theme, onToggle }: { theme: 'dark' | 'light'; onToggle: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
-      title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
-      className="rounded-md border border-[var(--color-line)] bg-[var(--color-surface-2)] px-2 py-1.5 text-[12px] text-[var(--color-ink-muted)] hover:border-[var(--color-line-strong)] hover:text-[var(--color-ink)]"
-    >
-      {theme === 'dark' ? '☾' : '☀'}
-    </button>
-  )
-}
-
-/* ---------- posture ---------- */
-
-/** The single verdict an operator looks for first: can this thing trade? */
-export function systemPosture(status?: Status): {
-  label: string
-  detail: string
-  tone: Tone
-} {
-  if (!status) {
-    return { label: 'CONNECTING', detail: 'reaching the service', tone: 'off' }
-  }
-  if (status.risk_policy?.killSwitch) {
-    return { label: 'HALTED', detail: 'kill switch engaged — every intent refused', tone: 'bad' }
-  }
-  // Ranked above the link and the switches because it is the failure that
-  // looks like health: the service answers, the terminal is live, and nothing
-  // is ever decided. Two in a row rules out one transient provider hiccup.
-  const failures = status.decisions?.consecutiveFailures ?? 0
-  if (failures >= 2) {
-    const lastModel = status.decisions?.lastModel
-      ? ` · last LLM ${status.decisions.lastModel}`
-      : ''
-    return {
-      label: 'NOT DECIDING',
-      detail: `${failures} decisions in a row failed${lastModel} — ${status.decisions?.lastFailure ?? 'no reason reported'}`,
-      tone: 'bad',
-    }
-  }
-  if (!status.broker_connected) {
-    return { label: 'NO LINK', detail: 'terminal is not reporting', tone: 'bad' }
-  }
-  if (!status.trading_enabled) {
-    return { label: 'STANDBY', detail: 'deciding only — nothing will execute', tone: 'off' }
-  }
-  if (!status.ea_live_orders) {
-    return { label: 'DRY RUN', detail: 'service armed, terminal still validating only', tone: 'warn' }
-  }
-  return { label: 'LIVE', detail: 'orders reach the market', tone: 'ok' }
-}
-
-const postureFrame: Record<Tone, string> = {
-  ok: 'border-[var(--color-ok)]/40 bg-[var(--color-ok-dim)]',
-  warn: 'border-[var(--color-warn)]/40 bg-[var(--color-warn-dim)]',
-  bad: 'border-[var(--color-bad)]/50 bg-[var(--color-bad-dim)]',
-  off: 'border-[var(--color-line-strong)] bg-[var(--color-surface-2)]',
-  info: 'border-[var(--color-info)]/40 bg-[var(--color-info-dim)]',
-}
-
-export function PostureBanner({ status }: { status?: Status }) {
-  const posture = systemPosture(status)
-  return (
-    <div
-      className={`flex items-center gap-3.5 rounded-xl border px-4 py-3 ${postureFrame[posture.tone]}`}
-      role="status"
-    >
-      <span className={`size-2.5 shrink-0 rounded-full ${toneDot[posture.tone]} ${posture.tone === 'ok' ? 'live-dot' : ''}`} />
-      <div className="min-w-0">
-        <div className={`text-base font-semibold leading-none tracking-tight ${toneText[posture.tone]}`}>
-          {posture.label}
-        </div>
-        <div className="mt-1 truncate text-[11px] text-[var(--color-ink-muted)]">{posture.detail}</div>
-      </div>
-    </div>
-  )
-}
-
-/* ---------- headline numbers ---------- */
-
-/** The four figures that decide whether anything else needs attention. */
-export function HeroMetrics({ account, error }: { account?: Account; error?: string }) {
-  const positions = account?.positions ?? []
-  const open = positions.reduce((sum, position) => sum + (position.profit ?? 0), 0)
-  const openTone = open > 0 ? 'text-[var(--color-ok)]' : open < 0 ? 'text-[var(--color-bad)]' : 'text-[var(--color-ink)]'
-  const cells: Array<{ label: string; value: ReactNode; tone?: string; hint?: string }> = [
-    {
-      label: 'Equity',
-      value: account?.equity === undefined ? null : money(account.equity),
-      hint: account?.balance === undefined ? undefined : `balance ${money(account.balance)}`,
-    },
-    {
-      label: 'Open P/L',
-      value: account ? (positions.length > 0 ? `${open >= 0 ? '+' : ''}${open.toFixed(2)}` : '—') : null,
-      tone: openTone,
-      hint: `${positions.length} position${positions.length === 1 ? '' : 's'}`,
-    },
-    {
-      // A snapshot can arrive before its money fields do, so an absent value
-      // reads as pending rather than rendering the word "undefined".
-      label: 'Exposure',
-      value: account?.lots === undefined ? null : `${account.lots} lots`,
-      hint:
-        account?.orders === undefined
-          ? undefined
-          : `${account.orders} order${account.orders === 1 ? '' : 's'}`,
-    },
-    {
-      label: 'Free margin',
-      value: account?.freeMargin === undefined ? null : money(account.freeMargin),
-      hint: account?.marginLevel != null ? `level ${account.marginLevel.toFixed(0)}%` : undefined,
-    },
-  ]
-  return (
-    <div className="hero-metrics grid grid-cols-2 gap-px overflow-hidden rounded-[6px] border border-[var(--color-line)] bg-[var(--color-line)] lg:grid-cols-4">
-      {cells.map((cell) => (
-        <div key={cell.label} className="hero-metric bg-[var(--color-surface-1)] px-4 py-3">
-          <div className="label">{cell.label}</div>
-          <div className={`readout mt-1.5 text-xl leading-none font-medium ${cell.tone ?? 'text-[var(--color-ink)]'}`}>
-            {cell.value ?? (error ? <span className="text-sm text-[var(--color-bad)]">unavailable</span> : <Skeleton className="h-5 w-24" />)}
-          </div>
-          <div className="mt-1.5 h-3 text-[11px] text-[var(--color-ink-faint)]">{cell.value ? (cell.hint ?? '') : ''}</div>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-/* ---------- safety controls ---------- */
-
-/**
- * The two switches an operator reaches for in a hurry, promoted out of the
- * policy editor. Both are one click plus a confirm, because a mis-click on
- * either one changes what the bot is allowed to do with real money.
- */
-export function SafetyControls({
-  policy,
-  jevHealthy,
-  onApply,
-}: {
-  policy?: RiskPolicy
-  /** Whether the judge answered recently; drives the degraded warning. */
-  jevHealthy?: boolean
-  onApply?: (patch: RiskPolicyPatch) => Promise<string | undefined>
-}) {
-  const [pending, setPending] = useState<keyof RiskPolicyPatch>()
-  const [error, setError] = useState<string>()
-  const [confirming, setConfirming] = useState<keyof RiskPolicyPatch>()
-
-  const submit = async (key: 'killSwitch' | 'allowTradingWithoutJev', next: boolean) => {
-    if (!onApply) return
-    setPending(key)
-    setError(undefined)
-    const failure = await onApply({ [key]: next })
-    setPending(undefined)
-    setConfirming(undefined)
-    if (failure) setError(failure)
-  }
-
-  const halted = policy?.killSwitch ?? false
-  const withoutJev = policy?.allowTradingWithoutJev ?? false
-  const degraded = jevHealthy === false
-
-  return (
-    <Panel
-      title="Risk controls"
-      detail={error ? <span className="text-[var(--color-bad)]">{error}</span> : undefined}
-    >
-      <div className="flex flex-col gap-px bg-[var(--color-line)]">
-        <Switch
-          label="Kill switch"
-          description={
-            halted
-              ? 'Engaged. Every new intent is refused; open positions are untouched.'
-              : 'Blocks new orders; open positions stay open.'
-          }
-          checked={halted}
-          tone="bad"
-          busy={pending === 'killSwitch'}
-          disabled={!policy || !onApply}
-          confirming={confirming === 'killSwitch'}
-          onRequest={() => setConfirming(confirming === 'killSwitch' ? undefined : 'killSwitch')}
-          onConfirm={() => void submit('killSwitch', !halted)}
-          confirmLabel={halted ? 'Release the kill switch' : 'Halt all new intents'}
-        />
-        <Switch
-          label="Trade without the judge"
-          description={
-            withoutJev
-              ? 'Override active. Trading can continue if the judge cannot answer.'
-              : 'Allows trading only when the judge can answer.'
-          }
-          checked={withoutJev}
-          tone="warn"
-          busy={pending === 'allowTradingWithoutJev'}
-          disabled={!policy || !onApply}
-          confirming={confirming === 'allowTradingWithoutJev'}
-          onRequest={() =>
-            setConfirming(confirming === 'allowTradingWithoutJev' ? undefined : 'allowTradingWithoutJev')
-          }
-          onConfirm={() => void submit('allowTradingWithoutJev', !withoutJev)}
-          confirmLabel={withoutJev ? 'Require the judge again' : 'Allow trading without the judge'}
-          warning={
-            degraded && !withoutJev
-              ? 'The judge is not answering — new decisions are paused right now.'
-              : degraded && withoutJev
-                ? 'The judge is not answering and the override is on: the model is deciding alone.'
-                : undefined
-          }
-        />
-      </div>
-    </Panel>
-  )
-}
-
-function Switch({
-  label,
-  description,
-  checked,
-  tone,
-  busy,
-  disabled,
-  confirming,
-  onRequest,
-  onConfirm,
-  confirmLabel,
-  warning,
-}: {
-  label: string
-  description: string
-  checked: boolean
-  tone: Tone
-  busy: boolean
-  disabled: boolean
-  confirming: boolean
-  onRequest: () => void
-  onConfirm: () => void
-  confirmLabel: string
-  warning?: string
-}) {
-  return (
-    <div className="bg-[var(--color-surface-1)] px-3.5 py-3">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-[13px] font-medium text-[var(--color-ink)]">{label}</span>
-            {checked ? (
-              <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${toneText[tone]} bg-[var(--color-surface-3)]`}>
-                on
-              </span>
-            ) : null}
-          </div>
-          <p className="mt-1 text-[11px] leading-relaxed text-[var(--color-ink-faint)]">{description}</p>
-        </div>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={checked}
-          aria-label={label}
-          disabled={disabled || busy}
-          onClick={onRequest}
-          className={`relative mt-0.5 h-5 w-9 shrink-0 rounded-full border transition-colors disabled:opacity-40 ${
-            checked
-              ? `${toneDot[tone]} border-transparent`
-              : 'border-[var(--color-line-strong)] bg-[var(--color-surface-3)]'
-          }`}
-        >
-          <span
-            className={`absolute top-0.5 size-3.5 rounded-full bg-[var(--color-surface-0)] transition-all ${
-              checked ? 'left-[1.15rem]' : 'left-0.5'
-            }`}
-          />
-        </button>
-      </div>
-      {warning ? (
-        <p className="mt-2 rounded border border-[var(--color-warn)]/30 bg-[var(--color-warn-dim)] px-2 py-1.5 text-[11px] text-[var(--color-warn)]">
-          {warning}
-        </p>
-      ) : null}
-      {confirming ? (
-        <div className="mt-2 flex items-center justify-between gap-2 rounded border border-[var(--color-line-strong)] bg-[var(--color-surface-2)] px-2 py-1.5">
-          <span className="text-[11px] text-[var(--color-ink-muted)]">{confirmLabel}?</span>
-          <span className="flex gap-1.5">
-            <button
-              type="button"
-              onClick={onRequest}
-              className="rounded border border-[var(--color-line-strong)] px-2 py-0.5 text-[11px] text-[var(--color-ink-muted)] hover:border-[var(--color-ink-faint)]"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={onConfirm}
-              disabled={busy}
-              className={`rounded px-2 py-0.5 text-[11px] font-medium text-[var(--color-surface-0)] disabled:opacity-50 ${toneDot[tone]}`}
-            >
-              {busy ? 'Applying…' : 'Confirm'}
-            </button>
-          </span>
-        </div>
-      ) : null}
-    </div>
-  )
-}
-
-/* ---------- header ---------- */
-
-export function StatusPills({ status }: { status?: Status }) {
-  if (!status) {
-    return <div className="status-strip"><span className="status-state is-off"><i /><span>connecting…</span></span></div>
-  }
-  const posture = systemPosture(status)
-  const indicator = (label: string, value: string, tone: string) => (
-    <span className={`status-state ${tone}`}><i /><span>{label}</span> <span>{value}</span></span>
-  )
-  return (
-    <div className="status-strip">
-      <span className={`status-state is-${posture.tone}`} title={posture.tone === 'ok' ? undefined : posture.detail}>
-        <i />
-        <span>{posture.label}</span>
-        {posture.tone !== 'ok' ? <span className="status-posture-detail">· {posture.detail}</span> : null}
-      </span>
-      {indicator('Terminal', status.broker_connected ? 'connected' : 'stale', status.broker_connected ? 'is-ok' : 'is-bad')}
-      {indicator('EA', status.ea_live_orders ? 'armed' : 'disarmed', status.ea_live_orders ? 'is-ok' : 'is-off')}
-      {indicator('Trading', status.trading_enabled ? 'enabled' : 'disabled', status.trading_enabled ? 'is-warn' : 'is-off')}
-      {indicator('Autopilot', status.autopilot?.enabled ? `${status.autopilot.interval_secs}s · ${status.autopilot.timeframe}` : 'off', status.autopilot?.enabled ? 'is-ok' : 'is-off')}
-      <span className="sr-only"><span>{status.persistence ?? 'off'}</span> <span>{status.environment}</span> <span>v{status.version}</span></span>
-    </div>
-  )
+/** ISO instant for a `<time>` element, or undefined for an unreadable one. */
+function isoTime(ms: number): string | undefined {
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined
 }
 
 /* ---------- account ---------- */
 
 export function AccountPanel({ account, error }: { account?: Account; error?: string }) {
+  // Nothing on screen is invented: before the first poll every value is a
+  // skeleton, and after a failed one it is a dash.
+  const pending = !account && !error
+  const show = (present: boolean, text: () => string) => (account && present ? text() : pending ? undefined : '—')
   const positions = account?.positions ?? []
-  const totalProfit = positions.reduce((sum, position) => sum + (position.profit ?? 0), 0)
+  const open = positions.reduce((sum, position) => sum + (position.profit ?? 0), 0)
   return (
     <Panel
       title="Account"
-      detail={
-        account
-          ? `updated ${relativeTime(Date.now() - account.ageSecs * 1000)}`
-          : error
-            ? <span className="text-[var(--color-bad)]">{error}</span>
-            : 'waiting…'
+      className="tab-panel"
+      actions={
+        account ? (
+          <span className={account.fresh ? undefined : 'tone-warn'}>
+            Updated {relativeTime(Date.now() - account.ageSecs * 1000)}
+          </span>
+        ) : error ? (
+          <Unavailable error={error} />
+        ) : null
       }
     >
-      <div className="grid grid-cols-2 gap-x-4 gap-y-3 p-3 sm:grid-cols-3">
-        <Field label="Balance" value={money(account?.balance)} />
-        <Field label="Equity" value={money(account?.equity)} />
-        <Field label="Free margin" value={money(account?.freeMargin)} />
-        <Field
-          label="Margin level"
-          value={account?.marginLevel != null ? `${account.marginLevel.toFixed(1)}%` : '—'}
-        />
-        <Field label="Leverage" value={account?.leverage != null ? `1:${account.leverage}` : '—'} />
-        <Field label="Open orders" value={account?.orders ?? '—'} />
-        <Field label="Open lots" value={account?.lots ?? '—'} />
+      <Fields>
+        <Field label="Balance" value={show(account?.balance !== undefined, () => amount(account?.balance))} />
+        <Field label="Equity" value={show(account?.equity !== undefined, () => amount(account?.equity))} />
+        <Field label="Free margin" value={show(account?.freeMargin !== undefined, () => amount(account?.freeMargin))} />
+        {/* Zero means no margin is in use, so there is no level to report. */}
+        <Field label="Margin level" value={show(Boolean(account?.marginLevel), () => percent(account?.marginLevel, 1))} />
+        <Field label="Leverage" value={show(Boolean(account?.leverage), () => `1:${account?.leverage}`)} />
+        <Field label="Open orders" value={show(account?.orders !== undefined, () => String(account?.orders))} />
+        <Field label="Open lots" value={show(account?.lots !== undefined, () => String(account?.lots))} />
         <Field
           label="Open P/L"
-          value={positions.length > 0 ? `${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(2)}` : '—'}
-          tone={totalProfit >= 0 ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}
+          value={show(positions.length > 0, () => signedAmount(open))}
+          tone={positions.length > 0 ? signTone(open) : undefined}
         />
-      </div>
-      <div className="border-t border-[var(--color-line)]/80 px-3 py-2 text-[11px] text-[var(--color-ink-faint)]">
-        {account?.server ? `${account.server} · #${account.login} · ` : ''}
-        {account?.symbol ?? ''}
-      </div>
+        <Field label="Server" value={show(Boolean(account?.server), () => String(account?.server))} />
+        <Field label="Login" value={show(account?.login != null, () => String(account?.login))} />
+      </Fields>
     </Panel>
   )
 }
 
-/**
- * How far price has moved in the position's favour. A sell profits as price
- * falls, so the raw difference is signed against the side rather than reported
- * as a bare price change that would read backwards on half the book.
- */
-function favourableMove(position: Position): number {
-  if (!position.current) return 0
-  return position.kind === 'buy'
-    ? position.current - position.price
-    : position.price - position.current
-}
-
-/**
- * The move as a signed price delta at the venue's own quote precision.
- *
- * Deliberately not pips: pip size differs per instrument class (and this book
- * mixes FX with metals), so a converted figure would be wrong somewhere and
- * silently so. The delta is always true.
- *
- * Precision is the widest seen across the row's prices, because any single one
- * can be short a digit — an entry that happens to land on 1.3 says nothing
- * about how finely the instrument is quoted, and rounding to it would report a
- * real move as no move at all.
- */
-function quotedDecimals(position: Position): number {
-  const prices = [position.price, position.current, position.sl, position.tp]
-  const widest = prices.reduce<number>((most, price) => {
-    if (!price) return most
-    return Math.max(most, (String(price).split('.')[1] ?? '').length)
-  }, 0)
-  return widest || 2
-}
-
-function formatMove(position: Position): string {
-  const move = favourableMove(position)
-  return `${move >= 0 ? '+' : ''}${move.toFixed(quotedDecimals(position))}`
-}
-
-export function PositionsPanel({ account }: { account?: Account }) {
-  const positions = account?.positions ?? []
-  const [expandedTicket, setExpandedTicket] = useState<number | null>(null)
-  return (
-    <Panel
-      title="Positions"
-      detail={account?.positionsTruncated ? <span className="text-[var(--color-warn)]">truncated</span> : `${positions.length}`}
-    >
-      {positions.length === 0 ? (
-        <div className="p-3 text-xs text-[var(--color-ink-faint)]">Flat — no open orders.</div>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="positions-table w-full text-left">
-            <thead className="position-table-head">
-              <tr className="border-b border-[var(--color-line)]/80">
-                <th className="px-3 py-1.5 font-medium">Symbol</th>
-                <th className="px-2 py-1.5 font-medium">Side</th>
-                <th className="px-2 py-1.5 font-medium">Lots</th>
-                <th className="px-2 py-1.5 font-medium">Entry</th>
-                <th className="px-2 py-1.5 font-medium">Current</th>
-                <th className="px-2 py-1.5 font-medium">SL</th>
-                <th className="px-2 py-1.5 font-medium">TP</th>
-                <th className="px-2 py-1.5 font-medium">P/L</th>
-                <th className="px-3 py-1.5 font-medium"><span className="sr-only">Details</span></th>
-              </tr>
-            </thead>
-            <tbody className="tabular-nums">
-              {positions.map((position: Position) => (
-                <Fragment key={position.ticket}>
-                <tr className="border-b border-[var(--color-line)]/40">
-                  <td className="px-3 py-1.5 font-semibold text-[var(--color-ink)]">{position.symbol}</td>
-                  <td className={`px-2 py-1.5 ${position.kind === 'buy' ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}`}>
-                    {position.kind}
-                  </td>
-                  <td className="px-2 py-1.5 text-[var(--color-ink)]">{position.lots}</td>
-                  <td className="px-2 py-1.5 text-[var(--color-ink)]">{position.price}</td>
-                  <td className="px-2 py-1.5 text-[var(--color-ink)]">
-                    {position.current ? (
-                      <>
-                        {position.current}
-                        {/* The move only means anything with a direction, so it
-                            is signed against the side rather than the price. */}
-                        <span
-                          className={`ml-1.5 text-[10px] ${
-                            favourableMove(position) >= 0
-                              ? 'text-[var(--color-ok)]'
-                              : 'text-[var(--color-bad)]'
-                          }`}
-                        >
-                          {formatMove(position)}
-                        </span>
-                      </>
-                    ) : (
-                      '—'
-                    )}
-                  </td>
-                  <td className="px-2 py-1.5 text-[var(--color-bad)]">{position.sl > 0 ? position.sl : '—'}</td>
-                  <td className="px-2 py-1.5 text-[var(--color-ok)]">{position.tp > 0 ? position.tp : '—'}</td>
-                  <td className={`px-2 py-1.5 ${position.profit >= 0 ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}`}>
-                    {position.profit >= 0 ? '+' : ''}
-                    {position.profit.toFixed(2)}
-                  </td>
-                  <td className="px-3 py-1.5 text-right">
-                    <button type="button" className="position-details-toggle" aria-label={`Details for ${position.symbol}`} aria-expanded={expandedTicket === position.ticket} aria-controls={`position-${position.ticket}`} onClick={() => setExpandedTicket(expandedTicket === position.ticket ? null : position.ticket)}>•••</button>
-                  </td>
-                </tr>
-                {expandedTicket === position.ticket ? (
-                  <tr id={`position-${position.ticket}`}>
-                    <td colSpan={9}>
-                      <div className="position-details-row">
-                        <span>Ticket <b>{position.ticket}</b></span>
-                        <span>Swap <b>{position.swap == null ? '—' : `${position.swap >= 0 ? '+' : ''}${position.swap.toFixed(2)}`}</b></span>
-                        <span>Owner <b>{position.magic === VEYRA_MAGIC ? 'veyra' : 'manual'}</b></span>
-                      </div>
-                    </td>
-                  </tr>
-                ) : null}
-                </Fragment>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </Panel>
-  )
-}
-
-/* ---------- performance ---------- */
-
-export function PerformancePanel({
-  performance,
-  error,
-}: {
-  performance?: Performance
-  error?: string
-}) {
-  const report = performance?.report
-  const money = (value: number | null | undefined) =>
-    value == null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(2)}`
-  return (
-    <Panel
-      title="30-day performance"
-      detail={
-        performance
-          ? `last ${performance.days}d · ${performance.total} closed${performance.truncated ? ' · truncated' : ''}`
-          : error
-            ? <span className="text-[var(--color-bad)]">{error}</span>
-            : 'waiting…'
-      }
-    >
-      <div className="performance-headlines">
-        <Field
-          label="Win rate"
-          value={report && report.trades > 0 ? `${report.win_rate_percent.toFixed(1)}%` : '—'}
-          tone={
-            report && report.trades > 0 && report.win_rate_percent >= 50
-              ? 'text-[var(--color-ok)]'
-              : undefined
-          }
-        />
-        <Field
-          label="Net P/L"
-          value={performance ? money(report?.net_profit) : '—'}
-          tone={report && report.net_profit >= 0 ? 'text-[var(--color-ok)]' : report ? 'text-[var(--color-bad)]' : undefined}
-        />
-        <Field label="Closed trades" value={report && report.trades > 0 ? String(report.trades) : '—'} />
-      </div>
-      <details className="performance-details">
-        <summary>View detailed performance</summary>
-        <div className="performance-detail-grid">
-          <Field label="Record" value={report && report.trades > 0 ? `${report.wins}W · ${report.losses}L${report.breakeven > 0 ? ` · ${report.breakeven}F` : ''}` : '—'} />
-          <Field label="Profit factor" value={report?.profit_factor != null ? report.profit_factor.toFixed(2) : '—'} />
-          <Field label="Avg win" value={money(report?.average_win)} />
-          <Field label="Avg loss" value={report?.average_loss != null ? `-${report.average_loss.toFixed(2)}` : '—'} />
-          <Field label="Expectancy" value={money(report?.expectancy)} />
-          <Field label="Best / worst" value={report?.best_trade != null && report.worst_trade != null ? `${money(report.best_trade)} / ${money(report.worst_trade)}` : '—'} />
-        </div>
-        {report && report.by_symbol.length > 0 ? (
-          <div className="performance-symbols">
-            {report.by_symbol.map((entry) => (
-              <span key={entry.symbol}>
-                {entry.symbol} {entry.wins}/{entry.trades}{' '}
-                <span className={entry.net_profit >= 0 ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}>{money(entry.net_profit)}</span>
-              </span>
-            ))}
-          </div>
-        ) : null}
-      </details>
-    </Panel>
-  )
-}
-
-/* ---------- account balance history ---------- */
-
-function historyTime(ms: number): string {
-  const date = new Date(ms)
-  return date.toLocaleString([], {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
-  })
-}
-
-function historyValue(value: number): string {
-  return Number.isFinite(value) ? value.toFixed(2) : '—'
-}
-
-/**
- * Shows only broker-observed balance points for the currently connected
- * account. A single point is intentionally rendered as a dot, not a line;
- * an empty history never gets an invented percentage or trend.
- */
-export function BalanceHistoryPanel({
-  history,
-  account,
-  error,
-}: {
-  history?: BalanceHistory
-  account?: Account
-  error?: string
-}) {
-  const [rangeDays, setRangeDays] = useState<1 | 7 | 30>(30)
-  const sameAccount = Boolean(
-    history?.account &&
-      account?.login != null &&
-      account.server &&
-      history.account.login === account.login &&
-      history.account.server === account.server,
-  )
-  const current = sameAccount ? history : undefined
-  const allPoints = current?.points ?? []
-  const rangeAnchor = Date.now()
-  const points = rangeAnchor
-    ? allPoints.filter((point) => point.atMs >= rangeAnchor - rangeDays * 86_400_000)
-    : []
-  const first = points[0]
-  const last = points.at(-1)
-  const spanMs = first && last ? Math.max(last.atMs - first.atMs, 1) : 1
-  const values = points.map((point) => point.balance).filter(Number.isFinite)
-  const min = values.length ? Math.min(...values) : 0
-  const max = values.length ? Math.max(...values) : 1
-  const padding = values.length > 1 ? Math.max((max - min) * 0.12, Math.abs(max) * 0.001, 0.01) : 1
-  const low = min - padding
-  const high = max + padding
-  const range = high - low || 1
-  const plotWidth = 760
-  const plotHeight = 220
-  const chartPoints = points.map((point) => {
-      const x = points.length === 1 ? plotWidth / 2 : ((point.atMs - (first?.atMs ?? point.atMs)) / spanMs) * plotWidth
-      const y = plotHeight - ((point.balance - low) / range) * plotHeight
-      return { x, y, atMs: point.atMs }
-    })
-  const maxGapMs = current?.sampled ? Math.max(300_000, (spanMs / Math.max(points.length - 1, 1)) * 4) : 300_000
-  const segments: Array<typeof chartPoints> = []
-  for (const point of chartPoints) {
-    const segment = segments.at(-1)
-    if (!segment || (point.atMs - segment.at(-1)!.atMs) > maxGapMs) {
-      segments.push([point])
-    } else {
-      segment.push(point)
-    }
-  }
-  const change = first && last && points.length > 1 ? last.balance - first.balance : null
-  const changeText = change == null || change === 0 ? null : `${change > 0 ? '+' : '−'}${historyValue(Math.abs(change))}`
-  const statusText =
-    history?.status === 'disabled'
-      ? 'Balance history is disabled.'
-      : history?.status === 'waiting_for_account'
-        ? 'Waiting for the broker account.'
-        : error
-          ? error
-          : !account
-            ? 'Waiting for the current account.'
-            : !sameAccount && history?.account
-              ? 'Waiting for this account’s history.'
-              : current && allPoints.length > 0 && points.length === 0
-                ? 'No observations in this period.'
-                : 'History starts with the next broker reading.'
-
-  return (
-    <Panel
-      title="Balance over time"
-      detail={
-        <div className="balance-panel-detail">
-          {error ? <span className="text-[var(--color-bad)]">unavailable</span> : null}
-          {current?.sampled ? <span title="Points are sampled broker observations; gaps remain visible.">Sampled</span> : null}
-          <span className="balance-range-controls" aria-label="Balance history range">
-            {[1, 7, 30].map((days) => (
-              <button key={days} type="button" aria-pressed={rangeDays === days} onClick={() => setRangeDays(days as 1 | 7 | 30)}>{days}D</button>
-            ))}
-          </span>
-        </div>
-      }
-      className="balance-history-panel"
-    >
-      {points.length === 0 ? (
-        <div className="balance-history-empty" role="status">
-          <span className="balance-history-empty-mark" aria-hidden="true" />
-          <div>
-            <strong>{statusText}</strong>
-          </div>
-        </div>
-      ) : (
-        <figure className="balance-history-figure" aria-label="Broker-observed account balance over time">
-          <div className="balance-history-summary">
-            <div className="balance-summary-line">
-              <strong className="readout" aria-label="Latest balance">{historyValue(last?.balance ?? NaN)}</strong>
-              {changeText ? <span className={`balance-history-change ${change! > 0 ? 'is-positive' : change! < 0 ? 'is-negative' : ''}`}>Balance change {changeText}</span> : null}
-            </div>
-          </div>
-          <div className="balance-history-chart-wrap">
-            <svg className="balance-history-chart" viewBox={`0 0 ${plotWidth} ${plotHeight}`} preserveAspectRatio="none" role="img">
-              <title>Observed account balance history</title>
-              {[0, 0.5, 1].map((fraction) => {
-                const y = plotHeight * fraction
-                return (
-                  <g key={fraction}>
-                    <line x1="0" x2={plotWidth} y1={y} y2={y} className="chart-grid-line" />
-                  </g>
-                )
-              })}
-              {segments.map((segment, index) => segment.length > 1 ? (
-                <path
-                  key={index}
-                  d={segment.slice(1).reduce((path, point) => `${path} H ${point.x.toFixed(2)} V ${point.y.toFixed(2)}`, `M ${segment[0].x.toFixed(2)} ${segment[0].y.toFixed(2)}`)}
-                  className="balance-history-line"
-                />
-              ) : (
-                <circle key={index} cx={segment[0].x} cy={segment[0].y} r="4" className="balance-history-dot" />
-              ))}
-              {chartPoints.length > 1 && last ? <circle cx={chartPoints.at(-1)?.x} cy={chartPoints.at(-1)?.y} r="4" className="balance-history-dot" /> : null}
-            </svg>
-            <div className="chart-y-axis">
-              {[0, 0.5, 1].map((fraction) => <span key={fraction}>{historyValue(high - range * fraction)}</span>)}
-            </div>
-          </div>
-          {points.length > 0 ? <div className="chart-x-axis">{points.length === 1 ? <span>{historyTime(first!.atMs)}</span> : [0, 0.5, 1].map((fraction) => <span key={fraction}>{historyTime((first?.atMs ?? 0) + spanMs * fraction)}</span>)}</div> : null}
-          {current?.sampled ? <span className="sr-only">Points are sampled broker observations; gaps remain visible.</span> : null}
-          {error || !current?.fresh ? <figcaption><span>{error ? 'last known · refresh failed' : 'last known'}</span></figcaption> : null}
-        </figure>
-      )}
-    </Panel>
-  )
-}
-
-/* ---------- market ---------- */
-
-function Sparkline({ candles }: { candles: Candle[] }) {
-  if (candles.length < 2) return null
-  const closes = candles.map((candle) => candle.close)
-  const min = Math.min(...closes)
-  const max = Math.max(...closes)
-  const span = max - min || 1
-  const width = 100
-  const height = 30
-  const points = closes
-    .map((close, index) => {
-      const x = (index / (closes.length - 1)) * width
-      const y = height - ((close - min) / span) * height
-      return `${x.toFixed(2)},${y.toFixed(2)}`
-    })
-    .join(' ')
-  const rising = closes[closes.length - 1] >= closes[0]
-  const stroke = rising ? '#34d399' : '#fb7185'
-  return (
-    <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" className="h-16 w-full">
-      <polygon points={`0,${height} ${points} ${width},${height}`} fill={stroke} opacity={0.08} />
-      <polyline points={points} fill="none" stroke={stroke} strokeWidth={1.2} vectorEffect="non-scaling-stroke" />
-    </svg>
-  )
-}
+/* ---------- market session ---------- */
 
 /** UTC clock label for an instant, e.g. `Fri 21:00 UTC`. */
 function utcClock(unix: number): string {
@@ -959,6 +276,13 @@ function utcClock(unix: number): string {
   const hh = String(date.getUTCHours()).padStart(2, '0')
   const mm = String(date.getUTCMinutes()).padStart(2, '0')
   return `${weekday} ${hh}:${mm} UTC`
+}
+
+/** Minute of the UTC day as a clock, e.g. `1245` → `20:45`. */
+function utcMinute(minute: number): string {
+  const hh = String(Math.floor(minute / 60) % 24).padStart(2, '0')
+  const mm = String(minute % 60).padStart(2, '0')
+  return `${hh}:${mm}`
 }
 
 /** Compact time-until label, e.g. `in 3h 12m`. */
@@ -972,11 +296,17 @@ function untilLabel(unix: number, now: number): string {
   return `in ${minutes}m`
 }
 
+const MARKET_STATE: Record<MarketSessions['market']['state'], { tone: Tone; label: string }> = {
+  open: { tone: 'ok', label: 'Open' },
+  rollover: { tone: 'warn', label: 'Rollover' },
+  closed: { tone: 'idle', label: 'Closed' },
+}
+
 const SESSION_EVENT_LABELS: Record<MarketSessions['market']['nextEvent'], string> = {
-  opens: 'opens',
-  closes: 'closes',
-  pauses: 'rollover pause',
-  resumes: 'resumes',
+  opens: 'Opens',
+  closes: 'Closes',
+  pauses: 'Pauses',
+  resumes: 'Resumes',
 }
 
 const ENTRY_BLOCK_LABELS: Record<string, string> = {
@@ -986,93 +316,102 @@ const ENTRY_BLOCK_LABELS: Record<string, string> = {
   session_closed: 'session window',
 }
 
-/** How the active weekend preference reads on the market line. */
-const WEEKEND_POLICY_LABELS: Record<WeekendPositions, string> = {
-  agent: 'the analyst settles each open position',
-  hold: 'positions stay through the weekend',
-  flatten: 'every open position is flattened',
+/** How the weekend preference reads, shared by the policy and the session. */
+const WEEKEND_LABELS: Record<WeekendPositions, string> = {
+  agent: 'Analyst decides',
+  hold: 'Held through',
+  flatten: 'Flattened before close',
 }
 
-export function MarketPanel({
-  series,
+/**
+ * Where the trading week stands: the market state, when it next changes,
+ * whether new entries are allowed and what is exposed meanwhile.
+ */
+export function SessionPanel({
   sessions,
   account,
-  error,
 }: {
-  series?: CandleSeries
   sessions?: MarketSessions
-  /** Positions are surfaced here so the panel names what is exposed when the market is closed. */
+  /** Positions are named here so the panel says what is exposed while the market is shut. */
   account?: Account
-  error?: string
 }) {
-  const last = series?.candles.at(-1)
-  const first = series?.candles.at(0)
-  const change = last && first ? ((last.close - first.close) / first.close) * 100 : undefined
-  const held = (account?.positions ?? []).map((position) => position.symbol)
-  const state = sessions?.market.state
-  const stateTone =
-    state === 'open' ? 'text-[var(--color-ok)]' : state === 'rollover' ? 'text-amber-400' : 'text-[var(--color-bad)]'
+  const state = sessions ? MARKET_STATE[sessions.market.state] : undefined
+  const held = account ? (account.positions ?? []).map((position) => position.symbol) : undefined
+  const checkpoint = sessions?.weekend.closesInSecs ?? null
+  const blockedBy = sessions?.entries.blockedBy
+  const blockReason = blockedBy ? (ENTRY_BLOCK_LABELS[blockedBy] ?? blockedBy) : undefined
   return (
     <Panel
-      title="Market"
-      detail={series ? `${series.symbol} ${series.timeframe}` : error ? <span className="text-[var(--color-bad)]">{error}</span> : '…'}
+      title="Market session"
+      className="tab-panel"
+      actions={state ? <State tone={state.tone}>{state.label}</State> : null}
     >
-      <div className="p-3">
-        {series ? <Sparkline candles={series.candles} /> : <div className="h-16" />}
-        <div className="mt-2 grid grid-cols-3 gap-3">
-          <Field label="Last close" value={last ? last.close.toFixed(5) : '—'} />
-          <Field
-            label={`Change ${series?.candles.length ?? 0}b`}
-            value={change === undefined ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`}
-            tone={change !== undefined && change >= 0 ? 'text-[var(--color-ok)]' : 'text-[var(--color-bad)]'}
-          />
-          <Field label="H / L" value={last ? `${last.high.toFixed(5)} / ${last.low.toFixed(5)}` : '—'} />
-        </div>
-      </div>
-      {sessions ? (
-        <div className="border-t border-[var(--color-line)] px-3 py-2 text-[11px] leading-relaxed text-[var(--color-muted)]">
-          <div>
-            <span className={`font-semibold uppercase ${stateTone}`}>{state}</span>
-            {' · '}
-            {SESSION_EVENT_LABELS[sessions.market.nextEvent]} {utcClock(sessions.market.nextAt)} (
-            {untilLabel(sessions.market.nextAt, sessions.now)})
-          </div>
-          <div>
-            Entries{' '}
-            {sessions.entries.open ? (
-              <span className="text-[var(--color-ok)]">open</span>
-            ) : (
-              <span className="text-amber-400">
-                blocked — {ENTRY_BLOCK_LABELS[sessions.entries.blockedBy ?? ''] ?? sessions.entries.blockedBy}
-              </span>
-            )}
-          </div>
-          {held.length > 0 ? (
-            <div>
-              Holding {held.join(' · ')}
-              {state !== 'open' ? ' — market closed; stops rest at the broker' : ''}
-            </div>
-          ) : null}
-          {sessions.weekend.closesInSecs !== null ? (
-            <div>
-              <span className="text-[var(--color-warn)]">Weekend checkpoint</span>
-              {' · closes '}
-              {utcClock(sessions.now + sessions.weekend.closesInSecs)} (
-              {untilLabel(sessions.now + sessions.weekend.closesInSecs, sessions.now)}) {' — '}
-              {WEEKEND_POLICY_LABELS[sessions.weekend.policy]}
-            </div>
-          ) : null}
-        </div>
-      ) : null}
+      <Fields columns={1}>
+        <Field
+          label={sessions ? SESSION_EVENT_LABELS[sessions.market.nextEvent] : 'Next'}
+          value={
+            sessions
+              ? `${utcClock(sessions.market.nextAt)} · ${untilLabel(sessions.market.nextAt, sessions.now)}`
+              : undefined
+          }
+        />
+        <Field
+          label="Entries"
+          value={
+            sessions
+              ? sessions.entries.open
+                ? 'Open'
+                : blockReason
+                  ? `Blocked · ${blockReason}`
+                  : 'Blocked'
+              : undefined
+          }
+          tone={sessions ? (sessions.entries.open ? 'tone-ok' : 'tone-warn') : undefined}
+        />
+        <Field label="Holding" value={held ? (held.length > 0 ? held.join(' · ') : 'None') : undefined} />
+        <Field
+          label="Rollover"
+          value={
+            sessions
+              ? `${utcMinute(sessions.policy.rolloverBlackout.startMinute)}–${utcMinute(sessions.policy.rolloverBlackout.endMinute)} UTC`
+              : undefined
+          }
+        />
+        <Field
+          label="Entry window"
+          value={
+            sessions
+              ? `Sun ${utcMinute(sessions.policy.sundayEntryOpenMinute)} – Fri ${utcMinute(sessions.policy.fridayEntryCutoffMinute)} UTC`
+              : undefined
+          }
+        />
+        {sessions && checkpoint !== null ? (
+          <>
+            <Field
+              label="Weekend close"
+              value={`${utcClock(sessions.now + checkpoint)} · ${untilLabel(sessions.now + checkpoint, sessions.now)}`}
+              tone="tone-warn"
+            />
+            <Field label="Weekend positions" value={WEEKEND_LABELS[sessions.weekend.policy]} />
+          </>
+        ) : null}
+      </Fields>
     </Panel>
   )
 }
 
 /* ---------- autopilot ---------- */
 
-/** Compact token count for the panel (1234 -> 1.2k). */
+/** Compact token count: 1234 → 1.2k, 2164642 → 2.2M. */
 function compactTokens(value: number): string {
-  return value >= 1000 ? `${(value / 1000).toFixed(1)}k` : String(value)
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}k`
+  return String(value)
+}
+
+/** A call cap, where zero means unbounded. */
+function cap(limit: number): string {
+  return limit ? amount(limit, 0) : '∞'
 }
 
 export function AutopilotPanel({
@@ -1080,118 +419,114 @@ export function AutopilotPanel({
   budget,
   jevUsage,
   decisions,
-  compact = false,
-  lastDecisionAt,
 }: {
   status?: Status['autopilot']
   budget?: Status['model_budget']
   jevUsage?: Status['jev_usage']
   decisions?: Status['decisions']
-  compact?: boolean
-  lastDecisionAt?: number
 }) {
   const on = status?.enabled === true
-  if (compact) {
-    return (
-      <Panel title="Autopilot" detail={<span className={`autopilot-state ${on ? 'is-ok' : decisions?.consecutiveFailures ? 'is-bad' : 'is-off'}`}><i /> {on ? 'Running' : decisions?.consecutiveFailures ? 'Error' : 'Off'}</span>} className="autopilot-summary-panel">
-        <div className="autopilot-summary">
-          <Field label="Cadence" value={on && status ? `${status.interval_secs} seconds · ${status.timeframe}` : '—'} />
-          <Field label="Last decision" value={lastDecisionAt ? clockTime(lastDecisionAt) : 'No recent decision.'} />
-          <Field label="Status" value={decisions?.lastFailure ?? (on ? 'Enabled' : 'Autopilot is off.')} />
-        </div>
-        <details className="autopilot-details">
-          <summary>View autopilot details</summary>
-          <div className="grid grid-cols-2 gap-x-4 gap-y-3 p-3">
-            <Field label="Window" value={on && status ? `${status.bars} bars` : '—'} />
-            <Field label="Model tier" value={status?.tier ?? '—'} />
-            <Field label="Judgements" value={status?.jev ?? '—'} />
-            <Field label="Symbols" value={status && status.symbols.length > 0 ? status.symbols.join(' · ') : 'chart symbol'} />
-            <Field label="Stops" value={status && (status.breakeven_r > 0 || status.trail_r > 0) ? [status.breakeven_r > 0 ? `BE ${status.breakeven_r}R` : null, status.trail_r > 0 ? `trail ${status.trail_r}R` : null].filter(Boolean).join(' · ') : 'bracket only'} />
-            <Field label="Profit harvest" value={status?.profit_harvest ? `${status.profit_harvest.arm_r}R arm · ${status.profit_harvest.trail_r}R trail · ${status.profit_harvest.min_profit.toFixed(2)} floor` : 'off'} />
-            <Field label="Model chain" value={status?.model_chain?.length ? status.model_chain.join(' → ') : status?.model_fallbacks?.length ? `fallbacks: ${status.model_fallbacks.join(' → ')}` : 'none — a provider outage stops the loop'} />
-            <Field label="Last LLM" value={decisions?.lastModel ?? 'not called yet'} />
-            <Field label="Last answer" value={decisions?.lastSuccessfulModel ?? 'none yet'} />
-            <Field label="Model calls" value={budget ? `${budget.hourCalls}/${budget.hourLimit || '∞'} h · ${budget.dayCalls}/${budget.dayLimit || '∞'} d` : '—'} />
-            <Field label="JEV usage" value={jevUsage && jevUsage.calls > 0 ? `${jevUsage.calls} calls · ${compactTokens(jevUsage.inputTokens + jevUsage.outputTokens)} tok${jevUsage.failures > 0 ? ` · ${jevUsage.failures} failed` : ''}` : '—'} />
-          </div>
-        </details>
-      </Panel>
-    )
-  }
+  // A null autopilot is a known answer (none configured); undefined is a poll
+  // that has not landed yet.
+  const known = status !== undefined
+  const stops = status
+    ? sentence(
+        [status.breakeven_r > 0 ? `break-even ${status.breakeven_r}R` : null, status.trail_r > 0 ? `trail ${status.trail_r}R` : null]
+          .filter(Boolean)
+          .join(' · ') || 'bracket only',
+      )
+    : undefined
+  const chain = status?.model_chain?.length
+    ? status.model_chain.join(' → ')
+    : status?.model_fallbacks?.length
+      ? `Fallbacks: ${status.model_fallbacks.join(' → ')}`
+      : undefined
+  const failing = decisions && decisions.consecutiveFailures > 0 && decisions.lastFailure
   return (
-    <Panel title="Autopilot" detail={on ? 'deciding on cadence' : 'disabled'}>
-      <div className="grid grid-cols-2 gap-x-4 gap-y-3 p-3">
-        <Field label="Cadence" value={on && status ? `${status.interval_secs}s` : '—'} />
-        <Field label="Timeframe" value={status?.timeframe ?? '—'} />
-        <Field label="Window" value={on && status ? `${status.bars} bars` : '—'} />
-        <Field label="Model tier" value={status?.tier ?? '—'} />
-        <Field label="Judgements" value={status?.jev ?? '—'} />
+    <Panel
+      title="Autopilot"
+      className="tab-panel"
+      actions={known ? <State tone={on ? 'ok' : 'idle'}>{on ? 'Running' : 'Off'}</State> : null}
+    >
+      <Fields>
+        <Field label="Cadence" value={known ? (on && status ? `${status.interval_secs} seconds` : '—') : undefined} />
+        <Field label="Timeframe" value={known ? (status?.timeframe ?? '—') : undefined} />
+        <Field label="Window" value={known ? (on && status ? `${status.bars} bars` : '—') : undefined} />
+        <Field label="Tier" value={known ? (status?.tier ?? '—') : undefined} />
+        <Field label="Judgements" value={known ? (status?.jev ?? '—') : undefined} />
+        <Field label="Stops" value={known ? (stops ?? '—') : undefined} />
         <Field
           label="Symbols"
-          value={status && status.symbols.length > 0 ? status.symbols.join(' · ') : 'chart symbol'}
-        />
-        <Field
-          label="Stops"
-          value={
-            status && (status.breakeven_r > 0 || status.trail_r > 0)
-              ? [status.breakeven_r > 0 ? `BE ${status.breakeven_r}R` : null, status.trail_r > 0 ? `trail ${status.trail_r}R` : null]
-                  .filter(Boolean)
-                  .join(' · ')
-              : 'bracket only'
-          }
+          wide
+          value={known ? (status ? (status.symbols.length > 0 ? status.symbols.join(' · ') : 'Chart symbol') : '—') : undefined}
         />
         <Field
           label="Profit harvest"
+          wide
           value={
-            status?.profit_harvest
-              ? `${status.profit_harvest.arm_r}R arm · ${status.profit_harvest.trail_r}R trail · ${status.profit_harvest.min_profit.toFixed(2)} floor`
-              : 'off'
+            known
+              ? status?.profit_harvest
+                ? `${status.profit_harvest.arm_r}R arm · ${status.profit_harvest.trail_r}R trail · ${amount(status.profit_harvest.min_profit)} floor`
+                : 'Off'
+              : undefined
           }
         />
         <Field
           label="Model chain"
-          value={
-            status?.model_chain?.length
-              ? status.model_chain.join(' → ')
-              : status?.model_fallbacks?.length
-                ? `fallbacks: ${status.model_fallbacks.join(' → ')}`
-              : 'none — a provider outage stops the loop'
-          }
-          tone={status?.model_chain?.length || status?.model_fallbacks?.length ? undefined : 'text-[var(--color-warn)]'}
+          wide
+          value={known ? (status ? (chain ?? 'No fallbacks') : '—') : undefined}
+          tone={status && !chain ? 'tone-warn' : undefined}
         />
         <Field
           label="Last LLM"
-          value={decisions?.lastModel ?? 'not called yet'}
-          tone={decisions?.lastModel ? undefined : 'text-[var(--color-ink-faint)]'}
+          wide
+          value={decisions === undefined ? undefined : (decisions?.lastModel ?? 'Not called yet')}
+          tone={decisions?.lastModel ? undefined : 'tone-faint'}
         />
         <Field
           label="Last answer"
-          value={decisions?.lastSuccessfulModel ?? 'none yet'}
-          tone={decisions?.lastSuccessfulModel ? undefined : 'text-[var(--color-ink-faint)]'}
+          wide
+          value={decisions === undefined ? undefined : (decisions?.lastSuccessfulModel ?? 'None yet')}
+          tone={decisions?.lastSuccessfulModel ? undefined : 'tone-faint'}
         />
         <Field
-          label="Model calls"
-          value={
-            budget
-              ? `${budget.hourCalls}/${budget.hourLimit || '∞'} h · ${budget.dayCalls}/${budget.dayLimit || '∞'} d`
-              : '—'
-          }
+          label="Calls per hour"
+          value={budget === undefined ? undefined : budget ? `${budget.hourCalls} / ${cap(budget.hourLimit)}` : '—'}
         />
         <Field
-          label="Jev usage"
+          label="Calls per day"
+          value={budget === undefined ? undefined : budget ? `${amount(budget.dayCalls, 0)} / ${cap(budget.dayLimit)}` : '—'}
+        />
+        <Field
+          label="Judge calls"
           value={
-            jevUsage && jevUsage.calls > 0
-              ? `${jevUsage.calls} calls · ${compactTokens(
-                  jevUsage.inputTokens + jevUsage.outputTokens,
-                )} tok${jevUsage.failures > 0 ? ` · ${jevUsage.failures} failed` : ''}`
-              : '—'
+            jevUsage === undefined
+              ? undefined
+              : jevUsage && jevUsage.calls > 0
+                ? `${amount(jevUsage.calls, 0)}${jevUsage.failures > 0 ? ` · ${jevUsage.failures} failed` : ''}`
+                : '—'
+          }
+          tone={jevUsage && jevUsage.failures > 0 ? 'tone-warn' : undefined}
+        />
+        <Field
+          label="Judge tokens"
+          value={
+            jevUsage === undefined
+              ? undefined
+              : jevUsage && jevUsage.calls > 0
+                ? compactTokens(jevUsage.inputTokens + jevUsage.outputTokens)
+                : '—'
           }
         />
-      </div>
-      <div className="border-t border-[var(--color-line)]/80 px-3 py-2 text-[11px] leading-relaxed text-[var(--color-ink-faint)]">
-        Every entry carries both stops, passes the deterministic risk gate, and still needs both armed switches
-        before the terminal can place it.
-      </div>
+        {failing ? (
+          <Field
+            label="Last failure"
+            wide
+            value={`${decisions.consecutiveFailures} in a row · ${decisions.lastFailure}`}
+            tone="tone-bad"
+          />
+        ) : null}
+      </Fields>
     </Panel>
   )
 }
@@ -1218,6 +553,18 @@ type PolicyDraft = {
   minStopAtrFraction: string
 }
 
+type NumericDraftKey =
+  | 'maxVolumePerOrder'
+  | 'maxTotalLots'
+  | 'maxOpenOrders'
+  | 'duplicateWindowSecs'
+  | 'maxRiskPercent'
+  | 'maxDailyLossPercent'
+  | 'maxPeakDrawdownPercent'
+  | 'maxNetFactorLots'
+  | 'calendarBlackoutMinutes'
+  | 'minStopAtrFraction'
+
 const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer: boolean }> = [
   { key: 'maxVolumePerOrder', label: 'Max / order (lots)', integer: false },
   { key: 'maxTotalLots', label: 'Max total (lots)', integer: false },
@@ -1230,18 +577,6 @@ const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer
   { key: 'calendarBlackoutMinutes', label: 'News blackout (minutes)', integer: true },
   { key: 'minStopAtrFraction', label: 'Min stop (× ATR)', integer: false },
 ]
-
-type NumericDraftKey =
-  | 'maxVolumePerOrder'
-  | 'maxTotalLots'
-  | 'maxOpenOrders'
-  | 'duplicateWindowSecs'
-  | 'maxRiskPercent'
-  | 'maxDailyLossPercent'
-  | 'maxPeakDrawdownPercent'
-  | 'maxNetFactorLots'
-  | 'calendarBlackoutMinutes'
-  | 'minStopAtrFraction'
 
 function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
   return {
@@ -1265,7 +600,7 @@ function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
 }
 
 /** Parses the draft into a patch, or returns the first input error. */
-function patchFromDraft(draft: PolicyDraft): { patch?: RiskPolicyPatch; error?: string } {
+function patchFromDraft(draft: PolicyDraft): { patch: RiskPolicyPatch } | { error: string } {
   const patch: RiskPolicyPatch = {
     killSwitch: draft.killSwitch,
     allowTradingWithoutJev: draft.allowTradingWithoutJev,
@@ -1294,6 +629,109 @@ function patchFromDraft(draft: PolicyDraft): { patch?: RiskPolicyPatch; error?: 
   return { patch }
 }
 
+/** Label above, optional marker beside it, control below. */
+function Control({
+  id,
+  label,
+  title,
+  span = false,
+  aside,
+  children,
+}: {
+  id: string
+  label: string
+  title?: string
+  /** Take two columns (long lists). */
+  span?: boolean
+  /** Right-aligned beside the label, e.g. an override marker. */
+  aside?: ReactNode
+  children: ReactNode
+}) {
+  return (
+    <div className={`tab-control${span ? ' is-span' : ''}`}>
+      <div className="tab-control-head">
+        <label htmlFor={id} title={title}>
+          {label}
+        </label>
+        {aside ? <span className="tab-control-aside">{aside}</span> : null}
+      </div>
+      {children}
+    </div>
+  )
+}
+
+/** A labelled text input for the editors. */
+function TextControl({
+  label,
+  field,
+  value,
+  onChange,
+  placeholder,
+  span,
+  disabled = false,
+  dirty = false,
+  aside,
+  title,
+}: {
+  label: string
+  /** Rides on the element as `data-field`, so one handler serves every input. */
+  field: string
+  value: string
+  onChange: (event: ChangeEvent<HTMLInputElement>) => void
+  placeholder?: string
+  span?: boolean
+  disabled?: boolean
+  /** Changed but not yet applied. */
+  dirty?: boolean
+  aside?: ReactNode
+  title?: string
+}) {
+  const id = useId()
+  return (
+    <Control id={id} label={label} title={title} span={span} aside={aside}>
+      <input
+        id={id}
+        className={`tab-input${dirty ? ' is-dirty' : ''}`}
+        data-field={field}
+        value={value}
+        placeholder={placeholder}
+        disabled={disabled}
+        onChange={onChange}
+        spellCheck={false}
+        autoComplete="off"
+      />
+    </Control>
+  )
+}
+
+/** The weekend preference is a choice, not free text. */
+function WeekendControl({
+  value,
+  onChange,
+}: {
+  value: WeekendPositions
+  onChange: (value: WeekendPositions) => void
+}) {
+  const id = useId()
+  return (
+    <Control id={id} label="Weekend positions">
+      <span className="tab-select">
+        <select
+          id={id}
+          className="tab-input"
+          value={value}
+          onChange={(event) => onChange(event.target.value as WeekendPositions)}
+        >
+          <option value="agent">Agent decides per position</option>
+          <option value="hold">Hold through the weekend</option>
+          <option value="flatten">Flatten before the close</option>
+        </select>
+        <Icon name="chevron-down" size={16} />
+      </span>
+    </Control>
+  )
+}
+
 export function RiskPanel({
   policy,
   status,
@@ -1304,7 +742,7 @@ export function RiskPanel({
   /** Applies a patch; resolves to an error message or undefined on success. */
   onApply?: (patch: RiskPolicyPatch) => Promise<string | undefined>
 }) {
-  const [editing, setEditing] = useState(false)
+  // An open draft is the editor; there is no separate editing flag to drift.
   const [draft, setDraft] = useState<PolicyDraft>()
   const [error, setError] = useState<string>()
   const [saving, setSaving] = useState(false)
@@ -1312,266 +750,175 @@ export function RiskPanel({
   const startEditing = (current: RiskPolicy) => {
     setDraft(draftFromPolicy(current))
     setError(undefined)
-    setEditing(true)
   }
   const cancelEditing = () => {
-    setEditing(false)
+    setDraft(undefined)
     setError(undefined)
   }
-  /** One handler for every editor input; the field name rides on the element. */
+  /** One handler for every text input; the field name rides on the element. */
   const handleField = (event: ChangeEvent<HTMLInputElement>) => {
     const key = event.target.dataset.field as keyof PolicyDraft
-    const value =
-      event.target.type === 'checkbox' ? event.target.checked : event.target.value
-    setDraft((current) => (current ? { ...current, [key]: value } : current))
+    const value = event.target.value
+    setDraft((current) => current && { ...current, [key]: value })
   }
-  /** The weekend preference is a choice, not free text. */
-  const handleSelect = (event: ChangeEvent<HTMLSelectElement>) => {
-    const value = event.target.value as WeekendPositions
-    setDraft((current) => (current ? { ...current, weekendPositions: value } : current))
-  }
-  const save = async () => {
-    if (!draft || !onApply) return
-    const { patch, error: inputError } = patchFromDraft(draft)
-    if (!patch) {
-      setError(inputError ?? 'invalid policy')
+  const flip = (key: 'killSwitch' | 'allowTradingWithoutJev') =>
+    setDraft((current) => current && { ...current, [key]: !current[key] })
+  const setWeekend = (value: WeekendPositions) =>
+    setDraft((current) => current && { ...current, weekendPositions: value })
+  const save = async (apply: (patch: RiskPolicyPatch) => Promise<string | undefined>, current: PolicyDraft) => {
+    const parsed = patchFromDraft(current)
+    if ('error' in parsed) {
+      setError(parsed.error)
       return
     }
     setSaving(true)
     setError(undefined)
-    const failure = await onApply(patch)
+    const failure = await apply(parsed.patch)
     setSaving(false)
     if (failure) {
       setError(failure)
     } else {
-      setEditing(false)
+      setDraft(undefined)
     }
   }
 
-  const detail = editing ? (
-    <span className="flex items-center gap-2">
-      {error ? <span className="text-[var(--color-bad)]">{error}</span> : null}
-      <button
-        type="button"
-        onClick={cancelEditing}
-        className="rounded border border-[var(--color-line-strong)] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-[var(--color-ink-muted)] hover:border-[var(--color-ink-faint)]"
-      >
-        cancel
-      </button>
-      <button
-        type="button"
-        onClick={() => void save()}
-        disabled={saving}
-        className="rounded border border-[var(--color-ok)]/60 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-[var(--color-ok)] hover:border-[var(--color-ok)] disabled:opacity-50"
-      >
-        {saving ? 'saving…' : 'save'}
-      </button>
-    </span>
-  ) : (
-    <span className="flex items-center gap-2">
-      {policy?.killSwitch ? <span className="text-[var(--color-bad)]">kill switch on</span> : 'gate active'}
-      {onApply && policy ? (
-        <button
-          type="button"
-          onClick={() => startEditing(policy)}
-          className="rounded border border-[var(--color-line-strong)] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-[var(--color-ink-muted)] hover:border-[var(--color-ink-faint)]"
-        >
-          edit
-        </button>
-      ) : null}
-    </span>
-  )
-
-  if (editing && draft) {
-    const inputClass =
-      'w-full rounded border border-[var(--color-line-strong)] bg-[var(--color-surface-2)] px-1.5 py-1 font-mono text-[11px] text-[var(--color-ink)]'
-    const labelClass = 'flex flex-col gap-1'
+  if (draft && onApply) {
     return (
       <Panel
-        title="Risk"
-        detail={detail}
-        className="min-h-[320px]"
+        title="Risk policy"
+        className="tab-panel"
+        actions={
+          <>
+            <Button onClick={cancelEditing}>Cancel</Button>
+            <Button tone="ok" onClick={() => void save(onApply, draft)} disabled={saving}>
+              {saving ? 'Saving…' : 'Save'}
+            </Button>
+          </>
+        }
       >
-        <div className="grid grid-cols-1 gap-x-4 gap-y-3 p-3 sm:grid-cols-2">
-          <label className={labelClass}>
-            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">Symbols (comma separated)</span>
-            <input
-              className={inputClass}
-              data-field="symbols"
-              value={draft.symbols}
-              onChange={handleField}
-            />
-          </label>
-          <label className={labelClass}>
-            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">
-              Weekend-traded symbols (must be allowed above)
-            </span>
-            <input
-              className={inputClass}
-              data-field="weekendSymbols"
-              value={draft.weekendSymbols}
-              onChange={handleField}
-            />
-          </label>
-          <label className={labelClass}>
-            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">Session UTC (8-17, empty = always open)</span>
-            <input
-              className={inputClass}
-              data-field="sessionUtc"
-              value={draft.sessionUtc}
-              onChange={handleField}
-            />
-          </label>
-          <label className={labelClass}>
-            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">
-              Weekend positions (final hours before Friday's close)
-            </span>
-            <select
-              className={inputClass}
-              data-field="weekendPositions"
-              value={draft.weekendPositions}
-              onChange={handleSelect}
-            >
-              <option value="agent">agent decides per position</option>
-              <option value="hold">hold through the weekend</option>
-              <option value="flatten">flatten before the close</option>
-            </select>
-          </label>
-          {POLICY_NUMBER_FIELDS.map((field) => (
-            <label key={field.key} className={labelClass}>
-              <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">{field.label}</span>
-              <input
-                className={inputClass}
-                data-field={field.key}
-                value={draft[field.key]}
-                onChange={handleField}
-              />
-            </label>
-          ))}
-          <label className="flex items-center gap-2 pt-1">
-            <input
-              type="checkbox"
-              data-field="killSwitch"
-              checked={draft.killSwitch}
-              onChange={handleField}
-            />
-            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-muted)]">
-              Kill switch (refuses every new intent)
-            </span>
-          </label>
-          <label className="flex items-center gap-2 pt-1">
-            <input
-              type="checkbox"
-              data-field="allowTradingWithoutJev"
+        {error ? (
+          <p className="tab-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+        <div className="tab-form">
+          <div className="tab-switch is-span">
+            <span>Kill switch</span>
+            <Toggle checked={draft.killSwitch} label="Kill switch" tone="bad" onClick={() => flip('killSwitch')} />
+          </div>
+          <div className="tab-switch is-span">
+            <span>Judge bypass</span>
+            <Toggle
               checked={draft.allowTradingWithoutJev}
+              label="Judge bypass"
+              tone="warn"
+              onClick={() => flip('allowTradingWithoutJev')}
+            />
+          </div>
+          <TextControl label="Symbols" field="symbols" value={draft.symbols} onChange={handleField} span />
+          <TextControl
+            label="Weekend symbols"
+            field="weekendSymbols"
+            value={draft.weekendSymbols}
+            onChange={handleField}
+            span
+          />
+          <TextControl
+            label="Session UTC"
+            field="sessionUtc"
+            value={draft.sessionUtc}
+            onChange={handleField}
+            placeholder="Always open"
+          />
+          <WeekendControl value={draft.weekendPositions} onChange={setWeekend} />
+          {POLICY_NUMBER_FIELDS.map((field) => (
+            <TextControl
+              key={field.key}
+              label={field.label}
+              field={field.key}
+              value={draft[field.key]}
               onChange={handleField}
             />
-            <span className="text-[10px] uppercase tracking-wider text-[var(--color-ink-muted)]">
-              Trade without the judge (otherwise a judge outage pauses decisions)
-            </span>
-          </label>
-        </div>
-        <div className="border-t border-[var(--color-line)]/80 px-3 py-2 text-[11px] leading-relaxed text-[var(--color-ink-faint)]">
-          Changes apply to the live gate immediately and are journaled with the resulting policy. Restarting the
-          service restores the environment defaults.
+          ))}
         </div>
       </Panel>
     )
   }
 
+  const known = policy !== undefined
+  const view = (text: (current: RiskPolicy) => string) => (policy ? text(policy) : undefined)
+  const offOr = (active: boolean, text: string) => (active ? text : 'Off')
   return (
     <Panel
-      title="Risk"
-      detail={detail}
+      title="Risk policy"
+      className="tab-panel"
+      actions={
+        known ? (
+          <>
+            {policy.killSwitch ? <State tone="bad">Kill switch on</State> : <State tone="ok">Gate active</State>}
+            {onApply ? <Button onClick={() => startEditing(policy)}>Edit</Button> : null}
+          </>
+        ) : null
+      }
     >
-      <div className="grid grid-cols-2 gap-x-4 gap-y-3 p-3 sm:grid-cols-4">
+      <Fields columns={3}>
         <Field
           label="Symbols"
-          value={policy ? (policy.symbols.length > 0 ? policy.symbols.join(' · ') : 'none allowed') : '—'}
+          wide
+          value={view((current) => (current.symbols.length > 0 ? current.symbols.join(' · ') : 'None allowed'))}
         />
-        <Field
-          label="Weekend markets"
-          value={policy ? ((policy.weekendSymbols ?? []).join(' · ') || 'none') : '—'}
-        />
-        <Field label="Max / order" value={policy ? `${policy.maxVolumePerOrder} lots` : '—'} />
-        <Field label="Max total" value={policy ? `${policy.maxTotalLots} lots` : '—'} />
-        <Field label="Max open" value={policy?.maxOpenOrders ?? '—'} />
-        <Field label="Duplicates" value={policy ? `${policy.duplicateWindowSecs}s window` : '—'} />
+        <Field label="Weekend markets" value={view((current) => (current.weekendSymbols ?? []).join(' · ') || 'None')} />
+        <Field label="Session UTC" value={view((current) => current.sessionUtc ?? 'Always open')} />
+        <Field label="Weekend positions" value={view((current) => WEEKEND_LABELS[current.weekendPositions])} />
+        <Field label="Max per order" value={view((current) => `${current.maxVolumePerOrder} lots`)} />
+        <Field label="Max total" value={view((current) => `${current.maxTotalLots} lots`)} />
+        <Field label="Max open orders" value={view((current) => String(current.maxOpenOrders))} />
+        <Field label="Duplicate window" value={view((current) => `${current.duplicateWindowSecs}s`)} />
         <Field
           label="Max risk"
-          value={policy ? (policy.maxRiskPercent > 0 ? `${policy.maxRiskPercent}% / trade` : 'off') : '—'}
+          value={view((current) => offOr(current.maxRiskPercent > 0, `${current.maxRiskPercent}% per trade`))}
         />
         <Field
-          label="Brakes"
-          value={
-            policy
-              ? [
-                  policy.maxDailyLossPercent > 0 ? `day ${policy.maxDailyLossPercent}%` : null,
-                  policy.maxPeakDrawdownPercent > 0 ? `peak ${policy.maxPeakDrawdownPercent}%` : null,
-                ]
-                  .filter(Boolean)
-                  .join(' · ') || 'off'
-              : '—'
-          }
+          label="Loss brakes"
+          value={view((current) =>
+            sentence(
+              [
+                current.maxDailyLossPercent > 0 ? `day ${current.maxDailyLossPercent}%` : null,
+                current.maxPeakDrawdownPercent > 0 ? `peak ${current.maxPeakDrawdownPercent}%` : null,
+              ]
+                .filter(Boolean)
+                .join(' · ') || 'off',
+            ),
+          )}
         />
         <Field
-          label="Net USD"
-          value={policy ? (policy.maxNetFactorLots > 0 ? `${policy.maxNetFactorLots} lots` : 'off') : '—'}
+          label="Net USD cap"
+          value={view((current) => offOr(current.maxNetFactorLots > 0, `${current.maxNetFactorLots} lots`))}
         />
         <Field
-          label="News"
-          value={
-            policy
-              ? policy.calendarBlackoutMinutes > 0
-                ? `${policy.calendarBlackoutMinutes}m blackout`
-                : 'off'
-              : '—'
-          }
+          label="News blackout"
+          value={view((current) => offOr(current.calendarBlackoutMinutes > 0, `${current.calendarBlackoutMinutes}m`))}
         />
         <Field
           label="Stop floor"
-          value={
-            policy
-              ? policy.minStopAtrFraction > 0
-                ? `${policy.minStopAtrFraction}\u00d7 ATR`
-                : 'off'
-              : '—'
-          }
-        />
-        <Field label="Session UTC" value={policy?.sessionUtc ?? 'always open'} />
-        <Field
-          label="Weekend"
-          value={
-            policy
-              ? {
-                  agent: 'analyst decides',
-                  hold: 'held through',
-                  flatten: 'flattened before close',
-                }[policy.weekendPositions]
-              : '—'
-          }
+          value={view((current) => offOr(current.minStopAtrFraction > 0, `${current.minStopAtrFraction}× ATR`))}
         />
         <Field
           label="Judge outage"
-          value={policy ? (policy.allowTradingWithoutJev ? 'keeps trading' : 'pauses decisions') : '—'}
-          tone={policy?.allowTradingWithoutJev ? 'text-[var(--color-warn)]' : undefined}
+          value={view((current) => (current.allowTradingWithoutJev ? 'Keeps trading' : 'Pauses decisions'))}
+          tone={policy?.allowTradingWithoutJev ? 'tone-warn' : undefined}
         />
         <Field
           label="Execution"
-          value={status?.trading_enabled ? 'switch on' : 'switch off'}
-          tone={status?.trading_enabled ? 'text-[var(--color-warn)]' : undefined}
+          value={status ? (status.trading_enabled ? 'Enabled' : 'Disabled') : undefined}
+          tone={status?.trading_enabled ? 'tone-warn' : undefined}
         />
         <Field
           label="Terminal"
-          value={status?.ea_live_orders ? 'armed' : 'disarmed'}
-          tone={status?.ea_live_orders ? 'text-[var(--color-ok)]' : undefined}
+          value={status ? (status.ea_live_orders ? 'Armed' : 'Disarmed') : undefined}
+          tone={status?.ea_live_orders ? 'tone-ok' : undefined}
         />
-      </div>
-      <div className="border-t border-[var(--color-line)]/80 px-3 py-2 text-[11px] leading-relaxed text-[var(--color-ink-faint)]">
-        Every intent passes the gate in order: kill switch, allowlist, entry window, session, per-order cap,
-        account facts, permission, drawdown brakes, one-per-asset, order cap, exposure, per-trade risk, net
-        exposure, duplicates. Approved entries then pass the venue contract check and the news blackout.
-      </div>
+      </Fields>
     </Panel>
   )
 }
@@ -1587,28 +934,36 @@ export function MetricsPanel({ metrics, error, status }: { metrics?: Metrics; er
   return (
     <Panel
       title="Metrics"
-      detail={metrics ? `feed #${metrics.feedLatest}` : error ? <span className="text-[var(--color-bad)]">{error}</span> : '…'}
+      className="tab-panel"
+      actions={error && !metrics ? <Unavailable error={error} /> : null}
     >
-      {status ? (
-        <div className="diagnostics-meta">
-          <Field label="Version" value={status.version} />
-          <Field label="Environment" value={status.environment} />
-          <Field label="Audit" value={status.persistence ?? 'off'} />
+      <Fields>
+        <Field label="Version" value={status?.version} />
+        <Field label="Environment" value={status?.environment} />
+        <Field label="Audit" value={status ? (status.persistence ?? 'Off') : undefined} />
+        <Field label="Feed" value={metrics ? `#${metrics.feedLatest}` : error ? '—' : undefined} />
+      </Fields>
+      {counters.length > 0 ? (
+        <div className="tab-table tab-counters">
+          <div className="tab-table-head" aria-hidden="true">
+            <span>Counter</span>
+            <span>Count</span>
+          </div>
+          <ul className="tab-list">
+            {counters.map(([key, value]) => (
+              <li key={key} className="tab-row tab-counter">
+                <span className="mono" title={key}>
+                  {key}
+                </span>
+                <span className="readout">{amount(value, 0)}</span>
+              </li>
+            ))}
+          </ul>
         </div>
-      ) : null}
-      {counters.length === 0 ? (
-        <div className="p-3 text-xs text-[var(--color-ink-faint)]">No counters yet.</div>
-      ) : (
-        <ul className="divide-y divide-[var(--color-line)]/40">
-          {counters.map(([key, value]) => (
-            <li key={key} className="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
-              <span className="truncate font-mono text-[10px] text-[var(--color-ink-muted)]" title={key}>
-                {key}
-              </span>
-              <span className="shrink-0 font-mono tabular-nums text-[var(--color-ink)]">{value}</span>
-            </li>
-          ))}
-        </ul>
+      ) : metrics ? (
+        <Empty>No counters yet</Empty>
+      ) : error ? null : (
+        <SkeletonRows />
       )}
     </Panel>
   )
@@ -1616,70 +971,131 @@ export function MetricsPanel({ metrics, error, status }: { metrics?: Metrics; er
 
 /* ---------- commands ---------- */
 
+const COMMAND_STATUS: Record<CommandRecord['status'], { tone: Tone; label: string }> = {
+  pending: { tone: 'idle', label: 'Pending' },
+  completed: { tone: 'ok', label: 'Completed' },
+  failed: { tone: 'bad', label: 'Failed' },
+}
+
 export function CommandsPanel({ commands }: { commands?: CommandRecord[] }) {
   const [expandedId, setExpandedId] = useState<string | undefined>(undefined)
-  const paged = usePaged(commands ?? [], 8)
+  const paged = usePaged(commands ?? [], 12)
   return (
-    <Panel title="Commands" detail={`${commands?.length ?? 0} recent`}>
-      {!commands || commands.length === 0 ? (
-        <div className="p-3 text-xs text-[var(--color-ink-faint)]">No commands yet.</div>
+    <Panel title="Commands" count={commands?.length} className="tab-panel">
+      {!commands ? (
+        <SkeletonRows />
+      ) : commands.length === 0 ? (
+        <Empty>No commands yet</Empty>
       ) : (
-        <ul className="divide-y divide-[var(--color-line)]">
-          {paged.items.map((command) => {
-            const expanded = command.id === expandedId
-            return (
-              <li key={command.id}>
-                <button
-                  type="button"
-                  onClick={() => setExpandedId(expanded ? undefined : command.id)}
-                  aria-expanded={expanded}
-                  className={`flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-xs transition-colors ${
-                    expanded ? 'bg-[var(--color-surface-3)]/50' : 'hover:bg-[var(--color-surface-3)]/20'
-                  }`}
-                >
-                  <span className="flex min-w-0 items-center gap-2">
-                    <span className="rounded bg-[var(--color-surface-3)]/80 px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-ink)]">
-                      {command.kind}
+        <div className="tab-table">
+          <div className="tab-table-head tab-command" aria-hidden="true">
+            <span>Command</span>
+            <span className="tab-command-id">Id</span>
+            <span className="tab-command-result">Result</span>
+            <span>Status</span>
+          </div>
+          <ul className="tab-list">
+            {paged.items.map((command) => {
+              const expanded = command.id === expandedId
+              const state = COMMAND_STATUS[command.status]
+              return (
+                <li key={command.id} className="tab-row">
+                  <button
+                    type="button"
+                    onClick={() => setExpandedId(expanded ? undefined : command.id)}
+                    aria-expanded={expanded}
+                    className="tab-row-button tab-command"
+                  >
+                    <span className="tab-command-kind">{sentence(command.kind)}</span>
+                    <span className="tab-command-id mono">{command.id.slice(0, 8)}</span>
+                    <span className="tab-command-result">
+                      {command.reason ? (
+                        <span className="tone-bad">{command.reason}</span>
+                      ) : command.summary ? (
+                        <span className="mono">{JSON.stringify(command.summary)}</span>
+                      ) : null}
                     </span>
-                    <span className="truncate font-mono text-[10px] text-[var(--color-ink-faint)]">{command.id.slice(0, 8)}</span>
-                    {command.summary ? (
-                      <span className="truncate font-mono text-[10px] text-[var(--color-ink-muted)]">
-                        {JSON.stringify(command.summary)}
-                      </span>
-                    ) : null}
-                    {command.reason ? <span className="truncate text-[10px] text-[var(--color-bad)]">{command.reason}</span> : null}
-                  </span>
-                  <span className={`shrink-0 text-[10px] uppercase tracking-wider ${commandTone[command.status]}`}>
-                    {command.status}
-                  </span>
-                </button>
-                {expanded ? (
-                  <div className="space-y-1 border-t border-[var(--color-line)]/60 bg-[var(--color-surface-2)]/50 px-3 py-2">
-                    <div className="font-mono text-[10px] text-[var(--color-ink-faint)]">id {command.id}</div>
-                    <pre className="max-h-40 overflow-auto rounded bg-[var(--color-surface-0)] p-2 font-mono text-[10px] leading-relaxed text-[var(--color-ink-muted)]">
-                      {JSON.stringify({ summary: command.summary ?? null, reason: command.reason ?? null }, null, 2)}
-                    </pre>
-                  </div>
-                ) : null}
-              </li>
-            )
-          })}
-        </ul>
+                    <span className="tab-command-status">
+                      <Dot tone={state.tone} />
+                      {state.label}
+                    </span>
+                  </button>
+                  {expanded ? (
+                    <div className="tab-detail">
+                      <dl className="tab-detail-rows">
+                        <div>
+                          <dt>Id</dt>
+                          <dd className="mono">{command.id}</dd>
+                        </div>
+                      </dl>
+                      <Raw value={{ summary: command.summary ?? null, reason: command.reason ?? null }} />
+                    </div>
+                  ) : null}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
       )}
-      <Pager
-        page={paged.page}
-        pages={paged.pages}
-        start={paged.start}
-        count={paged.items.length}
-        total={paged.total}
-        onPrevious={paged.previous}
-        onNext={paged.next}
-      />
+      <ListPager paged={paged} />
     </Panel>
   )
 }
 
 /* ---------- activity feed ---------- */
+
+/**
+ * The line under an activity title: the decision's reason where there is one,
+ * else the model's stated rationale, else a digest of the payload. `raw` marks
+ * a digest that is still JSON, which is set in the mono face.
+ */
+function eventLine(event: FeedEvent): { text: string; raw: boolean } | undefined {
+  const detail = activityDetail(event)
+  if (detail) return { text: detail, raw: false }
+  const payload = event.payload ?? {}
+  const answer = payload.answer as { rationale?: unknown } | null | undefined
+  if (typeof answer?.rationale === 'string') return { text: answer.rationale, raw: false }
+  if (event.kind.startsWith('command_') && typeof payload.kind === 'string') {
+    return { text: sentence(payload.kind), raw: false }
+  }
+  if (event.kind === 'broker_snapshot' && typeof payload.orders === 'number') {
+    return { text: `${payload.orders} order${payload.orders === 1 ? '' : 's'} · ${payload.lots ?? 0} lots`, raw: false }
+  }
+  if (event.kind === 'balance_observed' && typeof payload.balance === 'number') {
+    return { text: `Balance ${amount(payload.balance)}`, raw: false }
+  }
+  const summary = payloadSummary(event)
+  if (summary === '{}') return undefined
+  return { text: summary, raw: summary.startsWith('{') }
+}
+
+function EventDetail({ event }: { event: FeedEvent }) {
+  const payload = event.payload ?? {}
+  return (
+    <div className="tab-detail">
+      <div className="tab-detail-meta">
+        <span>
+          <span className="mono">{event.kind}</span> · #{event.seq}
+        </span>
+        <span>
+          <span className="mono">{isoTime(event.at_ms)}</span> · {relativeTime(event.at_ms)}
+        </span>
+      </div>
+      <dl className="tab-detail-rows">
+        {detailRows(payload).map((row) => (
+          <div key={row.label}>
+            <dt>{row.label}</dt>
+            <dd className={/^[[{]/.test(row.value) ? 'mono' : undefined}>{row.value}</dd>
+          </div>
+        ))}
+      </dl>
+      <details className="tab-raw">
+        <summary>Raw payload</summary>
+        <Raw value={payload} />
+      </details>
+    </div>
+  )
+}
 
 export function ActivityFeed({
   events,
@@ -1699,202 +1115,83 @@ export function ActivityFeed({
   return (
     <Panel
       title="Activity"
-      className="min-h-[320px]"
-      detail={
-        <span className="flex items-center gap-3">
-          <span className="hidden text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)] sm:inline">
-            click a row for detail
-          </span>
-          <button
-            type="button"
-            onClick={() => onFocusChange(!focus)}
-            className={`rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wider transition-colors ${
-              focus
-                ? 'border-[var(--color-line-strong)] text-[var(--color-ink)] hover:border-[var(--color-ink-faint)]'
-                : 'border-[var(--color-warn)]/40 text-[var(--color-warn)]'
-            }`}
-            title={focus ? 'Show routine snapshots and reads' : 'Hide routine snapshots and reads'}
-          >
-            {focus ? 'focus' : 'all'}
-          </button>
-          <span className="flex items-center gap-1.5">
-            <span className={`size-1.5 rounded-full ${connected ? 'animate-pulse bg-[var(--color-ok)]' : 'bg-[var(--color-bad)]'}`} />
-            {connected ? 'streaming' : 'reconnecting…'}
-          </span>
-        </span>
+      className="tab-panel"
+      actions={
+        <>
+          {connected ? (
+            <State tone="ok">Streaming</State>
+          ) : events.length > 0 ? (
+            <State tone="bad">Reconnecting</State>
+          ) : (
+            <State tone="idle">Connecting</State>
+          )}
+          <Segmented
+            label="Activity filter"
+            options={[
+              { value: 'focus', label: 'Focus' },
+              { value: 'all', label: 'All' },
+            ]}
+            value={focus ? 'focus' : 'all'}
+            onChange={(value) => onFocusChange(value === 'focus')}
+          />
+        </>
       }
     >
-      {visible.length === 0 ? (
-        <div className="p-3 text-xs text-[var(--color-ink-faint)]">
-          {events.length === 0 ? 'Waiting for events…' : 'No decisions yet — routine activity hidden.'}
-        </div>
+      {events.length === 0 && !connected ? (
+        <SkeletonRows />
+      ) : visible.length === 0 ? (
+        <Empty>{events.length === 0 ? 'No events yet' : 'No decisions yet'}</Empty>
       ) : (
-        <ul className="divide-y divide-[var(--color-line)]">
+        <ul className="tab-list">
           {paged.items.map((event) => {
-            const outcome = typeof event.payload?.outcome === 'string' ? event.payload.outcome : undefined
             const expanded = event.seq === selectedSeq
+            const line = eventLine(event)
             return (
-              <li key={event.seq}>
+              <li key={event.seq} className="tab-row">
                 <button
                   type="button"
                   onClick={() => setSelectedSeq(expanded ? undefined : event.seq)}
                   aria-expanded={expanded}
-                  title={JSON.stringify(event.payload)}
-                  className={`flex w-full items-start gap-2 px-3 py-1.5 text-left text-xs transition-colors ${
-                    expanded ? 'bg-[var(--color-surface-3)]/50' : 'hover:bg-[var(--color-surface-3)]/20'
-                  }`}
+                  className="tab-row-button tab-event"
                 >
-                  <span className="w-14 shrink-0 pt-0.5 font-mono text-[10px] text-[var(--color-ink-faint)]">
+                  <time className="tab-time readout" dateTime={isoTime(event.at_ms)}>
                     {clockTime(event.at_ms)}
-                  </span>
-                  <span
-                    className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] ${
-                      kindTone[event.kind] ?? 'bg-[var(--color-surface-3)]/30 text-[var(--color-ink)]'
-                    }`}
-                  >
-                    {event.kind}
-                  </span>
-                  <span
-                    className={`min-w-0 flex-1 truncate font-mono text-[11px] ${
-                      outcome ? (outcomeTone[outcome] ?? 'text-[var(--color-ink)]') : 'text-[var(--color-ink)]'
-                    }`}
-                  >
-                    {payloadSummary(event)}
+                  </time>
+                  {/* Routine plumbing stays grey so the eye lands on decisions. */}
+                  <Dot tone={isRoutine(event) ? 'idle' : activityTone(event)} />
+                  <span className="tab-event-text">
+                    <span className="tab-event-title">{activityTitle(event)}</span>
+                    {line ? <span className={`tab-event-line${line.raw ? ' mono' : ''}`}>{line.text}</span> : null}
                   </span>
                 </button>
-                {expanded ? (
-                  <div className="space-y-1.5 border-t border-[var(--color-line)]/60 bg-[var(--color-surface-2)]/50 px-3 py-2">
-                    <div className="flex items-center justify-between font-mono text-[10px] text-[var(--color-ink-faint)]">
-                      <span>
-                        #{event.seq} · {new Date(event.at_ms).toISOString()}
-                      </span>
-                      <span>{relativeTime(event.at_ms)}</span>
-                    </div>
-                    <div className="space-y-1">
-                      {detailRows(event.payload ?? {}).map((row) => (
-                        <div key={row.label} className="grid grid-cols-[8rem_1fr] gap-x-3">
-                          <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--color-ink-faint)]">
-                            {row.label}
-                          </span>
-                          <span className="min-w-0 break-words font-mono text-[11px] text-[var(--color-ink)]">{row.value}</span>
-                        </div>
-                      ))}
-                    </div>
-                    <pre className="max-h-40 overflow-auto rounded bg-[var(--color-surface-0)] p-2 font-mono text-[10px] leading-relaxed text-[var(--color-ink-muted)]">
-                      {JSON.stringify(event.payload ?? {}, null, 2)}
-                    </pre>
-                  </div>
-                ) : null}
+                {expanded ? <EventDetail event={event} /> : null}
               </li>
             )
           })}
         </ul>
       )}
-      <Pager
-        page={paged.page}
-        pages={paged.pages}
-        start={paged.start}
-        count={paged.items.length}
-        total={paged.total}
-        onPrevious={paged.previous}
-        onNext={paged.next}
-      />
-    </Panel>
-  )
-}
-
-function activityTitle(event: FeedEvent): string {
-  if (event.kind === 'proposal_evaluated') {
-    const outcome = typeof event.payload?.outcome === 'string' ? event.payload.outcome : ''
-    if (outcome === 'no_trade') return 'No trade'
-    if (outcome === 'held') return 'Trade held'
-    if (outcome === 'queued') return 'Trade queued'
-    if (outcome === 'approved_dry_run') return 'Approved · dry run'
-    if (outcome === 'rejected') return 'Trade rejected'
-    if (outcome === 'unavailable') return 'Decision unavailable'
-    if (outcome === 'break_even') return 'Break-even queued'
-    if (outcome === 'break_even_rejected') return 'Break-even rejected'
-    if (outcome === 'close_queued') return 'Close queued'
-    if (outcome === 'close_rejected') return 'Close rejected'
-    if (outcome === 'trailing_stop' || outcome === 'profit_harvest_stop' || outcome === 'stop_queued') return 'Stop adjustment queued'
-    if (outcome === 'stop_rejected') return 'Stop adjustment rejected'
-  }
-  if (event.kind === 'position_closed') return 'Position closed'
-  if (event.kind === 'failure') return 'Decision failed'
-  return event.kind
-    .split('_')
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(' ')
-}
-
-function activityDetail(event: FeedEvent): string | undefined {
-  if (event.kind === 'position_closed') return payloadSummary(event)
-  if (event.kind === 'proposal_evaluated' || event.kind === 'failure' || event.kind === 'command_failed') {
-    const detail = event.payload?.reason ?? event.payload?.rationale
-    return typeof detail === 'string' ? detail : undefined
-  }
-  return undefined
-}
-
-/** Three-row overview digest; the Activity tab remains the full drill-down. */
-export function RecentActivityPreview({
-  events,
-  connected,
-  onViewAll,
-}: {
-  events: FeedEvent[]
-  connected: boolean
-  onViewAll: () => void
-}) {
-  const rows = events
-    .filter((event) => !isRoutine(event) && event.kind !== 'agent_turn' && event.kind !== 'agent_tool_called')
-    .slice(0, 3)
-  return (
-    <Panel
-      title="Recent activity"
-      detail={
-        <span className="activity-preview-detail">
-          {!connected ? <span className="activity-preview-connection">Reconnecting…</span> : null}
-          <button type="button" className="panel-link" onClick={onViewAll}>View all</button>
-        </span>
-      }
-      className="activity-preview-panel"
-    >
-      {rows.length === 0 ? (
-        <div className="activity-preview-empty">{connected ? 'No recent activity.' : 'Reconnecting…'}</div>
-      ) : (
-        <ul className="activity-preview-list">
-          {rows.map((event) => {
-            const outcome = typeof event.payload?.outcome === 'string' ? event.payload.outcome : undefined
-            const tone = event.kind === 'failure' || event.kind === 'command_failed' || outcome?.endsWith('rejected') || outcome === 'unavailable' ? 'is-bad' : outcome === 'no_trade' || outcome === 'approved_dry_run' ? 'is-muted' : outcome === 'held' || outcome === 'close_queued' ? 'is-warn' : 'is-ok'
-            const detail = activityDetail(event)
-            return (
-              <li key={event.seq} className="activity-preview-row">
-                <time dateTime={new Date(event.at_ms).toISOString()}>{clockTime(event.at_ms)}</time>
-                <span className={`activity-preview-dot ${tone}`} aria-hidden="true" />
-                <div>
-                  <strong>{activityTitle(event)}</strong>
-                  {detail ? <p>{detail}</p> : null}
-                </div>
-              </li>
-            )
-          })}
-        </ul>
-      )}
+      <ListPager paged={paged} />
     </Panel>
   )
 }
 
 /* ---------- durable trace ---------- */
 
-/** Long values are shown whole on demand, not silently clipped in the row. */
-function TraceValue({ value }: { value: unknown }) {
-  const rendered = typeof value === 'string' ? value : JSON.stringify(value, null, 2)
-  return (
-    <pre className="max-h-[28rem] overflow-auto rounded bg-[var(--color-surface-0)] p-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-[var(--color-ink-muted)]">
-      {rendered}
-    </pre>
+/**
+ * What identifies a trail row at a glance, from the fields most rows carry.
+ * A part that only repeats the row's own kind says nothing and is dropped.
+ */
+function traceSummary(kind: string, payload: Record<string, unknown>): string {
+  const parts = [payload.outcome, payload.kind, payload.tool, payload.symbol].filter(
+    (part): part is string => typeof part === 'string' && part !== '' && part !== kind,
   )
+  return parts.length > 0 ? sentence(parts.join(' · ')) : `${Object.keys(payload).length} fields`
+}
+
+/** Short single-line scalars read as a row; anything larger keeps a block. */
+function isInline(value: unknown): boolean {
+  if (value === null || typeof value === 'number' || typeof value === 'boolean') return true
+  return typeof value === 'string' && value.length <= 120 && !value.includes('\n')
 }
 
 /**
@@ -1921,83 +1218,87 @@ export function TracePanel({
   const kinds = ['all', ...Array.from(new Set(rows.map((row) => row.kind))).sort()]
   const visible = kind === 'all' ? rows : rows.filter((row) => row.kind === kind)
   const paged = usePaged(visible, 12)
+  // A disabled or unreachable trail must not pass for an empty one.
+  const problem = error ? 'Unavailable' : page && page.status !== 'ok' ? sentence(page.status) : undefined
 
   return (
     <Panel
-      title="Trace"
-      className="min-h-[320px]"
-      detail={
-        <span className="flex flex-wrap items-center gap-1">
-          {page?.status && page.status !== 'ok' ? (
-            <span className="text-[var(--color-warn)]">{page.status}</span>
-          ) : null}
-          {kinds.slice(0, 8).map((candidate) => (
-            <button
-              key={candidate}
-              type="button"
-              onClick={() => onKindChange(candidate)}
-              className={`rounded border px-1.5 py-0.5 text-[10px] transition-colors ${
-                candidate === kind
-                  ? 'border-[var(--color-ink-faint)] text-[var(--color-ink)]'
-                  : 'border-[var(--color-line)] text-[var(--color-ink-faint)] hover:border-[var(--color-line-strong)]'
-              }`}
-            >
-              {candidate}
-            </button>
-          ))}
-        </span>
+      title="Audit trail"
+      count={page ? rows.length : undefined}
+      className="tab-panel"
+      actions={
+        problem && rows.length > 0 ? (
+          <State tone={error ? 'bad' : 'warn'} title={error ?? page?.error}>
+            {problem}
+          </State>
+        ) : null
       }
     >
-      {error ? <div className="px-3 py-2 text-[11px] text-[var(--color-bad)]">{error}</div> : null}
-      {visible.length === 0 ? (
-        <div className="p-3 text-xs text-[var(--color-ink-faint)]">
-          {error ? 'Trail unavailable.' : 'No durable events recorded yet.'}
+      {rows.length > 0 ? (
+        <div className="tab-toolbar">
+          <Segmented
+            label="Trail kind"
+            options={kinds.slice(0, 8).map((candidate) => ({ value: candidate, label: sentence(candidate) }))}
+            value={kind}
+            onChange={onKindChange}
+          />
         </div>
+      ) : null}
+      {visible.length === 0 ? (
+        !page && !error ? (
+          <SkeletonRows />
+        ) : (
+          <Empty>
+            <span title={error ?? page?.error}>{problem ?? 'No events yet'}</span>
+          </Empty>
+        )
       ) : (
-        <ul className="divide-y divide-[var(--color-line)]">
+        <ul className="tab-list">
           {paged.items.map((row) => {
             const open = row.id === openId
             const payload = row.payload ?? {}
-            const outcome = typeof payload.outcome === 'string' ? payload.outcome : undefined
+            const at = auditTimeMs(row.at)
             return (
-              <li key={row.id}>
+              <li key={row.id} className="tab-row">
                 <button
                   type="button"
                   onClick={() => setOpenId(open ? undefined : row.id)}
                   aria-expanded={open}
-                  className={`flex w-full items-start gap-2 px-3 py-1.5 text-left text-xs transition-colors ${
-                    open ? 'bg-[var(--color-surface-3)]/50' : 'hover:bg-[var(--color-surface-3)]/20'
-                  }`}
+                  className="tab-row-button tab-trace"
                 >
-                  <span className="readout w-14 shrink-0 pt-0.5 text-[10px] text-[var(--color-ink-faint)]">
-                    {Number.isNaN(auditTimeMs(row.at)) ? '—' : clockTime(auditTimeMs(row.at))}
-                  </span>
-                  <span
-                    className={`readout shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
-                      kindTone[row.kind] ?? 'bg-[var(--color-surface-3)]/30 text-[var(--color-ink)]'
-                    }`}
-                  >
-                    {row.kind}
-                  </span>
-                  <span className="readout min-w-0 flex-1 truncate text-[11px] text-[var(--color-ink-muted)]">
-                    {outcome ? `${outcome} · ` : ''}
-                    {Object.keys(payload).length} fields
-                  </span>
-                  <span
-                    className="readout shrink-0 text-[10px] text-[var(--color-ink-faint)]"
-                    title={row.id}
-                  >
+                  <time className="tab-time readout" dateTime={isoTime(at)}>
+                    {Number.isNaN(at) ? '—' : clockTime(at)}
+                  </time>
+                  <span className="tab-trace-kind">{sentence(row.kind)}</span>
+                  <span className="tab-trace-summary">{traceSummary(row.kind, payload)}</span>
+                  <span className="tab-trace-id mono" title={row.id}>
                     {row.id.slice(0, 8)}
                   </span>
                 </button>
                 {open ? (
-                  <div className="space-y-2 border-t border-[var(--color-line)] bg-[var(--color-surface-2)]/40 px-3 py-2">
-                    {Object.entries(payload).map(([field, value]) => (
-                      <div key={field}>
-                        <div className="label mb-0.5">{field}</div>
-                        <TraceValue value={value} />
-                      </div>
-                    ))}
+                  <div className="tab-detail">
+                    <div className="tab-detail-meta">
+                      <span className="mono">{row.kind}</span>
+                      <span className="mono">{row.id}</span>
+                    </div>
+                    <dl className="tab-detail-rows is-raw">
+                      {Object.entries(payload)
+                        .filter(([, value]) => isInline(value))
+                        .map(([field, value]) => (
+                          <div key={field}>
+                            <dt>{field}</dt>
+                            <dd className="mono">{String(value)}</dd>
+                          </div>
+                        ))}
+                    </dl>
+                    {Object.entries(payload)
+                      .filter(([, value]) => !isInline(value))
+                      .map(([field, value]) => (
+                        <div key={field} className="tab-trace-field">
+                          <div className="tab-trace-label mono">{field}</div>
+                          <Raw value={value} />
+                        </div>
+                      ))}
                   </div>
                 ) : null}
               </li>
@@ -2005,28 +1306,12 @@ export function TracePanel({
           })}
         </ul>
       )}
-      <Pager
-        page={paged.page}
-        pages={paged.pages}
-        start={paged.start}
-        count={paged.items.length}
-        total={paged.total}
-        onPrevious={paged.previous}
-        onNext={paged.next}
-      />
+      <ListPager paged={paged} />
     </Panel>
   )
 }
 
 /* ---------- agent log ---------- */
-
-const logLevelTone: Record<string, string> = {
-  error: 'text-[var(--color-bad)] bg-[var(--color-bad)]/15',
-  warn: 'text-[var(--color-warn)] bg-[var(--color-warn)]/15',
-  info: 'text-[var(--color-info)] bg-[var(--color-info)]/10',
-  debug: 'text-[var(--color-ink-muted)] bg-[var(--color-surface-3)]/30',
-  trace: 'text-[var(--color-ink-faint)] bg-[var(--color-surface-3)]/20',
-}
 
 export function LogsPanel({
   logs,
@@ -2044,82 +1329,57 @@ export function LogsPanel({
   return (
     <Panel
       title="Agent log"
-      className="min-h-[280px]"
-      detail={
-        <span className="flex items-center gap-1">
-          {LOG_LEVELS.map((candidate) => (
-            <button
-              key={candidate}
-              type="button"
-              onClick={() => onLevelChange(candidate)}
-              className={`rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wider transition-colors ${
-                candidate === level
-                  ? 'border-[var(--color-ink-faint)] text-[var(--color-ink)]'
-                  : 'border-[var(--color-line)] text-[var(--color-ink-faint)] hover:border-[var(--color-line-strong)]'
-              }`}
-            >
-              {candidate}
-            </button>
-          ))}
-        </span>
+      className="tab-panel"
+      actions={
+        <Segmented
+          label="Log level"
+          options={LOG_LEVELS.map((candidate) => ({ value: candidate, label: sentence(candidate) }))}
+          value={level}
+          onChange={onLevelChange}
+        />
       }
     >
-      {error ? <div className="px-3 py-2 text-[11px] text-[var(--color-bad)]">{error}</div> : null}
       {ordered.length === 0 ? (
-        <div className="p-3 text-xs text-[var(--color-ink-faint)]">
-          {error ? 'Log tail unavailable.' : 'No log records yet.'}
-        </div>
+        <Empty>{error ? <span title={error}>Unavailable</span> : 'No log lines yet'}</Empty>
       ) : (
-        <ul className="divide-y divide-[var(--color-line)]">
+        <ul className="tab-list">
           {paged.items.map((record) => (
-            <li key={record.seq} className="flex items-start gap-2 px-3 py-1 text-xs">
-              <span className="w-14 shrink-0 pt-0.5 font-mono text-[10px] text-[var(--color-ink-faint)]">
+            <li key={record.seq} className="tab-row tab-log">
+              <time className="tab-time readout" dateTime={isoTime(record.atMs)}>
                 {clockTime(record.atMs)}
-              </span>
-              <span
-                className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] uppercase ${
-                  logLevelTone[record.level] ?? 'bg-[var(--color-surface-3)]/30 text-[var(--color-ink)]'
-                }`}
-              >
-                {record.level}
-              </span>
-              <span className="min-w-0 flex-1 font-mono text-[11px] leading-relaxed text-[var(--color-ink)]">
-                <span className="text-[var(--color-ink-faint)]">{record.target}</span>{' '}
-                <span>{record.message}</span>
+              </time>
+              <span className={`tab-level is-${record.level}`}>{sentence(record.level)}</span>
+              <span className="tab-log-line mono">
+                <span className="tab-log-target">{record.target}</span> {record.message}
                 {Object.keys(record.fields).length > 0 ? (
-                  <span className="text-[var(--color-ink-faint)]"> {JSON.stringify(record.fields)}</span>
+                  <span className="tab-log-fields"> {JSON.stringify(record.fields)}</span>
                 ) : null}
               </span>
             </li>
           ))}
         </ul>
       )}
-      <Pager
-        page={paged.page}
-        pages={paged.pages}
-        start={paged.start}
-        count={paged.items.length}
-        total={paged.total}
-        onPrevious={paged.previous}
-        onNext={paged.next}
-      />
+      <ListPager paged={paged} />
     </Panel>
   )
 }
 
+/* ---------- live settings ---------- */
+
 /**
  * Settings grouped the way an operator thinks about them, not the way the
- * environment file happens to be ordered.
+ * environment file happens to be ordered. `prefixes` are dropped from labels
+ * inside the group, so "Autopilot" does not repeat on every field under it.
  */
-const SETTING_GROUPS: Array<{ title: string; detail: string; names: string[] }> = [
+const SETTING_GROUPS: Array<{ title: string; prefixes: string[]; names: string[] }> = [
   {
     title: 'Execution',
-    detail: 'the service half of the two-key control',
+    prefixes: [],
     names: ['VEYRA_TRADING_ENABLED'],
   },
   {
     title: 'Autopilot',
-    detail: 'the autonomous loop',
+    prefixes: ['AUTOPILOT_'],
     names: [
       'VEYRA_AUTOPILOT_ENABLED',
       'VEYRA_AUTOPILOT_SYMBOL',
@@ -2137,7 +1397,7 @@ const SETTING_GROUPS: Array<{ title: string; detail: string; names: string[] }> 
   },
   {
     title: 'Profit harvesting',
-    detail: 'the deterministic early-profit ratchet',
+    prefixes: ['AUTOPILOT_HARVEST_', 'AUTOPILOT_'],
     names: [
       'VEYRA_AUTOPILOT_PROFIT_HARVEST',
       'VEYRA_AUTOPILOT_HARVEST_ARM_R',
@@ -2150,7 +1410,7 @@ const SETTING_GROUPS: Array<{ title: string; detail: string; names: string[] }> 
   },
   {
     title: 'Model',
-    detail: 'tiers, fallbacks and the call budget',
+    prefixes: ['MODEL_'],
     names: [
       'VEYRA_MODEL_FAST',
       'VEYRA_MODEL_BALANCED',
@@ -2171,7 +1431,7 @@ const SETTING_GROUPS: Array<{ title: string; detail: string; names: string[] }> 
   },
   {
     title: 'Judgement and market data',
-    detail: 'applies at the next restart',
+    prefixes: [],
     names: [
       'VEYRA_JEV_PROVIDER',
       'VEYRA_JEV_BASE_URL',
@@ -2182,7 +1442,7 @@ const SETTING_GROUPS: Array<{ title: string; detail: string; names: string[] }> 
   },
   {
     title: 'Housekeeping',
-    detail: 'applies at the next restart',
+    prefixes: [],
     names: ['VEYRA_RECONCILE_SECS', 'VEYRA_AUDIT_RETENTION_DAYS', 'VEYRA_ALERT_WEBHOOK'],
   },
 ]
@@ -2190,18 +1450,189 @@ const SETTING_GROUPS: Array<{ title: string; detail: string; names: string[] }> 
 /** Sections the service applies immediately; the rest wait for a restart. */
 const LIVE_GROUPS = new Set(['Execution', 'Autopilot', 'Profit harvesting', 'Model'])
 
-/** Drops the shared prefix so the label reads as a setting, not a shout. */
-function settingLabel(name: string) {
-  return name.replace(/^VEYRA_/, '').replace(/_/g, ' ').toLowerCase()
+/**
+ * How a setting is edited when its accepted values are a closed set.
+ *
+ * The service's parser stays the only judge of a value; these only choose a
+ * control that cannot express anything outside what that parser accepts.
+ * `fallback` is what the service does with an empty value, so an unset field
+ * shows the behaviour in force rather than a blank. Every other setting is
+ * free text.
+ */
+type SettingKind =
+  | { kind: 'switch'; fallback: boolean }
+  | { kind: 'choice'; fallback: string; options: ReadonlyArray<{ value: string; label: string }> }
+  /** Exactly one supported value: shown, not edited. */
+  | { kind: 'fixed'; fallback: string }
+
+const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN1'].map((value) => ({ value, label: value }))
+
+const SETTING_KINDS: Record<string, SettingKind> = {
+  VEYRA_TRADING_ENABLED: { kind: 'switch', fallback: false },
+  VEYRA_AUTOPILOT_ENABLED: { kind: 'switch', fallback: false },
+  VEYRA_AUTOPILOT_PROFIT_HARVEST: { kind: 'switch', fallback: false },
+  VEYRA_MODEL_COMPEL_STRUCTURED: { kind: 'switch', fallback: true },
+  VEYRA_MODEL_APP_HIDDEN: { kind: 'switch', fallback: false },
+  VEYRA_AUTOPILOT_TIMEFRAME: { kind: 'choice', fallback: 'H4', options: TIMEFRAMES },
+  VEYRA_AUTOPILOT_TIER: {
+    kind: 'choice',
+    fallback: 'balanced',
+    options: [
+      { value: 'fast', label: 'Fast' },
+      { value: 'balanced', label: 'Balanced' },
+      { value: 'reasoning', label: 'Reasoning' },
+    ],
+  },
+  VEYRA_AUTOPILOT_JEV: {
+    kind: 'choice',
+    fallback: 'auto',
+    options: [
+      { value: 'auto', label: 'Auto' },
+      { value: 'off', label: 'Off' },
+    ],
+  },
+  VEYRA_MODEL_PROVIDER: { kind: 'fixed', fallback: 'openrouter' },
+  VEYRA_JEV_PROVIDER: { kind: 'fixed', fallback: 'typesafe' },
+  VEYRA_MARKET_PROVIDER: { kind: 'fixed', fallback: '' },
+}
+
+/** A value as the service reads it: empty means the setting's fallback. */
+function settingValue(name: string, raw: string): string {
+  const kind = SETTING_KINDS[name]
+  if (!kind || raw.trim() !== '') return raw.trim()
+  return String(kind.fallback)
+}
+
+const LABEL_WORDS: Record<string, string> = {
+  r: 'R',
+  atr: 'ATR',
+  url: 'URL',
+  http: 'HTTP',
+  jev: 'JEV',
+  ea: 'EA',
+}
+
+/**
+ * A setting's name as a label: `VEYRA_AUTOPILOT_TRAIL_R` under Autopilot reads
+ * `Trail R`, and a trailing `SECS` becomes a unit. The raw name stays on the
+ * label's tooltip, so it can still be found in `.env`.
+ */
+function settingLabel(name: string, prefixes: readonly string[]): string {
+  let key = name.replace(/^VEYRA_/, '')
+  const prefix = prefixes.find((candidate) => key.startsWith(candidate) && key.length > candidate.length)
+  if (prefix) key = key.slice(prefix.length)
+  const words = key
+    .toLowerCase()
+    .split('_')
+    .map((word) => LABEL_WORDS[word] ?? word)
+  const seconds = words.at(-1) === 'secs'
+  if (seconds) words.pop()
+  const label = words.join(' ')
+  return `${label.charAt(0).toUpperCase()}${label.slice(1)}${seconds ? ' (s)' : ''}`
+}
+
+/** A flag: label above, the shared ON/OFF switch below. */
+function SwitchSetting({
+  label,
+  title,
+  checked,
+  disabled,
+  dirty,
+  aside,
+  onFlip,
+}: {
+  label: string
+  title: string
+  checked: boolean
+  disabled: boolean
+  dirty: boolean
+  aside?: ReactNode
+  onFlip: () => void
+}) {
+  return (
+    <div className="tab-control">
+      <div className="tab-control-head">
+        <span title={title}>{label}</span>
+        {aside ? <span className="tab-control-aside">{aside}</span> : null}
+      </div>
+      <div className={`tab-setting-switch${dirty ? ' is-dirty' : ''}`}>
+        <Toggle checked={checked} label={label} tone="ok" disabled={disabled} onClick={onFlip} />
+      </div>
+    </div>
+  )
+}
+
+/** A closed set: a menu that holds only values the service accepts. */
+function ChoiceSetting({
+  label,
+  title,
+  field,
+  value,
+  options,
+  disabled,
+  dirty,
+  aside,
+  onChange,
+}: {
+  label: string
+  title: string
+  field: string
+  value: string
+  options: ReadonlyArray<{ value: string; label: string }>
+  disabled: boolean
+  dirty: boolean
+  aside?: ReactNode
+  onChange: (event: ChangeEvent<HTMLSelectElement>) => void
+}) {
+  const id = useId()
+  // A value the service accepts outside the menu (a timeframe in minutes)
+  // is kept as its own entry rather than silently replaced.
+  const choices = options.some((option) => option.value === value) ? options : [...options, { value, label: value }]
+  return (
+    <Control id={id} label={label} title={title} aside={aside}>
+      <span className="tab-select">
+        <select
+          id={id}
+          className={`tab-input${dirty ? ' is-dirty' : ''}`}
+          data-field={field}
+          value={value}
+          disabled={disabled}
+          onChange={onChange}
+        >
+          {choices.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+        <Icon name="chevron-down" size={16} />
+      </span>
+    </Control>
+  )
+}
+
+/** A setting with a single supported value: stated, not offered as a choice. */
+function FixedSetting({ label, title, value, aside }: { label: string; title: string; value: string; aside?: ReactNode }) {
+  return (
+    <div className="tab-control">
+      <div className="tab-control-head">
+        <span title={title}>{label}</span>
+        {aside ? <span className="tab-control-aside">{aside}</span> : null}
+      </div>
+      <div className="tab-setting-fixed">{value || 'Not set'}</div>
+    </div>
+  )
 }
 
 /**
  * Live settings, editable without a restart.
  *
- * Every field is a plain text box on purpose: the service validates an edit
- * with the same parser that validates `.env`, so the console does not need to
- * restate a single acceptance rule — and cannot drift from one. A rejected
- * patch changes nothing, so the draft stays on screen to be corrected.
+ * Flags are switches and closed sets are menus (see `SETTING_KINDS`); the rest
+ * are text boxes. Either way the service validates an edit with the same
+ * parser that validates `.env`, so the console restates no acceptance rule
+ * beyond those closed sets. Nothing applies until Apply, so a switch cannot
+ * change the live service by itself, and a rejected patch leaves the draft on
+ * screen to be corrected.
  */
 export function LiveSettingsPanel({
   settings,
@@ -2220,14 +1651,17 @@ export function LiveSettingsPanel({
 
   if (!settings) {
     return (
-      <Panel title="Live settings">
-        <div className="p-3.5 text-[13px] text-[var(--color-ink-faint)]">Loading…</div>
+      <Panel title="Live settings" className="tab-panel">
+        <SkeletonRows />
       </Panel>
     )
   }
 
-  const effective = (name: string) => draft[name] ?? settings[name]?.value ?? ''
-  const dirty = Object.keys(draft).filter((name) => draft[name] !== (settings[name]?.value ?? ''))
+  // Only rendered names ever reach the draft, and those exist in `settings`.
+  const effective = (name: string) => draft[name] ?? settings[name].value
+  const isDirty = (name: string) =>
+    name in draft && settingValue(name, draft[name]) !== settingValue(name, settings[name].value)
+  const dirty = Object.keys(draft).filter(isDirty)
 
   const submit = async () => {
     if (!onApply || dirty.length === 0) return
@@ -2265,86 +1699,126 @@ export function LiveSettingsPanel({
     onRefresh?.()
   }
 
+  const handleChange = (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    const name = event.target.dataset.field as string
+    const value = event.target.value
+    setDraft((current) => ({ ...current, [name]: value }))
+  }
+  const flip = (name: string) =>
+    setDraft((current) => ({ ...current, [name]: settingValue(name, effective(name)) === 'true' ? 'false' : 'true' }))
+
   return (
     <Panel
       title="Live settings"
-      detail={
-        dirty.length > 0
-          ? `${dirty.length} unsaved`
-          : saved
-            ? 'applied'
-            : 'credentials stay in the environment'
+      className="tab-panel tab-settings"
+      actions={
+        dirty.length > 0 ? (
+          <span className="tone-warn">{dirty.length} unsaved</span>
+        ) : saved ? (
+          <span className="tone-ok">Applied</span>
+        ) : null
       }
     >
-      <div className="flex flex-col gap-4 p-3.5">
-        {error ? (
-          <p role="alert" className="text-[12px] text-[var(--color-bad)]">
-            {error}
-          </p>
-        ) : null}
-
-        {SETTING_GROUPS.map((group) => (
-          <section key={group.title}>
-            <div className="mb-2 flex items-baseline justify-between gap-2">
-              <h3 className="label text-[var(--color-ink-muted)]">{group.title}</h3>
-              <span className="text-[11px] text-[var(--color-ink-faint)]">
-                {LIVE_GROUPS.has(group.title) ? group.detail : `${group.detail}`}
-              </span>
+      {SETTING_GROUPS.map((group) => {
+        const names = group.names.filter((name) => settings[name] !== undefined)
+        if (names.length === 0) return null
+        return (
+          <section key={group.title} className="tab-group">
+            <div className="tab-group-head">
+              <h3>{group.title}</h3>
+              {LIVE_GROUPS.has(group.title) ? null : <span className="tab-group-note">Applies on restart</span>}
             </div>
-            <div className="grid gap-2 sm:grid-cols-2">
-              {group.names
-                .filter((name) => settings[name] !== undefined)
-                .map((name) => (
-                  <label key={name} className="min-w-0">
-                    <span className="label flex items-center gap-1.5">
-                      {settingLabel(name)}
-                      {settings[name].overridden ? (
-                        <button
-                          type="button"
-                          onClick={() => void revert(name)}
-                          disabled={busy}
-                          title="Clear this override and return to the deployed value"
-                          className="rounded border border-[var(--color-line)] px-1 text-[10px] text-[var(--color-ink-faint)] hover:text-[var(--color-ink)]"
-                        >
-                          set · revert
-                        </button>
-                      ) : null}
-                    </span>
-                    <input
-                      data-field={name}
-                      value={effective(name)}
+            <div className="tab-group-fields">
+              {names.map((name) => {
+                const label = settingLabel(name, group.prefixes)
+                const kind = SETTING_KINDS[name]
+                const aside = settings[name].overridden ? (
+                  <>
+                    <span className="tone-warn">Overridden</span>
+                    <button
+                      type="button"
+                      className="tab-link"
+                      onClick={() => void revert(name)}
                       disabled={busy}
-                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                        setDraft((current) => ({ ...current, [name]: event.target.value }))
-                      }
-                      className="readout mt-0.5 w-full rounded border border-[var(--color-line)] bg-[var(--color-surface-2)] px-2 py-1 text-[13px]"
+                      title="Return to the deployed value"
+                    >
+                      Revert
+                    </button>
+                  </>
+                ) : undefined
+                if (kind?.kind === 'switch') {
+                  return (
+                    <SwitchSetting
+                      key={name}
+                      label={label}
+                      title={name}
+                      checked={settingValue(name, effective(name)) === 'true'}
+                      disabled={busy}
+                      dirty={isDirty(name)}
+                      aside={aside}
+                      onFlip={() => flip(name)}
                     />
-                  </label>
-                ))}
+                  )
+                }
+                if (kind?.kind === 'choice') {
+                  return (
+                    <ChoiceSetting
+                      key={name}
+                      label={label}
+                      title={name}
+                      field={name}
+                      value={settingValue(name, effective(name))}
+                      options={kind.options}
+                      disabled={busy}
+                      dirty={isDirty(name)}
+                      aside={aside}
+                      onChange={handleChange}
+                    />
+                  )
+                }
+                if (kind?.kind === 'fixed') {
+                  return (
+                    <FixedSetting key={name} label={label} title={name} value={settingValue(name, effective(name))} aside={aside} />
+                  )
+                }
+                return (
+                  <TextControl
+                    key={name}
+                    label={label}
+                    title={name}
+                    field={name}
+                    value={effective(name)}
+                    disabled={busy}
+                    dirty={isDirty(name)}
+                    placeholder="Not set"
+                    onChange={handleChange}
+                    aside={aside}
+                  />
+                )
+              })}
             </div>
           </section>
-        ))}
+        )
+      })}
 
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => void submit()}
-            disabled={busy || dirty.length === 0}
-            className="rounded border border-[var(--color-line)] bg-[var(--color-surface-2)] px-3 py-1.5 text-[13px] disabled:opacity-50"
-          >
-            {busy ? 'Applying…' : 'Apply'}
-          </button>
+      <div className="tab-settings-foot">
+        {error ? (
+          <p className="tab-error" role="alert">
+            {error}
+          </p>
+        ) : (
+          <span />
+        )}
+        <span className="tab-settings-actions">
           {dirty.length > 0 ? (
-            <button
-              type="button"
-              onClick={() => setDraft({})}
-              disabled={busy}
-              className="text-[12px] text-[var(--color-ink-faint)] hover:text-[var(--color-ink)]"
-            >
+            <Button onClick={() => setDraft({})} disabled={busy}>
               Discard
-            </button>
+            </Button>
           ) : null}
-        </div>
+          <Button tone="ok" onClick={() => void submit()} disabled={busy || dirty.length === 0}>
+            {busy ? 'Applying…' : 'Apply'}
+          </Button>
+        </span>
       </div>
     </Panel>
   )

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { api, type FeedEvent, type LogLevel, type LogRecord } from './api'
+import { isNotable } from './format'
 
 /** Polls an async source on an interval, keeping the last good value on error. */
 export function usePoll<T>(load: () => Promise<T>, intervalMs: number) {
@@ -42,27 +43,51 @@ export function usePoll<T>(load: () => Promise<T>, intervalMs: number) {
   return { data, error, refetch }
 }
 
-/** Follows /events with a cursor; reconnects on any transport failure. */
-export function useEventFeed(capacity = 80) {
+/** Largest page `/events` serves; a shorter page means the backfill caught up. */
+const FEED_PAGE = 200
+
+/**
+ * Follows /events with a cursor; reconnects on any transport failure.
+ *
+ * The service keeps a short ring dominated by plumbing (snapshots and command
+ * round-trips), so a plain tail on first load would miss the decisions an
+ * operator looks for. The first pass therefore pages through the whole ring
+ * without waiting, then settles into long-polling. Notable events are kept in
+ * their own list as well, so a burst of plumbing never pushes the last
+ * decision out of view.
+ *
+ * `settled` turns true once the first request has answered either way, which
+ * separates "not connected yet" from "lost the connection".
+ */
+export function useEventFeed(capacity = 80, notableCapacity = 40) {
   const [events, setEvents] = useState<FeedEvent[]>([])
+  const [notable, setNotable] = useState<FeedEvent[]>([])
   const [connected, setConnected] = useState(false)
-  const cursor = useRef<number | undefined>(undefined)
+  const [settled, setSettled] = useState(false)
+  const cursor = useRef(0)
+  const backfilling = useRef(true)
 
   useEffect(() => {
     let alive = true
     const run = async () => {
       while (alive) {
         try {
-          const feed = await api.events(cursor.current)
+          const feed = await api.events(cursor.current, backfilling.current ? 0 : 15000, FEED_PAGE)
           if (!alive) return
           cursor.current = feed.next
+          if (feed.events.length < FEED_PAGE) backfilling.current = false
           if (feed.events.length > 0) {
-            setEvents((previous) => [...feed.events].reverse().concat(previous).slice(0, capacity))
+            const newest = [...feed.events].reverse()
+            setEvents((previous) => newest.concat(previous).slice(0, capacity))
+            const kept = newest.filter(isNotable)
+            if (kept.length > 0) setNotable((previous) => kept.concat(previous).slice(0, notableCapacity))
           }
           setConnected(true)
+          setSettled(true)
         } catch {
           if (!alive) return
           setConnected(false)
+          setSettled(true)
           await new Promise((resolve) => setTimeout(resolve, 2000))
         }
       }
@@ -71,9 +96,9 @@ export function useEventFeed(capacity = 80) {
     return () => {
       alive = false
     }
-  }, [capacity])
+  }, [capacity, notableCapacity])
 
-  return { events, connected }
+  return { events, notable, connected, settled }
 }
 
 /**

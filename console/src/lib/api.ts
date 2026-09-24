@@ -129,6 +129,8 @@ export type Position = {
    */
   current?: number
   magic: number
+  /** Broker open time, unix seconds (absent on older terminals). */
+  openedAt?: number
 }
 
 export type Account = {
@@ -414,7 +416,10 @@ export const api = {
   reconciliation: () => get<Reconciliation>('/reconciliation'),
   metrics: () => get<Metrics>('/metrics'),
   commands: (limit = 25) => get<{ commands: CommandRecord[] }>(`/commands?limit=${limit}`),
-  candles: (bars = 48) => get<CandleSeries>(`/market/candles?timeframe=H4&bars=${bars}`),
+  candles: (bars = 48, timeframe = 'H4', symbol?: string) =>
+    get<CandleSeries>(
+      `/market/candles?timeframe=${timeframe}&bars=${bars}${symbol ? `&symbol=${encodeURIComponent(symbol)}` : ''}`,
+    ),
   balanceHistory: (days = 30) => get<BalanceHistory>(`/account/balance-history?days=${days}`),
   performance: (days = 30) => get<Performance>(`/performance?days=${days}`),
   sessions: () => get<MarketSessions>('/market/sessions'),

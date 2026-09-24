@@ -218,7 +218,34 @@ describe('useEventFeed', () => {
     })
     expect(result.current.connected).toBe(true)
     expect(result.current.events.map((event) => event.seq)).toEqual([2, 1])
-    expect(mocks.events).toHaveBeenLastCalledWith(2)
+    // A short first page ends the backfill, so the next call long-polls.
+    expect(mocks.events).toHaveBeenNthCalledWith(1, 0, 0, 200)
+    expect(mocks.events).toHaveBeenLastCalledWith(2, 15000, 200)
+  })
+
+  it('pages through the whole ring before long-polling and keeps notable events apart', async () => {
+    const page = Array.from({ length: 200 }, (_, index) => ({
+      seq: index + 1,
+      at_ms: index + 1,
+      kind: index === 5 ? 'proposal_evaluated' : 'broker_snapshot',
+      payload: {},
+    }))
+    mocks.events
+      .mockResolvedValueOnce({ events: page, latest: 201, next: 200 })
+      .mockResolvedValueOnce({ events: [{ seq: 201, at_ms: 201, kind: 'agent_turn', payload: {} }], latest: 201, next: 201 })
+      .mockImplementation(() => new Promise(() => undefined))
+
+    const { result } = renderHook(() => useEventFeed(80))
+    expect(result.current.settled).toBe(false)
+    await act(async () => undefined)
+
+    expect(mocks.events).toHaveBeenNthCalledWith(1, 0, 0, 200)
+    // A full page means more may be buffered: keep paging without waiting.
+    expect(mocks.events).toHaveBeenNthCalledWith(2, 200, 0, 200)
+    expect(mocks.events).toHaveBeenNthCalledWith(3, 201, 15000, 200)
+    expect(result.current.events).toHaveLength(80)
+    expect(result.current.notable.map((event) => event.seq)).toEqual([6])
+    expect(result.current.settled).toBe(true)
   })
 
   it('uses the default ring capacity for an empty batch', async () => {
@@ -244,6 +271,7 @@ describe('useEventFeed', () => {
       await Promise.resolve()
     })
     expect(result.current.connected).toBe(false)
+    expect(result.current.settled).toBe(false)
   })
 
   it('caps the ring and ignores a batch that arrives after unmount', async () => {

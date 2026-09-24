@@ -1,0 +1,317 @@
+/* Overview chart panel (components/chart.tsx): view menu, range/timeframe
+ * control, stats row and the SVG plot. Geometry that depends on the measured
+ * width (axis position, label thinning) lives in the component; this file
+ * holds type, colour and the fixed paddings measured from the design. */
+
+.chart {
+  /* Above the panels that follow, so the view menu can drop over them; still
+     under the sticky top bar. */
+  position: relative;
+  z-index: 1;
+  container: chart / inline-size;
+}
+
+.chart-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 15px 13px 0 18px;
+}
+
+.chart-title {
+  min-width: 0;
+}
+
+.chart-head .segmented {
+  gap: 8px;
+}
+
+/* ---------- view menu ---------- */
+
+.chart-menu {
+  position: relative;
+  min-width: 0;
+}
+
+.chart-menu-button {
+  display: inline-flex;
+  max-width: 100%;
+  min-height: 28px;
+  align-items: center;
+  gap: 8px;
+  border-radius: 4px;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  white-space: nowrap;
+}
+
+/* The middle dot's own side bearings already space it; trim the word spaces. */
+.chart-title-sep {
+  margin: 0 -3px;
+}
+
+.chart-menu-chevron {
+  color: var(--color-ink-muted);
+  transition: transform 120ms ease;
+}
+
+.chart-menu-button[aria-expanded="true"] .chart-menu-chevron {
+  transform: rotate(180deg);
+}
+
+.chart-menu-button:hover .chart-menu-chevron {
+  color: var(--color-ink);
+}
+
+.chart-menu-list {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 6px);
+  left: -6px;
+  display: flex;
+  min-width: 208px;
+  max-height: min(430px, 70vh);
+  flex-direction: column;
+  padding: 4px;
+  overflow-y: auto;
+  border: 1px solid var(--color-line);
+  border-radius: 6px;
+  background: var(--color-surface-1);
+  box-shadow: 0 12px 28px -10px color-mix(in srgb, var(--color-surface-0) 85%, transparent);
+}
+
+[data-theme="light"] .chart-menu-list {
+  box-shadow: 0 10px 24px -12px color-mix(in srgb, var(--color-ink) 22%, transparent);
+}
+
+.chart-menu-item {
+  display: flex;
+  min-height: 32px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  color: var(--color-ink-muted);
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.chart-menu-item:hover {
+  background: var(--color-surface-2);
+  color: var(--color-ink);
+}
+
+.chart-menu-item[aria-checked="true"] {
+  color: var(--color-ink);
+}
+
+.chart-menu-check {
+  color: var(--color-warn);
+}
+
+/* ---------- stats row ---------- */
+
+.chart-stats {
+  display: flex;
+  min-height: 26px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px 18px;
+  padding: 8px 24px 0 18px;
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.chart-stat {
+  display: inline-flex;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.chart-stat-label {
+  color: var(--color-ink-muted);
+}
+
+.chart-stat-value {
+  color: var(--color-ink);
+  font-weight: 500;
+}
+
+.chart-stat-value.tone-ok {
+  color: var(--color-ok);
+}
+
+.chart-stat-value.tone-bad {
+  color: var(--color-bad);
+}
+
+/* ---------- plot ---------- */
+
+.chart-plot {
+  position: relative;
+  margin-top: 10px;
+  overflow: hidden;
+  border-radius: 0 0 6px 6px;
+}
+
+.chart-svg {
+  display: block;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+  touch-action: pan-y;
+}
+
+.chart-grid line {
+  stroke: var(--color-chart-grid);
+  stroke-width: 1;
+}
+
+/* The axes carry a stronger rule than the grid, as in the design, without a
+   token of their own: the faint ink at reduced strength reads in both themes. */
+.chart-axis line {
+  stroke: var(--color-ink-faint);
+  stroke-opacity: 0.62;
+  stroke-width: 1;
+}
+
+.chart-ylabel,
+.chart-xlabel {
+  fill: var(--color-ink-muted);
+}
+
+.chart-line {
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.chart-line.is-up,
+.chart-leader.is-up {
+  stroke: var(--color-ok);
+}
+
+.chart-line.is-down,
+.chart-leader.is-down {
+  stroke: var(--color-bad);
+}
+
+.chart-leader {
+  stroke-width: 1;
+}
+
+.chart-point {
+  stroke: var(--color-surface-1);
+  stroke-width: 2;
+}
+
+.chart-point.is-up {
+  fill: var(--color-ok);
+}
+
+.chart-point.is-down {
+  fill: var(--color-bad);
+}
+
+.chart-cross {
+  stroke: var(--color-line-strong);
+  stroke-width: 1;
+}
+
+.chart-tag path {
+  fill: var(--color-chart-tag);
+}
+
+.chart-tag.is-down path {
+  fill: var(--color-bad);
+}
+
+.chart-tag-text {
+  fill: var(--color-chart-tag-ink);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.chart-tip {
+  position: absolute;
+  z-index: 5;
+  top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 10px;
+  border: 1px solid var(--color-line);
+  border-radius: 6px;
+  background: var(--color-surface-1);
+  color: var(--color-ink);
+  font-size: 12px;
+  line-height: 16px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.chart-tip-time {
+  color: var(--color-ink-muted);
+}
+
+.chart-tip-value {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.chart-tip-trade {
+  color: var(--color-ink-muted);
+}
+
+/* Loading and unavailable states hold the plot's footprint. */
+.chart-fill {
+  position: absolute;
+  top: 0;
+  right: 14px;
+  left: 18px;
+  display: flex;
+}
+
+.chart-unavailable {
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+/* ---------- narrow panels ---------- */
+
+@container chart (max-width: 620px) {
+  .chart-head {
+    padding: 14px 16px 0 16px;
+  }
+
+  .chart-title {
+    flex: 1 0 100%;
+  }
+
+  .chart-head .segmented {
+    gap: 4px;
+    margin-left: -8px;
+  }
+
+  .chart-stats {
+    justify-content: flex-start;
+    gap: 2px 14px;
+    padding: 8px 16px 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chart-menu-chevron {
+    transition: none;
+  }
+}

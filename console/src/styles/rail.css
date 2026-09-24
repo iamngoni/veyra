@@ -1,0 +1,278 @@
+/* Overview right rail (components/rail.tsx): the autopilot card (ap-), the
+ * recent-activity timeline (act-) and the risk switches (rc-).
+ *
+ * Every card body sits on the same 16px inset as the header rule, so text,
+ * row rules and toggles all line up on one left and one right edge. */
+
+/* ---------- autopilot ---------- */
+
+.ap-state {
+  position: relative;
+  /* Sit on the title's baseline rather than its centre line. */
+  top: 1px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+.ap-state .dot {
+  width: 12px;
+  height: 12px;
+}
+
+.ap-rows {
+  margin: 0 16px;
+  padding: 0 0 14px;
+}
+
+.ap-row {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  align-items: baseline;
+  padding: 12px 0 9px;
+  border-top: 1px solid var(--color-line);
+}
+
+.ap-row:first-child {
+  padding-top: 16px;
+  border-top: 0;
+}
+
+.ap-row dt {
+  color: var(--color-ink-muted);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.ap-row dd {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  margin: 0;
+  color: var(--color-ink);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.ap-note {
+  display: -webkit-box;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--color-ink-muted);
+  font-size: 13px;
+  line-height: 18px;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+/* ---------- recent activity ---------- */
+
+.act-reconnecting {
+  color: var(--color-warn);
+  font-size: 13px;
+}
+
+.act-list {
+  margin: 0 16px;
+  padding: 0 0 10px;
+  list-style: none;
+}
+
+.act-row {
+  display: grid;
+  /* Time, the timeline rule, the state dot, then the text. */
+  grid-template-columns: 56px 37px minmax(0, 1fr);
+  padding: 15px 0 14px;
+  border-top: 1px solid var(--color-line);
+}
+
+.act-row:first-child {
+  border-top: 0;
+}
+
+.act-time {
+  border-right: 1px solid var(--color-line);
+  color: var(--color-ink-muted);
+  font-size: 14px;
+  line-height: 22px;
+}
+
+.act-mark {
+  display: flex;
+  height: 22px;
+  align-items: center;
+  padding-left: 10px;
+}
+
+.act-mark .dot {
+  width: 12px;
+  height: 12px;
+}
+
+.act-text {
+  min-width: 0;
+}
+
+.act-title {
+  margin: 0;
+  overflow: hidden;
+  color: var(--color-ink);
+  font-size: 15px;
+  line-height: 22px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.act-detail {
+  display: -webkit-box;
+  margin: 2px 0 0;
+  overflow: hidden;
+  color: var(--color-ink-muted);
+  font-size: 13.5px;
+  line-height: 19px;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+.act-empty {
+  margin: 0;
+  padding: 18px 16px 20px;
+}
+
+/* ---------- risk controls ---------- */
+
+.rc-list {
+  margin: 0 16px;
+  padding: 0 0 12px;
+}
+
+.rc-row {
+  padding: 16px 0 17px;
+  border-top: 1px solid var(--color-line);
+}
+
+.rc-row:first-child {
+  border-top: 0;
+}
+
+.rc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.rc-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--color-ink);
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 22px;
+}
+
+.rc-info {
+  display: inline-flex;
+  color: var(--color-ink-muted);
+  cursor: help;
+}
+
+.rc-info .icon {
+  stroke-width: 1.4;
+}
+
+.rc-desc {
+  margin: 7px 0 0;
+  color: var(--color-ink-muted);
+  font-size: 14px;
+  line-height: 21px;
+  text-wrap: pretty;
+}
+
+.rc-warning {
+  margin: 8px 0 0;
+  color: var(--color-warn);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.rc-confirm {
+  display: flex;
+  /* On a narrow rail the buttons drop below the question rather than
+     breaking it across lines. */
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 6px;
+  margin-top: 12px;
+  padding: 4px 4px 4px 10px;
+  border-radius: 6px;
+  background: var(--color-surface-2);
+  color: var(--color-ink);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.rc-confirm-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.rc-cancel,
+.rc-apply {
+  min-height: 28px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.rc-cancel {
+  color: var(--color-ink-muted);
+}
+
+.rc-cancel:hover:not(:disabled) {
+  background: var(--color-surface-3);
+  color: var(--color-ink);
+}
+
+.rc-apply {
+  /* Wide enough for "Applying…", so the row does not reflow mid-request. */
+  min-width: 84px;
+  padding: 0 8px;
+  /* Panel fill as ink reads on both the pale dark-theme and deep light-theme hues. */
+  color: var(--color-surface-1);
+  font-weight: 500;
+  text-align: center;
+}
+
+.rc-apply.is-bad {
+  background: var(--color-bad);
+}
+
+.rc-apply.is-warn {
+  background: var(--color-warn);
+}
+
+.rc-cancel:disabled,
+.rc-apply:disabled {
+  opacity: 0.6;
+}
+
+.rc-error {
+  margin: 8px 0 0;
+  color: var(--color-bad);
+  font-size: 13px;
+  line-height: 18px;
+}

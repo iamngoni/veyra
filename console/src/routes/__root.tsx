@@ -28,13 +28,20 @@ export const Route = createRootRoute({
   shellComponent: RootDocument,
 })
 
+/**
+ * Applies the remembered (or system) theme before first paint, so a light
+ * preference never flashes the dark server render. Mirrors `useTheme`.
+ */
+const THEME_BOOT = `try{var t=localStorage.getItem('veyra.theme');if(t!=='dark'&&t!=='light'){t=matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'}document.documentElement.dataset.theme=t}catch(e){}`
+
 function RootDocument({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_BOOT }} />
         <HeadContent />
       </head>
-      <body className="bg-[var(--color-surface-0)] text-[var(--color-ink)] antialiased">
+      <body>
         {children}
         <TanStackDevtools
           config={{

@@ -1,52 +1,31 @@
 /**
- * Render tests for the console panels.
+ * Render tests for the tab panels.
  *
  * These exercise the operator-visible surfaces with the same payload shapes
- * the service emits: armed/disarmed pills, the open-position table, decision
- * drill-downs, routine-event focus mode, and command inspection.
+ * the service emits: the risk policy and its editor, the account and session,
+ * decision drill-downs, routine-event focus mode, the durable trail, command
+ * inspection, diagnostics and live settings.
  */
 
 import { useState } from 'react'
 
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type {
-  Account,
-  CandleSeries,
-  BalanceHistory,
-  CommandRecord,
-  FeedEvent,
-  LogRecord,
-  MarketSessions,
-  Performance,
-  Status,
-} from '../lib/api'
+import type { Account, AuditPage, CommandRecord, FeedEvent, LogRecord, MarketSessions, Status } from '../lib/api'
 import { VEYRA_MAGIC } from '../lib/api'
 import { auditTimeMs } from '../lib/hooks'
 import {
   AccountPanel,
   ActivityFeed,
   AutopilotPanel,
-  BalanceHistoryPanel,
   CommandsPanel,
   LiveSettingsPanel,
-  HeroMetrics,
   LogsPanel,
-  MarketPanel,
   MetricsPanel,
-  Panel,
-  PerformancePanel,
-  Pill,
-  PositionsPanel,
-  PostureBanner,
-  RecentActivityPreview,
+  Pager,
   RiskPanel,
-  SafetyControls,
-  StatusPills,
-  systemPosture,
-  Tabs,
-  ThemeToggle,
+  SessionPanel,
   TracePanel,
 } from './veyra'
 
@@ -91,6 +70,7 @@ const status: Status = {
     killSwitch: false,
     allowTradingWithoutJev: false,
     symbols: ['EURUSD'],
+    weekendSymbols: ['BTCUSD', 'ETHUSD'],
     maxVolumePerOrder: 0.01,
     maxTotalLots: 0.01,
     maxOpenOrders: 1,
@@ -140,16 +120,6 @@ const account: Account = {
   serverTime: 1,
 }
 
-const series: CandleSeries = {
-  symbol: 'EURUSD',
-  timeframe: 'H4',
-  candles: [
-    { time: 1, open: 1.1, high: 1.115, low: 1.095, close: 1.1, volume: 10 },
-    { time: 2, open: 1.1, high: 1.112, low: 1.098, close: 1.11, volume: 12 },
-    { time: 3, open: 1.11, high: 1.113, low: 1.1, close: 1.105, volume: 11 },
-  ],
-}
-
 const commands: CommandRecord[] = [
   { id: 'cmd-1111-2222', kind: 'open_order', status: 'completed', summary: { ticket: 99 }, reason: null },
   { id: 'cmd-3333-4444', kind: 'close_order', status: 'failed', summary: null, reason: 'broker_timeout' },
@@ -176,623 +146,111 @@ const events: FeedEvent[] = [
   },
 ]
 
-const sampledHistoryForTest: BalanceHistory = {
-  status: 'ok',
-  source: 'broker_balance',
-  account: { login: 123456, server: 'ICMarketsSC-MT4' },
-  days: 30,
-  retentionDays: 365,
-  currency: null,
-  points: [
-    { atMs: Date.now() - 86_400_000, balance: 1000 },
-    { atMs: Date.now(), balance: 1004.5 },
-  ],
-  firstObservedAtMs: Date.now() - 86_400_000,
-  lastObservedAtMs: Date.now(),
-  sampled: true,
-  fresh: true,
+/** A promise the test resolves by hand, to observe in-flight states. */
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((settle) => {
+    resolve = settle
+  })
+  return { promise, resolve }
 }
 
-describe('Pill and StatusPills', () => {
-  it('renders a connecting state without data', () => {
-    render(<StatusPills />)
-    expect(screen.getByText('connecting…')).toBeTruthy()
-  })
+/** The value cell beside a label in a label/value grid. */
+function valueOf(label: string): HTMLElement {
+  const term = screen.getByText(label, { selector: 'dt' })
+  return term.nextElementSibling as HTMLElement
+}
 
-  it('renders armed switches and autopilot cadence', () => {
-    render(<StatusPills status={status} />)
-    expect(screen.getByText('armed')).toBeTruthy()
-    expect(screen.getByText('enabled')).toBeTruthy()
-    expect(screen.getByText('60s · H4')).toBeTruthy()
-    expect(screen.getByText('postgres')).toBeTruthy()
-    expect(screen.getByText('development')).toBeTruthy()
-  })
-
-  it('renders stale and disarmed variants', () => {
-    render(
-      <StatusPills
-        status={{ ...status, broker_connected: false, ea_live_orders: false, autopilot: { ...autopilot, enabled: false } }}
-      />,
+describe('Pager', () => {
+  it('hides itself for a single page', () => {
+    const { container } = render(
+      <Pager page={0} pages={1} start={0} count={3} total={3} onPrevious={vi.fn()} onNext={vi.fn()} />,
     )
-    expect(screen.getByText('stale')).toBeTruthy()
-    expect(screen.getByText('disarmed')).toBeTruthy()
-    expect(screen.getByText('off')).toBeTruthy()
-    expect(screen.getByText(/terminal is not reporting/)).toBeTruthy()
+    expect(container.textContent).toBe('')
   })
 
-  it('renders arbitrary pill tones', () => {
-    render(<Pill tone="warn" label="risk" value="widened" />)
-    expect(screen.getByText('widened')).toBeTruthy()
-  })
-})
-
-describe('Tabs, ThemeToggle, and HeroMetrics', () => {
-  it('renders a badge, selects tabs, and flips the theme label', () => {
-    const onSelect = vi.fn()
-    render(
-      <Tabs
-        tabs={[
-          { id: 'overview', label: 'Overview' },
-          { id: 'trace', label: 'Trace', badge: 7 },
-        ]}
-        active="overview"
-        onSelect={onSelect}
-      />,
-    )
-    expect(screen.getByText('7')).toBeTruthy()
-    fireEvent.click(screen.getByText('Trace'))
-    expect(onSelect).toHaveBeenCalledWith('trace')
-
-    const onToggle = vi.fn()
-    const view = render(<ThemeToggle theme="dark" onToggle={onToggle} />)
-    fireEvent.click(view.getByLabelText('Switch to light theme'))
-    expect(onToggle).toHaveBeenCalledTimes(1)
-    view.rerender(<ThemeToggle theme="light" onToggle={onToggle} />)
-    expect(view.getByLabelText('Switch to dark theme')).toBeTruthy()
-  })
-
-  it('sums open P/L with singular hints', () => {
-    render(<HeroMetrics account={account} />)
-    expect(screen.getByText('-0.32')).toBeTruthy()
-    expect(screen.getByText('1 position')).toBeTruthy()
-    expect(screen.getByText('1 order')).toBeTruthy()
-  })
-
-  it('pluralises a two-position book and skips absent money fields', () => {
-    const first = account.positions?.[0]
+  it('states the visible range and guards both ends', () => {
+    const onPrevious = vi.fn()
+    const onNext = vi.fn()
     const { rerender } = render(
-      <HeroMetrics
-        account={{
-          ...account,
-          orders: 2,
-          lots: 0.02,
-          positions: first
-            ? [
-                { ...first, profit: 0.5 },
-                { ...first, ticket: 2, profit: -0.1 },
-              ]
-            : [],
-        }}
-      />,
+      <Pager page={0} pages={3} start={0} count={10} total={25} onPrevious={onPrevious} onNext={onNext} />,
     )
-    expect(screen.getByText('+0.40')).toBeTruthy()
-    expect(screen.getByText('2 positions')).toBeTruthy()
-    expect(screen.getByText('2 orders')).toBeTruthy()
+    expect(screen.getByText('1–10 of 25')).toBeTruthy()
+    expect((screen.getByLabelText('Previous page') as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByLabelText('Next page'))
+    expect(onNext).toHaveBeenCalledOnce()
 
-    // Absent money fields keep their skeletons instead of rendering numbers.
-    rerender(
-      <HeroMetrics
-        account={{
-          ...account,
-          equity: undefined,
-          lots: undefined,
-          freeMargin: undefined,
-          marginLevel: undefined,
-        }}
-      />,
-    )
-    expect(screen.queryByText('1 order')).toBeNull()
-    expect(screen.queryByText(/balance/)).toBeNull()
-  })
-
-  it('treats a missing profit as zero in the open total', () => {
-    const first = account.positions?.[0]
-    render(
-      <HeroMetrics
-        account={{
-          ...account,
-          positions: first ? [{ ...first, profit: undefined as unknown as number }] : [],
-        }}
-      />,
-    )
-    expect(screen.getByText('+0.00')).toBeTruthy()
-  })
-
-  it('renders pending skeletons and an explicit outage', () => {
-    const { rerender } = render(<HeroMetrics />)
-    expect(screen.queryByText('unavailable')).toBeNull()
-    rerender(<HeroMetrics error="account down" />)
-    expect(screen.getAllByText('unavailable').length).toBe(4)
+    rerender(<Pager page={2} pages={3} start={20} count={5} total={25} onPrevious={onPrevious} onNext={onNext} />)
+    expect((screen.getByLabelText('Next page') as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByLabelText('Previous page'))
+    expect(onPrevious).toHaveBeenCalledOnce()
   })
 })
 
 describe('AccountPanel', () => {
   it('renders balances, exposure, and the connected server', () => {
     render(<AccountPanel account={account} />)
-    expect(screen.getByText('1000.00')).toBeTruthy()
-    expect(screen.getByText('1005.50')).toBeTruthy()
-    expect(screen.getByText('900.00')).toBeTruthy()
-    expect(screen.getByText('357.5%')).toBeTruthy()
-    expect(screen.getByText('1:100')).toBeTruthy()
-    expect(screen.getByText('0.01')).toBeTruthy()
-    expect(screen.getByText('-0.32')).toBeTruthy()
-    expect(screen.getByText(/ICMarketsSC-MT4 · #123456/)).toBeTruthy()
+    expect(valueOf('Balance').textContent).toBe('1,000.00')
+    expect(valueOf('Equity').textContent).toBe('1,005.50')
+    expect(valueOf('Free margin').textContent).toBe('900.00')
+    expect(valueOf('Margin level').textContent).toBe('357.5%')
+    expect(valueOf('Leverage').textContent).toBe('1:100')
+    expect(valueOf('Open orders').textContent).toBe('1')
+    expect(valueOf('Open lots').textContent).toBe('0.01')
+    expect(valueOf('Open P/L').textContent).toBe('−0.32')
+    expect(valueOf('Open P/L').className).toContain('tone-bad')
+    expect(valueOf('Server').textContent).toBe('ICMarketsSC-MT4')
+    expect(valueOf('Login').textContent).toBe('123456')
+    expect(screen.getByText('Updated 3s ago').className).toBe('')
   })
 
-  it('shows the waiting and error states', () => {
-    const { rerender } = render(<AccountPanel />)
-    expect(screen.getByText('waiting…')).toBeTruthy()
+  it('holds skeletons before the first poll and dashes after a failed one', () => {
+    const { container, rerender } = render(<AccountPanel />)
+    expect(container.querySelectorAll('.skeleton').length).toBe(10)
+    expect(screen.queryByText('Unavailable')).toBeNull()
+
     rerender(<AccountPanel error="account down" />)
-    expect(screen.getByText('account down')).toBeTruthy()
-  })
-})
-
-describe('BalanceHistoryPanel', () => {
-  const historyNow = Date.now()
-  const history: BalanceHistory = {
-    status: 'ok',
-    source: 'broker_balance',
-    account: { login: 123456, server: 'ICMarketsSC-MT4' },
-    days: 30,
-    retentionDays: 365,
-    currency: null,
-    points: [
-      { atMs: historyNow - 86_400_000, balance: 1000 },
-      { atMs: historyNow, balance: 1004.5 },
-    ],
-    firstObservedAtMs: historyNow - 86_400_000,
-    lastObservedAtMs: historyNow,
-    sampled: true,
-    fresh: true,
-  }
-
-  it('renders observed balance points without inventing a return metric', () => {
-    render(<BalanceHistoryPanel history={history} account={account} />)
-    expect(screen.getByText('1004.50')).toBeTruthy()
-    expect(screen.queryByText(/%/)).toBeNull()
+    expect(screen.getByText('Unavailable').closest('[title]')?.getAttribute('title')).toBe('account down')
+    expect(container.querySelectorAll('.skeleton').length).toBe(0)
+    expect(valueOf('Balance').textContent).toBe('—')
   })
 
-  it('discards history when the connected account changes', () => {
-    render(<BalanceHistoryPanel history={history} account={{ ...account, login: 999999 }} />)
-    expect(screen.getByText('Waiting for this account’s history.')).toBeTruthy()
-    expect(screen.queryByText('1004.50')).toBeNull()
-  })
-
-  it('keeps a one-point history honest', () => {
-    render(<BalanceHistoryPanel history={{ ...history, points: [history.points[0]] }} account={account} />)
-    expect(screen.getByRole('figure', { name: 'Broker-observed account balance over time' })).toBeTruthy()
-    expect(screen.getByText(historyTimeForTest(history.points[0].atMs))).toBeTruthy()
-    expect(screen.queryByText('No broker balance observations yet.')).toBeNull()
-  })
-
-  it('filters observed points when a shorter range is selected', () => {
-    const now = Date.now()
-    render(<BalanceHistoryPanel history={{ ...history, points: [{ atMs: now - 2 * 86_400_000, balance: 1000 }, { atMs: now, balance: 1004.5 }] }} account={account} />)
-    fireEvent.click(screen.getByRole('button', { name: '1D' }))
-    expect(screen.queryByText('Balance change +4.50')).toBeNull()
-  })
-
-  it('uses the current time when deciding whether a history is stale', () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-09-23T12:00:00Z'))
-    try {
-      const staleAt = Date.parse('2026-08-14T12:00:00Z')
-      render(<BalanceHistoryPanel history={{ ...history, points: [{ atMs: staleAt, balance: 1000 }] }} account={account} />)
-      expect(screen.getByText('No observations in this period.')).toBeTruthy()
-      expect(document.querySelector('.balance-history-chart')).toBeNull()
-    } finally {
-      vi.useRealTimers()
+  it('marks a stale snapshot and dashes what the terminal did not report', () => {
+    render(
+      <AccountPanel
+        account={{
+          ...account,
+          fresh: false,
+          balance: undefined,
+          equity: undefined,
+          freeMargin: undefined,
+          marginLevel: 0,
+          leverage: 0,
+          orders: undefined,
+          lots: undefined,
+          positions: [],
+          server: undefined,
+          login: undefined,
+        }}
+      />,
+    )
+    expect(screen.getByText('Updated 3s ago').className).toBe('tone-warn')
+    for (const label of ['Balance', 'Equity', 'Margin level', 'Leverage', 'Open orders', 'Open P/L', 'Server', 'Login']) {
+      expect(valueOf(label).textContent).toBe('—')
     }
   })
 
-  it('shows a negative observed balance without calling the change profit', () => {
-    render(<BalanceHistoryPanel history={{ ...history, points: [{ atMs: history.points[0].atMs, balance: 4 }, { atMs: history.points[0].atMs + 60_000, balance: -2.5 }] }} account={account} />)
-    expect(screen.getByText('-2.50')).toBeTruthy()
-    expect(screen.getByText('Balance change −6.50')).toBeTruthy()
-    expect(screen.queryByText(/profit/i)).toBeNull()
-  })
-
-  it('shows dates for observations spanning days', () => {
-    const dated = {
-      ...history,
-      points: [
-        { atMs: Date.parse('2026-09-20T12:00:00Z'), balance: 20 },
-        { atMs: Date.parse('2026-09-23T12:00:00Z'), balance: 21 },
-      ],
-    }
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-09-23T12:00:00Z'))
-    try {
-      render(<BalanceHistoryPanel history={dated} account={account} error="refresh failed" />)
-      const ticks = document.querySelector('.chart-x-axis')?.textContent ?? ''
-      expect(ticks).toContain('Sep 20')
-      expect(ticks).toContain('Sep 23')
-      expect(screen.getByText('last known · refresh failed')).toBeTruthy()
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-
-  function historyTimeForTest(ms: number): string {
-    return new Date(ms).toLocaleString([], {
-      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
-    })
-  }
-
-  it('names disabled and waiting history without drawing a series', () => {
-    const empty = { ...history, account: null, points: [], firstObservedAtMs: null, lastObservedAtMs: null }
-    const { rerender } = render(<BalanceHistoryPanel history={{ ...empty, status: 'disabled' }} account={account} />)
-    expect(screen.getByText('Balance history is disabled.')).toBeTruthy()
-    expect(document.querySelector('.balance-history-chart')).toBeNull()
-    rerender(<BalanceHistoryPanel history={{ ...empty, status: 'waiting_for_account' }} account={account} />)
-    expect(screen.getByText('Waiting for the broker account.')).toBeTruthy()
-    expect(document.querySelector('.balance-history-chart')).toBeNull()
-  })
-})
-
-describe('overview summaries', () => {
-  it('keeps autopilot compact while exposing full details on demand', () => {
-    render(<AutopilotPanel status={autopilot} budget={status.model_budget} jevUsage={status.jev_usage} decisions={status.decisions} compact lastDecisionAt={1_700_000_000_000} />)
-    expect(screen.getByText('Running')).toBeTruthy()
-    expect(screen.queryByText('No recent decision.')).toBeNull()
-    expect(screen.getByText(/^\d\d:\d\d:\d\d$/)).toBeTruthy()
-    fireEvent.click(screen.getByText('View autopilot details'))
-    expect(screen.getByText('Model chain')).toBeTruthy()
-  })
-
-  it('summarises recent activity and routes View all to the full feed', () => {
-    const onViewAll = vi.fn()
-    render(<RecentActivityPreview events={events} connected onViewAll={onViewAll} />)
-    expect(screen.getByText('Trade held')).toBeTruthy()
-    fireEvent.click(screen.getByText('View all'))
-    expect(onViewAll).toHaveBeenCalledOnce()
-  })
-
-  it('uses concise titles and safe details for decision outcomes and failures', () => {
+  it('treats a missing profit as zero and a missing book as flat', () => {
     const { rerender } = render(
-      <RecentActivityPreview
-        events={[
-          { seq: 11, at_ms: 1_700_000_011_000, kind: 'proposal_evaluated', payload: { outcome: 'no_trade', reason: 'spread too wide' } },
-          { seq: 12, at_ms: 1_700_000_012_000, kind: 'proposal_evaluated', payload: { outcome: 'queued', side: 'buy', volume: 0.1 } },
-          { seq: 13, at_ms: 1_700_000_013_000, kind: 'proposal_evaluated', payload: { outcome: 'approved_dry_run', side: 'sell' } },
-        ]}
-        connected
-        onViewAll={() => undefined}
-      />,
+      <AccountPanel account={{ ...account, positions: [{ ...account.positions![0], profit: undefined as unknown as number }] }} />,
     )
-    expect(screen.getByText('No trade')).toBeTruthy()
-    expect(screen.getByText('Trade queued')).toBeTruthy()
-    expect(screen.getByText('Approved · dry run')).toBeTruthy()
-    expect(screen.getByText(/spread too wide/)).toBeTruthy()
-
-    rerender(
-      <RecentActivityPreview
-        events={[
-          { seq: 14, at_ms: 1_700_000_014_000, kind: 'failure', payload: { reason: 'provider timeout' } },
-          { seq: 15, at_ms: 1_700_000_015_000, kind: 'command_failed', payload: { reason: 'broker rejected order' } },
-          { seq: 16, at_ms: 1_700_000_016_000, kind: 'position_closed', payload: { ticket: 8, symbol: 'EURUSD', kind: 'sell', profit: -2.5 } },
-        ]}
-        connected
-        onViewAll={() => undefined}
-      />,
-    )
-    expect(screen.getByText('Decision failed')).toBeTruthy()
-    expect(screen.getByText('provider timeout')).toBeTruthy()
-    expect(screen.getByText('broker rejected order')).toBeTruthy()
-    expect(screen.getByText('Position closed')).toBeTruthy()
-
-    const mappedOutcomes = [
-      ['rejected', 'Trade rejected'],
-      ['unavailable', 'Decision unavailable'],
-      ['break_even', 'Break-even queued'],
-      ['break_even_rejected', 'Break-even rejected'],
-      ['close_queued', 'Close queued'],
-      ['close_rejected', 'Close rejected'],
-      ['trailing_stop', 'Stop adjustment queued'],
-      ['profit_harvest_stop', 'Stop adjustment queued'],
-      ['stop_queued', 'Stop adjustment queued'],
-      ['stop_rejected', 'Stop adjustment rejected'],
-    ] as const
-    for (const [index, [outcome, title]] of mappedOutcomes.entries()) {
-      rerender(
-        <RecentActivityPreview
-          events={[{ seq: 20 + index, at_ms: 1_700_000_020_000 + index, kind: 'proposal_evaluated', payload: { outcome } }]}
-          connected
-          onViewAll={() => undefined}
-        />,
-      )
-      expect(screen.getByText(title)).toBeTruthy()
-    }
-  })
-
-  it('keeps intermediate model events out of the activity digest', () => {
-    render(
-      <RecentActivityPreview
-        events={[{ seq: 9, at_ms: 1_700_000_003_000, kind: 'agent_turn', payload: { prompt: 'private prompt' } }, ...events]}
-        connected
-        onViewAll={() => undefined}
-      />,
-    )
-    expect(screen.queryByText('Agent turn')).toBeNull()
-    expect(screen.queryByText('Decision step completed.')).toBeNull()
-    expect(screen.getByText('Trade held')).toBeTruthy()
-  })
-
-  it('marks cached activity while the event stream reconnects', () => {
-    render(<RecentActivityPreview events={[events[1]]} connected={false} onViewAll={() => undefined} />)
-    expect(screen.getAllByText('Reconnecting…').length).toBeGreaterThan(0)
-    expect(screen.getByText('Trade held')).toBeTruthy()
-  })
-
-  it('states when there is no recent activity', () => {
-    render(<RecentActivityPreview events={[]} connected={false} onViewAll={() => undefined} />)
-    expect(screen.getAllByText('Reconnecting…').length).toBeGreaterThan(0)
+    expect(valueOf('Open P/L').textContent).toBe('0.00')
+    rerender(<AccountPanel account={{ ...account, positions: undefined }} />)
+    expect(valueOf('Open P/L').textContent).toBe('—')
   })
 })
 
-describe('PositionsPanel', () => {
-  it('renders an empty account cleanly', () => {
-    render(<PositionsPanel account={{ ...account, positions: [] }} />)
-    expect(screen.getByText('Flat — no open orders.')).toBeTruthy()
-  })
-
-  it('labels veyra-owned and manual positions', () => {
-    render(
-      <PositionsPanel
-        account={{
-          ...account,
-          positionsTruncated: true,
-          positions: [
-            account.positions?.[0] ?? {
-              ticket: 1,
-              symbol: 'EURUSD',
-              kind: 'sell',
-              lots: 0.01,
-              price: 1,
-              profit: 0,
-              sl: 0,
-              tp: 0,
-              magic: 0,
-            },
-            { ticket: 42, symbol: 'USDJPY', kind: 'buy', lots: 0.1, price: 156.2, profit: 4, sl: 155.9, tp: 156.4, magic: 0 },
-            { ticket: 43, symbol: 'XAUUSD', kind: 'buy', lots: 0.01, price: 2_400, profit: 0.5, sl: 2_390, tp: 2_420, swap: 0.02, magic: 0 },
-          ],
-        }}
-      />,
-    )
-    expect(screen.getByText('EURUSD')).toBeTruthy()
-    expect(screen.getByText('USDJPY')).toBeTruthy()
-    expect(screen.getByText('XAUUSD')).toBeTruthy()
-    expect(screen.getByText('truncated')).toBeTruthy()
-    expect(screen.getByText('+4.00')).toBeTruthy()
-
-    fireEvent.click(screen.getByLabelText('Details for EURUSD'))
-    expect(screen.getByText('10650805')).toBeTruthy()
-    expect(screen.getByText('veyra')).toBeTruthy()
-    fireEvent.click(screen.getByLabelText('Details for USDJPY'))
-    expect(screen.getByText('42')).toBeTruthy()
-    expect(screen.getAllByText('manual').length).toBeGreaterThanOrEqual(1)
-    fireEvent.click(screen.getByLabelText('Details for XAUUSD'))
-    expect(screen.getByText('43')).toBeTruthy()
-    expect(screen.getByText('+0.02')).toBeTruthy()
-  })
-
-  it('opens the per-position disclosure for operational metadata', () => {
-    render(<PositionsPanel account={account} />)
-    const summary = screen.getByLabelText('Details for EURUSD')
-    fireEvent.click(summary)
-    expect(summary.getAttribute('aria-expanded')).toBe('true')
-    expect(screen.getByText('Ticket')).toBeTruthy()
-    expect(screen.getByText('Swap')).toBeTruthy()
-    expect(screen.getByText('Owner')).toBeTruthy()
-  })
-
-  it('reports the live price and signs the move against the side', () => {
-    render(
-      <PositionsPanel
-        account={{
-          ...account,
-          positions: [
-            // A sell in profit: price fell below the entry.
-            { ticket: 1, symbol: 'EURUSD', kind: 'sell', lots: 0.01, price: 1.14757, current: 1.14585, profit: 1.72, sl: 1.1497, tp: 1.14554, magic: VEYRA_MAGIC },
-            // A buy against it: price fell below the entry too.
-            { ticket: 2, symbol: 'GBPUSD', kind: 'buy', lots: 0.01, price: 1.3, current: 1.295, profit: -5, sl: 1.29, tp: 1.31, magic: 0 },
-          ],
-        }}
-      />,
-    )
-    expect(screen.getByText('1.14585')).toBeTruthy()
-    // The same downward move is favourable for the sell and adverse for the buy.
-    expect(screen.getByText('+0.00172')).toBeTruthy()
-    expect(screen.getByText('-0.005')).toBeTruthy()
-  })
-
-  it('falls back to two decimals when every price is zero', () => {
-    render(
-      <PositionsPanel
-        account={{
-          ...account,
-          positions: [
-            {
-              ticket: 9,
-              symbol: 'XAUUSD',
-              kind: 'buy',
-              lots: 0.01,
-              price: 0,
-              profit: 0,
-              sl: 0,
-              tp: 0,
-              magic: 0,
-            },
-          ],
-        }}
-      />,
-    )
-    expect(screen.getByText('+0.00')).toBeTruthy()
-  })
-
-  it('widens to two decimals when every quoted price is an integer', () => {
-    render(
-      <PositionsPanel
-        account={{
-          ...account,
-          positions: [
-            {
-              ticket: 11,
-              symbol: 'XAUUSD',
-              kind: 'buy',
-              lots: 0.01,
-              price: 2,
-              current: 2,
-              profit: 1.5,
-              sl: 0,
-              tp: 0,
-              magic: 0,
-            },
-          ],
-        }}
-      />,
-    )
-    expect(screen.getByText('+0.00')).toBeTruthy()
-    expect(screen.getByText('+1.50')).toBeTruthy()
-  })
-
-  it('states a missing current price rather than implying one', () => {
-    render(
-      <PositionsPanel
-        account={{
-          ...account,
-          positions: [
-            { ticket: 3, symbol: 'EURUSD', kind: 'buy', lots: 0.01, price: 1.1, current: 0, profit: 0, sl: 0, tp: 0, magic: 0 },
-          ],
-        }}
-      />,
-    )
-    // A zero from the terminal means "not reported", never a real price.
-    expect(screen.queryByText('+0.0')).toBeNull()
-    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(1)
-  })
-})
-
-describe('PerformancePanel', () => {
-  const performance: Performance = {
-    days: 30,
-    report: {
-      trades: 2,
-      wins: 1,
-      losses: 1,
-      breakeven: 0,
-      win_rate_percent: 50,
-      net_profit: 0.55,
-      gross_profit: 1.36,
-      gross_loss: 0.81,
-      profit_factor: 1.68,
-      average_win: 1.36,
-      average_loss: 0.81,
-      expectancy: 0.28,
-      best_trade: 1.36,
-      worst_trade: -0.81,
-      by_symbol: [
-        { symbol: 'USDJPY', trades: 1, wins: 1, net_profit: 1.36 },
-        { symbol: 'EURUSD', trades: 1, wins: 0, net_profit: -0.81 },
-      ],
-    },
-    trades: [],
-    total: 2,
-    truncated: false,
-  }
-
-  it('renders realized performance and per-symbol totals', () => {
-    render(<PerformancePanel performance={performance} />)
-    expect(screen.getByText('Win rate')).toBeTruthy()
-    expect(screen.getByText('50.0%')).toBeTruthy()
-    expect(screen.getByText('1W · 1L')).toBeTruthy()
-    expect(screen.getByText('+0.55')).toBeTruthy()
-    expect(screen.getByText('1.68')).toBeTruthy()
-    expect(screen.getAllByText('+1.36').length).toBe(2)
-    expect(screen.getAllByText('-0.81').length).toBe(2)
-    expect(screen.getByText(/last 30d · 2 closed/)).toBeTruthy()
-  })
-
-  it('reports a truncated window with breakeven trades and a cost-adjusted loss', () => {
-    render(
-      <PerformancePanel
-        performance={{
-          ...performance,
-          truncated: true,
-          report: {
-            ...performance.report,
-            trades: 3,
-            wins: 1,
-            losses: 1,
-            breakeven: 1,
-            net_profit: -0.25,
-            average_loss: 0.4,
-            by_symbol: [],
-          },
-        }}
-      />,
-    )
-    expect(screen.getByText(/last 30d · 2 closed · truncated/)).toBeTruthy()
-    expect(screen.getByText('1W · 1L · 1F')).toBeTruthy()
-    expect(screen.getByText('-0.25')).toBeTruthy()
-    expect(screen.getByText('-0.40')).toBeTruthy()
-  })
-
-  it('shows waiting, error, and empty states', () => {
-    const { rerender } = render(<PerformancePanel />)
-    expect(screen.getByText('waiting…')).toBeTruthy()
-    rerender(<PerformancePanel error="performance down" />)
-    expect(screen.getByText('performance down')).toBeTruthy()
-
-    rerender(
-      <PerformancePanel
-        performance={{
-          ...performance,
-          report: {
-            ...performance.report,
-            trades: 0,
-            wins: 0,
-            losses: 0,
-            net_profit: 0,
-            profit_factor: null,
-            average_win: null,
-            average_loss: null,
-            by_symbol: [],
-          },
-        }}
-      />,
-    )
-    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(4)
-  })
-})
-
-describe('MarketPanel', () => {
-  it('renders the series summary', () => {
-    render(<MarketPanel series={series} />)
-    expect(screen.getByText('EURUSD H4')).toBeTruthy()
-    expect(screen.getByText('1.10500')).toBeTruthy()
-    expect(screen.getByText('+0.45%')).toBeTruthy()
-    expect(screen.getByText('1.11300 / 1.10000')).toBeTruthy()
-  })
-
-  it('handles a one-candle series and an error', () => {
-    const { rerender } = render(<MarketPanel series={{ ...series, candles: [series.candles[0]] }} />)
-    expect(screen.getByText('+0.00%')).toBeTruthy()
-    rerender(<MarketPanel error="feed down" />)
-    expect(screen.getByText('feed down')).toBeTruthy()
-  })
-
+describe('SessionPanel', () => {
   const closedSessions: MarketSessions = {
     now: 1_789_776_000, // Saturday 2026-09-19 00:00 UTC
     market: { state: 'closed', nextEvent: 'opens', nextAt: 1_789_938_000 }, // Sunday 21:00 UTC
@@ -805,83 +263,60 @@ describe('MarketPanel', () => {
     weekend: { policy: 'agent', closesInSecs: null },
   }
 
-  it('reports the weekend checkpoint while the window is open', () => {
-    const runUp: MarketSessions = {
-      now: 1_789_761_600, // Friday 2026-09-18 20:00 UTC
-      market: { state: 'open', nextEvent: 'closes', nextAt: 1_789_765_200 },
-      entries: {
-        open: false,
-        blockedBy: 'weekend_approach',
-        detail: 'the weekend entry cutoff has passed',
-      },
-      policy: {
-        rolloverBlackout: { startMinute: 1245, endMinute: 1335 },
-        fridayEntryCutoffMinute: 1140,
-        sundayEntryOpenMinute: 1380,
-      },
-      weekend: { policy: 'agent', closesInSecs: 3_600 },
-    }
-    const { rerender } = render(<MarketPanel series={series} sessions={runUp} account={account} />)
-    expect(screen.getByText(/Weekend checkpoint/)).toBeTruthy()
-    // Both the session line and the checkpoint line count down to the same
-    // close, so the label appears twice with the same instant.
-    expect(screen.getAllByText(/closes Fri 21:00 UTC/)).toHaveLength(2)
-    expect(screen.getAllByText(/in 1h 0m/)).toHaveLength(2)
-    expect(screen.getByText(/the analyst settles each open position/)).toBeTruthy()
-
-    // The operator's override reads differently on the same line.
-    rerender(
-      <MarketPanel
-        series={series}
-        sessions={{ ...runUp, weekend: { policy: 'flatten', closesInSecs: 1_800 } }}
-        account={account}
-      />,
-    )
-    expect(screen.getByText(/every open position is flattened/)).toBeTruthy()
+  it('holds its rows while the first poll is in flight', () => {
+    const { container } = render(<SessionPanel />)
+    expect(screen.getByText('Next')).toBeTruthy()
+    expect(container.querySelectorAll('.skeleton').length).toBe(5)
   })
 
   it('reports the closed week, the entry block, and what is held', () => {
-    render(<MarketPanel series={series} sessions={closedSessions} account={account} />)
-    expect(screen.getByText('closed')).toBeTruthy()
-    expect(screen.getByText(/opens Sun 21:00 UTC/)).toBeTruthy()
-    expect(screen.getByText(/in 1d 21h/)).toBeTruthy()
-    expect(screen.getByText('blocked — weekend')).toBeTruthy()
-    expect(screen.getByText('Holding EURUSD — market closed; stops rest at the broker')).toBeTruthy()
+    render(<SessionPanel sessions={closedSessions} account={account} />)
+    expect(screen.getByText('Closed')).toBeTruthy()
+    expect(valueOf('Opens').textContent).toBe('Sun 21:00 UTC · in 1d 21h')
+    expect(valueOf('Entries').textContent).toBe('Blocked · weekend')
+    expect(valueOf('Entries').className).toBe('tone-warn')
+    expect(valueOf('Holding').textContent).toBe('EURUSD')
+    expect(valueOf('Rollover').textContent).toBe('20:45–22:15 UTC')
+    expect(valueOf('Entry window').textContent).toBe('Sun 23:00 – Fri 19:00 UTC')
+    expect(screen.queryByText('Weekend close')).toBeNull()
   })
 
-  it('reports an open market, an open rollover pause, and open entries', () => {
+  it('counts down to the weekend checkpoint and names the preference', () => {
+    const runUp: MarketSessions = {
+      ...closedSessions,
+      now: 1_789_761_600, // Friday 2026-09-18 20:00 UTC
+      market: { state: 'open', nextEvent: 'closes', nextAt: 1_789_765_200 },
+      entries: { open: false, blockedBy: 'weekend_approach', detail: 'the weekend entry cutoff has passed' },
+      weekend: { policy: 'agent', closesInSecs: 3_600 },
+    }
+    const { rerender } = render(<SessionPanel sessions={runUp} account={account} />)
+    expect(valueOf('Closes').textContent).toBe('Fri 21:00 UTC · in 1h 0m')
+    expect(valueOf('Weekend close').textContent).toBe('Fri 21:00 UTC · in 1h 0m')
+    expect(valueOf('Weekend positions').textContent).toBe('Analyst decides')
+    expect(valueOf('Entries').textContent).toBe('Blocked · weekend cutoff')
+
+    rerender(<SessionPanel sessions={{ ...runUp, weekend: { policy: 'flatten', closesInSecs: 1_800 } }} account={account} />)
+    expect(valueOf('Weekend positions').textContent).toBe('Flattened before close')
+  })
+
+  it('reports an open market, a rollover pause, and a flat book', () => {
     const { rerender } = render(
-      <MarketPanel
-        series={series}
-        sessions={{
-          ...closedSessions,
-          now: 1_789_776_000,
-          market: { state: 'open', nextEvent: 'pauses', nextAt: 1_789_776_000 + 3_600 },
-          entries: { open: true, blockedBy: null, detail: null },
-        }}
-      />,
-    )
-    expect(screen.getAllByText('open')).toHaveLength(2) // week state and entries
-    expect(screen.getByText(/rollover pause/)).toBeTruthy()
-    expect(screen.queryByText(/Holding/)).toBeNull()
-
-    // An open market with a position keeps the plain holding line.
-    rerender(
-      <MarketPanel
-        series={series}
-        account={account}
+      <SessionPanel
         sessions={{
           ...closedSessions,
           market: { state: 'open', nextEvent: 'pauses', nextAt: 1_789_776_000 + 3_600 },
           entries: { open: true, blockedBy: null, detail: null },
         }}
+        account={{ ...account, positions: undefined }}
       />,
     )
-    expect(screen.getByText('Holding EURUSD')).toBeTruthy()
+    expect(screen.getAllByText('Open')).toHaveLength(2) // week state and entries
+    expect(valueOf('Entries').className).toBe('tone-ok')
+    expect(valueOf('Pauses').textContent).toBe('Sat 01:00 UTC · in 1h 0m')
+    expect(valueOf('Holding').textContent).toBe('None')
 
     rerender(
-      <MarketPanel
-        series={series}
+      <SessionPanel
         sessions={{
           ...closedSessions,
           market: { state: 'rollover', nextEvent: 'resumes', nextAt: 1_789_776_000 + 600 },
@@ -889,98 +324,97 @@ describe('MarketPanel', () => {
         }}
       />,
     )
-    expect(screen.getByText('rollover')).toBeTruthy()
-    expect(screen.getByText('blocked — rollover blackout')).toBeTruthy()
-    expect(screen.getByText(/in 10m/)).toBeTruthy()
+    expect(screen.getByText('Rollover', { selector: '.tab-state' })).toBeTruthy()
+    expect(valueOf('Resumes').textContent).toBe('Sat 00:10 UTC · in 10m')
+    expect(valueOf('Entries').textContent).toBe('Blocked · rollover blackout')
   })
 
-  it('renders an unrecognised block reason verbatim instead of guessing', () => {
-    render(
-      <MarketPanel
-        series={series}
-        sessions={{
-          ...closedSessions,
-          entries: { open: false, blockedBy: 'broker_holiday', detail: 'closed for a holiday' },
-        }}
+  it('renders an unrecognised block reason verbatim and a missing one plainly', () => {
+    const { rerender } = render(
+      <SessionPanel
+        sessions={{ ...closedSessions, entries: { open: false, blockedBy: 'broker_holiday', detail: 'holiday' } }}
       />,
     )
-    expect(screen.getByText('blocked — broker_holiday')).toBeTruthy()
+    expect(valueOf('Entries').textContent).toBe('Blocked · broker_holiday')
+    rerender(<SessionPanel sessions={{ ...closedSessions, entries: { open: false, blockedBy: null, detail: null } }} />)
+    expect(valueOf('Entries').textContent).toBe('Blocked')
   })
 })
 
 describe('AutopilotPanel', () => {
-  it('renders cadence, stops, and budget', () => {
+  it('renders cadence, stops, the chain, and budgets', () => {
     render(
-      <AutopilotPanel status={autopilot} budget={status.model_budget} jevUsage={status.jev_usage} />,
+      <AutopilotPanel status={autopilot} budget={status.model_budget} jevUsage={status.jev_usage} decisions={status.decisions} />,
     )
-    expect(screen.getByText('60s')).toBeTruthy()
-    expect(screen.getByText('48 bars')).toBeTruthy()
-    expect(screen.getByText('BE 1R · trail 1R')).toBeTruthy()
-    expect(screen.getByText('5/120 h · 5/2000 d')).toBeTruthy()
-    expect(screen.getByText('EURUSD')).toBeTruthy()
-    expect(
-      screen.getByText(
-        'deepseek/deepseek-v4.1-flash → z-ai/glm-5.3-flash → xiaomi/mimo-v2.6-flash → z-ai/glm-4.7-flash',
-      ),
-    ).toBeTruthy()
-    expect(screen.getByText('12 calls · 5.5k tok')).toBeTruthy()
-  })
-
-  it('reports small token counts and judge failures verbatim', () => {
-    render(
-      <AutopilotPanel
-        status={autopilot}
-        budget={status.model_budget}
-        jevUsage={{ calls: 3, failures: 2, inputTokens: 420, outputTokens: 80 }}
-      />,
+    expect(screen.getByText('Running')).toBeTruthy()
+    expect(valueOf('Cadence').textContent).toBe('60 seconds')
+    expect(valueOf('Timeframe').textContent).toBe('H4')
+    expect(valueOf('Window').textContent).toBe('48 bars')
+    expect(valueOf('Tier').textContent).toBe('balanced')
+    expect(valueOf('Judgements').textContent).toBe('auto')
+    expect(valueOf('Stops').textContent).toBe('Break-even 1R · trail 1R')
+    expect(valueOf('Symbols').textContent).toBe('EURUSD')
+    expect(valueOf('Profit harvest').textContent).toBe('Off')
+    expect(valueOf('Model chain').textContent).toBe(
+      'deepseek/deepseek-v4.1-flash → z-ai/glm-5.3-flash → xiaomi/mimo-v2.6-flash → z-ai/glm-4.7-flash',
     )
-    expect(screen.getByText('3 calls · 500 tok · 2 failed')).toBeTruthy()
+    expect(valueOf('Calls per hour').textContent).toBe('5 / 120')
+    expect(valueOf('Calls per day').textContent).toBe('5 / 2,000')
+    expect(valueOf('Judge calls').textContent).toBe('12')
+    expect(valueOf('Judge tokens').textContent).toBe('5.5k')
+    expect(valueOf('Last LLM').textContent).toBe('Not called yet')
+    expect(valueOf('Last answer').textContent).toBe('None yet')
+    expect(screen.queryByText('Last failure')).toBeNull()
   })
 
-  it('renders the last LLM model when decision telemetry is available', () => {
-    render(
-      <AutopilotPanel
-        status={autopilot}
-        decisions={{
-          ...status.decisions!,
-          lastModel: 'openai/gpt-5.6-mini',
-          lastSuccessfulModel: 'openai/gpt-4.1-mini',
-        }}
-      />,
-    )
-
-    expect(screen.getByText('openai/gpt-5.6-mini')).toBeTruthy()
-    expect(screen.getByText('openai/gpt-4.1-mini')).toBeTruthy()
-  })
-
-  it('keeps the last LLM field graceful when model telemetry is missing', () => {
-    render(<AutopilotPanel status={autopilot} decisions={status.decisions} />)
-
-    expect(screen.getByText('not called yet')).toBeTruthy()
-    expect(screen.getByText('none yet')).toBeTruthy()
-  })
-
-  it('renders a multi-symbol rotation and the chart-symbol fallback', () => {
+  it('reports small and large token counts and judge failures', () => {
     const { rerender } = render(
-      <AutopilotPanel status={{ ...autopilot, symbols: ['EURUSD', 'GBPUSD'] }} budget={status.model_budget} />,
+      <AutopilotPanel status={autopilot} jevUsage={{ calls: 3, failures: 2, inputTokens: 420, outputTokens: 80 }} />,
     )
-    expect(screen.getByText('EURUSD · GBPUSD')).toBeTruthy()
-    rerender(<AutopilotPanel status={{ ...autopilot, symbols: [] }} />)
-    expect(screen.getByText('chart symbol')).toBeTruthy()
+    expect(valueOf('Judge calls').textContent).toBe('3 · 2 failed')
+    expect(valueOf('Judge calls').className).toBe('tone-warn')
+    expect(valueOf('Judge tokens').textContent).toBe('500')
+
+    rerender(
+      <AutopilotPanel status={autopilot} jevUsage={{ calls: 4429, failures: 0, inputTokens: 2_164_642, outputTokens: 314_388 }} />,
+    )
+    expect(valueOf('Judge calls').textContent).toBe('4,429')
+    expect(valueOf('Judge tokens').textContent).toBe('2.5M')
+
+    rerender(<AutopilotPanel status={autopilot} jevUsage={{ calls: 0, failures: 0, inputTokens: 0, outputTokens: 0 }} budget={null} />)
+    expect(valueOf('Judge calls').textContent).toBe('—')
+    expect(valueOf('Judge tokens').textContent).toBe('—')
+    expect(valueOf('Calls per hour').textContent).toBe('—')
   })
 
-  it('renders the disabled shape', () => {
-    render(<AutopilotPanel status={{ ...autopilot, enabled: false, breakeven_r: 0, trail_r: 0 }} />)
-    expect(screen.getByText('disabled')).toBeTruthy()
-    expect(screen.getByText('bracket only')).toBeTruthy()
-    expect(screen.getAllByText('—').length).toBeGreaterThan(0)
-  })
-
-  it('shows the deterministic profit-harvest policy', () => {
+  it('names the models last asked and last answering', () => {
     render(
+      <AutopilotPanel
+        status={autopilot}
+        decisions={{ ...status.decisions!, lastModel: 'openai/gpt-5.6-mini', lastSuccessfulModel: 'openai/gpt-4.1-mini' }}
+      />,
+    )
+    expect(valueOf('Last LLM').textContent).toBe('openai/gpt-5.6-mini')
+    expect(valueOf('Last LLM').className).toBe('')
+    expect(valueOf('Last answer').textContent).toBe('openai/gpt-4.1-mini')
+  })
+
+  it('surfaces a run of decision failures', () => {
+    render(
+      <AutopilotPanel status={autopilot} decisions={{ consecutiveFailures: 2, lastFailure: 'provider timeout', lastFailureAt: 1 }} />,
+    )
+    expect(valueOf('Last failure').textContent).toBe('2 in a row · provider timeout')
+    expect(valueOf('Last failure').className).toBe('tone-bad')
+  })
+
+  it('renders rotation, stop, harvest and budget variants', () => {
+    const { rerender } = render(
       <AutopilotPanel
         status={{
           ...autopilot,
+          symbols: ['EURUSD', 'GBPUSD'],
+          breakeven_r: 0,
+          trail_r: 2,
           profit_harvest: {
             arm_r: 0.2,
             trail_r: 0.2,
@@ -990,46 +424,76 @@ describe('AutopilotPanel', () => {
             reentry_cooldown_secs: 900,
           },
         }}
+        budget={{ hourLimit: 0, hourCalls: 1, dayLimit: 0, dayCalls: 1 }}
       />,
     )
-    expect(screen.getByText('0.2R arm · 0.2R trail · 0.50 floor')).toBeTruthy()
+    expect(valueOf('Symbols').textContent).toBe('EURUSD · GBPUSD')
+    expect(valueOf('Stops').textContent).toBe('Trail 2R')
+    expect(valueOf('Profit harvest').textContent).toBe('0.2R arm · 0.2R trail · 0.50 floor')
+    expect(valueOf('Calls per hour').textContent).toBe('1 / ∞')
+    expect(valueOf('Calls per day').textContent).toBe('1 / ∞')
+
+    rerender(<AutopilotPanel status={{ ...autopilot, symbols: [], breakeven_r: 1, trail_r: 0 }} />)
+    expect(valueOf('Symbols').textContent).toBe('Chart symbol')
+    expect(valueOf('Stops').textContent).toBe('Break-even 1R')
   })
 
-  it('shows fallback models and a compact error state with full details available', () => {
-    render(
-      <AutopilotPanel
-        status={{ ...autopilot, enabled: false, model_chain: [], model_fallbacks: ['backup/model'] }}
-        decisions={{ ...status.decisions!, consecutiveFailures: 2, lastFailure: 'provider timeout' }}
-        compact
-      />,
+  it('renders the disabled shape and a chain without fallbacks', () => {
+    const { rerender } = render(
+      <AutopilotPanel status={{ ...autopilot, enabled: false, breakeven_r: 0, trail_r: 0, model_chain: [], model_fallbacks: ['backup/model'] }} />,
     )
-    expect(screen.getByText('Error')).toBeTruthy()
-    expect(screen.getByText('provider timeout')).toBeTruthy()
-    fireEvent.click(screen.getByText('View autopilot details'))
-    expect(screen.getByText('fallbacks: backup/model')).toBeTruthy()
+    expect(screen.getByText('Off', { selector: '.tab-state' })).toBeTruthy()
+    expect(valueOf('Cadence').textContent).toBe('—')
+    expect(valueOf('Window').textContent).toBe('—')
+    expect(valueOf('Stops').textContent).toBe('Bracket only')
+    expect(valueOf('Model chain').textContent).toBe('Fallbacks: backup/model')
+
+    rerender(<AutopilotPanel status={{ ...autopilot, model_chain: undefined, model_fallbacks: undefined }} />)
+    expect(valueOf('Model chain').textContent).toBe('No fallbacks')
+    expect(valueOf('Model chain').className).toBe('tone-warn')
   })
 
-  it('exposes the sampled-history disclosure while keeping the plot honest', () => {
-    const sampled = { ...sampledHistoryForTest, sampled: true }
-    render(<BalanceHistoryPanel history={sampled} account={account} />)
-    expect(screen.getByText(/sampled broker observations/)).toBeTruthy()
-    expect(screen.getByRole('figure', { name: 'Broker-observed account balance over time' })).toBeTruthy()
+  it('distinguishes no autopilot from one that has not reported yet', () => {
+    const { container, rerender } = render(<AutopilotPanel status={null} budget={null} jevUsage={null} decisions={null} />)
+    expect(screen.getByText('Off', { selector: '.tab-state' })).toBeTruthy()
+    for (const label of ['Cadence', 'Timeframe', 'Tier', 'Judgements', 'Symbols', 'Stops', 'Model chain']) {
+      expect(valueOf(label).textContent).toBe('—')
+    }
+    expect(valueOf('Last LLM').textContent).toBe('Not called yet')
+
+    rerender(<AutopilotPanel />)
+    expect(screen.queryByText('Off', { selector: '.tab-state' })).toBeNull()
+    expect(container.querySelectorAll('.skeleton').length).toBeGreaterThan(10)
   })
 })
 
 describe('RiskPanel', () => {
   it('renders the active gate with both switches', () => {
-    render(<RiskPanel policy={status.risk_policy} status={status} />)
-    expect(screen.getByText('EURUSD')).toBeTruthy()
-    expect(screen.getByText('switch on')).toBeTruthy()
-    expect(screen.getByText('armed')).toBeTruthy()
-    expect(screen.getByText('always open')).toBeTruthy()
-    expect(screen.getByText('30m blackout')).toBeTruthy()
-    expect(screen.getByText('0.25× ATR')).toBeTruthy()
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={vi.fn()} />)
+    expect(screen.getByText('Gate active')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeTruthy()
+    expect(valueOf('Symbols').textContent).toBe('EURUSD')
+    expect(valueOf('Weekend markets').textContent).toBe('BTCUSD · ETHUSD')
+    expect(valueOf('Session UTC').textContent).toBe('Always open')
+    expect(valueOf('Weekend positions').textContent).toBe('Analyst decides')
+    expect(valueOf('Max per order').textContent).toBe('0.01 lots')
+    expect(valueOf('Max total').textContent).toBe('0.01 lots')
+    expect(valueOf('Max open orders').textContent).toBe('1')
+    expect(valueOf('Duplicate window').textContent).toBe('60s')
+    expect(valueOf('Max risk').textContent).toBe('12% per trade')
+    expect(valueOf('Loss brakes').textContent).toBe('Day 10% · peak 25%')
+    expect(valueOf('Net USD cap').textContent).toBe('0.01 lots')
+    expect(valueOf('News blackout').textContent).toBe('30m')
+    expect(valueOf('Stop floor').textContent).toBe('0.25× ATR')
+    expect(valueOf('Judge outage').textContent).toBe('Pauses decisions')
+    expect(valueOf('Execution').textContent).toBe('Enabled')
+    expect(valueOf('Execution').className).toBe('tone-warn')
+    expect(valueOf('Terminal').textContent).toBe('Armed')
+    expect(valueOf('Terminal').className).toBe('tone-ok')
   })
 
-  it('shows disabled valuation limits explicitly', () => {
-    render(
+  it('shows disabled limits explicitly', () => {
+    const { rerender } = render(
       <RiskPanel
         policy={{
           ...status.risk_policy,
@@ -1043,32 +507,167 @@ describe('RiskPanel', () => {
         status={status}
       />,
     )
-    expect(screen.getAllByText('off').length).toBeGreaterThanOrEqual(3)
+    for (const label of ['Max risk', 'Loss brakes', 'Net USD cap', 'News blackout', 'Stop floor']) {
+      expect(valueOf(label).textContent).toBe('Off')
+    }
+    rerender(<RiskPanel policy={{ ...status.risk_policy, maxDailyLossPercent: 0 }} status={status} />)
+    expect(valueOf('Loss brakes').textContent).toBe('Peak 25%')
   })
 
   it('states whether a judge outage keeps trading or pauses decisions', () => {
-    const { rerender } = render(<RiskPanel policy={status.risk_policy} status={status} />)
-    expect(screen.getByText('pauses decisions')).toBeTruthy()
-    rerender(
-      <RiskPanel
-        policy={{ ...status.risk_policy, allowTradingWithoutJev: true }}
-        status={status}
-      />,
-    )
-    expect(screen.getByText('keeps trading')).toBeTruthy()
+    render(<RiskPanel policy={{ ...status.risk_policy, allowTradingWithoutJev: true }} status={status} />)
+    expect(valueOf('Judge outage').textContent).toBe('Keeps trading')
+    expect(valueOf('Judge outage').className).toBe('tone-warn')
   })
 
-  it('renders the kill switch and missing policy', () => {
-    const { rerender } = render(<RiskPanel policy={{ ...status.risk_policy, killSwitch: true }} status={status} />)
-    expect(screen.getByText('kill switch on')).toBeTruthy()
+  it('names the kill switch, and holds its place before the first status', () => {
+    const { container, rerender } = render(<RiskPanel policy={{ ...status.risk_policy, killSwitch: true }} status={status} />)
+    expect(screen.getByText('Kill switch on')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull()
+
     rerender(<RiskPanel />)
-    expect(screen.getAllByText('—').length).toBeGreaterThan(0)
+    expect(screen.queryByText('Gate active')).toBeNull()
+    expect(container.querySelectorAll('.skeleton').length).toBe(16)
+  })
+
+  it('renders an empty allowlist, a session window, and disarmed switches', () => {
+    render(
+      <RiskPanel
+        policy={{ ...status.risk_policy, symbols: [], weekendSymbols: undefined, sessionUtc: '07:00-21:00' }}
+        status={{ ...status, trading_enabled: false, ea_live_orders: false }}
+      />,
+    )
+    expect(valueOf('Symbols').textContent).toBe('None allowed')
+    expect(valueOf('Weekend markets').textContent).toBe('None')
+    expect(valueOf('Session UTC').textContent).toBe('07:00-21:00')
+    expect(valueOf('Execution').textContent).toBe('Disabled')
+    expect(valueOf('Terminal').textContent).toBe('Disarmed')
+  })
+
+  it('names the weekend preference in the read-only summary', () => {
+    const { rerender } = render(<RiskPanel policy={{ ...status.risk_policy, weekendPositions: 'flatten' }} status={status} />)
+    expect(valueOf('Weekend positions').textContent).toBe('Flattened before close')
+    rerender(<RiskPanel policy={{ ...status.risk_policy, weekendPositions: 'hold' }} status={status} />)
+    expect(valueOf('Weekend positions').textContent).toBe('Held through')
+  })
+})
+
+describe('RiskPanel editing', () => {
+  it('applies a patched policy and leaves edit mode', async () => {
+    const pending = deferred<string | undefined>()
+    const onApply = vi.fn().mockReturnValue(pending.promise)
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: '7' } })
+    fireEvent.change(screen.getByLabelText('Net USD cap (lots)'), { target: { value: '0.02' } })
+    fireEvent.change(screen.getByLabelText('News blackout (minutes)'), { target: { value: '45' } })
+    fireEvent.change(screen.getByLabelText('Min stop (× ATR)'), { target: { value: '0.75' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    // In flight: the save cannot be sent twice.
+    const saving = screen.getByRole('button', { name: 'Saving…' }) as HTMLButtonElement
+    expect(saving.disabled).toBe(true)
+
+    await act(async () => pending.resolve(undefined))
+    expect(screen.getByText('Gate active')).toBeTruthy()
+    expect(onApply).toHaveBeenCalledTimes(1)
+    const patch = onApply.mock.calls[0][0]
+    expect(patch.maxOpenOrders).toBe(7)
+    expect(patch.maxNetFactorLots).toBe(0.02)
+    expect(patch.calendarBlackoutMinutes).toBe(45)
+    expect(patch.minStopAtrFraction).toBe(0.75)
+    expect(patch.symbols).toEqual(['EURUSD'])
+    expect(patch.weekendSymbols).toEqual(['BTCUSD', 'ETHUSD'])
+    expect(patch.killSwitch).toBe(false)
+  })
+
+  it('refuses non-numeric input without calling the service', () => {
+    const onApply = vi.fn()
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    fireEvent.change(screen.getByLabelText('Max total (lots)'), { target: { value: 'lots' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(onApply).not.toHaveBeenCalled()
+    expect(screen.getByRole('alert').textContent).toBe('Max total (lots): must be a number')
+  })
+
+  it('rejects empty and fractional whole-number fields', () => {
+    const onApply = vi.fn()
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: '2.5' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(screen.getByRole('alert').textContent).toBe('Max open orders: must be a whole number')
+
+    fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: ' ' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(screen.getByRole('alert').textContent).toBe('Max open orders: must be a number')
+    expect(onApply).not.toHaveBeenCalled()
+  })
+
+  it('shows a service rejection and stays editable', async () => {
+    const onApply = vi.fn().mockResolvedValue('maxOpenOrders: must be an integer from 0 through 1000')
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await screen.findByText(/must be an integer from 0 through 1000/)
+    expect(screen.getByRole('button', { name: 'Save' })).toBeTruthy()
+  })
+
+  it('flips both switches in the draft and cancels cleanly', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    const killSwitch = screen.getByRole('switch', { name: 'Kill switch' })
+    fireEvent.click(killSwitch)
+    expect(killSwitch.getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(screen.getByRole('switch', { name: 'Judge bypass' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await screen.findByText('Gate active')
+    expect(onApply.mock.calls[0][0].killSwitch).toBe(true)
+    expect(onApply.mock.calls[0][0].allowTradingWithoutJev).toBe(true)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Save' })).toBeNull()
+  })
+
+  it('projects the session and symbol edits into the patch', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    render(<RiskPanel policy={{ ...status.risk_policy, weekendSymbols: undefined }} status={status} onApply={onApply} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    fireEvent.change(screen.getByLabelText('Symbols'), { target: { value: 'eurusd, gbpusd' } })
+    fireEvent.change(screen.getByLabelText('Weekend symbols'), { target: { value: ' btcusd ,' } })
+    fireEvent.change(screen.getByLabelText('Session UTC'), { target: { value: '8-17' } })
+    fireEvent.change(screen.getByLabelText('Weekend positions'), { target: { value: 'flatten' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await screen.findByText('Gate active')
+
+    const patch = onApply.mock.calls[0][0]
+    expect(patch.symbols).toEqual(['eurusd', 'gbpusd'])
+    expect(patch.weekendSymbols).toEqual(['btcusd'])
+    expect(patch.sessionUtc).toBe('8-17')
+    expect(patch.weekendPositions).toBe('flatten')
+  })
+
+  it('offers no edit affordance without a handler', () => {
+    render(<RiskPanel policy={status.risk_policy} status={status} />)
+    expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull()
   })
 })
 
 describe('TracePanel', () => {
-  const page = {
-    status: 'ok' as const,
+  const page: AuditPage = {
+    status: 'ok',
     provider: 'postgres',
     events: [
       {
@@ -1094,23 +693,56 @@ describe('TracePanel', () => {
 
   it('shows the whole payload of a turn rather than a summary', () => {
     render(<TracePanel page={page} kind="all" onKindChange={() => {}} />)
+    expect(screen.getByText('(2)')).toBeTruthy()
 
     // Scoped to the rows: the same kind also names a filter button above.
     const rows = screen.getByRole('list')
-    fireEvent.click(within(rows).getByText('agent_turn'))
+    fireEvent.click(within(rows).getByText('Agent turn'))
     // The prompt is readable in full: that is the point of the view.
     expect(screen.getByText('the exact prompt the model was shown')).toBeTruthy()
     expect(screen.getByText('inputChars')).toBeTruthy()
+    expect(screen.getByText(/"action": "none"/)).toBeTruthy()
+  })
+
+  it('keeps long and multi-line values in their own block', () => {
+    const long = 'x'.repeat(121)
+    render(
+      <TracePanel
+        page={{
+          status: 'ok',
+          events: [
+            {
+              id: 'blocks-1',
+              at: '2026-09-18 17:47:46+00',
+              kind: 'agent_turn',
+              payload: { long, lines: 'first\nsecond', flag: true, empty: null, count: 3 },
+            },
+          ],
+        }}
+        kind="all"
+        onKindChange={() => {}}
+      />,
+    )
+    fireEvent.click(within(screen.getByRole('list')).getByText('Agent turn'))
+    expect(screen.getByText(long).tagName).toBe('PRE')
+    expect(screen.getByText(/first\s+second/).tagName).toBe('PRE')
+    expect(screen.getByText('true').tagName).toBe('DD')
+    expect(screen.getByText('null').tagName).toBe('DD')
+    expect(screen.getByText('3').tagName).toBe('DD')
   })
 
   it('filters by kind and states an empty trail plainly', () => {
-    const { rerender } = render(<TracePanel page={page} kind="failure" onKindChange={() => {}} />)
+    const onKindChange = vi.fn()
+    const { rerender } = render(<TracePanel page={page} kind="failure" onKindChange={onKindChange} />)
     const rows = screen.getByRole('list')
-    expect(within(rows).getByText('panic · 2 fields')).toBeTruthy()
-    expect(within(rows).queryByText('agent_turn')).toBeNull()
+    expect(within(rows).getByText('Panic')).toBeTruthy()
+    expect(within(rows).queryByText('Agent turn')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Agent turn' }))
+    expect(onKindChange).toHaveBeenCalledWith('agent_turn')
 
     rerender(<TracePanel page={{ status: 'ok', events: [] }} kind="all" onKindChange={() => {}} />)
-    expect(screen.getByText('No durable events recorded yet.')).toBeTruthy()
+    expect(screen.getByText('No events yet')).toBeTruthy()
+    expect(screen.queryByRole('group', { name: 'Trail kind' })).toBeNull()
   })
 
   it('reads a Postgres timestamp rather than printing Invalid Date', () => {
@@ -1124,545 +756,306 @@ describe('TracePanel', () => {
   })
 
   it('surfaces a disabled or unreachable trail instead of looking empty', () => {
-    render(
-      <TracePanel page={{ status: 'disabled', events: [] }} kind="all" onKindChange={() => {}} />,
+    const { rerender } = render(<TracePanel page={{ status: 'disabled', events: [] }} kind="all" onKindChange={() => {}} />)
+    expect(screen.getByText('Disabled')).toBeTruthy()
+
+    // Rows still on screen from before: the header qualifies them.
+    rerender(
+      <TracePanel page={{ ...page, status: 'unavailable', error: 'pool timed out' }} kind="all" onKindChange={() => {}} />,
     )
-    expect(screen.getByText('disabled')).toBeTruthy()
+    const state = screen.getByText('Unavailable', { selector: '.tab-state' })
+    expect(state.className).toContain('is-warn')
+    expect(state.getAttribute('title')).toBe('pool timed out')
+
+    rerender(<TracePanel page={page} error="audit down" kind="all" onKindChange={() => {}} />)
+    expect(screen.getByText('Unavailable', { selector: '.tab-state' }).className).toContain('is-bad')
   })
 
-  it('states an absent page and an errored trail explicitly', () => {
-    const { rerender } = render(<TracePanel kind="all" onKindChange={() => {}} />)
-    expect(screen.getByText('No durable events recorded yet.')).toBeTruthy()
+  it('holds skeleton rows while loading and names an outage without data', () => {
+    const { container, rerender } = render(<TracePanel kind="all" onKindChange={() => {}} />)
+    expect(container.querySelectorAll('.tab-skeleton-row').length).toBe(3)
 
     rerender(<TracePanel error="audit down" kind="all" onKindChange={() => {}} />)
-    expect(screen.getByText('audit down')).toBeTruthy()
-    expect(screen.getByText('Trail unavailable.')).toBeTruthy()
+    expect(screen.getByText('Unavailable').getAttribute('title')).toBe('audit down')
   })
 
   it('collapses a row, and tolerates an unknown kind, no payload, and a bad time', () => {
     const rows = {
       status: 'ok' as const,
       events: [
-        { id: 'mystery-1', at: 'not a timestamp', kind: 'mystery_event' },
+        { id: 'mystery-1', at: 'not a timestamp', kind: 'mystery_event', payload: null },
         { id: 'plain-2', at: '2026-09-18 17:47:46.844116+00', kind: 'service_started', payload: {} },
       ],
     }
-    const onKindChange = vi.fn()
-    render(<TracePanel page={rows as never} kind="all" onKindChange={onKindChange} />)
+    render(<TracePanel page={rows} kind="all" onKindChange={vi.fn()} />)
 
     // An unreadable instant is a dash, never a confident wrong time.
     expect(screen.getByText('—')).toBeTruthy()
     // Payload-less rows still report themselves honestly.
     expect(screen.getAllByText('0 fields').length).toBe(2)
 
-    // Clicking a kind chip asks the dashboard to filter; clicking a row twice
-    // expands and collapses it.
-    fireEvent.click(screen.getAllByText('mystery_event')[0])
-    expect(onKindChange).toHaveBeenCalledWith('mystery_event')
     const list = screen.getByRole('list')
-    fireEvent.click(within(list).getByText('mystery_event'))
-    const expanded = screen.queryAllByRole('button', { expanded: true })
-    expect(expanded.length).toBe(1)
-    fireEvent.click(within(list).getByText('mystery_event'))
+    fireEvent.click(within(list).getByText('Mystery event'))
+    expect(screen.queryAllByRole('button', { expanded: true }).length).toBe(1)
+    fireEvent.click(within(list).getByText('Mystery event'))
     expect(screen.queryAllByRole('button', { expanded: true }).length).toBe(0)
   })
-})
 
-describe('systemPosture', () => {
-  it('reports the most restrictive true statement first', () => {
-    expect(systemPosture(undefined).label).toBe('CONNECTING')
-    // A halted gate outranks everything else that looks healthy.
-    expect(systemPosture({ ...status, risk_policy: { ...status.risk_policy, killSwitch: true } }).label).toBe(
-      'HALTED',
-    )
-    expect(systemPosture({ ...status, broker_connected: false }).label).toBe('NO LINK')
-    expect(systemPosture({ ...status, trading_enabled: false }).label).toBe('STANDBY')
-    // Service armed but the terminal still validating only.
-    expect(systemPosture({ ...status, ea_live_orders: false }).label).toBe('DRY RUN')
-    expect(systemPosture(status).label).toBe('LIVE')
-  })
-
-  it('names a decision outage that every other signal reports as healthy', () => {
-    // The exact shape of today's failures: service up, terminal live, trading
-    // armed — and every request refused.
-    const refusing = {
-      ...status,
-      decisions: {
-        consecutiveFailures: 4,
-        lastFailure: 'openrouter call returned 400: Thinking mode does not support this tool_choice',
-        lastFailureAt: 1_700_000_000,
-        lastModel: 'openai/gpt-5.6-mini',
-      },
+  it('pages a long trail', () => {
+    const many: AuditPage = {
+      status: 'ok',
+      events: Array.from({ length: 14 }, (_, index) => ({
+        id: `row-${index}`,
+        at: '2026-09-18 17:47:46+00',
+        kind: 'command_completed',
+        payload: { kind: 'rates', symbol: 'EURUSD' },
+      })),
     }
-    expect(systemPosture(refusing).label).toBe('NOT DECIDING')
-    expect(systemPosture(refusing).tone).toBe('bad')
-    expect(systemPosture(refusing).detail).toContain('last LLM openai/gpt-5.6-mini')
-    expect(systemPosture(refusing).detail).toContain('Thinking mode')
-
-    // The reason can be missing; the banner says so rather than guessing.
-    expect(
-      systemPosture({ ...status, decisions: { consecutiveFailures: 2, lastFailure: null, lastFailureAt: 0 } })
-        .detail,
-    ).toContain('no reason reported')
-
-    // One failure is a hiccup, not an outage.
-    expect(
-      systemPosture({ ...status, decisions: { consecutiveFailures: 1, lastFailure: 'x', lastFailureAt: 1 } }).label,
-    ).toBe('LIVE')
-
-    // A halted gate still outranks it: the owner stopped this deliberately.
-    expect(
-      systemPosture({ ...refusing, risk_policy: { ...status.risk_policy, killSwitch: true } }).label,
-    ).toBe('HALTED')
-  })
-
-  it('renders the verdict and its explanation', () => {
-    render(<PostureBanner status={status} />)
-    expect(screen.getByText('LIVE')).toBeTruthy()
-    expect(screen.getByText('orders reach the market')).toBeTruthy()
-  })
-})
-
-describe('SafetyControls', () => {
-  it('requires a confirmation before changing either switch', async () => {
-    const onApply = vi.fn().mockResolvedValue(undefined)
-    render(<SafetyControls policy={status.risk_policy} onApply={onApply} />)
-
-    // Tripping the switch only asks the question; nothing is sent yet.
-    fireEvent.click(screen.getByRole('switch', { name: 'Kill switch' }))
-    expect(onApply).not.toHaveBeenCalled()
-    expect(screen.getByText('Halt all new intents?')).toBeTruthy()
-
-    fireEvent.click(screen.getByText('Confirm'))
-    await screen.findByRole('switch', { name: 'Kill switch' })
-    expect(onApply).toHaveBeenCalledWith({ killSwitch: true })
-  })
-
-  it('sends the judge override and reports a refusal', async () => {
-    const onApply = vi.fn().mockResolvedValue('invalid_policy')
-    render(<SafetyControls policy={status.risk_policy} onApply={onApply} />)
-
-    fireEvent.click(screen.getByRole('switch', { name: 'Trade without the judge' }))
-    fireEvent.click(screen.getByText('Confirm'))
-    expect(await screen.findByText('invalid_policy')).toBeTruthy()
-    expect(onApply).toHaveBeenCalledWith({ allowTradingWithoutJev: true })
-  })
-
-  it('cancels a confirmation and stays quiet while the judge is healthy', () => {
-    render(<SafetyControls policy={status.risk_policy} jevHealthy={true} onApply={vi.fn()} />)
-    const killSwitch = screen.getByRole('switch', { name: 'Kill switch' })
-    fireEvent.click(killSwitch)
-    expect(screen.getByText('Halt all new intents?')).toBeTruthy()
-    fireEvent.click(killSwitch)
-    expect(screen.queryByText('Halt all new intents?')).toBeNull()
-    expect(screen.queryByText(/judge is not answering/)).toBeNull()
-  })
-
-  it('cancels the judge-override confirmation', () => {
-    render(<SafetyControls policy={status.risk_policy} onApply={vi.fn()} />)
-    const judge = screen.getByRole('switch', { name: 'Trade without the judge' })
-    fireEvent.click(judge)
-    expect(screen.getByText('Allow trading without the judge?')).toBeTruthy()
-    fireEvent.click(judge)
-    expect(screen.queryByText('Allow trading without the judge?')).toBeNull()
-  })
-
-  it('describes engaged switches and their release actions', () => {
-    render(
-      <SafetyControls
-        policy={{ ...status.risk_policy, killSwitch: true, allowTradingWithoutJev: true }}
-        onApply={vi.fn()}
-      />,
-    )
-    expect(screen.getByText(/Engaged. Every new intent is refused/)).toBeTruthy()
-    expect(screen.getByText(/Override active/)).toBeTruthy()
-    fireEvent.click(screen.getByRole('switch', { name: 'Kill switch' }))
-    expect(screen.getByText('Release the kill switch?')).toBeTruthy()
-  })
-
-  it('warns while the judge is failing, differently for each setting', () => {
-    const { rerender } = render(<SafetyControls policy={status.risk_policy} jevHealthy={false} />)
-    expect(screen.getByText(/new decisions are paused right now/)).toBeTruthy()
-
-    rerender(
-      <SafetyControls
-        policy={{ ...status.risk_policy, allowTradingWithoutJev: true }}
-        jevHealthy={false}
-      />,
-    )
-    expect(screen.getByText(/the model is deciding alone/)).toBeTruthy()
-  })
-})
-
-describe('RiskPanel editing', () => {
-  it('applies a patched policy and leaves edit mode', async () => {
-    const onApply = vi.fn().mockResolvedValue(undefined)
-    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
-
-    fireEvent.click(screen.getByText('edit'))
-    fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: '7' } })
-    fireEvent.change(screen.getByLabelText('Net USD cap (lots)'), { target: { value: '0.02' } })
-    fireEvent.change(screen.getByLabelText('News blackout (minutes)'), { target: { value: '45' } })
-    fireEvent.change(screen.getByLabelText('Min stop (× ATR)'), { target: { value: '0.75' } })
-    fireEvent.click(screen.getByText('save'))
-
-    await screen.findByText('gate active')
-    expect(onApply).toHaveBeenCalledTimes(1)
-    const patch = onApply.mock.calls[0][0]
-    expect(patch.maxOpenOrders).toBe(7)
-    expect(patch.maxNetFactorLots).toBe(0.02)
-    expect(patch.calendarBlackoutMinutes).toBe(45)
-    expect(patch.minStopAtrFraction).toBe(0.75)
-    expect(patch.symbols).toEqual(['EURUSD'])
-    expect(patch.killSwitch).toBe(false)
-  })
-
-  it('refuses non-numeric input without calling the service', () => {
-    const onApply = vi.fn()
-    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
-
-    fireEvent.click(screen.getByText('edit'))
-    fireEvent.change(screen.getByLabelText('Max total (lots)'), { target: { value: 'lots' } })
-    fireEvent.click(screen.getByText('save'))
-
-    expect(onApply).not.toHaveBeenCalled()
-    expect(screen.getByText(/Max total \(lots\): must be a number/)).toBeTruthy()
-  })
-
-  it('rejects fractional whole-number fields', () => {
-    const onApply = vi.fn()
-    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
-
-    fireEvent.click(screen.getByText('edit'))
-    fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: '2.5' } })
-    fireEvent.click(screen.getByText('save'))
-
-    expect(onApply).not.toHaveBeenCalled()
-    expect(screen.getByText(/Max open orders: must be a whole number/)).toBeTruthy()
-  })
-
-  it('shows a service rejection and stays editable', async () => {
-    const onApply = vi.fn().mockResolvedValue('maxOpenOrders: must be an integer from 0 through 1000')
-    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
-
-    fireEvent.click(screen.getByText('edit'))
-    fireEvent.click(screen.getByText('save'))
-
-    await screen.findByText(/must be an integer from 0 through 1000/)
-    expect(screen.getByText('save')).toBeTruthy()
-  })
-
-  it('applies a kill-switch toggle and cancels cleanly', async () => {
-    const onApply = vi.fn().mockResolvedValue(undefined)
-    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
-
-    fireEvent.click(screen.getByText('edit'))
-    fireEvent.click(screen.getByLabelText(/Kill switch/))
-    fireEvent.click(screen.getByText('save'))
-    await screen.findByText('gate active')
-    expect(onApply.mock.calls[0][0].killSwitch).toBe(true)
-
-    fireEvent.click(screen.getByText('edit'))
-    fireEvent.click(screen.getByText('cancel'))
-    expect(screen.getByText('edit')).toBeTruthy()
-    expect(screen.queryByText('save')).toBeNull()
-  })
-
-  it('projects the session and symbol edits into the patch', async () => {
-    const onApply = vi.fn().mockResolvedValue(undefined)
-    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
-
-    fireEvent.click(screen.getByText('edit'))
-    fireEvent.change(screen.getByLabelText(/^Symbols/), { target: { value: 'eurusd, gbpusd' } })
-    fireEvent.change(screen.getByLabelText(/^Session UTC/), { target: { value: '8-17' } })
-    fireEvent.change(screen.getByLabelText(/Weekend positions/), { target: { value: 'flatten' } })
-    fireEvent.click(screen.getByText('save'))
-    await screen.findByText('gate active')
-
-    const patch = onApply.mock.calls[0][0]
-    expect(patch.symbols).toEqual(['eurusd', 'gbpusd'])
-    expect(patch.sessionUtc).toBe('8-17')
-    expect(patch.weekendPositions).toBe('flatten')
-  })
-
-  it('names the weekend preference in the read-only summary', () => {
-    const { rerender } = render(<RiskPanel policy={status.risk_policy} status={status} />)
-    expect(screen.getByText('analyst decides')).toBeTruthy()
-    rerender(
-      <RiskPanel policy={{ ...status.risk_policy, weekendPositions: 'flatten' }} status={status} />,
-    )
-    expect(screen.getByText('flattened before close')).toBeTruthy()
-    rerender(
-      <RiskPanel policy={{ ...status.risk_policy, weekendPositions: 'hold' }} status={status} />,
-    )
-    expect(screen.getByText('held through')).toBeTruthy()
-  })
-
-  it('offers no edit affordance without a handler', () => {
-    render(<RiskPanel policy={status.risk_policy} status={status} />)
-    expect(screen.queryByText('edit')).toBeNull()
+    render(<TracePanel page={many} kind="all" onKindChange={() => {}} />)
+    expect(screen.getByText('1–12 of 14')).toBeTruthy()
+    expect(screen.getAllByText('Rates · EURUSD')).toHaveLength(12)
+    fireEvent.click(screen.getByLabelText('Next page'))
+    expect(screen.getByText('13–14 of 14')).toBeTruthy()
   })
 })
 
 describe('MetricsPanel', () => {
-  it('sorts counters by count and renders the feed cursor', () => {
-    render(
-      <MetricsPanel
-        metrics={{
-          service: 'veyra',
-          version: '0.1.0',
-          counters: { 'proposal.held': 9, 'command.completed': 3 },
-          feedLatest: 44,
-        }}
-      />,
-    )
+  const metrics = {
+    service: 'veyra',
+    version: '0.1.0',
+    counters: { 'proposal.held': 9, 'command.completed': 1200 },
+    feedLatest: 44,
+  }
+
+  it('sorts counters by count and reports the build and feed cursor', () => {
+    render(<MetricsPanel metrics={metrics} status={status} />)
+    const items = within(screen.getByRole('list')).getAllByRole('listitem')
+    expect(items[0].textContent).toContain('command.completed')
+    expect(items[0].textContent).toContain('1,200')
     expect(screen.getByText('proposal.held')).toBeTruthy()
-    expect(screen.getByText('9')).toBeTruthy()
-    expect(screen.getByText('feed #44')).toBeTruthy()
+    expect(valueOf('Version').textContent).toBe('0.1.0')
+    expect(valueOf('Environment').textContent).toBe('development')
+    expect(valueOf('Audit').textContent).toBe('postgres')
+    expect(valueOf('Feed').textContent).toBe('#44')
   })
 
-  it('renders the waiting state before any poll lands', () => {
-    render(<MetricsPanel />)
-    expect(screen.getByText('No counters yet.')).toBeTruthy()
+  it('holds skeletons before any poll lands', () => {
+    const { container } = render(<MetricsPanel />)
+    expect(container.querySelectorAll('.tab-skeleton-row').length).toBe(3)
+    expect(container.querySelectorAll('dd .skeleton').length).toBe(4)
   })
 
-  it('renders empty and error states', () => {
+  it('renders empty, audit-off, and error states', () => {
     const { rerender } = render(
-      <MetricsPanel metrics={{ service: 'veyra', version: '0.1.0', counters: {}, feedLatest: 0 }} />,
+      <MetricsPanel metrics={{ ...metrics, counters: {} }} status={{ ...status, persistence: null }} />,
     )
-    expect(screen.getByText('No counters yet.')).toBeTruthy()
-    rerender(<MetricsPanel error="metrics down" />)
-    expect(screen.getByText('metrics down')).toBeTruthy()
+    expect(screen.getByText('No counters yet')).toBeTruthy()
+    expect(valueOf('Audit').textContent).toBe('Off')
+
+    rerender(<MetricsPanel error="metrics down" status={status} />)
+    expect(screen.getByText('Unavailable').closest('[title]')?.getAttribute('title')).toBe('metrics down')
+    expect(valueOf('Feed').textContent).toBe('—')
+    expect(screen.queryByRole('list')).toBeNull()
+
+    // A failed refresh keeps the last good counters without the outage label.
+    rerender(<MetricsPanel metrics={metrics} error="metrics down" status={status} />)
+    expect(screen.queryByText('Unavailable')).toBeNull()
+  })
+
+  it('orders equal counts alphabetically', () => {
+    render(<MetricsPanel metrics={{ ...metrics, counters: { beta: 2, alpha: 2 } }} />)
+    const items = within(screen.getByRole('list')).getAllByRole('listitem')
+    expect(items[0].textContent).toContain('alpha')
   })
 })
 
 describe('CommandsPanel', () => {
-  it('renders an empty state', () => {
-    render(<CommandsPanel />)
-    expect(screen.getByText('No commands yet.')).toBeTruthy()
+  it('renders loading and empty states', () => {
+    const { container, rerender } = render(<CommandsPanel />)
+    expect(container.querySelectorAll('.tab-skeleton-row').length).toBe(3)
+    rerender(<CommandsPanel commands={[]} />)
+    expect(screen.getByText('No commands yet')).toBeTruthy()
   })
 
   it('expands a command into its full record', () => {
     render(<CommandsPanel commands={commands} />)
-    expect(screen.getByText('open_order')).toBeTruthy()
+    expect(screen.getByText('(2)')).toBeTruthy()
+    expect(screen.getByText('Open order')).toBeTruthy()
+    expect(screen.getByText('{"ticket":99}')).toBeTruthy()
     expect(screen.getByText('broker_timeout')).toBeTruthy()
+    expect(screen.getByText('Completed')).toBeTruthy()
+    expect(screen.getByText('Failed')).toBeTruthy()
 
-    const row = screen.getByText('open_order').closest('button')
-    expect(row).toBeTruthy()
-    fireEvent.click(row as HTMLButtonElement)
-    expect(screen.getByText('id cmd-1111-2222')).toBeTruthy()
+    const row = screen.getByText('Open order').closest('button') as HTMLButtonElement
+    fireEvent.click(row)
+    expect(row.getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByText('cmd-1111-2222')).toBeTruthy()
     expect(screen.getByText(/"ticket": 99/)).toBeTruthy()
 
-    fireEvent.click(row as HTMLButtonElement)
-    expect(screen.queryByText('id cmd-1111-2222')).toBeNull()
+    fireEvent.click(row)
+    expect(screen.queryByText('cmd-1111-2222')).toBeNull()
   })
 
-  it('expands a failed command with no summary', () => {
-    render(<CommandsPanel commands={[commands[1]]} />)
-    fireEvent.click(screen.getByText('close_order').closest('button') as HTMLButtonElement)
+  it('expands a failed command with no summary, and a pending one with neither', () => {
+    render(
+      <CommandsPanel
+        commands={[commands[1], { id: 'cmd-5555-6666', kind: 'rates', status: 'pending', summary: null, reason: null }]}
+      />,
+    )
+    expect(screen.getByText('Pending')).toBeTruthy()
+    fireEvent.click(screen.getByText('Close order').closest('button') as HTMLButtonElement)
     expect(screen.getByText(/"summary": null/)).toBeTruthy()
     expect(screen.getByText(/"reason": "broker_timeout"/)).toBeTruthy()
+  })
+
+  it('pages a long command list', () => {
+    const many = Array.from({ length: 13 }, (_, index) => ({ ...commands[0], id: `cmd-${index}` }))
+    render(<CommandsPanel commands={many} />)
+    expect(screen.getByText('1–12 of 13')).toBeTruthy()
+    fireEvent.click(screen.getByLabelText('Next page'))
+    expect(screen.getByText('13–13 of 13')).toBeTruthy()
   })
 })
 
 describe('ActivityFeed', () => {
-  function Harness({ initialFocus = true, connected = true }: { initialFocus?: boolean; connected?: boolean }) {
+  function Harness({
+    initialFocus = true,
+    connected = true,
+    feed = events,
+  }: {
+    initialFocus?: boolean
+    connected?: boolean
+    feed?: FeedEvent[]
+  }) {
     const [focus, setFocus] = useState(initialFocus)
-    return <ActivityFeed events={events} connected={connected} focus={focus} onFocusChange={setFocus} />
+    return <ActivityFeed events={feed} connected={connected} focus={focus} onFocusChange={setFocus} />
   }
 
-  it('renders the empty state', () => {
-    render(<ActivityFeed events={[]} connected={false} focus onFocusChange={vi.fn()} />)
-    expect(screen.getByText('Waiting for events…')).toBeTruthy()
-    expect(screen.getByText('reconnecting…')).toBeTruthy()
+  it('holds skeleton rows while the feed first connects', () => {
+    const { container } = render(<ActivityFeed events={[]} connected={false} focus onFocusChange={vi.fn()} />)
+    expect(screen.getByText('Connecting')).toBeTruthy()
+    expect(container.querySelectorAll('.tab-skeleton-row').length).toBe(3)
+  })
+
+  it('states an empty stream and a reconnecting one', () => {
+    const { rerender } = render(<ActivityFeed events={[]} connected focus onFocusChange={vi.fn()} />)
+    expect(screen.getByText('Streaming')).toBeTruthy()
+    expect(screen.getByText('No events yet')).toBeTruthy()
+
+    rerender(<ActivityFeed events={events} connected={false} focus onFocusChange={vi.fn()} />)
+    expect(screen.getByText('Reconnecting')).toBeTruthy()
+    expect(screen.getByText('Trade held')).toBeTruthy()
   })
 
   it('hides routine plumbing in focus mode and restores it on toggle', () => {
     render(<Harness />)
-    expect(screen.queryByText('broker_snapshot')).toBeNull()
-    expect(screen.getByText('proposal_evaluated')).toBeTruthy()
+    expect(screen.queryByText('Broker snapshot')).toBeNull()
+    expect(screen.getByText('Trade held')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Focus' }).getAttribute('aria-pressed')).toBe('true')
 
-    fireEvent.click(screen.getByText('focus'))
-    expect(screen.getByText('broker_snapshot')).toBeTruthy()
-    expect(screen.getByText('all')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'All' }))
+    expect(screen.getByText('Broker snapshot')).toBeTruthy()
+    expect(screen.getByText('1 order · 0.01 lots')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Focus' }))
+    expect(screen.queryByText('Broker snapshot')).toBeNull()
   })
 
   it('reports an idle decision stream when everything is routine', () => {
     render(<ActivityFeed events={[events[0]]} connected focus onFocusChange={vi.fn()} />)
-    expect(screen.getByText('No decisions yet — routine activity hidden.')).toBeTruthy()
+    expect(screen.getByText('No decisions yet')).toBeTruthy()
   })
 
-  it('summarises closed positions with a signed profit', () => {
-    render(<Harness initialFocus={false} />)
-    expect(screen.getByText('ticket 7 EURUSD buy · P/L +12.50')).toBeTruthy()
+  it('titles each event and colours its dot by what it means', () => {
+    const { container } = render(<Harness initialFocus={false} />)
+    expect(screen.getByText('Position closed')).toBeTruthy()
+    expect(screen.getByText('EURUSD buy · +12.50')).toBeTruthy()
+    expect(screen.getByText('EURUSD — Momentum favours the upside.')).toBeTruthy()
+    // Held reviews are amber, closes green, and routine snapshots stay grey.
+    const dots = Array.from(container.querySelectorAll('.tab-event .dot')).map((dot) => dot.className)
+    expect(dots).toEqual(['dot is-idle', 'dot is-warn', 'dot is-ok'])
   })
 
   it('expands a decision into ordered detail and raw payload', () => {
     render(<Harness />)
-    const row = screen.getByText('held · #10650805').closest('button') as HTMLButtonElement
+    const row = screen.getByText('Trade held').closest('button') as HTMLButtonElement
     fireEvent.click(row)
 
     expect(row.getAttribute('aria-expanded')).toBe('true')
     expect(screen.getByText('outcome')).toBeTruthy()
-    expect(screen.getAllByText('held').length).toBeGreaterThan(0)
-    expect(screen.getByText('symbol')).toBeTruthy()
+    expect(screen.getByText('held')).toBeTruthy()
     expect(screen.getByText('rationale')).toBeTruthy()
     expect(screen.getByText('Momentum favours the upside.')).toBeTruthy()
+    expect(screen.getByText('proposal_evaluated')).toBeTruthy()
+    expect(screen.getByText('Raw payload')).toBeTruthy()
     expect(screen.getByText(/"outcome": "held"/)).toBeTruthy()
 
     fireEvent.click(row)
     expect(screen.queryByText(/"outcome": "held"/)).toBeNull()
   })
 
-  it('colours held reviews as healthy and shows streaming state', () => {
-    render(<Harness />)
-    const summary = screen.getByText('held · #10650805')
-    expect(summary.className).toContain('text-[var(--color-info)]')
-    expect(screen.getByText('streaming')).toBeTruthy()
-  })
-})
-
-describe('Panel and Pill edges', () => {
-  it('renders a bare panel without detail and a pill without value', () => {
+  it('digests model, command, snapshot and balance events without raw JSON where it can', () => {
     render(
-      <>
-        <Panel title="Bare">child</Panel>
-        <Pill tone="off" label="empty" />
-      </>,
-    )
-    expect(screen.getByText('Bare')).toBeTruthy()
-    expect(screen.getByText('child')).toBeTruthy()
-    expect(screen.getByText('empty')).toBeTruthy()
-  })
-})
-
-describe('StatusPills switch-off variant', () => {
-  it('renders disabled trading, missing audit, and no autopilot', () => {
-    render(<StatusPills status={{ ...status, trading_enabled: false, persistence: null, autopilot: null }} />)
-    expect(screen.getByText('disabled')).toBeTruthy()
-    expect(screen.getAllByText('off').length).toBeGreaterThanOrEqual(2)
-  })
-})
-
-describe('AccountPanel edge shapes', () => {
-  it('renders a flat account and tolerates a missing profit', () => {
-    const { rerender } = render(<AccountPanel account={{ ...account, positions: [] }} />)
-    expect(screen.getAllByText('—').length).toBeGreaterThan(0)
-
-    rerender(
-      <AccountPanel
-        account={{
-          ...account,
-          positions: [
-            {
-              ticket: 1,
-              symbol: 'EURUSD',
-              kind: 'buy',
-              lots: 0.01,
-              price: 1.1,
-              profit: undefined as unknown as number,
-              sl: 0,
-              tp: 0,
-              magic: 0,
-            },
-          ],
-        }}
+      <Harness
+        initialFocus={false}
+        feed={[
+          { seq: 20, at_ms: 1, kind: 'agent_turn', payload: { answer: { action: 'none', rationale: 'Nothing lines up.' } } },
+          { seq: 21, at_ms: 2, kind: 'agent_tool_called', payload: { tool: 'check_risk', result: { decision: 'rejected' } } },
+          { seq: 22, at_ms: 3, kind: 'command_completed', payload: { kind: 'open_order', result: { ticket: 1 } } },
+          { seq: 23, at_ms: 4, kind: 'broker_snapshot', payload: { orders: 2 } },
+          { seq: 24, at_ms: 5, kind: 'balance_observed', payload: { balance: 36.39 } },
+          { seq: 25, at_ms: 6, kind: 'command_queued', payload: { command_id: 'abc' } },
+          { seq: 26, at_ms: 7, kind: 'agent_turn', payload: { answer: null } },
+        ]}
       />,
     )
-    expect(screen.getByText('+0.00')).toBeTruthy()
+    expect(screen.getByText('Nothing lines up.')).toBeTruthy()
+    expect(screen.getByText('check_risk · rejected').className).toBe('tab-event-line')
+    expect(screen.getByText('Open order')).toBeTruthy()
+    expect(screen.getByText('2 orders · 0 lots')).toBeTruthy()
+    expect(screen.getByText('Balance 36.39')).toBeTruthy()
+    // What cannot be digested is shown as it is, in the mono face.
+    expect(screen.getByText('{"command_id":"abc"}').className).toBe('tab-event-line mono')
+    expect(screen.getByText('{"answer":null}')).toBeTruthy()
   })
 
-  it('renders an account without connection labels', () => {
-    render(<AccountPanel account={{ ...account, server: undefined, login: undefined, symbol: undefined }} />)
-    expect(screen.queryByText(/ICMarketsSC-MT4/)).toBeNull()
-  })
-})
-
-describe('MarketPanel edge shapes', () => {
-  const candle = (close: number) => ({ time: 1, open: close, high: close + 0.001, low: close - 0.001, close, volume: 1 })
-
-  it('renders falling, flat, and empty series', () => {
-    const { rerender } = render(
-      <MarketPanel series={{ ...series, candles: [candle(1.12), candle(1.115), candle(1.1)] }} />,
-    )
-    expect(screen.getByText('-1.79%')).toBeTruthy()
-
-    rerender(<MarketPanel series={{ ...series, candles: [candle(1.1), candle(1.1)] }} />)
-    expect(screen.getByText('+0.00%')).toBeTruthy()
-
-    rerender(<MarketPanel series={{ ...series, candles: [] }} />)
-    expect(screen.getAllByText('—').length).toBeGreaterThan(0)
-  })
-})
-
-describe('AutopilotPanel stop permutations', () => {
-  it('renders trailing-only, break-even-only, and unbounded budgets', () => {
-    const { rerender } = render(<AutopilotPanel status={{ ...autopilot, breakeven_r: 0, trail_r: 2 }} />)
-    expect(screen.getByText('trail 2R')).toBeTruthy()
-
-    rerender(<AutopilotPanel status={{ ...autopilot, breakeven_r: 1, trail_r: 0 }} />)
-    expect(screen.getByText('BE 1R')).toBeTruthy()
-
-    rerender(
-      <AutopilotPanel status={autopilot} budget={{ hourLimit: 0, hourCalls: 1, dayLimit: 0, dayCalls: 1 }} />,
-    )
-    expect(screen.getByText('1/∞ h · 1/∞ d')).toBeTruthy()
-  })
-})
-
-describe('RiskPanel edge shapes', () => {
-  it('renders an empty allowlist, a session window, and disarmed switches', () => {
-    render(
-      <RiskPanel
-        policy={{ ...status.risk_policy, symbols: [], sessionUtc: '07:00-21:00' }}
-        status={{ ...status, trading_enabled: false, ea_live_orders: false }}
-      />,
-    )
-    expect(screen.getByText('none allowed')).toBeTruthy()
-    expect(screen.getByText('07:00-21:00')).toBeTruthy()
-    expect(screen.getByText('switch off')).toBeTruthy()
-    expect(screen.getByText('disarmed')).toBeTruthy()
-  })
-})
-
-describe('MetricsPanel tie-breaking', () => {
-  it('orders equal counts alphabetically', () => {
-    render(
-      <MetricsPanel
-        metrics={{ service: 'veyra', version: '0.1.0', counters: { beta: 2, alpha: 2 }, feedLatest: 1 }}
-      />,
-    )
-    const items = screen.getAllByRole('listitem')
-    expect(items[0].textContent).toContain('alpha')
-  })
-})
-
-describe('ActivityFeed unknown shapes', () => {
-  it('falls back for unknown kinds and outcomes', () => {
+  it('falls back for unknown kinds and marks nested values in the drill-down', () => {
     render(
       <ActivityFeed
-        events={[{ seq: 9, at_ms: 1, kind: 'strategy_note', payload: { outcome: 'mystery' } }]}
+        events={[{ seq: 9, at_ms: 1, kind: 'strategy_note', payload: { outcome: 'mystery', extra: { depth: 1 } } }]}
         connected
         focus
         onFocusChange={vi.fn()}
       />,
     )
-    expect(screen.getByText('strategy_note')).toBeTruthy()
-    const summary = screen.getByText('{"outcome":"mystery"}')
-    expect(summary.className).toContain('text-[var(--color-ink)]')
+    expect(screen.getByText('Strategy note')).toBeTruthy()
+    fireEvent.click(screen.getByText('Strategy note').closest('button') as HTMLButtonElement)
+    expect(screen.getByText('{"depth":1}').className).toBe('mono')
+    expect(screen.getByText('mystery').className).toBe('')
   })
 
   it('renders an event without a payload', () => {
     render(
       <ActivityFeed
-        events={[{ seq: 10, at_ms: 1, kind: 'orphan', payload: undefined as unknown as Record<string, unknown> }]}
+        events={[{ seq: 10, at_ms: Number.NaN, kind: 'orphan', payload: undefined as unknown as Record<string, unknown> }]}
         connected
         focus
         onFocusChange={vi.fn()}
       />,
     )
-    fireEvent.click(screen.getByText('{}').closest('button') as HTMLButtonElement)
-    expect(screen.getAllByText('{}').length).toBeGreaterThan(1)
+    const row = screen.getByText('Orphan').closest('button') as HTMLButtonElement
+    expect(row.querySelector('.tab-event-line')).toBeNull()
+    expect(row.querySelector('time')?.hasAttribute('datetime')).toBe(false)
+    fireEvent.click(row)
+    expect(screen.getByText('{}')).toBeTruthy()
+  })
+
+  it('pages a busy feed', () => {
+    const busy = Array.from({ length: 15 }, (_, index) => ({ ...events[2], seq: 100 + index }))
+    render(<Harness feed={busy} />)
+    expect(screen.getByText('1–14 of 15')).toBeTruthy()
+    fireEvent.click(screen.getByLabelText('Next page'))
+    expect(screen.getByText('15–15 of 15')).toBeTruthy()
   })
 })
 
@@ -1688,96 +1081,132 @@ describe('LogsPanel', () => {
 
   it('renders records newest first with levels and fields', () => {
     render(<LogsPanel logs={records} level="info" onLevelChange={vi.fn()} />)
-    const items = screen.getAllByRole('listitem')
+    const items = within(screen.getByRole('list')).getAllByRole('listitem')
     expect(items[0].textContent).toContain('stale heartbeat')
-    expect(screen.getByText('autopilot tick')).toBeTruthy()
+    expect(items[0].querySelector('.tab-log-fields')).toBeNull()
+    expect(screen.getByText('Warn', { selector: '.tab-level' }).className).toBe('tab-level is-warn')
     expect(screen.getByText(/"symbol":"EURUSD"/)).toBeTruthy()
   })
 
   it('reports filter changes', () => {
     const onLevelChange = vi.fn()
     render(<LogsPanel logs={records} level="info" onLevelChange={onLevelChange} />)
-    fireEvent.click(screen.getByRole('button', { name: 'warn' }))
+    expect(screen.getByRole('button', { name: 'Info' }).getAttribute('aria-pressed')).toBe('true')
+    fireEvent.click(screen.getByRole('button', { name: 'Warn' }))
     expect(onLevelChange).toHaveBeenCalledWith('warn')
   })
 
-  it('renders unknown levels with the fallback tone', () => {
-    render(
-      <LogsPanel
-        logs={[{ ...records[0], seq: 9, level: 'notice', message: 'custom level' }]}
-        level="info"
-        onLevelChange={vi.fn()}
-      />,
-    )
+  it('renders unknown levels in the neutral voice', () => {
+    render(<LogsPanel logs={[{ ...records[0], seq: 9, level: 'notice', message: 'custom level' }]} level="info" onLevelChange={vi.fn()} />)
     expect(screen.getByText('custom level')).toBeTruthy()
-    expect(screen.getByText('notice')).toBeTruthy()
+    expect(screen.getByText('Notice').className).toBe('tab-level is-notice')
   })
 
   it('renders empty and error states', () => {
     const { rerender } = render(<LogsPanel logs={[]} level="info" onLevelChange={vi.fn()} />)
-    expect(screen.getByText('No log records yet.')).toBeTruthy()
+    expect(screen.getByText('No log lines yet')).toBeTruthy()
     rerender(<LogsPanel logs={[]} error="logs down" level="info" onLevelChange={vi.fn()} />)
-    expect(screen.getByText('logs down')).toBeTruthy()
-    expect(screen.getByText('Log tail unavailable.')).toBeTruthy()
+    expect(screen.getByText('Unavailable').getAttribute('title')).toBe('logs down')
+  })
+
+  it('pages a long tail', () => {
+    const many = Array.from({ length: 21 }, (_, index) => ({ ...records[0], seq: index }))
+    render(<LogsPanel logs={many} level="info" onLevelChange={vi.fn()} />)
+    expect(screen.getByText('1–20 of 21')).toBeTruthy()
   })
 })
-
 
 describe('LiveSettingsPanel', () => {
   const settings = {
     VEYRA_TRADING_ENABLED: { value: 'false', overridden: false },
     VEYRA_AUTOPILOT_PROFIT_HARVEST: { value: 'true', overridden: true },
+    VEYRA_AUTOPILOT_HARVEST_MIN_HOLD_SECS: { value: '300', overridden: false },
     VEYRA_AUTOPILOT_TRAIL_R: { value: '', overridden: false },
     VEYRA_MODEL_FALLBACKS: { value: 'z-ai/glm-5.3-flash', overridden: false },
+    VEYRA_MARKET_EA_AWAIT_SECS: { value: '5', overridden: false },
   }
 
-  it('sends only the fields that actually changed', async () => {
-    const onApply = vi.fn().mockResolvedValue(undefined)
-    render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+  const field = (name: string) => document.querySelector<HTMLInputElement>(`[data-field="${name}"]`)!
 
-    fireEvent.change(document.querySelector('[data-field="VEYRA_AUTOPILOT_TRAIL_R"]')!, {
-      target: { value: '1.5' },
-    })
-    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
-
-    expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_TRAIL_R: '1.5' })
+  it('labels settings plainly and marks the ones that wait for a restart', () => {
+    render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} />)
+    expect(screen.getByRole('switch', { name: 'Trading enabled' }).getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByLabelText('Trail R')).toBe(field('VEYRA_AUTOPILOT_TRAIL_R'))
+    expect(screen.getByRole('switch', { name: 'Profit harvest' }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByLabelText('Min hold (s)')).toBe(field('VEYRA_AUTOPILOT_HARVEST_MIN_HOLD_SECS'))
+    expect(screen.getByLabelText('Fallbacks')).toBe(field('VEYRA_MODEL_FALLBACKS'))
+    expect(screen.getByLabelText('Market EA await (s)')).toBe(field('VEYRA_MARKET_EA_AWAIT_SECS'))
+    // The raw name stays findable for the .env file.
+    expect(screen.getByText('Trail R').getAttribute('title')).toBe('VEYRA_AUTOPILOT_TRAIL_R')
+    expect(field('VEYRA_AUTOPILOT_TRAIL_R').placeholder).toBe('Not set')
+    expect(screen.getAllByText('Applies on restart')).toHaveLength(1)
+    // Groups with nothing to show are left out entirely.
+    expect(screen.queryByText('Housekeeping')).toBeNull()
   })
 
-  it('shows the loading state before the config response arrives', () => {
-    render(<LiveSettingsPanel />)
-    expect(screen.getByText('Loading…')).toBeTruthy()
+  it('sends only the fields that actually changed', async () => {
+    const pending = deferred<string | undefined>()
+    const onApply = vi.fn().mockReturnValue(pending.promise)
+    const onRefresh = vi.fn()
+    render(<LiveSettingsPanel settings={settings} onApply={onApply} onRefresh={onRefresh} />)
+
+    fireEvent.change(field('VEYRA_AUTOPILOT_TRAIL_R'), { target: { value: '1.5' } })
+    // Flipped and flipped back: not a change.
+    const trading = screen.getByRole('switch', { name: 'Trading enabled' })
+    fireEvent.click(trading)
+    fireEvent.click(trading)
+    expect(screen.getByText('1 unsaved')).toBeTruthy()
+    expect(field('VEYRA_AUTOPILOT_TRAIL_R').className).toBe('tab-input is-dirty')
+    expect(trading.closest('.tab-setting-switch')?.className).toBe('tab-setting-switch')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_TRAIL_R: '1.5' })
+    expect(screen.getByRole('button', { name: 'Applying…' })).toBeTruthy()
+    expect(field('VEYRA_AUTOPILOT_TRAIL_R').disabled).toBe(true)
+
+    await act(async () => pending.resolve(undefined))
+    expect(screen.getByText('Applied')).toBeTruthy()
+    expect(onRefresh).toHaveBeenCalledOnce()
+  })
+
+  it('holds skeleton rows before the config response arrives', () => {
+    const { container } = render(<LiveSettingsPanel />)
+    expect(screen.getByText('Live settings')).toBeTruthy()
+    expect(container.querySelectorAll('.tab-skeleton-row').length).toBe(3)
   })
 
   it('keeps the draft on screen when the service refuses it', async () => {
-    const onApply = vi
-      .fn()
-      .mockResolvedValue('VEYRA_AUTOPILOT_TRAIL_R: must be a finite positive number')
+    const onApply = vi.fn().mockResolvedValue('VEYRA_AUTOPILOT_TRAIL_R: must be a finite positive number')
     render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
 
-    fireEvent.change(document.querySelector('[data-field="VEYRA_AUTOPILOT_TRAIL_R"]')!, {
-      target: { value: '99' },
-    })
+    fireEvent.change(field('VEYRA_AUTOPILOT_TRAIL_R'), { target: { value: '99' } })
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
     const alert = await screen.findByRole('alert')
     expect(alert.textContent).toContain('must be a finite positive number')
-    expect(
-      document.querySelector<HTMLInputElement>('[data-field="VEYRA_AUTOPILOT_TRAIL_R"]')!.value,
-    ).toBe('99')
+    expect(field('VEYRA_AUTOPILOT_TRAIL_R').value).toBe('99')
   })
 
   it('clears an override with null rather than an empty string', async () => {
     const onApply = vi.fn().mockResolvedValue(undefined)
-    render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+    const onRefresh = vi.fn()
+    render(<LiveSettingsPanel settings={settings} onApply={onApply} onRefresh={onRefresh} />)
 
-    fireEvent.click(screen.getByTitle('Clear this override and return to the deployed value'))
+    const harvest = screen.getByRole('switch', { name: 'Profit harvest' })
+    fireEvent.click(harvest)
+    expect(harvest.getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByText('Overridden')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Revert' }))
 
     expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_PROFIT_HARVEST: null })
+    await vi.waitFor(() => expect(onRefresh).toHaveBeenCalledOnce())
+    // The reverted field drops its draft and shows the stored value again.
+    expect(screen.getByRole('switch', { name: 'Profit harvest' }).getAttribute('aria-checked')).toBe('true')
   })
 
   it('leaves a failed override revert visible', async () => {
     const onApply = vi.fn().mockResolvedValue('cannot revert')
     render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
-    fireEvent.click(screen.getByTitle('Clear this override and return to the deployed value'))
+    fireEvent.click(screen.getByRole('button', { name: 'Revert' }))
     expect((await screen.findByRole('alert')).textContent).toContain('cannot revert')
     expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_PROFIT_HARVEST: null })
   })
@@ -1785,25 +1214,97 @@ describe('LiveSettingsPanel', () => {
   it('discards a changed draft without sending it', () => {
     const onApply = vi.fn()
     render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
-    fireEvent.change(document.querySelector('[data-field="VEYRA_AUTOPILOT_TRAIL_R"]')!, {
-      target: { value: '1.5' },
-    })
+    expect(screen.queryByRole('button', { name: 'Discard' })).toBeNull()
+    fireEvent.change(field('VEYRA_AUTOPILOT_TRAIL_R'), { target: { value: '1.5' } })
     fireEvent.click(screen.getByRole('button', { name: 'Discard' }))
     expect(onApply).not.toHaveBeenCalled()
-    expect(document.querySelector<HTMLInputElement>('[data-field="VEYRA_AUTOPILOT_TRAIL_R"]')!.value).toBe('')
+    expect(field('VEYRA_AUTOPILOT_TRAIL_R').value).toBe('')
   })
 
-  it('keeps a disabled revert control inert without an apply handler', () => {
+  it('keeps apply and revert inert without an apply handler', () => {
     render(<LiveSettingsPanel settings={settings} />)
-    fireEvent.click(screen.getByTitle('Clear this override and return to the deployed value'))
+    fireEvent.change(field('VEYRA_AUTOPILOT_TRAIL_R'), { target: { value: '1.5' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Revert' }))
     expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByText('1 unsaved')).toBeTruthy()
+  })
+
+  it('flips a flag in the draft and applies it only with the rest', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+    const trading = screen.getByRole('switch', { name: 'Trading enabled' })
+
+    fireEvent.click(trading)
+    expect(trading.getAttribute('aria-checked')).toBe('true')
+    expect(trading.closest('.tab-setting-switch')?.className).toBe('tab-setting-switch is-dirty')
+    // A switch never reaches the service by itself.
+    expect(onApply).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(onApply).toHaveBeenCalledWith({ VEYRA_TRADING_ENABLED: 'true' })
+    await screen.findByText('Applied')
+  })
+
+  it('shows what an unset setting does, and offers only accepted values', () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    render(
+      <LiveSettingsPanel
+        settings={{
+          VEYRA_MODEL_COMPEL_STRUCTURED: { value: '', overridden: false },
+          VEYRA_AUTOPILOT_TIER: { value: '', overridden: false },
+          VEYRA_AUTOPILOT_TIMEFRAME: { value: '240', overridden: false },
+          VEYRA_AUTOPILOT_JEV: { value: 'auto', overridden: false },
+        }}
+        onApply={onApply}
+      />,
+    )
+    // Unset compels a structured answer, so the switch reads on.
+    expect(screen.getByRole('switch', { name: 'Compel structured' }).getAttribute('aria-checked')).toBe('true')
+
+    const tier = screen.getByLabelText('Tier') as HTMLSelectElement
+    expect(tier.value).toBe('balanced')
+    expect([...tier.options].map((option) => option.value)).toEqual(['fast', 'balanced', 'reasoning'])
+    // Choosing the behaviour already in force is not a change.
+    fireEvent.change(tier, { target: { value: 'balanced' } })
+    expect(screen.queryByText(/unsaved/)).toBeNull()
+    fireEvent.change(tier, { target: { value: 'reasoning' } })
+    expect(tier.className).toBe('tab-input is-dirty')
+    expect(screen.getByText('1 unsaved')).toBeTruthy()
+
+    // A timeframe given in minutes is kept, not replaced by the menu.
+    const timeframe = screen.getByLabelText('Timeframe') as HTMLSelectElement
+    expect(timeframe.value).toBe('240')
+    expect([...timeframe.options].map((option) => option.value)).toContain('H4')
+    expect([...(screen.getByLabelText('JEV') as HTMLSelectElement).options].map((option) => option.label)).toEqual([
+      'Auto',
+      'Off',
+    ])
+  })
+
+  it('states single-value providers instead of offering an input', () => {
+    render(
+      <LiveSettingsPanel
+        settings={{
+          VEYRA_MODEL_PROVIDER: { value: '', overridden: false },
+          VEYRA_JEV_PROVIDER: { value: 'typesafe', overridden: true },
+          VEYRA_MARKET_PROVIDER: { value: '', overridden: false },
+        }}
+        onApply={vi.fn()}
+      />,
+    )
+    expect(document.querySelector('[data-field="VEYRA_MODEL_PROVIDER"]')).toBeNull()
+    expect(screen.getByText('openrouter')).toBeTruthy()
+    expect(screen.getByText('typesafe')).toBeTruthy()
+    // A market provider left empty means none runs.
+    expect(screen.getByText('Not set')).toBeTruthy()
+    // An override can still be cleared.
+    expect(screen.getByRole('button', { name: 'Revert' })).toBeTruthy()
   })
 
   it('marks only the values an operator has moved', () => {
     render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} />)
-
-    expect(screen.getAllByTitle('Clear this override and return to the deployed value')).toHaveLength(
-      1,
-    )
+    expect(screen.getAllByRole('button', { name: 'Revert' })).toHaveLength(1)
+    expect(screen.getByRole('button', { name: 'Revert' }).getAttribute('title')).toBe('Return to the deployed value')
   })
 })

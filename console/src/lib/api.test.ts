@@ -85,10 +85,12 @@ describe('api', () => {
 
     await api.commands()
     await api.candles()
+    await api.candles(120, 'D1', 'SP500m')
 
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       '/api/commands?limit=25',
       '/api/market/candles?timeframe=H4&bars=48',
+      '/api/market/candles?timeframe=D1&bars=120&symbol=SP500m',
     ])
   })
 

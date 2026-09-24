@@ -4,7 +4,7 @@
  * promise is left pending so the polling loops stay quiet in the test.
  */
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -45,7 +45,7 @@ vi.mock('../lib/api', () => ({
   },
 }))
 
-import { Dashboard } from './index'
+import { Dashboard } from '../components/dashboard'
 
 afterEach(cleanup)
 
@@ -123,7 +123,22 @@ beforeEach(() => {
       worst_trade: 1.36,
       by_symbol: [{ symbol: 'USDJPY', trades: 1, wins: 1, net_profit: 1.36 }],
     },
-    trades: [],
+    trades: [
+      {
+        ticket: 10654166,
+        symbol: 'USDJPY',
+        kind: 'buy',
+        lots: 0.01,
+        openPrice: 158.1,
+        closePrice: 158.3,
+        openTime: Math.floor(Date.now() / 1000) - 7200,
+        closeTime: Math.floor(Date.now() / 1000) - 3600,
+        profit: 1.36,
+        swap: 0,
+        commission: 0,
+        magic: 77041,
+      },
+    ],
     total: 1,
     truncated: false,
   })
@@ -181,54 +196,73 @@ beforeEach(() => {
 })
 
 describe('Dashboard', () => {
-  /** Moves to a tab by its control, mirroring what an operator clicks. */
-  const openTab = (label: string) => fireEvent.click(screen.getByRole('tab', { name: label }))
+  /** Moves to a view through the sidebar, mirroring what an operator clicks. */
+  const openTab = (label: string) =>
+    fireEvent.click(within(screen.getByRole('navigation', { name: 'Main' })).getByRole('button', { name: label }))
 
-  it('pins posture, money and the safety switches above the tabs', async () => {
+  it('lays out the overview: status, money, growth chart, positions, rail and switches', async () => {
     render(<Dashboard />)
 
-    expect(await screen.findByText('VEYRA')).toBeTruthy()
-    // Always visible, whichever tab is selected.
+    expect(await screen.findByText('Veyra')).toBeTruthy()
+    expect(await screen.findByText('Terminal connected')).toBeTruthy()
     expect(await screen.findByText('Equity')).toBeTruthy()
     expect(screen.getByText('Open P/L')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Performance/ })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Open positions/ })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: '30-day performance' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Autopilot' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Recent activity' })).toBeTruthy()
     expect(screen.getByRole('switch', { name: 'Kill switch' })).toBeTruthy()
-    expect(screen.getByRole('switch', { name: 'Trade without the judge' })).toBeTruthy()
-    expect(screen.getByText(/v0.1.0/)).toBeTruthy()
+    expect(screen.getByRole('switch', { name: 'Judge bypass' })).toBeTruthy()
+    expect(within(screen.getByRole('navigation', { name: 'Main' })).getByRole('button', { name: 'Overview' }).getAttribute('aria-current')).toBe('page')
   })
 
-  it('reaches every operational panel through its tab', async () => {
+  it('reaches every operational panel through the sidebar', async () => {
     render(<Dashboard />)
     await screen.findByText('Equity')
 
-    // Overview is the landing tab.
-    expect(screen.getByText('Positions')).toBeTruthy()
-    expect(screen.getByRole('heading', { name: 'Autopilot' })).toBeTruthy()
-    expect(screen.getByText('Market')).toBeTruthy()
-
     openTab('Activity')
-    expect(screen.getByText('Commands')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Commands/ })).toBeTruthy()
 
     openTab('Risk')
     expect(await screen.findByText('Balance')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Risk policy' })).toBeTruthy()
 
     openTab('Diagnostics')
-    expect(screen.getByText('Metrics')).toBeTruthy()
-    expect(screen.getByText('Agent log')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Metrics' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Agent log' })).toBeTruthy()
 
     openTab('Trace')
-    expect(screen.getAllByText('Trace').length).toBeGreaterThanOrEqual(1)
+    expect(screen.getByRole('heading', { name: /Audit trail/ })).toBeTruthy()
   })
 
-  it('opens the market view and routes the overview digest to Activity', async () => {
+  it('switches the chart to an instrument and refetches its candles at once', async () => {
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+    await waitFor(() => expect(mocks.candles).toHaveBeenCalledWith(120, 'H4', undefined))
+
+    fireEvent.click(screen.getByRole('button', { name: /Performance/ }))
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Market · EURUSD' }))
+    await waitFor(() => expect(mocks.candles).toHaveBeenCalledWith(120, 'H4', 'EURUSD'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'D1' }))
+    await waitFor(() => expect(mocks.candles).toHaveBeenCalledWith(120, 'D1', 'EURUSD'))
+  })
+
+  it('routes the activity digest, the gear and the theme toggle', async () => {
     render(<Dashboard />)
     await screen.findByText('Equity')
 
-    openTab('Market')
-    expect(screen.getAllByRole('heading', { name: 'Market' }).length).toBeGreaterThanOrEqual(1)
-
-    openTab('Overview')
     fireEvent.click(screen.getByRole('button', { name: 'View all' }))
-    expect(screen.getAllByRole('heading', { name: 'Activity' }).length).toBeGreaterThanOrEqual(1)
+    expect(screen.getByRole('heading', { level: 1, name: 'Activity' })).toBeTruthy()
+
+    const topbar = document.querySelector<HTMLElement>('.shell-topbar')!
+    fireEvent.click(within(topbar).getByRole('button', { name: 'Settings' }))
+    expect(await screen.findByRole('heading', { name: 'Live settings' })).toBeTruthy()
+
+    const before = document.documentElement.dataset.theme
+    fireEvent.click(within(topbar).getByRole('button', { name: /Switch to (light|dark) theme/ }))
+    expect(document.documentElement.dataset.theme).not.toBe(before)
   })
 
   it('shows diagnostic metadata and applies live settings through the route', async () => {
@@ -241,10 +275,10 @@ describe('Dashboard', () => {
     expect(screen.getAllByText('postgres').length).toBeGreaterThanOrEqual(1)
 
     openTab('Settings')
-    expect(await screen.findByText('Live settings')).toBeTruthy()
-    fireEvent.change(screen.getByDisplayValue('true'), { target: { value: 'false' } })
+    await screen.findByRole('heading', { name: 'Live settings' })
+    fireEvent.click(screen.getByRole('switch', { name: 'Trading enabled' }))
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
-    await screen.findByText('applied')
+    await screen.findByText('Applied')
     expect(mocks.updateConfig).toHaveBeenCalledWith({ VEYRA_TRADING_ENABLED: 'false' })
   })
 
@@ -253,8 +287,8 @@ describe('Dashboard', () => {
     render(<Dashboard />)
     await screen.findByText('Equity')
     openTab('Settings')
-    await screen.findByText('Live settings')
-    fireEvent.change(screen.getByDisplayValue('true'), { target: { value: 'false' } })
+    await screen.findByRole('heading', { name: 'Live settings' })
+    fireEvent.click(screen.getByRole('switch', { name: 'Trading enabled' }))
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
     expect((await screen.findByRole('alert')).textContent).toContain('setting rejected')
   })
@@ -270,16 +304,16 @@ describe('Dashboard', () => {
     })
 
     fireEvent.click(screen.getByRole('switch', { name: 'Kill switch' }))
-    fireEvent.click(screen.getByText('Confirm'))
-    expect(await screen.findByText(/judge is not answering — new decisions are paused/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+    expect(await screen.findByText('Judge not answering — decisions paused.')).toBeTruthy()
 
     mocks.status.mockResolvedValue({
       ...initialStatus,
       jev_usage: { ...initialStatus.jev_usage, calls: initialStatus.jev_usage.calls + 2, failures: initialStatus.jev_usage.failures + 1 },
     })
-    fireEvent.click(screen.getByRole('switch', { name: 'Trade without the judge' }))
-    fireEvent.click(screen.getByText('Confirm'))
-    await waitFor(() => expect(screen.queryByText(/new decisions are paused/)).toBeNull())
+    fireEvent.click(screen.getByRole('switch', { name: 'Judge bypass' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+    await waitFor(() => expect(screen.queryByText(/decisions paused/)).toBeNull())
   })
 
   it('keeps a non-Error policy rejection readable', async () => {
@@ -287,7 +321,7 @@ describe('Dashboard', () => {
     render(<Dashboard />)
     await screen.findByText('Equity')
     fireEvent.click(screen.getByRole('switch', { name: 'Kill switch' }))
-    fireEvent.click(screen.getByText('Confirm'))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
     expect(await screen.findByText('policy transport failed')).toBeTruthy()
   })
 
@@ -298,11 +332,11 @@ describe('Dashboard', () => {
     openTab('Risk')
     await screen.findByText('Balance')
 
-    fireEvent.click(screen.getByText('edit'))
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
     fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: '4' } })
-    fireEvent.click(screen.getByText('save'))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
-    await screen.findByText('gate active')
+    await screen.findByText('Gate active')
     expect(mocks.updatePolicy).toHaveBeenCalledTimes(1)
     expect(mocks.updatePolicy.mock.calls[0][0].maxOpenOrders).toBe(4)
   })
@@ -314,22 +348,21 @@ describe('Dashboard', () => {
     openTab('Risk')
     await screen.findByText('Balance')
 
-    fireEvent.click(screen.getByText('edit'))
-    fireEvent.click(screen.getByText('save'))
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await screen.findByText('maxOpenOrders: too large')
-    expect(screen.getByText('save')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeTruthy()
   })
 
-  it('sends a confirmed kill switch from the pinned controls', async () => {
+  it('sends a confirmed kill switch from the overview controls', async () => {
     mocks.updatePolicy.mockResolvedValue({})
     render(<Dashboard />)
     await screen.findByText('Equity')
 
     fireEvent.click(screen.getByRole('switch', { name: 'Kill switch' }))
-    fireEvent.click(screen.getByText('Confirm'))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
 
-    await screen.findByText('Equity')
-    expect(mocks.updatePolicy).toHaveBeenCalledWith({ killSwitch: true })
+    await waitFor(() => expect(mocks.updatePolicy).toHaveBeenCalledWith({ killSwitch: true }))
   })
 })

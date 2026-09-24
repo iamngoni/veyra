@@ -1,0 +1,836 @@
+/* Tabs area: Activity, Risk, Trace, Diagnostics and Settings
+ * (components/veyra.tsx).
+ *
+ * The panels speak the overview's language: bodies inset 18px from the frame,
+ * hairline rules between rows rather than boxes around them, 13px muted labels
+ * over 14px ink values, and colour only where it names a state. */
+
+/* ---------- panel frame ---------- */
+
+/* Header controls wrap under the title on narrow screens instead of forcing
+   the page wider. */
+.tab-panel .panel-head {
+  flex-wrap: wrap;
+  row-gap: 10px;
+}
+
+.tab-panel .panel-actions {
+  flex-wrap: wrap;
+}
+
+.tab-panel .panel-body {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 6px;
+}
+
+.tab-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.tab-state.is-ok { color: var(--color-ok); }
+.tab-state.is-warn { color: var(--color-warn); }
+.tab-state.is-bad { color: var(--color-bad); }
+.tab-state.is-idle,
+.tab-state.is-off { color: var(--color-ink-muted); }
+
+.tab-error {
+  margin: 0 18px 12px;
+  color: var(--color-bad);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- label / value rows ---------- */
+
+.tab-fields {
+  display: grid;
+  column-gap: 32px;
+  margin: 0;
+  padding: 0 18px 8px;
+}
+
+.tab-fields.is-cols-1 { grid-template-columns: minmax(0, 1fr); }
+.tab-fields.is-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.tab-fields.is-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+.tab-field {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(96px, 38%) minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--color-line-soft);
+}
+
+.tab-fields.is-cols-1 .tab-field {
+  grid-template-columns: minmax(96px, 30%) minmax(0, 1fr);
+}
+
+.tab-field.is-wide {
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(96px, calc((100% - 32px) / 2 * 0.38)) minmax(0, 1fr);
+}
+
+.tab-fields.is-cols-3 .tab-field.is-wide {
+  grid-template-columns: minmax(96px, calc((100% - 64px) / 3 * 0.38)) minmax(0, 1fr);
+}
+
+.tab-field dt {
+  color: var(--color-ink-muted);
+  font-size: 13px;
+}
+
+.tab-field dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--color-ink);
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-wrap: break-word;
+}
+
+.tab-field dd.tone-ok { color: var(--color-ok); }
+.tab-field dd.tone-warn { color: var(--color-warn); }
+.tab-field dd.tone-bad { color: var(--color-bad); }
+.tab-field dd.tone-faint { color: var(--color-ink-faint); }
+
+/* ---------- lists ---------- */
+
+.tab-list {
+  margin: 0;
+  padding: 0 18px;
+  list-style: none;
+}
+
+.tab-row {
+  min-width: 0;
+  border-top: 1px solid var(--color-line-soft);
+}
+
+/* The whole row is the disclosure. The fill reaches slightly past the rules so
+   the hover reads as a surface, not a highlighted line. */
+.tab-row-button {
+  display: grid;
+  width: calc(100% + 20px);
+  min-width: 0;
+  margin: 0 -10px;
+  align-items: baseline;
+  column-gap: 14px;
+  padding: 12px 10px;
+  border-radius: 6px;
+  color: var(--color-ink);
+  font-size: 14px;
+  text-align: left;
+  transition: background-color 120ms ease;
+}
+
+.tab-row-button:hover,
+.tab-row-button[aria-expanded="true"] {
+  background: var(--color-surface-2);
+}
+
+/* An open row and its drill-down read as one surface. */
+.tab-row-button[aria-expanded="true"] {
+  border-radius: 6px 6px 0 0;
+}
+
+.tab-row-button > * {
+  min-width: 0;
+}
+
+.tab-time {
+  color: var(--color-ink-muted);
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.tab-skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 0;
+}
+
+/* Column headings for list-shaped tables. */
+.tab-table-head {
+  display: grid;
+  column-gap: 14px;
+  margin: 0 18px;
+  padding: 4px 0 10px;
+  color: var(--color-ink-muted);
+  font-size: 13px;
+}
+
+/* ---------- activity ---------- */
+
+.tab-event {
+  grid-template-columns: 72px 9px minmax(0, 1fr);
+}
+
+/* Sits on the title line, not between the title and its detail. */
+.tab-event .dot {
+  align-self: start;
+  margin-top: 6px;
+}
+
+.tab-event-text {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.tab-event-title {
+  font-weight: 500;
+}
+
+.tab-event-line {
+  overflow: hidden;
+  color: var(--color-ink-muted);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-event-line.mono {
+  font-size: 12px;
+}
+
+/* ---------- drill-down ---------- */
+
+.tab-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0 -10px 12px;
+  padding: 6px 10px 14px;
+  border-radius: 0 0 6px 6px;
+  background: var(--color-surface-2);
+  font-size: 13px;
+}
+
+.tab-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 16px;
+  color: var(--color-ink-muted);
+  font-size: 12px;
+}
+
+.tab-detail-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+}
+
+.tab-detail-rows > div {
+  display: grid;
+  grid-template-columns: minmax(96px, 150px) minmax(0, 1fr);
+  column-gap: 16px;
+}
+
+.tab-detail-rows dt {
+  color: var(--color-ink-muted);
+  overflow-wrap: anywhere;
+}
+
+.tab-detail-rows dt::first-letter {
+  text-transform: uppercase;
+}
+
+/* The trail shows keys exactly as stored. */
+.tab-detail-rows.is-raw dt {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.tab-detail-rows.is-raw dt::first-letter {
+  text-transform: none;
+}
+
+.tab-detail-rows dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}
+
+.tab-detail-rows dd.mono {
+  font-size: 12px;
+}
+
+.tab-pre {
+  max-height: 28rem;
+  margin: 0;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--color-line-soft);
+  border-radius: 6px;
+  background: var(--color-surface-1);
+  color: var(--color-ink-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.tab-raw summary {
+  width: max-content;
+  color: var(--color-ink-muted);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.tab-raw summary:hover {
+  color: var(--color-ink);
+}
+
+.tab-raw[open] summary {
+  margin-bottom: 8px;
+}
+
+/* ---------- commands ---------- */
+
+.tab-command {
+  grid-template-columns: minmax(96px, 1fr) 72px minmax(0, 1.6fr) 100px;
+}
+
+.tab-command-kind,
+.tab-command-result {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-command-id {
+  color: var(--color-ink-faint);
+  font-size: 12px;
+}
+
+.tab-command-result {
+  color: var(--color-ink-muted);
+  font-size: 13px;
+}
+
+.tab-command-result .mono {
+  font-size: 12px;
+}
+
+.tab-command-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+/* ---------- trace ---------- */
+
+.tab-toolbar {
+  margin: 0 18px 12px;
+}
+
+.tab-toolbar .segmented {
+  flex-wrap: wrap;
+}
+
+.tab-trace {
+  grid-template-columns: 72px minmax(120px, 0.9fr) minmax(0, 2fr) 72px;
+}
+
+.tab-trace-kind,
+.tab-trace-summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-trace-summary {
+  color: var(--color-ink-muted);
+  font-size: 13px;
+}
+
+.tab-trace-id {
+  color: var(--color-ink-faint);
+  font-size: 12px;
+  text-align: right;
+}
+
+.tab-trace-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tab-trace-label {
+  color: var(--color-ink-muted);
+  font-size: 12px;
+}
+
+/* ---------- metrics ---------- */
+
+.tab-counters {
+  margin-top: 14px;
+}
+
+.tab-counters .tab-table-head,
+.tab-counter {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.tab-counters .tab-table-head span:last-child,
+.tab-counter .readout {
+  text-align: right;
+}
+
+.tab-counter {
+  display: grid;
+  column-gap: 16px;
+  align-items: baseline;
+  padding: 10px 0;
+}
+
+.tab-counter .mono {
+  overflow: hidden;
+  color: var(--color-ink);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-counter .readout {
+  font-size: 14px;
+}
+
+/* ---------- agent log ---------- */
+
+.tab-log {
+  display: grid;
+  grid-template-columns: 72px 48px minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 14px;
+  padding: 9px 0;
+}
+
+.tab-log .tab-time {
+  font-size: 13px;
+}
+
+.tab-level {
+  color: var(--color-ink-muted);
+  font-size: 13px;
+}
+
+.tab-level.is-error { color: var(--color-bad); }
+.tab-level.is-warn { color: var(--color-warn); }
+.tab-level.is-info { color: var(--color-info); }
+.tab-level.is-debug,
+.tab-level.is-trace { color: var(--color-ink-faint); }
+
+.tab-log-line {
+  min-width: 0;
+  color: var(--color-ink);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.tab-log-target,
+.tab-log-fields {
+  color: var(--color-ink-faint);
+}
+
+/* ---------- pager ---------- */
+
+.tab-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 18px;
+  padding: 10px 0 6px;
+  border-top: 1px solid var(--color-line-soft);
+  color: var(--color-ink-muted);
+  font-size: 13px;
+}
+
+.tab-pager-controls {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.tab-pager-button {
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: var(--color-ink-muted);
+}
+
+.tab-pager-button:hover:not(:disabled) {
+  background: var(--color-surface-2);
+  color: var(--color-ink);
+}
+
+.tab-pager-button:disabled {
+  opacity: 0.35;
+}
+
+.tab-pager-button.is-previous .icon { transform: rotate(90deg); }
+.tab-pager-button.is-next .icon { transform: rotate(-90deg); }
+
+/* ---------- buttons ---------- */
+
+.tab-button {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 14px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 6px;
+  color: var(--color-ink);
+  font-size: 13px;
+  white-space: nowrap;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.tab-button:hover:not(:disabled) {
+  background: var(--color-surface-2);
+}
+
+.tab-button.is-ok {
+  border-color: transparent;
+  background: var(--color-ok-dim);
+  color: var(--color-ok);
+}
+
+.tab-button.is-ok:hover:not(:disabled) {
+  border-color: var(--color-ok);
+  background: var(--color-ok-dim);
+}
+
+.tab-button:disabled {
+  opacity: 0.45;
+}
+
+.tab-link {
+  color: var(--color-ink-muted);
+  font-size: 13px;
+  text-decoration: underline;
+  text-decoration-color: var(--color-line-strong);
+  text-underline-offset: 3px;
+}
+
+.tab-link:hover:not(:disabled) {
+  color: var(--color-ink);
+  text-decoration-color: currentColor;
+}
+
+/* ---------- editors ---------- */
+
+.tab-form {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px 20px;
+  padding: 4px 18px 14px;
+}
+
+.tab-control {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.tab-control.is-span,
+.tab-switch.is-span {
+  grid-column: span 2;
+}
+
+.tab-control-head {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--color-ink-muted);
+  font-size: 13px;
+}
+
+.tab-control-head label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-control-aside {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.tab-input {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 11px;
+  border: 1px solid var(--color-line);
+  border-radius: 6px;
+  background: var(--color-surface-2);
+  color: var(--color-ink);
+  font-size: 14px;
+  transition: border-color 120ms ease;
+}
+
+.tab-input::placeholder {
+  color: var(--color-ink-faint);
+}
+
+.tab-input:hover:not(:disabled) {
+  border-color: var(--color-line-strong);
+}
+
+.tab-input:focus-visible {
+  border-color: var(--color-info);
+  border-radius: 6px;
+  outline: 1px solid var(--color-info);
+  outline-offset: 0;
+}
+
+.tab-input.is-dirty {
+  border-color: var(--color-warn);
+}
+
+.tab-input:disabled {
+  opacity: 0.6;
+}
+
+.tab-select {
+  position: relative;
+  display: block;
+}
+
+.tab-select select {
+  appearance: none;
+  padding-right: 34px;
+  cursor: pointer;
+}
+
+.tab-select .icon {
+  position: absolute;
+  top: 50%;
+  right: 11px;
+  color: var(--color-ink-muted);
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.tab-switch {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--color-line-soft);
+  font-size: 15px;
+}
+
+/* ---------- live settings ---------- */
+
+.tab-group {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 16px 32px;
+  margin: 0 18px;
+  padding: 20px 0 22px;
+  border-top: 1px solid var(--color-line-soft);
+}
+
+.tab-group-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tab-group-head h3 {
+  margin: 0;
+  color: var(--color-ink);
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.tab-group-note {
+  color: var(--color-ink-faint);
+  font-size: 13px;
+}
+
+.tab-group-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 20px;
+}
+
+/* Pinned to the viewport's bottom edge while the panel is in view, so a
+   change made far down the list is applied without scrolling back. */
+.tab-settings-foot {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: auto;
+  padding: 12px 18px;
+  border-top: 1px solid var(--color-line);
+  border-radius: 0 0 6px 6px;
+  background: var(--color-surface-1);
+}
+
+.tab-settings .panel-body {
+  padding-bottom: 0;
+}
+
+.tab-settings-foot .tab-error {
+  margin: 0;
+}
+
+.tab-settings-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 1240px) {
+  .tab-form {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .tab-fields.is-cols-3 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .tab-fields.is-cols-3 .tab-field.is-wide {
+    grid-template-columns: minmax(96px, calc((100% - 32px) / 2 * 0.38)) minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 960px) {
+  .tab-group {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 660px) {
+  .tab-fields.is-cols-2,
+  .tab-fields.is-cols-3 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .tab-field.is-wide,
+  .tab-fields.is-cols-3 .tab-field.is-wide {
+    grid-template-columns: minmax(96px, 38%) minmax(0, 1fr);
+  }
+
+  .tab-form,
+  .tab-group-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .tab-control.is-span,
+  .tab-switch.is-span {
+    grid-column: auto;
+  }
+
+  .tab-event {
+    grid-template-columns: 64px 9px minmax(0, 1fr);
+    column-gap: 10px;
+  }
+
+  /* Commands and trace rows fold to two lines: what and state on top, the
+     digest underneath; the short id stays in the drill-down. */
+  .tab-command {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 4px;
+  }
+
+  .tab-table-head.tab-command,
+  .tab-command .tab-command-id {
+    display: none;
+  }
+
+  .tab-command .tab-command-result {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .tab-trace {
+    grid-template-columns: 64px minmax(0, 1fr);
+    column-gap: 10px;
+    row-gap: 4px;
+  }
+
+  .tab-trace .tab-trace-summary {
+    grid-column: 2;
+  }
+
+  .tab-trace .tab-trace-id {
+    display: none;
+  }
+
+  .tab-log {
+    grid-template-columns: auto minmax(0, 1fr);
+    row-gap: 4px;
+    column-gap: 10px;
+  }
+
+  .tab-log .tab-log-line {
+    grid-column: 1 / -1;
+  }
+
+  .tab-detail-rows > div {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tab-row-button,
+  .tab-button,
+  .tab-input {
+    transition: none;
+  }
+}
+
+/* ---------- settings: switches and fixed values ---------- */
+
+.tab-setting-switch,
+.tab-setting-fixed {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+}
+
+.tab-setting-fixed {
+  color: var(--color-ink);
+  font-size: 14px;
+}
+
+/* An unapplied flip is marked the way an edited text box is. */
+.tab-setting-switch.is-dirty .toggle {
+  box-shadow: 0 0 0 2px var(--color-warn-dim), 0 0 0 1px var(--color-warn);
+}
