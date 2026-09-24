@@ -11,9 +11,11 @@
 //! `openai/gpt-5.4-mini`, `openai/gpt-5.4`.
 
 use std::fmt;
+use std::net::IpAddr;
 
 use crate::config::ConfigError;
 use crate::model::{ModelProvider, ModelTier};
+use reqwest::Url;
 
 /// Model API key that never appears in `Debug` output.
 #[derive(Clone, PartialEq, Eq)]
@@ -113,7 +115,7 @@ impl TierModels {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSettings {
     provider: ModelProvider,
-    api_key: ApiKey,
+    api_key: Option<ApiKey>,
     base_url: Option<String>,
     tiers: TierModels,
     http_referer: Option<String>,
@@ -136,12 +138,13 @@ impl ModelSettings {
 
     /// Parses an injected settings source.
     ///
-    /// Absent key with no related variables disables model integration; any
-    /// partially configured section fails closed.
+    /// A key alone can be saved before tier settings are supplied and leaves
+    /// model integration disabled. Other partially configured sections fail
+    /// closed.
     ///
     /// # Errors
-    /// Returns [`ConfigError`] when the provider is unsupported, the key is
-    /// missing or short, a tier is missing, or the base URL is malformed.
+    /// Returns [`ConfigError`] when the provider is unsupported, a required
+    /// key is missing or short, a tier is missing, or the base URL is unsafe.
     pub fn from_source(
         mut source: impl FnMut(&'static str) -> Result<String, ConfigError>,
     ) -> Result<Option<Self>, ConfigError> {
@@ -162,66 +165,76 @@ impl ModelSettings {
         let balanced_fallbacks_raw = optional(&mut source, "VEYRA_MODEL_BALANCED_FALLBACKS");
         let reasoning_fallbacks_raw = optional(&mut source, "VEYRA_MODEL_REASONING_FALLBACKS");
 
-        if key_raw.is_empty() {
-            let any_other = !provider_raw.is_empty()
-                || !base_raw.is_empty()
-                || !fast_raw.is_empty()
-                || !balanced_raw.is_empty()
-                || !reasoning_raw.is_empty()
-                || !referer_raw.is_empty()
-                || !hourly_cap_raw.is_empty()
-                || !daily_cap_raw.is_empty()
-                || !fallbacks_raw.is_empty()
-                || !fast_fallbacks_raw.is_empty()
-                || !balanced_fallbacks_raw.is_empty()
-                || !reasoning_fallbacks_raw.is_empty();
-            if any_other {
-                return Err(ConfigError::MissingEnvironmentVariable {
-                    name: "VEYRA_MODEL_API_KEY",
-                });
-            }
-            return Ok(None);
-        }
-
         let provider = if provider_raw.is_empty() {
             ModelProvider::OpenRouter
         } else {
             ModelProvider::parse(&provider_raw).ok_or(ConfigError::InvalidEnvironmentVariable {
                 name: "VEYRA_MODEL_PROVIDER",
-                reason: "unsupported provider; supported values: openrouter",
+                reason: "unsupported provider; supported values: codex, claude_code, openai, anthropic, openrouter, groq, deepseek, xai, mistral, kimi, ollama, custom",
             })?
         };
 
-        let api_key = ApiKey::parse(&key_raw)?;
-
-        let base_url = if base_raw.is_empty() {
-            None
-        } else if base_raw.starts_with("http://") || base_raw.starts_with("https://") {
-            Some(base_raw)
-        } else {
-            return Err(ConfigError::InvalidEnvironmentVariable {
-                name: "VEYRA_MODEL_BASE_URL",
-                reason: "must start with http:// or https://",
+        let any_other = !provider_raw.is_empty()
+            || !base_raw.is_empty()
+            || !fast_raw.is_empty()
+            || !balanced_raw.is_empty()
+            || !reasoning_raw.is_empty()
+            || !referer_raw.is_empty()
+            || !hourly_cap_raw.is_empty()
+            || !daily_cap_raw.is_empty()
+            || !fallbacks_raw.is_empty()
+            || !fast_fallbacks_raw.is_empty()
+            || !balanced_fallbacks_raw.is_empty()
+            || !reasoning_fallbacks_raw.is_empty()
+            || !title_raw.is_empty()
+            || !hidden_raw.is_empty()
+            || !compel_raw.is_empty();
+        if !any_other {
+            if !key_raw.is_empty() {
+                ApiKey::parse(&key_raw)?;
+            }
+            return Ok(None);
+        }
+        let key_optional = matches!(
+            provider,
+            ModelProvider::Ollama | ModelProvider::Codex | ModelProvider::ClaudeCode
+        );
+        if key_raw.is_empty() && !key_optional {
+            return Err(ConfigError::MissingEnvironmentVariable {
+                name: "VEYRA_MODEL_API_KEY",
             });
-        };
+        }
 
-        let tier = |name: &'static str, value: String| -> Result<String, ConfigError> {
+        let api_key = if key_raw.is_empty() {
+            None
+        } else {
+            Some(ApiKey::parse(&key_raw)?)
+        };
+        if api_key.is_none() && !key_optional {
+            return Err(ConfigError::MissingEnvironmentVariable {
+                name: "VEYRA_MODEL_API_KEY",
+            });
+        }
+
+        let base_url = parse_base_url(provider, &base_raw)?;
+
+        let tier = |name: &'static str, value: String| {
             if value.is_empty() {
                 Err(ConfigError::MissingEnvironmentVariable { name })
             } else {
-                Ok(value)
+                validate_model_identifier(provider, name, &value)
             }
         };
 
         // A shared list applies to every tier; a tier-specific list replaces it
         // for that tier rather than extending it, so one narrow override never
         // has to restate the shared chain.
-        let shared_fallbacks = parse_fallbacks("VEYRA_MODEL_FALLBACKS", &fallbacks_raw)?;
+        let shared_fallbacks = parse_fallbacks(provider, "VEYRA_MODEL_FALLBACKS", &fallbacks_raw)?;
         let per_tier = |name: &'static str, raw: &str| -> Result<Vec<String>, ConfigError> {
             if raw.is_empty() {
                 Ok(shared_fallbacks.clone())
             } else {
-                parse_fallbacks(name, raw)
+                parse_fallbacks(provider, name, raw)
             }
         };
 
@@ -321,8 +334,10 @@ impl ModelSettings {
     }
 
     /// Model API key.
-    pub fn api_key(&self) -> &ApiKey {
-        &self.api_key
+    pub fn api_key(&self) -> Option<&ApiKey> {
+        // Ollama is the one supported unauthenticated provider; all other
+        // variants are checked during construction above.
+        self.api_key.as_ref()
     }
 
     /// Optional OpenAI-compatible base URL override.
@@ -385,22 +400,21 @@ const MAX_FALLBACKS_PER_TIER: usize = 4;
 /// Parses a comma-separated fallback chain into validated model identifiers.
 ///
 /// Blank segments are skipped so a trailing comma is harmless. Identifiers are
-/// only shape-checked (`vendor/model`); whether the provider actually serves
-/// one is not knowable here, and a wrong id simply fails over to the next
-/// candidate at request time.
-fn parse_fallbacks(name: &'static str, raw: &str) -> Result<Vec<String>, ConfigError> {
+/// shape-checked; OpenRouter uses `vendor/model`, while other providers accept
+/// their native model names. Whether a provider actually serves one is not
+/// knowable here, and a wrong id simply fails over at request time.
+fn parse_fallbacks(
+    provider: ModelProvider,
+    name: &'static str,
+    raw: &str,
+) -> Result<Vec<String>, ConfigError> {
     let mut models = Vec::new();
     for segment in raw.split(',') {
         let candidate = segment.trim();
         if candidate.is_empty() {
             continue;
         }
-        if !candidate.contains('/') || candidate.starts_with('/') || candidate.ends_with('/') {
-            return Err(ConfigError::InvalidEnvironmentVariable {
-                name,
-                reason: "each fallback must be a `vendor/model` identifier",
-            });
-        }
+        validate_model_identifier(provider, name, candidate)?;
         if models.iter().any(|existing| existing == candidate) {
             continue;
         }
@@ -413,6 +427,87 @@ fn parse_fallbacks(name: &'static str, raw: &str) -> Result<Vec<String>, ConfigE
         });
     }
     Ok(models)
+}
+
+/// Validates a model identifier without imposing OpenRouter's `vendor/model`
+/// naming convention on native and OpenAI-compatible providers.
+fn validate_model_identifier(
+    provider: ModelProvider,
+    name: &'static str,
+    value: &str,
+) -> Result<String, ConfigError> {
+    let invalid = || ConfigError::InvalidEnvironmentVariable {
+        name,
+        reason: "must be a non-empty model identifier without whitespace or control characters",
+    };
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(invalid());
+    }
+    if provider == ModelProvider::OpenRouter
+        && (!value.contains('/') || value.starts_with('/') || value.ends_with('/'))
+    {
+        return Err(ConfigError::InvalidEnvironmentVariable {
+            name,
+            reason: "OpenRouter models must use a `vendor/model` identifier",
+        });
+    }
+    Ok(value.to_owned())
+}
+
+/// Parses a provider base URL and rejects URL features that could leak a key
+/// or silently redirect model traffic. Custom endpoints also reject literal
+/// loopback/private addresses because they are an SSRF footgun; the dedicated
+/// Ollama provider retains its intentional local default.
+fn parse_base_url(provider: ModelProvider, raw: &str) -> Result<Option<String>, ConfigError> {
+    if raw.is_empty() {
+        if provider == ModelProvider::Custom {
+            return Err(ConfigError::MissingEnvironmentVariable {
+                name: "VEYRA_MODEL_BASE_URL",
+            });
+        }
+        return Ok(None);
+    }
+
+    let invalid = || ConfigError::InvalidEnvironmentVariable {
+        name: "VEYRA_MODEL_BASE_URL",
+        reason: "must be an absolute http(s) URL without credentials, query, or fragment",
+    };
+    let url = Url::parse(raw).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+
+    if provider == ModelProvider::Custom {
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        let private_literal = host.parse::<IpAddr>().ok().is_some_and(|address| {
+            address.is_loopback()
+                || address.is_unspecified()
+                || match address {
+                    IpAddr::V4(address) => address.is_private() || address.is_link_local(),
+                    IpAddr::V6(address) => {
+                        address.is_unique_local() || address.is_unicast_link_local()
+                    }
+                }
+        });
+        if private_literal || host == "localhost" || host.ends_with(".localhost") {
+            return Err(ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_MODEL_BASE_URL",
+                reason: "custom endpoints cannot target loopback or private hosts",
+            });
+        }
+    }
+
+    Ok(Some(raw.trim_end_matches('/').to_owned()))
 }
 
 #[cfg(test)]
@@ -601,6 +696,141 @@ mod tests {
             Some(ModelProvider::OpenRouter)
         );
         assert_eq!(ModelProvider::parse("jaeger"), None);
+    }
+
+    #[test]
+    fn all_supported_provider_names_parse_with_aliases() {
+        for (raw, provider) in [
+            ("codex", ModelProvider::Codex),
+            ("claude_code", ModelProvider::ClaudeCode),
+            ("openai", ModelProvider::OpenAi),
+            ("anthropic", ModelProvider::Anthropic),
+            ("openrouter", ModelProvider::OpenRouter),
+            ("groq", ModelProvider::Groq),
+            ("deepseek", ModelProvider::DeepSeek),
+            ("xai", ModelProvider::Xai),
+            ("mistral", ModelProvider::Mistral),
+            ("kimi", ModelProvider::Kimi),
+            ("ollama", ModelProvider::Ollama),
+            ("custom", ModelProvider::Custom),
+        ] {
+            assert_eq!(ModelProvider::parse(raw), Some(provider));
+            assert_eq!(
+                ModelProvider::parse(&raw.to_ascii_uppercase()),
+                Some(provider)
+            );
+            assert_eq!(provider.as_str(), raw);
+        }
+        assert_eq!(ModelProvider::parse("moonshot"), Some(ModelProvider::Kimi));
+        assert_eq!(
+            ModelProvider::parse("claude"),
+            Some(ModelProvider::Anthropic)
+        );
+    }
+
+    #[test]
+    fn subscription_tiers_do_not_require_an_api_key() {
+        for provider in ["codex", "claude_code"] {
+            let settings = ModelSettings::from_source(source(&[
+                ("VEYRA_MODEL_PROVIDER", provider),
+                ("VEYRA_MODEL_FAST", "model-fast"),
+                ("VEYRA_MODEL_BALANCED", "model-balanced"),
+                ("VEYRA_MODEL_REASONING", "model-reasoning"),
+            ]))
+            .expect("subscription settings parse")
+            .expect("configured");
+            assert_eq!(settings.api_key(), None);
+        }
+    }
+
+    #[test]
+    fn a_saved_key_without_tiers_keeps_the_model_disabled_across_restart() {
+        let settings = ModelSettings::from_source(source(&[("VEYRA_MODEL_API_KEY", KEY)]));
+        assert!(matches!(settings, Ok(None)));
+    }
+
+    #[test]
+    fn native_provider_models_do_not_require_openrouter_vendor_prefixes() {
+        let settings = ModelSettings::from_source(source(&full(&[
+            ("VEYRA_MODEL_PROVIDER", "deepseek"),
+            ("VEYRA_MODEL_FAST", "deepseek-chat"),
+            ("VEYRA_MODEL_BALANCED", "deepseek-chat"),
+            ("VEYRA_MODEL_REASONING", "deepseek-reasoner"),
+            ("VEYRA_MODEL_FALLBACKS", "deepseek-chat, deepseek-reasoner"),
+        ])))
+        .expect("settings parse")
+        .expect("configured");
+        assert_eq!(settings.provider(), ModelProvider::DeepSeek);
+        assert_eq!(settings.tiers().resolve(ModelTier::Fast), "deepseek-chat");
+        assert_eq!(
+            settings.tiers().fallbacks(ModelTier::Balanced),
+            ["deepseek-reasoner"]
+        );
+    }
+
+    #[test]
+    fn ollama_accepts_an_empty_key_but_custom_requires_a_safe_explicit_url() {
+        let settings = ModelSettings::from_source(source(&[
+            ("VEYRA_MODEL_PROVIDER", "ollama"),
+            ("VEYRA_MODEL_FAST", "llama3.2"),
+            ("VEYRA_MODEL_BALANCED", "llama3.2"),
+            ("VEYRA_MODEL_REASONING", "llama3.2"),
+        ]))
+        .expect("settings parse")
+        .expect("configured");
+        assert_eq!(settings.provider(), ModelProvider::Ollama);
+        assert!(settings.api_key().is_none());
+
+        let missing = ModelSettings::from_source(source(&[
+            ("VEYRA_MODEL_PROVIDER", "custom"),
+            ("VEYRA_MODEL_API_KEY", KEY),
+            ("VEYRA_MODEL_FAST", "local-fast"),
+            ("VEYRA_MODEL_BALANCED", "local-balanced"),
+            ("VEYRA_MODEL_REASONING", "local-reasoning"),
+        ]));
+        assert!(matches!(
+            missing,
+            Err(ConfigError::MissingEnvironmentVariable {
+                name: "VEYRA_MODEL_BASE_URL"
+            })
+        ));
+
+        let private = ModelSettings::from_source(source(&[
+            ("VEYRA_MODEL_PROVIDER", "custom"),
+            ("VEYRA_MODEL_API_KEY", KEY),
+            ("VEYRA_MODEL_BASE_URL", "http://127.0.0.1:8000/v1"),
+            ("VEYRA_MODEL_FAST", "local-fast"),
+            ("VEYRA_MODEL_BALANCED", "local-balanced"),
+            ("VEYRA_MODEL_REASONING", "local-reasoning"),
+        ]));
+        assert!(matches!(
+            private,
+            Err(ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_MODEL_BASE_URL",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn base_url_validation_rejects_credentials_and_url_suffix_data() {
+        for base_url in [
+            "ftp://example.test/v1",
+            "https://user:password@example.test/v1",
+            "https://example.test/v1?key=secret",
+            "https://example.test/v1#fragment",
+        ] {
+            let error =
+                ModelSettings::from_source(source(&full(&[("VEYRA_MODEL_BASE_URL", base_url)])))
+                    .expect_err("unsafe URL must fail");
+            assert!(matches!(
+                error,
+                ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_MODEL_BASE_URL",
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

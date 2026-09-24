@@ -137,6 +137,8 @@ impl From<ConfigError> for RejectedEdit {
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeConfig {
     overrides: Arc<RwLock<BTreeMap<String, String>>>,
+    /// Decrypted console credential, never included in snapshots or status.
+    model_key: Arc<RwLock<Option<crate::model::ApiKey>>>,
 }
 
 impl RuntimeConfig {
@@ -152,6 +154,15 @@ impl RuntimeConfig {
     /// values are returned to their defaults. Parsers already treat blank as
     /// unset, so this needs no special case downstream.
     pub fn resolve(&self, name: &'static str) -> Result<String, ConfigError> {
+        if name == "VEYRA_MODEL_API_KEY"
+            && let Some(key) = self
+                .model_key
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+        {
+            return Ok(key.expose().to_owned());
+        }
         if let Some(value) = self.read().get(name) {
             return Ok(value.clone());
         }
@@ -161,7 +172,17 @@ impl RuntimeConfig {
     /// A source function suitable for any section's `from_source` parser.
     pub fn source(&self) -> impl FnMut(&'static str) -> Result<String, ConfigError> + use<> {
         let snapshot = self.read().clone();
+        let model_key = self
+            .model_key
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         move |name| {
+            if name == "VEYRA_MODEL_API_KEY"
+                && let Some(key) = &model_key
+            {
+                return Ok(key.expose().to_owned());
+            }
             if let Some(value) = snapshot.get(name) {
                 return Ok(value.clone());
             }
@@ -176,15 +197,69 @@ impl RuntimeConfig {
         pending: &BTreeMap<String, String>,
     ) -> impl FnMut(&'static str) -> Result<String, ConfigError> + use<> {
         let mut snapshot = self.read().clone();
+        let model_key = self
+            .model_key
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         for (name, value) in pending {
             snapshot.insert(name.clone(), value.clone());
         }
         move |name| {
+            if name == "VEYRA_MODEL_API_KEY"
+                && let Some(key) = &model_key
+            {
+                return Ok(key.expose().to_owned());
+            }
             if let Some(value) = snapshot.get(name) {
                 return Ok(value.clone());
             }
             std::env::var(name).map_err(|_| ConfigError::MissingEnvironmentVariable { name })
         }
+    }
+
+    /// Installs or removes a separately persisted credential. This value is
+    /// intentionally absent from the ordinary settings overlay and audit.
+    pub fn set_model_key(&self, key: Option<crate::model::ApiKey>) {
+        *self
+            .model_key
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = key;
+    }
+
+    /// Non-sensitive credential status for the console.
+    pub fn model_key_status(&self) -> Value {
+        let key = self
+            .model_key
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(key) = key.as_ref() {
+            let hint: String = key
+                .expose()
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            return serde_json::json!({"set": true, "source": "console", "hint": hint});
+        }
+        if let Ok(value) = std::env::var("VEYRA_MODEL_API_KEY")
+            && !value.trim().is_empty()
+        {
+            let hint: String = value
+                .trim()
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            return serde_json::json!({"set": true, "source": "environment", "hint": hint});
+        }
+        serde_json::json!({"set": false, "source": null, "hint": null})
     }
 
     /// Screens a proposed edit for names that may not be set at all.
@@ -387,7 +462,7 @@ pub fn adopt(state: &crate::AppState, staged: StagedSettings) -> Result<(), Stri
     let rebuilt = match staged.model {
         None => None,
         Some(settings) => {
-            let runtime = crate::model::ModelRuntime::from_settings(settings)
+            let runtime = crate::model::ModelRuntime::from_settings_with_app(settings, state)
                 .map_err(|error| error.to_string())?;
             // A rebuilt runtime starts with empty call-budget windows. Carrying
             // the old counters across means an edit cannot be used — even
@@ -412,6 +487,34 @@ pub fn adopt(state: &crate::AppState, staged: StagedSettings) -> Result<(), Stri
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn separately_stored_key_is_usable_but_absent_from_config_snapshots() {
+        let config = RuntimeConfig::new();
+        let key = crate::model::ApiKey::parse("private-provider-key").expect("valid test key");
+        config.set_model_key(Some(key));
+        assert_eq!(
+            config.source()("VEYRA_MODEL_API_KEY").expect("key"),
+            "private-provider-key"
+        );
+        assert_eq!(
+            config.trial_source(&BTreeMap::new())("VEYRA_MODEL_API_KEY").expect("key"),
+            "private-provider-key"
+        );
+        assert!(
+            !config
+                .snapshot()
+                .to_string()
+                .contains("private-provider-key")
+        );
+        assert!(
+            !config
+                .effective()
+                .to_string()
+                .contains("private-provider-key")
+        );
+        assert_eq!(config.model_key_status()["source"], "console");
+    }
 
     fn patch(pairs: &[(&str, Value)]) -> Map<String, Value> {
         pairs

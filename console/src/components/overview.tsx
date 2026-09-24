@@ -267,7 +267,7 @@ export function OpenPositions({
     body = <div className="panel-empty">No open positions</div>
   } else {
     body = (
-      <div className="pos-scroll">
+      <div className="pos-scroll" role="region" aria-label="Open positions table" tabIndex={0}>
         <table className="pos-table">
           <colgroup>
             <col className="pos-col-symbol" />

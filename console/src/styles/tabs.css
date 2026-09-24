@@ -694,6 +694,7 @@
 
 .tab-group-fields {
   display: grid;
+  grid-column: 2;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px 20px;
 }
@@ -772,6 +773,10 @@
 @media (max-width: 960px) {
   .tab-group {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .tab-group-fields {
+    grid-column: 1;
   }
 }
 

@@ -6,7 +6,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { api } from './api'
+import { api, streamAssistant, type AssistantEvent } from './api'
 
 function jsonResponse(body: unknown, status = 200): Response {
   return {
@@ -21,6 +21,33 @@ afterEach(() => {
 })
 
 describe('api', () => {
+  it('accepts a long answer as bounded history on the next question', async () => {
+    const longAnswer = 'Opening context. ' + 'profit against days '.repeat(100) + 'Current conclusion.'
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(`event: answer\ndata: ${JSON.stringify({ text: longAnswer })}\n\n`, { status: 200 }),
+    ).mockResolvedValueOnce(
+      new Response(`event: answer\ndata: ${JSON.stringify({ text: 'Answered the follow-up.' })}\n\n`, { status: 200 }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const events: AssistantEvent[] = []
+    const signal = new AbortController().signal
+
+    await streamAssistant('How is performance?', [], (event) => events.push(event), signal)
+    expect(events[0]).toEqual({ event: 'answer', text: longAnswer })
+    await streamAssistant('How does that compare with last week?', [
+      { role: 'user', content: 'How is performance?' },
+      { role: 'assistant', content: longAnswer },
+    ], (event) => events.push(event), signal)
+
+    const request = JSON.parse(fetchMock.mock.calls[1][1].body as string) as {
+      history: Array<{ role: string; content: string }>
+    }
+    expect(Array.from(request.history[1].content).length).toBe(1_000)
+    expect(request.history[1].content).toMatch(/^Opening context/)
+    expect(request.history[1].content).toMatch(/Current conclusion\.$/)
+    expect(events.at(-1)).toEqual({ event: 'answer', text: 'Answered the follow-up.' })
+  })
+
   it('builds the diagnostic route URLs', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}))
     vi.stubGlobal('fetch', fetchMock)

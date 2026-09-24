@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use actix_web::web::{self, Data};
-use actix_web::{HttpResponse, get, post};
+use actix_web::{HttpRequest, HttpResponse, delete, get, post};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -165,7 +165,318 @@ pub async fn runtime_config(state: Data<AppState>) -> HttpResponse {
     HttpResponse::Ok().json(json!({
         "settings": state.runtime_config().effective(),
         "live_sections": crate::runtime_config::LIVE_SECTIONS,
+        "secret_store": state.credential_vault().is_some(),
+        "secrets": { "VEYRA_MODEL_API_KEY": state.runtime_config().model_key_status() },
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CredentialPatch {
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscriptionProviderPatch {
+    provider: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscriptionCompletePatch {
+    provider: String,
+    callback_value: String,
+}
+
+fn subscription_provider(
+    value: &str,
+) -> Result<crate::subscription_auth::SubscriptionProvider, Box<HttpResponse>> {
+    crate::subscription_auth::SubscriptionProvider::parse(value).ok_or_else(|| {
+        Box::new(
+            HttpResponse::BadRequest().json(json!({"error": "unsupported_subscription_provider"})),
+        )
+    })
+}
+
+fn subscription_state_key(provider: crate::subscription_auth::SubscriptionProvider) -> StateKey {
+    match provider {
+        crate::subscription_auth::SubscriptionProvider::Codex => StateKey::SubscriptionCodex,
+        crate::subscription_auth::SubscriptionProvider::ClaudeCode => {
+            StateKey::SubscriptionClaudeCode
+        }
+    }
+}
+
+fn active_subscription_selected(
+    state: &AppState,
+    provider: crate::subscription_auth::SubscriptionProvider,
+) -> bool {
+    let selected = match provider {
+        crate::subscription_auth::SubscriptionProvider::Codex => crate::model::ModelProvider::Codex,
+        crate::subscription_auth::SubscriptionProvider::ClaudeCode => {
+            crate::model::ModelProvider::ClaudeCode
+        }
+    };
+    crate::model::ModelSettings::from_source(state.runtime_config().source())
+        .ok()
+        .flatten()
+        .is_some_and(|settings| settings.provider() == selected)
+}
+
+/// Returns non-secret subscription connection status.
+#[get("/model/subscriptions")]
+pub async fn model_subscriptions(state: Data<AppState>) -> HttpResponse {
+    let status = |provider| json!({"connected": state.subscription_auth().connected(provider), "account_label": state.subscription_auth().credential(provider).and_then(|credential| credential.account_label)});
+    HttpResponse::Ok().json(json!({"subscriptions": {"codex": status(crate::subscription_auth::SubscriptionProvider::Codex), "claude_code": status(crate::subscription_auth::SubscriptionProvider::ClaudeCode)}}))
+}
+
+/// Starts one provider's browser PKCE authorization flow.
+#[post("/model/subscriptions/start")]
+pub async fn start_model_subscription(
+    state: Data<AppState>,
+    request: HttpRequest,
+    body: web::Json<SubscriptionProviderPatch>,
+) -> HttpResponse {
+    if let Some(response) = credential_rejection(&request, &state) {
+        return response;
+    }
+    let provider = match subscription_provider(&body.provider) {
+        Ok(provider) => provider,
+        Err(response) => return *response,
+    };
+    match crate::subscription_auth::prepare(provider) {
+        Ok(pending) => {
+            let response = json!({"provider": provider.as_str(), "authorize_url": pending.authorize_url, "state": pending.state});
+            state.subscription_auth().put_pending(pending);
+            HttpResponse::Ok().json(response)
+        }
+        Err(_) => HttpResponse::InternalServerError()
+            .json(json!({"error": "subscription_authorization_unavailable"})),
+    }
+}
+
+/// Completes a provider browser flow and durably encrypts the resulting token.
+#[post("/model/subscriptions/complete")]
+pub async fn complete_model_subscription(
+    state: Data<AppState>,
+    request: HttpRequest,
+    body: web::Json<SubscriptionCompletePatch>,
+) -> HttpResponse {
+    if let Some(response) = credential_rejection(&request, &state) {
+        return response;
+    }
+    let provider = match subscription_provider(&body.provider) {
+        Ok(provider) => provider,
+        Err(response) => return *response,
+    };
+    let (code, callback_state) =
+        match crate::subscription_auth::callback_parts(provider, &body.callback_value) {
+            Ok(parts) => parts,
+            Err(_) => {
+                return HttpResponse::BadRequest()
+                    .json(json!({"error": "invalid_subscription_callback"}));
+            }
+        };
+    let pending = match state
+        .subscription_auth()
+        .take_pending(provider, &callback_state)
+    {
+        Ok(pending) => pending,
+        Err(_) => {
+            return HttpResponse::BadRequest().json(json!({"error": "invalid_subscription_state"}));
+        }
+    };
+    let client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({"error": "subscription_client_unavailable"}));
+        }
+    };
+    let credential = match crate::subscription_auth::exchange(&client, &pending, &code).await {
+        Ok(credential) => credential,
+        Err(_) => {
+            return HttpResponse::BadGateway()
+                .json(json!({"error": "subscription_exchange_failed"}));
+        }
+    };
+    let Some(vault) = state.credential_vault() else {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"error": "credential_store_unavailable"}));
+    };
+    let serialized = match serde_json::to_string(&credential) {
+        Ok(value) => value,
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({"error": "credential_serialization_failed"}));
+        }
+    };
+    let encrypted = match vault.seal_text(&serialized) {
+        Ok(value) => value,
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({"error": "credential_encryption_failed"}));
+        }
+    };
+    if state
+        .runtime_state()
+        .save_required(subscription_state_key(provider), &encrypted)
+        .await
+        .is_err()
+    {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"error": "credential_storage_failed"}));
+    }
+    let label = credential.account_label.clone();
+    state.subscription_auth().set_credential(credential);
+    if active_subscription_selected(&state, provider) {
+        let pending = std::collections::BTreeMap::new();
+        let applied = crate::runtime_config::validate(state.runtime_config(), &pending)
+            .map_err(|_| "model_settings_incomplete")
+            .and_then(|staged| {
+                crate::runtime_config::adopt(&state, staged).map_err(|_| "model_rebuild_failed")
+            });
+        if let Err(reason) = applied {
+            state.set_model(None);
+            return HttpResponse::Accepted().json(json!({"connected": true, "active": false, "provider": provider.as_str(), "account_label": label, "reason": reason}));
+        }
+    }
+    HttpResponse::Ok().json(json!({"connected": true, "active": active_subscription_selected(&state, provider), "provider": provider.as_str(), "account_label": label}))
+}
+
+/// Removes a stored subscription credential.
+#[delete("/model/subscriptions/{provider}")]
+pub async fn delete_model_subscription(
+    state: Data<AppState>,
+    request: HttpRequest,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Some(response) = credential_rejection(&request, &state) {
+        return response;
+    }
+    let provider = match subscription_provider(&path.into_inner()) {
+        Ok(provider) => provider,
+        Err(response) => return *response,
+    };
+    let tombstone = json!({"version": 1, "ciphertext": null});
+    if state
+        .runtime_state()
+        .save_required(subscription_state_key(provider), &tombstone)
+        .await
+        .is_err()
+    {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"error": "credential_storage_failed"}));
+    }
+    let deleted = state.subscription_auth().remove_credential(provider);
+    if active_subscription_selected(&state, provider) {
+        state.set_model(None);
+    }
+    HttpResponse::Ok().json(json!({"deleted": deleted, "provider": provider.as_str()}))
+}
+
+fn credential_rejection(request: &HttpRequest, state: &AppState) -> Option<HttpResponse> {
+    let Some(vault) = state.credential_vault() else {
+        return Some(HttpResponse::ServiceUnavailable().json(json!({
+            "error": "credential_store_unavailable",
+            "reason": "Configure console secret storage before saving a model key."
+        })));
+    };
+    let supplied = request
+        .headers()
+        .get("x-veyra-admin-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !vault.authenticates(supplied) {
+        return Some(HttpResponse::Unauthorized().json(json!({"error": "invalid_operator_token"})));
+    }
+    None
+}
+
+async fn persist_model_credential(
+    state: &AppState,
+    key: Option<crate::model::ApiKey>,
+) -> HttpResponse {
+    let Some(vault) = state.credential_vault() else {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"error": "credential_store_unavailable"}));
+    };
+    let encrypted = match &key {
+        Some(key) => match vault.seal(key) {
+            Ok(value) => value,
+            Err(_) => {
+                return HttpResponse::InternalServerError()
+                    .json(json!({"error": "credential_encryption_failed"}));
+            }
+        },
+        None => json!({"version": 1, "ciphertext": null}),
+    };
+    if state
+        .runtime_state()
+        .save_required(StateKey::ModelSecret, &encrypted)
+        .await
+        .is_err()
+    {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"error": "credential_storage_failed"}));
+    }
+    state.runtime_config().set_model_key(key);
+    let pending = std::collections::BTreeMap::new();
+    let applied = match crate::runtime_config::validate(state.runtime_config(), &pending) {
+        Ok(staged) => {
+            crate::runtime_config::adopt(state, staged).map_err(|_| "model_rebuild_failed")
+        }
+        Err(_) => Err("model_settings_incomplete"),
+    };
+    if let Err(reason) = applied {
+        // A saved key must never leave an engine with a superseded credential
+        // running. The operator can complete settings and re-enable it.
+        state.set_model(None);
+        return HttpResponse::Accepted().json(json!({
+            "saved": true,
+            "active": false,
+            "reason": reason,
+            "secret": state.runtime_config().model_key_status()
+        }));
+    }
+    HttpResponse::Ok().json(json!({
+        "saved": true,
+        "active": state.model().is_some(),
+        "secret": state.runtime_config().model_key_status()
+    }))
+}
+
+/// Saves a model API key in encrypted durable state. The operator token is
+/// separate from the normal settings path and is never returned or journaled.
+#[post("/model/credential")]
+pub async fn set_model_credential(
+    state: Data<AppState>,
+    request: HttpRequest,
+    body: web::Json<CredentialPatch>,
+) -> HttpResponse {
+    if let Some(response) = credential_rejection(&request, &state) {
+        return response;
+    }
+    if body.key.len() > 4_096 {
+        return HttpResponse::BadRequest().json(json!({"error": "invalid_model_key"}));
+    }
+    let key = match crate::model::ApiKey::parse(&body.key) {
+        Ok(key) => key,
+        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "invalid_model_key"})),
+    };
+    persist_model_credential(&state, Some(key)).await
+}
+
+/// Removes the console credential; an environment key, if present, becomes
+/// effective again. A failed model rebuild leaves model decisions disabled.
+#[delete("/model/credential")]
+pub async fn delete_model_credential(state: Data<AppState>, request: HttpRequest) -> HttpResponse {
+    if let Some(response) = credential_rejection(&request, &state) {
+        return response;
+    }
+    persist_model_credential(&state, None).await
 }
 
 /// Applies a validated partial update to the live settings.

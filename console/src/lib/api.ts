@@ -355,10 +355,55 @@ export type Reconciliation = {
  */
 export type LiveSetting = { value: string; overridden: boolean }
 
+/**
+ * A write-only credential as the service reports it: whether one is in force
+ * and where it came from, never the value. `hint` is at most the last four
+ * characters, for telling two keys apart.
+ */
+export type SecretStatus = {
+  set: boolean
+  source: 'console' | 'environment' | null
+  hint: string | null
+}
+
 export type RuntimeConfig = {
   settings: Record<string, LiveSetting>
   /** Sections whose edits take effect without a restart. */
   live_sections: string[]
+  /** Credentials the console may set; values are never returned. */
+  secrets?: Record<string, SecretStatus>
+  /** Whether console-entered credentials can be stored (an encryption key is configured). */
+  secret_store?: boolean
+}
+
+export type CredentialSaveResult = { saved: boolean; active: boolean; reason?: string; secret: SecretStatus }
+
+export type SubscriptionProvider = 'codex' | 'claude_code'
+export type SubscriptionConnection = { connected: boolean; account_label?: string | null }
+export type SubscriptionStatus = { subscriptions: Record<SubscriptionProvider, SubscriptionConnection> }
+export type SubscriptionStart = { provider: SubscriptionProvider; authorize_url: string; state: string }
+
+/** Progress from the read-only assistant; every tool event is visible in chat. */
+export type AssistantEvent =
+  | { event: 'status'; label: string }
+  | { event: 'tool_start'; call_id?: string; tool: string; label?: string }
+  | { event: 'tool_result'; call_id?: string; tool: string; available: boolean; count?: number | null; reason?: string }
+  | { event: 'answer'; text: string }
+  | { event: 'error'; reason: string }
+
+export type AssistantTurn = { role: 'user' | 'assistant'; content: string }
+
+// Match the service's per-turn request limit. Keep both the beginning and end
+// of long answers so a follow-up retains the conclusion and its context.
+const ASSISTANT_HISTORY_CHARS = 1_000
+const ASSISTANT_HISTORY_TURNS = 6
+
+function boundedAssistantHistory(history: AssistantTurn[]): AssistantTurn[] {
+  return history.slice(-ASSISTANT_HISTORY_TURNS).map(({ role, content }) => {
+    const chars = Array.from(content)
+    if (chars.length <= ASSISTANT_HISTORY_CHARS) return { role, content }
+    return { role, content: `${chars.slice(0, 500).join('')}…${chars.slice(-499).join('')}` }
+  })
 }
 
 /**
@@ -401,13 +446,114 @@ async function post<T>(path: string, body: unknown): Promise<T> {
       // all of them rather than only the first.
       else if (payload.rejected?.length) {
         detail = payload.rejected.map((edit) => `${edit.field}: ${edit.reason}`).join('; ')
-      }
+      } else if (payload.reason) detail = payload.reason
     } catch {
       // Keep the status-only detail when the body is not JSON.
     }
     throw new Error(detail)
   }
   return (await response.json()) as T
+}
+
+/**
+ * Reads SSE frames from a POST response. Frames are buffered across arbitrary
+ * network chunk boundaries; an interrupted request never becomes an answer.
+ */
+export async function streamAssistant(
+  question: string,
+  history: AssistantTurn[],
+  onEvent: (event: AssistantEvent) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const response = await fetch(`${BASE}/assistant/chat`, {
+    method: 'POST',
+    signal,
+    headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+    body: JSON.stringify({ question, history: boundedAssistantHistory(history) }),
+  })
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as { reason?: string } | null
+    throw new Error(payload?.reason ?? `Assistant unavailable (${response.status})`)
+  }
+  if (!response.body) throw new Error('The assistant stream did not open.')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      buffer = (buffer + decoder.decode(value, { stream: !done })).replaceAll('\r\n', '\n')
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary !== -1) {
+        const frame = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        const kind = frame.split('\n').find((line) => line.startsWith('event: '))?.slice(7)
+        const data = frame.split('\n').find((line) => line.startsWith('data: '))?.slice(6)
+        if (kind && data) {
+          let payload: object
+          try {
+            payload = JSON.parse(data) as object
+          } catch {
+            throw new Error('The assistant sent an unreadable update.')
+          }
+          onEvent({ event: kind, ...payload } as AssistantEvent)
+        }
+        boundary = buffer.indexOf('\n\n')
+      }
+      if (done) break
+    }
+    if (buffer.trim()) throw new Error('The assistant stream ended partway through an update.')
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+/** Saves or removes a key through the authenticated, encrypted credential path. */
+export async function changeModelCredential(
+  token: string,
+  key?: string,
+): Promise<CredentialSaveResult> {
+  const response = await fetch(`${BASE}/model/credential`, {
+    method: key === undefined ? 'DELETE' : 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'x-veyra-admin-token': token,
+    },
+    ...(key === undefined ? {} : { body: JSON.stringify({ key }) }),
+  })
+  const payload = (await response.json().catch(() => null)) as
+    | (Partial<CredentialSaveResult> & { error?: string })
+    | null
+  if (!response.ok) {
+    throw new Error(payload?.reason ?? payload?.error?.replaceAll('_', ' ') ?? `Credential update failed (${response.status})`)
+  }
+  if (!payload?.saved || !payload.secret) throw new Error('The service did not confirm the credential update.')
+  return payload as CredentialSaveResult
+}
+
+async function subscriptionMutation<T>(path: string, method: 'POST' | 'DELETE', token: string, body?: object): Promise<T> {
+  const response = await fetch(`${BASE}${path}`, {
+    method,
+    headers: { accept: 'application/json', 'content-type': 'application/json', 'x-veyra-admin-token': token },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  })
+  const payload = (await response.json().catch(() => null)) as (T & { error?: string; reason?: string }) | null
+  if (!response.ok) throw new Error(payload?.reason ?? payload?.error?.replaceAll('_', ' ') ?? `Connection failed (${response.status})`)
+  if (!payload) throw new Error('The service did not confirm the connection change.')
+  return payload
+}
+
+/** Subscription sign-in uses the same authenticated encrypted store as API keys. */
+export const subscriptions = {
+  status: () => get<SubscriptionStatus>('/model/subscriptions'),
+  start: (provider: SubscriptionProvider, token: string) =>
+    subscriptionMutation<SubscriptionStart>('/model/subscriptions/start', 'POST', token, { provider }),
+  complete: (provider: SubscriptionProvider, callbackValue: string, token: string) =>
+    subscriptionMutation<SubscriptionConnection>('/model/subscriptions/complete', 'POST', token, { provider, callback_value: callbackValue }),
+  remove: (provider: SubscriptionProvider, token: string) =>
+    subscriptionMutation<{ deleted: boolean }>('/model/subscriptions/' + provider, 'DELETE', token),
 }
 
 export const api = {

@@ -6,12 +6,14 @@
 #![deny(missing_docs)]
 
 pub mod app;
+pub mod assistant_chat;
 pub mod audit;
 pub mod balance;
 pub mod broker;
 pub mod calendar;
 pub mod config;
 pub mod control;
+pub mod credential;
 pub mod jev;
 pub mod logs;
 pub mod market;
@@ -25,6 +27,7 @@ pub mod runtime_config;
 pub mod server;
 pub mod state;
 pub mod store;
+pub mod subscription_auth;
 pub mod trading;
 
 use std::sync::Arc;
@@ -61,6 +64,8 @@ pub struct AppState {
     trading_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// Writable overlay in front of the environment for every live setting.
     runtime_config: crate::runtime_config::RuntimeConfig,
+    credential_vault: Option<crate::credential::CredentialVault>,
+    subscription_auth: crate::subscription_auth::SubscriptionAuthState,
     jev: Option<JevRuntime>,
     audit: Option<AuditRuntime>,
     logs: Option<Arc<LogBuffer>>,
@@ -99,6 +104,8 @@ impl AppState {
             model: Arc::new(std::sync::RwLock::new(model)),
             trading_enabled,
             runtime_config: crate::runtime_config::RuntimeConfig::new(),
+            credential_vault: None,
+            subscription_auth: crate::subscription_auth::SubscriptionAuthState::new(),
             jev: None,
             audit: None,
             logs: None,
@@ -158,6 +165,20 @@ impl AppState {
     pub fn with_runtime_config(mut self, config: crate::runtime_config::RuntimeConfig) -> Self {
         self.runtime_config = config;
         self
+    }
+
+    /// Attaches the optional encrypted console credential boundary.
+    pub fn with_credential_vault(
+        mut self,
+        vault: Option<crate::credential::CredentialVault>,
+    ) -> Self {
+        self.credential_vault = vault;
+        self
+    }
+
+    /// Returns the subscription OAuth state shared by control routes and the provider runtime.
+    pub fn subscription_auth(&self) -> &crate::subscription_auth::SubscriptionAuthState {
+        &self.subscription_auth
     }
 
     /// Attaches the configured audit trail, if any.
@@ -227,6 +248,11 @@ impl AppState {
     /// The writable overlay in front of the environment.
     pub fn runtime_config(&self) -> &crate::runtime_config::RuntimeConfig {
         &self.runtime_config
+    }
+
+    /// Configured console credential vault, if secure persistence is enabled.
+    pub fn credential_vault(&self) -> Option<&crate::credential::CredentialVault> {
+        self.credential_vault.as_ref()
     }
 
     /// Whether the service half of the execution control is armed.

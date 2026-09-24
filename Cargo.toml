@@ -12,9 +12,12 @@ repository = "https://github.com/iamngoni/veyra"
 [workspace.dependencies]
 actix-web = "4"
 anyhow = "1"
+async-stream = "0.3"
+base64 = "0.22"
 agent-runtime = { git = "https://github.com/iamngoni/agent-runtime", rev = "dd44d81c1914ebb768fa3990e7c291ba08362384" }
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ring = "0.17"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "macros", "migrate", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

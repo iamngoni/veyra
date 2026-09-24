@@ -13,7 +13,7 @@
  * real size instead of being stretched with the frame.
  */
 
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 
 import type { CandleSeries, ClosedTrade } from '../lib/api'
 import { amount, signedAmount, signedPercent } from '../lib/format'
@@ -226,6 +226,8 @@ type PlotSpec = {
 
 function LinePlot({ spec, width, height }: { spec: PlotSpec; width: number; height: number }) {
   const [hover, setHover] = useState<number | null>(null)
+  const [keyboard, setKeyboard] = useState(false)
+  const instructionsId = useId()
   const { points, xDomain, decimals } = spec
 
   const values = points.map((point) => point.value)
@@ -280,6 +282,7 @@ function LinePlot({ spec, width, height }: { spec: PlotSpec; width: number; heig
   const active = hover === null ? undefined : points[hover]
   const hoverX = active ? xs[hover!] : 0
   const track = (clientX: number, target: Element) => {
+    setKeyboard(false)
     const x = clientX - target.getBoundingClientRect().left
     let nearest = 0
     for (let index = 1; index < xs.length; index++) {
@@ -298,6 +301,27 @@ function LinePlot({ spec, width, height }: { spec: PlotSpec; width: number; heig
         viewBox={`0 0 ${width} ${height + AXIS_BAND}`}
         role="img"
         aria-label={spec.label}
+        aria-describedby={instructionsId}
+        tabIndex={0}
+        onFocus={() => {
+          setKeyboard(true)
+          setHover(points.length - 1)
+        }}
+        onBlur={() => {
+          setKeyboard(false)
+          setHover(null)
+        }}
+        onKeyDown={(event) => {
+          const current = hover ?? points.length - 1
+          const next = event.key === 'ArrowLeft' ? Math.max(0, current - 1)
+            : event.key === 'ArrowRight' ? Math.min(points.length - 1, current + 1)
+              : event.key === 'Home' ? 0
+                : event.key === 'End' ? points.length - 1 : undefined
+          if (next === undefined) return
+          event.preventDefault()
+          setKeyboard(true)
+          setHover(next)
+        }}
         onMouseMove={(event) => track(event.clientX, event.currentTarget)}
         onMouseLeave={() => setHover(null)}
         onTouchStart={(event) => track(event.touches[0].clientX, event.currentTarget)}
@@ -359,6 +383,12 @@ function LinePlot({ spec, width, height }: { spec: PlotSpec; width: number; heig
           </text>
         </g>
       </svg>
+      <span className="sr-only" id={instructionsId}>
+        Use Left and Right arrow keys to inspect values. Home and End move to the first and last value.
+      </span>
+      <span className="sr-only" aria-live="polite" aria-atomic="true">
+        {keyboard && active ? `${pointTime(active.atMs)}: ${amount(active.value, decimals)}` : ''}
+      </span>
       {active ? (
         // The tip sits beside the crosshair, on whichever side has room.
         <div className="chart-tip" style={hoverX > width * 0.6 ? { right: width - hoverX + 12 } : { left: hoverX + 12 }}>
@@ -500,18 +530,24 @@ type MenuItem = { key: string; label: string; checked: boolean; select: () => vo
 
 function ViewMenu({ current, items }: { current: ReactNode; items: MenuItem[] }) {
   const [open, setOpen] = useState(false)
+  const menuId = useId()
   const root = useRef<HTMLDivElement>(null)
   const button = useRef<HTMLButtonElement>(null)
+  const menu = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (!open) return
+    const selected = menu.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]')
+    const first = menu.current?.querySelector<HTMLButtonElement>('button')
+    const target = selected ?? first
+    target?.focus()
     const onPointer = (event: MouseEvent) => {
-      if (!root.current!.contains(event.target as Node)) setOpen(false)
+      if (!root.current?.contains(event.target as Node)) setOpen(false)
     }
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
       setOpen(false)
-      button.current!.focus()
+      button.current?.focus()
     }
     document.addEventListener('mousedown', onPointer)
     document.addEventListener('keydown', onKey)
@@ -522,30 +558,61 @@ function ViewMenu({ current, items }: { current: ReactNode; items: MenuItem[] })
   }, [open])
 
   return (
-    <div className="chart-menu" ref={root}>
+    <div
+      className="chart-menu"
+      ref={root}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false)
+      }}
+    >
       <button
         ref={button}
         type="button"
         className="chart-menu-button"
         aria-haspopup="menu"
         aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
         onClick={() => setOpen(!open)}
+        onKeyDown={(event) => {
+          if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+          event.preventDefault()
+          setOpen(true)
+        }}
       >
         {current}
         <Icon name="chevron-down" className="chart-menu-chevron" />
       </button>
       {open ? (
-        <div className="chart-menu-list" role="menu" aria-label="Chart view">
+        <div
+          className="chart-menu-list"
+          role="menu"
+          aria-label="Chart view"
+          id={menuId}
+          ref={menu}
+          onKeyDown={(event) => {
+            const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('button'))
+            const index = buttons.indexOf(document.activeElement as HTMLButtonElement)
+            const next = event.key === 'ArrowDown' ? (index + 1) % buttons.length
+              : event.key === 'ArrowUp' ? (index - 1 + buttons.length) % buttons.length
+                : event.key === 'Home' ? 0
+                  : event.key === 'End' ? buttons.length - 1 : undefined
+            if (next === undefined) return
+            event.preventDefault()
+            buttons[next]?.focus()
+          }}
+        >
           {items.map((item) => (
             <button
               key={item.key}
               type="button"
               role="menuitemradio"
               aria-checked={item.checked}
+              tabIndex={-1}
               className="chart-menu-item"
               onClick={() => {
                 item.select()
                 setOpen(false)
+                button.current?.focus()
               }}
             >
               {item.label}

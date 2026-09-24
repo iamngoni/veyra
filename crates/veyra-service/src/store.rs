@@ -166,6 +166,28 @@ impl AuditTrail for Store {
         self.list(limit).await
     }
 
+    async fn recent_decisions(&self, limit: u32) -> Result<Vec<AuditRow>, AuditError> {
+        let rows = sqlx::query(
+            "select id::text as id, at::text as at, kind, payload \
+             from audit_events \
+             where kind in ('proposal_evaluated', 'position_closed', 'command_failed') \
+             order by at desc, id desc limit $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| storage_error("select decisions", &error))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AuditRow {
+                id: row.get("id"),
+                at: row.get("at"),
+                kind: row.get("kind"),
+                payload: row.get::<Value, _>("payload"),
+            })
+            .collect())
+    }
+
     async fn balance_history(
         &self,
         login: u64,

@@ -1,310 +1,143 @@
-/* Console chrome: top bar and navigation rail (components/shell.tsx). */
-
-/* ---------- top bar ---------- */
-
+/* Console chrome. The brand anchors the rail; live state belongs to the
+ * workspace header. Every status remains reachable at narrow widths. */
 .shell-topbar {
   position: sticky;
   top: 0;
   z-index: 20;
   display: flex;
-  height: 60px;
+  min-height: var(--topbar-height);
   flex: 0 0 auto;
   align-items: center;
-  padding-right: 18px;
-  border-bottom: 1px solid var(--color-line-strong);
+  padding-right: 16px;
   background: var(--color-surface-0);
 }
-
-/* The rail's right edge runs up through the bar, so the wordmark sits on the
-   content column rather than floating over the navigation. */
-.shell-topbar::before {
-  content: "";
+.shell-brand {
+  display: flex;
+  width: var(--sidebar-width);
+  min-width: var(--sidebar-width);
   align-self: stretch;
-  flex: 0 0 134px;
-  border-right: 1px solid var(--color-line-strong);
+  align-items: center;
+  gap: 10px;
+  padding: 0 20px;
 }
-
+.shell-brand-mark { width: 22px; height: 22px; fill: var(--color-warn); }
 .shell-wordmark {
-  flex: 0 0 auto;
-  /* Clear of the status strip when a narrow window pushes the two together. */
-  margin: 0 32px 0 25px;
-  /* Avenir's tall ascender sits a line-height:1 box high; this centres the caps. */
-  padding-top: 4px;
   color: var(--color-ink);
-  font-size: 24px;
-  font-weight: 500;
-  letter-spacing: 0.38em;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.04em;
   line-height: 1;
-  text-transform: uppercase;
   white-space: nowrap;
 }
-
+.shell-workspace {
+  margin-left: 22px;
+  color: var(--color-ink-faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
 .shell-status {
   display: flex;
   min-width: 0;
   align-items: center;
   margin: 0 0 0 auto;
-  padding: 0;
+  padding: 0 0 0 20px;
   list-style: none;
-  /* On a window too narrow for every item the strip scrolls sideways; it
-     never wraps or widens the page. */
   overflow-x: auto;
   scrollbar-width: none;
 }
-
-.shell-status::-webkit-scrollbar {
-  display: none;
-}
-
+.shell-status::-webkit-scrollbar { display: none; }
 .shell-status-item {
   display: flex;
-  height: 26px;
+  min-height: 26px;
   flex: 0 0 auto;
   align-items: center;
-  gap: 9px;
-  padding: 0 18px;
-  color: var(--color-ink);
-  font-size: 13.5px;
+  gap: 7px;
+  padding: 0 12px;
+  color: var(--color-ink-muted);
+  font-size: 11px;
   font-weight: 500;
   line-height: 1;
   white-space: nowrap;
 }
-
-.shell-status-item + .shell-status-item {
-  border-left: 1px solid var(--color-line-strong);
-}
-
-.shell-status-item:first-child {
-  padding-left: 0;
-}
-
-.shell-status-item:last-child {
-  padding-right: 0;
-}
-
-.shell-status-item .dot {
-  width: 10px;
-  height: 10px;
-}
-
-.shell-actions {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 2px;
-  margin-left: 30px;
-}
-
-/* ---------- navigation rail ---------- */
+.shell-status-item + .shell-status-item { border-left: 1px solid var(--color-line); }
+.shell-status-item:first-child { padding-left: 0; color: var(--color-ink); }
+.shell-status-item:last-child { padding-right: 0; }
+.shell-status-item .dot { width: 6px; height: 6px; }
+.shell-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; margin-left: 18px; }
+.shell-actions .icon { width: 17px; height: 17px; }
 
 .shell-sidebar {
   position: sticky;
-  top: 60px;
+  top: var(--topbar-height);
   display: flex;
-  height: calc(100vh - 60px);
+  height: calc(100dvh - var(--topbar-height));
   min-height: 0;
   flex-direction: column;
   align-self: start;
   overflow-y: auto;
-  /* Items sit inset from both edges; the first one tops out level with the
-     page title beside it. */
-  padding: 10px 6px 24px;
-  border-right: 1px solid var(--color-line-strong);
+  padding: 12px 12px 24px;
   background: var(--color-surface-0);
 }
-
-.shell-nav {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  /* As a sideways strip it glides to a view opened from elsewhere. */
-  scroll-behavior: smooth;
-}
-
+.shell-nav { display: flex; flex-direction: column; gap: 3px; scroll-behavior: smooth; }
 .shell-nav-item {
+  position: relative;
   display: flex;
-  height: 40px;
+  min-height: 36px;
   width: 100%;
   flex: 0 0 auto;
   align-items: center;
   gap: 10px;
-  /* Even on both sides of the longest label, Diagnostics. */
-  padding: 0 9px;
+  padding: 0 10px;
   border-radius: 6px;
   color: var(--color-ink-muted);
-  font-size: 14px;
+  font-size: 12px;
   line-height: 1;
   text-align: left;
   white-space: nowrap;
-  transition: color 120ms ease, background-color 120ms ease;
 }
-
-/* Stroked to the weight of the label's stems. */
-.shell-nav-item .icon {
-  width: 18px;
-  height: 18px;
-  stroke-width: 1.75;
-}
-
-/* Touch screens keep :hover after a tap, so only a pointer gets the fill. */
+.shell-nav-item .icon { width: 16px; height: 16px; color: var(--color-ink-faint); stroke-width: 1.65; }
 @media (hover: hover) {
-  .shell-nav-item:hover {
-    background: var(--color-surface-3);
-    color: var(--color-ink);
-  }
+  .shell-nav-item:hover { background: var(--color-surface-2); color: var(--color-ink); }
 }
-
-/* Amber on its dim tint: the same active state as the range buttons. */
-.shell-nav-item[aria-current="page"] {
-  background: var(--color-warn-dim);
-  color: var(--color-warn);
-  font-weight: 500;
+.shell-nav-item[aria-current="page"] { background: var(--color-surface-2); color: var(--color-ink); font-weight: 600; }
+.shell-nav-item[aria-current="page"] .icon { color: var(--color-warn); }
+.shell-nav-item[aria-current="page"]::after {
+  content: "";
+  width: 4px;
+  height: 4px;
+  margin-left: auto;
+  border-radius: 50%;
+  background: var(--color-warn);
 }
+.shell-nav-item:focus-visible { border-radius: 6px; outline-offset: -2px; }
 
-/* The ring follows the item's corners rather than the global 4px. */
-.shell-nav-item:focus-visible {
-  border-radius: 6px;
-  outline-offset: 0;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .shell-nav {
-    scroll-behavior: auto;
-  }
-
-  .shell-nav-item {
-    transition: none;
-  }
-}
-
-/* ---------- medium: the status strip moves to a second row ---------- */
-
-/* Below this width the strip no longer fits beside the wordmark. A second row
-   keeps every indicator in view instead of scrolling the verdict away. */
+@media (max-width: 1400px) { .shell-workspace { display: none; } }
 @media (max-width: 1180px) {
+  .app { --topbar-height: 92px; }
   .shell-topbar {
     display: grid;
-    height: auto;
-    grid-template-areas:
-      "rail brand actions"
-      "rail status status";
-    grid-template-columns: 134px minmax(0, 1fr) auto;
+    grid-template-areas: "brand actions" "status status";
+    grid-template-columns: minmax(0, 1fr) auto;
     padding-right: 0;
   }
-
-  .shell-topbar::before {
-    grid-area: rail;
-  }
-
-  .shell-wordmark {
-    grid-area: brand;
-  }
-
-  .shell-actions {
-    grid-area: actions;
-    height: 60px;
-    margin: 0;
-    padding-right: 18px;
-  }
-
-  .shell-status {
-    grid-area: status;
-    height: 44px;
-    margin: 0;
-    padding-left: 25px;
-    border-top: 1px solid var(--color-line-soft);
-  }
-
-  .shell-status-item:last-child {
-    /* A scroller drops its own end padding, so the last item carries it. */
-    padding-right: 25px;
-  }
-
-  .shell-sidebar {
-    top: 105px;
-    height: calc(100vh - 105px);
-  }
+  .shell-brand { grid-area: brand; height: 52px; }
+  .shell-actions { grid-area: actions; height: 52px; margin: 0; padding-right: 14px; }
+  .shell-status { grid-area: status; min-height: 40px; margin: 0; padding-left: 22px; border-top: 1px solid var(--color-line-soft); }
+  .shell-status-item:last-child { padding-right: 22px; }
 }
-
-/* ---------- narrow: the rail becomes a tab strip under the bar ---------- */
-
 @media (max-width: 860px) {
-  .shell-topbar {
-    position: static;
-    grid-template-areas:
-      "brand actions"
-      "status status";
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-
-  .shell-topbar::before {
-    display: none;
-  }
-
-  .shell-actions {
-    height: 56px;
-    padding-right: 14px;
-  }
-
-  .shell-status-item {
-    padding: 0 14px;
-  }
-
-  .shell-sidebar {
-    position: static;
-    height: auto;
-    overflow: visible;
-    padding: 0;
-    border-right: 0;
-    border-bottom: 1px solid var(--color-line-strong);
-  }
-
-  /* The strip's edges line up with the content column below it. */
-  .shell-nav {
-    flex-direction: row;
-    overflow-x: auto;
-    padding: 6px 25px;
-    scroll-padding-inline: 25px;
-    scrollbar-width: none;
-  }
-
-  .shell-nav::-webkit-scrollbar {
-    display: none;
-  }
-
-  .shell-nav-item {
-    height: 36px;
-    width: auto;
-    gap: 8px;
-    padding: 0 12px;
-  }
+  .shell-topbar { position: static; }
+  .shell-sidebar { position: static; height: auto; overflow: visible; padding: 0; }
+  .shell-nav { flex-direction: row; overflow-x: auto; padding: 7px 20px 12px; scroll-padding-inline: 20px; scrollbar-width: none; }
+  .shell-nav::-webkit-scrollbar { display: none; }
+  .shell-nav-item { min-height: 36px; width: auto; gap: 7px; padding: 0 12px; }
+  .shell-nav-item[aria-current="page"]::after { display: none; }
 }
-
-/* ---------- phone: tighter gutters to match the content column ---------- */
-
 @media (max-width: 660px) {
-  .shell-wordmark {
-    margin-left: 16px;
-    padding-top: 3px;
-    font-size: 20px;
-  }
-
-  .shell-actions {
-    height: 52px;
-    padding-right: 6px;
-  }
-
-  .shell-status {
-    height: 42px;
-    padding-left: 16px;
-  }
-
-  .shell-status-item:last-child {
-    padding-right: 16px;
-  }
-
-  .shell-nav {
-    padding-inline: 16px;
-    scroll-padding-inline: 16px;
-  }
+  .shell-brand { padding-left: 16px; }
+  .shell-actions { padding-right: 6px; }
+  .shell-status { padding-left: 16px; }
+  .shell-status-item:last-child { padding-right: 16px; }
+  .shell-nav { padding-inline: 12px; scroll-padding-inline: 12px; }
 }
+@media (prefers-reduced-motion: reduce) { .shell-nav { scroll-behavior: auto; } }

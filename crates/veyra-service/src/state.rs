@@ -34,6 +34,12 @@ pub enum StateKey {
     RiskPolicy,
     /// Operator overrides layered over the environment for live settings.
     RuntimeConfig,
+    /// Encrypted model API credential; plaintext never enters this store.
+    ModelSecret,
+    /// Encrypted Codex subscription credential.
+    SubscriptionCodex,
+    /// Encrypted Claude Code subscription credential.
+    SubscriptionClaudeCode,
 }
 
 impl StateKey {
@@ -47,6 +53,9 @@ impl StateKey {
             Self::ProfitHarvest => "profit_harvest",
             Self::RiskPolicy => "risk_policy",
             Self::RuntimeConfig => "runtime_config",
+            Self::ModelSecret => "model_secret",
+            Self::SubscriptionCodex => "subscription_codex",
+            Self::SubscriptionClaudeCode => "subscription_claude_code",
         }
     }
 }
@@ -116,6 +125,29 @@ impl RuntimeState {
     /// Whether a store is attached.
     pub fn enabled(&self) -> bool {
         self.store.is_some()
+    }
+
+    /// Loads security-sensitive state without the best-effort fallback used
+    /// for operational counters. A failed read must not look like no secret.
+    ///
+    /// # Errors
+    /// Returns a storage error when persistence is unavailable or fails.
+    pub async fn load_required(&self, key: StateKey) -> Result<Option<Value>, StateError> {
+        let store = self.store.as_ref().ok_or_else(|| StateError::Storage {
+            reason: "persistence is unavailable".to_owned(),
+        })?;
+        store.load(key.as_str()).await
+    }
+
+    /// Persists security-sensitive state and reports failure to the caller.
+    ///
+    /// # Errors
+    /// Returns a storage error if the credential could not be saved.
+    pub async fn save_required(&self, key: StateKey, value: &Value) -> Result<(), StateError> {
+        let store = self.store.as_ref().ok_or_else(|| StateError::Storage {
+            reason: "persistence is unavailable".to_owned(),
+        })?;
+        store.save(key.as_str(), value).await
     }
 
     /// Loads one key; failures log and read as absent so startup continues on

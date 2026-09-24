@@ -10,10 +10,12 @@
 pub mod agent_runtime_engine;
 pub mod budget;
 pub mod settings;
+pub mod subscription_engine;
 
 pub use agent_runtime_engine::AgentRuntimeEngine;
 pub use budget::{BudgetPolicy, BudgetSnapshot, BudgetTracker, BudgetedEngine};
 pub use settings::{ApiKey, ModelSettings, TierModels};
+pub use subscription_engine::SubscriptionEngine;
 
 use std::fmt;
 use std::sync::Arc;
@@ -62,22 +64,66 @@ impl fmt::Display for ModelTier {
 /// Supported model provider implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelProvider {
-    /// OpenRouter (or any OpenAI-compatible endpoint configured the same way).
+    /// ChatGPT consumer subscription through the Codex protocol.
+    Codex,
+    /// Claude consumer subscription through the Claude Code protocol.
+    ClaudeCode,
+    /// OpenAI's hosted API.
+    OpenAi,
+    /// Anthropic's native messages API.
+    Anthropic,
+    /// OpenRouter's OpenAI-compatible gateway.
     OpenRouter,
+    /// Groq's OpenAI-compatible API.
+    Groq,
+    /// DeepSeek's OpenAI-compatible API.
+    DeepSeek,
+    /// xAI's OpenAI-compatible API.
+    Xai,
+    /// Mistral's OpenAI-compatible API.
+    Mistral,
+    /// Moonshot/Kimi's OpenAI-compatible API.
+    Kimi,
+    /// A local Ollama OpenAI-compatible API. Its API key is optional.
+    Ollama,
+    /// One explicitly configured OpenAI-compatible endpoint.
+    Custom,
 }
 
 impl ModelProvider {
     /// Short identifier used in configuration and status output.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude_code",
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
             Self::OpenRouter => "openrouter",
+            Self::Groq => "groq",
+            Self::DeepSeek => "deepseek",
+            Self::Xai => "xai",
+            Self::Mistral => "mistral",
+            Self::Kimi => "kimi",
+            Self::Ollama => "ollama",
+            Self::Custom => "custom",
         }
     }
 
     /// Parses a configuration value; unknown providers are rejected.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "codex" | "chatgpt_subscription" => Some(Self::Codex),
+            "claude_code" | "claude_subscription" => Some(Self::ClaudeCode),
+            "openai" => Some(Self::OpenAi),
+            "anthropic" | "claude" => Some(Self::Anthropic),
             "openrouter" => Some(Self::OpenRouter),
+            "groq" => Some(Self::Groq),
+            "deepseek" => Some(Self::DeepSeek),
+            "xai" | "grok" => Some(Self::Xai),
+            "mistral" => Some(Self::Mistral),
+            "kimi" | "moonshot" => Some(Self::Kimi),
+            "ollama" => Some(Self::Ollama),
+            "custom" | "openai-compatible" | "openai_compatible" => Some(Self::Custom),
             _ => None,
         }
     }
@@ -116,6 +162,44 @@ pub struct DecisionRequest {
 pub struct DecisionAnswer {
     /// Parsed JSON payload satisfying [`DecisionRequest::format`].
     pub value: Value,
+}
+
+/// Provider-neutral metadata for one tool the model may call.
+#[derive(Debug, Clone)]
+pub struct ReadOnlyToolDefinition {
+    /// Stable tool name sent to the provider.
+    pub name: String,
+    /// Human-readable description used for model tool selection.
+    pub description: String,
+    /// JSON Schema for the tool arguments.
+    pub input_schema: Value,
+}
+
+/// A model-directed observation tool.
+///
+/// Implementations must only inspect already-retained service state. They
+/// must not enqueue broker commands, mutate configuration, or place orders.
+#[async_trait]
+pub trait ReadOnlyTool: Send + Sync + 'static {
+    /// Returns the provider-neutral definition exposed to the model.
+    fn definition(&self) -> ReadOnlyToolDefinition;
+
+    /// Executes one validated observation request.
+    ///
+    /// Errors are returned as bounded, non-sensitive text and remain model
+    /// evidence rather than becoming execution authority.
+    async fn execute(&self, arguments: Value) -> Result<Value, String>;
+}
+
+/// Receives lifecycle notifications for model-directed read-only tools.
+#[async_trait]
+pub trait ToolProgressSink: Send {
+    /// Called immediately before an allowlisted tool executes.
+    async fn tool_started(&mut self, call_id: &str, name: &str, arguments: &Value);
+
+    /// Called after an allowlisted tool returns an observation or bounded
+    /// failure. `available` distinguishes a missing dependency from a result.
+    async fn tool_completed(&mut self, call_id: &str, name: &str, result: &Value, available: bool);
 }
 
 /// Errors raised while constructing or using a model provider.
@@ -160,6 +244,23 @@ pub trait DecisionEngine: Send + Sync + fmt::Debug + 'static {
     /// Returns [`ModelError::Request`] when the provider call fails or the
     /// response does not satisfy the requested schema.
     async fn answer(&self, request: DecisionRequest) -> Result<DecisionAnswer, ModelError>;
+
+    /// Runs a model-directed, read-only tool session and returns a natural
+    /// language answer in the standard `{"answer": ...}` envelope.
+    ///
+    /// Implementations that do not expose provider tool sessions fail closed;
+    /// callers must not silently fall back to execution-capable paths.
+    async fn answer_with_tools(
+        &self,
+        request: DecisionRequest,
+        tools: Vec<Arc<dyn ReadOnlyTool>>,
+        progress: &mut dyn ToolProgressSink,
+    ) -> Result<DecisionAnswer, ModelError> {
+        let _ = (request, tools, progress);
+        Err(ModelError::Request {
+            reason: "read-only tool sessions are unavailable".to_owned(),
+        })
+    }
 }
 
 /// Active model integration selected by configuration.
@@ -182,18 +283,43 @@ impl ModelRuntime {
     /// Returns [`ModelError::Construction`] when the provider rejects its
     /// configuration.
     pub fn from_settings(settings: ModelSettings) -> Result<Self, ModelError> {
-        match settings.provider() {
-            ModelProvider::OpenRouter => {
-                let engine = AgentRuntimeEngine::build(&settings)?;
-                let budget = Arc::new(BudgetTracker::new(*settings.budget()));
-                let engine = Arc::new(BudgetedEngine::new(Arc::new(engine), budget.clone()));
-                Ok(Self {
-                    provider: settings.provider(),
-                    engine,
-                    budget,
-                    tiers: settings.tiers().clone(),
-                })
-            }
+        if matches!(
+            settings.provider(),
+            ModelProvider::Codex | ModelProvider::ClaudeCode
+        ) {
+            return Err(ModelError::Construction {
+                reason: "subscription runtime needs its encrypted connection".to_owned(),
+            });
+        }
+        let engine = AgentRuntimeEngine::build(&settings)?;
+        Ok(Self::wrap_engine(&settings, Arc::new(engine)))
+    }
+
+    /// Builds an API or connected subscription provider from the same narrow
+    /// decision contract, preserving the call budget for both transports.
+    pub fn from_settings_with_app(
+        settings: ModelSettings,
+        app: &crate::AppState,
+    ) -> Result<Self, ModelError> {
+        let engine: Arc<dyn DecisionEngine> = if matches!(
+            settings.provider(),
+            ModelProvider::Codex | ModelProvider::ClaudeCode
+        ) {
+            Arc::new(SubscriptionEngine::build(&settings, app)?)
+        } else {
+            Arc::new(AgentRuntimeEngine::build(&settings)?)
+        };
+        Ok(Self::wrap_engine(&settings, engine))
+    }
+
+    fn wrap_engine(settings: &ModelSettings, engine: Arc<dyn DecisionEngine>) -> Self {
+        let budget = Arc::new(BudgetTracker::new(*settings.budget()));
+        let engine = Arc::new(BudgetedEngine::new(engine, budget.clone()));
+        Self {
+            provider: settings.provider(),
+            engine,
+            budget,
+            tiers: settings.tiers().clone(),
         }
     }
 
@@ -215,6 +341,19 @@ impl ModelRuntime {
     /// Domain-level engine contract used by the decision layer.
     pub fn engine(&self) -> Arc<dyn DecisionEngine> {
         self.engine.clone()
+    }
+
+    /// Runs a model-directed, read-only tool session through the configured
+    /// provider while preserving the call-budget wrapper.
+    pub async fn answer_with_tools(
+        &self,
+        request: DecisionRequest,
+        tools: Vec<Arc<dyn ReadOnlyTool>>,
+        progress: &mut dyn ToolProgressSink,
+    ) -> Result<DecisionAnswer, ModelError> {
+        self.engine
+            .answer_with_tools(request, tools, progress)
+            .await
     }
 
     /// The ordered candidate models for a tier: primary first, then the

@@ -2,6 +2,10 @@
 
 Veyra is the foundation for an autonomous, provider-neutral trading service built with Rust and Actix Web. It will orchestrate a configured LLM runtime, Jev-style structured decisions, broker execution, durable risk and reconciliation logic, and a web console.
 
+**New here?** [`GETTING_STARTED.md`](GETTING_STARTED.md) walks through
+everything from cloning the repository to a supervised, 24/7 install, one
+stage at a time and in plain language.
+
 ## Current status
 
 This repository contains the first tested, safe service slice:
@@ -84,6 +88,11 @@ See [`docs/architecture.md`](docs/architecture.md) and [`docs/roadmap.md`](docs/
 
 ## Runtime
 
+A fresh copy of `.env.example` does not start as-is: it enables the EA, model,
+and Jev sections without their secrets, and each fails closed. The
+[getting-started guide](GETTING_STARTED.md#42-fill-in-the-three-things-the-template-leaves-blank)
+lists the lines to fill in or clear.
+
 ```sh
 set -a; source .env; set +a
 cargo run -p veyra-service
@@ -127,12 +136,40 @@ Then inspect:
 
 ## Model configuration
 
-`VEYRA_MODEL_PROVIDER=openrouter` plus `VEYRA_MODEL_API_KEY` and three explicit
-tier models (`VEYRA_MODEL_FAST`, `VEYRA_MODEL_BALANCED`, `VEYRA_MODEL_REASONING`)
-enable structured decisions. Partial configuration fails closed at startup.
+Select OpenRouter, OpenAI, Anthropic, Groq, DeepSeek, xAI, Mistral,
+Moonshot/Kimi, Ollama, a connected ChatGPT/Claude subscription, or a custom
+OpenAI-compatible endpoint with
+`VEYRA_MODEL_PROVIDER`. Configure three explicit tier models
+(`VEYRA_MODEL_FAST`, `VEYRA_MODEL_BALANCED`, `VEYRA_MODEL_REASONING`). API
+providers require `VEYRA_MODEL_API_KEY`; Ollama and connected subscriptions do
+not. Partial configuration fails closed at startup. Custom providers require
+`VEYRA_MODEL_BASE_URL`.
 
-Tier models must accept forced tool calls — the structured path enforces the
-schema through `tool_choice`, so reasoning modes that reject it cannot be used.
+For console key entry, configure `VEYRA_CONSOLE_SECRET_KEY` (a base64-encoded
+32-byte random key), `VEYRA_CONSOLE_ADMIN_TOKEN` (at least 32 characters), and
+the database. The console asks for the operator token each time a key is saved
+or removed, sends it only with that request, and never displays the saved key.
+The service encrypts it before storage and does not include it in live settings
+or audit entries. Preserve the encryption key across restarts.
+
+The console assistant reads retained positions, account state, audit decisions,
+and model health. Its `/assistant/chat` stream shows each retrieval as it runs.
+The assistant has no order, close, or modify tool and cannot authorize a trade.
+
+ChatGPT and Claude consumer subscriptions are available through the console's
+**Subscription connections** section. Connect ChatGPT through Codex or Claude
+through Claude Code, then select the corresponding subscription provider and
+three model IDs in Model configuration. The browser sign-in callback is pasted
+back into the console to complete the PKCE exchange; the service encrypts the
+result in its runtime store. A connected account does not change the active
+model until the new settings are applied. The OpenAI and Anthropic API choices
+continue to use developer API credentials. Subscription credentials require
+the console vault and database described above, and provider access depends on
+the models available to the connected account.
+
+Tier models must support structured answers. `VEYRA_MODEL_COMPEL_STRUCTURED`
+selects forced tool choice when a provider supports it; turn it off for
+reasoning models that reject a forced choice.
 Live check:
 
 ```sh

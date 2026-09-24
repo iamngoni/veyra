@@ -17,7 +17,10 @@ use serde_json::Value;
 
 use async_trait::async_trait;
 
-use crate::model::{DecisionAnswer, DecisionEngine, DecisionRequest, ModelError, ModelProvider};
+use crate::model::{
+    DecisionAnswer, DecisionEngine, DecisionRequest, ModelError, ModelProvider, ReadOnlyTool,
+    ToolProgressSink,
+};
 
 const HOUR: Duration = Duration::from_secs(3_600);
 const DAY: Duration = Duration::from_secs(86_400);
@@ -291,6 +294,20 @@ impl DecisionEngine for BudgetedEngine {
                 reason: refusal.to_string(),
             })?;
         self.inner.answer(request).await
+    }
+
+    async fn answer_with_tools(
+        &self,
+        request: DecisionRequest,
+        tools: Vec<Arc<dyn ReadOnlyTool>>,
+        progress: &mut dyn ToolProgressSink,
+    ) -> Result<DecisionAnswer, ModelError> {
+        self.tracker
+            .admit()
+            .map_err(|refusal| ModelError::Request {
+                reason: refusal.to_string(),
+            })?;
+        self.inner.answer_with_tools(request, tools, progress).await
     }
 }
 

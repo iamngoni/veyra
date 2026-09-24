@@ -7,15 +7,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { ChartPanel, MARKET_BARS, type ChartMode, type MarketTimeframe, type PerformanceRange } from './chart'
+import { AssistantChat } from './chat'
 import { KpiRow, OpenPositions, PerformanceSummary } from './overview'
 import { AutopilotCard, RecentActivity, RiskControls } from './rail'
+import { LiveSettingsPanel } from './settings'
 import { Sidebar, Topbar, type NavTab } from './shell'
 import {
   AccountPanel,
   ActivityFeed,
   AutopilotPanel,
   CommandsPanel,
-  LiveSettingsPanel,
   LogsPanel,
   MetricsPanel,
   RiskPanel,
@@ -151,13 +152,17 @@ export function Dashboard() {
   return (
     // The overview is laid out to fit the window; the other views scroll.
     <div className={`app${tab === 'overview' ? ' is-fit' : ''}`}>
+      <a className="skip-link" href="#main-content">Skip to content</a>
       <Topbar status={status} theme={theme} onToggleTheme={toggle} onOpenSettings={() => setTab('settings')} />
 
       <div className="app-body">
         <Sidebar tabs={TABS} active={tab} onSelect={(id) => setTab(id as TabId)} />
 
-        <main className="app-main">
-          <h1 className="page-title">{TABS.find((item) => item.id === tab)?.label ?? 'Overview'}</h1>
+        <main className="app-main" id="main-content" tabIndex={-1}>
+          <header className="page-header">
+            <h1 className="page-title">{TABS.find((item) => item.id === tab)?.label ?? 'Overview'}</h1>
+            {tab === 'overview' ? <p className="page-description">Your account, activity, and execution controls.</p> : null}
+          </header>
 
           {tab === 'overview' ? (
             <div className="overview">
@@ -237,12 +242,15 @@ export function Dashboard() {
           {tab === 'settings' ? (
             <LiveSettingsPanel
               settings={liveConfig?.settings}
+              secretStatus={liveConfig?.secrets?.VEYRA_MODEL_API_KEY}
+              secretStore={liveConfig?.secret_store}
               onApply={applyConfig}
               onRefresh={() => void refetchConfig()}
             />
           ) : null}
         </main>
       </div>
+      <AssistantChat />
     </div>
   )
 }

@@ -17,7 +17,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px 16px;
-  padding: 15px 13px 0 18px;
+  padding: 14px 16px 0 18px;
 }
 
 .chart-title {
@@ -25,7 +25,7 @@
 }
 
 .chart-head .segmented {
-  gap: 8px;
+  gap: 2px;
 }
 
 /* ---------- view menu ---------- */
@@ -77,8 +77,8 @@
   padding: 4px;
   overflow-y: auto;
   border: 1px solid var(--color-line);
-  border-radius: 6px;
-  background: var(--color-surface-1);
+  border-radius: 8px;
+  background: var(--color-surface-2);
   box-shadow: 0 12px 28px -10px color-mix(in srgb, var(--color-surface-0) 85%, transparent);
 }
 
@@ -96,7 +96,7 @@
   padding: 6px 10px;
   border-radius: 4px;
   color: var(--color-ink-muted);
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 400;
   letter-spacing: 0;
   text-align: left;
@@ -123,10 +123,10 @@
   min-height: 26px;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 2px 18px;
-  padding: 8px 24px 0 18px;
-  font-size: 13px;
+  padding: 12px 18px 4px;
+  font-size: 11px;
   line-height: 18px;
 }
 
@@ -187,7 +187,7 @@
    token of their own: the faint ink at reduced strength reads in both themes. */
 .chart-axis line {
   stroke: var(--color-ink-faint);
-  stroke-opacity: 0.62;
+  stroke-opacity: 0.3;
   stroke-width: 1;
 }
 
@@ -307,8 +307,8 @@
   }
 
   .chart-head .segmented {
-    gap: 4px;
-    margin-left: -8px;
+    gap: 2px;
+    margin-left: 0;
   }
 
   .chart-stats {
@@ -323,3 +323,11 @@
     transition: none;
   }
 }
+
+.chart-menu-item:focus-visible { background: var(--color-surface-3); outline-offset: -2px; }
+.chart-menu-button { padding: 2px 4px; margin-left: -4px; }
+.chart-menu-button:hover { background: var(--color-surface-2); }
+.chart-menu-chevron { width: 15px; height: 15px; }
+.chart-svg:focus-visible { outline-offset: -4px; }
+.chart-cross { stroke-dasharray: 3 3; }
+.chart-tip { box-shadow: 0 4px 20px rgb(0 0 0 / 0.16); }

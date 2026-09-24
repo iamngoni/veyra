@@ -68,7 +68,13 @@ export function Topbar({
   const themeLabel = theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'
   return (
     <header className="shell-topbar">
-      <span className="shell-wordmark">Veyra</span>
+      <div className="shell-brand">
+        <svg className="shell-brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m3 5 9 15L21 5h-5l-4 7-4-7Z" />
+        </svg>
+        <span className="shell-wordmark">Veyra</span>
+      </div>
+      <span className="shell-workspace">Trading workspace</span>
       <ul className="shell-status" aria-label="System status">
         {indicators(status).map((item) => (
           <li key={item.id} className="shell-status-item" title={item.title}>

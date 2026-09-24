@@ -9,6 +9,7 @@ use tokio::time::MissedTickBehavior;
 use veyra_service::audit::{AuditEvent, AuditKind, AuditRuntime, AuditTrail};
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
 use veyra_service::calendar::{CalendarRuntime, CalendarSettings};
+use veyra_service::credential::CredentialVault;
 use veyra_service::jev::{JevRuntime, JevSettings};
 use veyra_service::logs::{self, LogBuffer};
 use veyra_service::market::{MarketRuntime, MarketSettings};
@@ -44,11 +45,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => (RuntimeState::disabled(), None),
     };
 
+    let vault = CredentialVault::from_env()?;
+    if vault.is_some() && !runtime_state.enabled() {
+        return Err("console credential storage requires VEYRA_DATABASE_URL".into());
+    }
+    let runtime_config = veyra_service::runtime_config::RuntimeConfig::new();
+    if let Some(vault) = &vault
+        && let Some(stored) = runtime_state.load_required(StateKey::ModelSecret).await?
+    {
+        runtime_config.set_model_key(vault.open(&stored)?);
+    }
+
     let broker = match BrokerSettings::from_env()? {
         Some(settings) => Some(BrokerRuntime::from_settings(settings)?),
         None => None,
     };
-    let model = match ModelSettings::from_env()? {
+    let model = match ModelSettings::from_source(runtime_config.source())? {
+        Some(settings)
+            if matches!(
+                settings.provider(),
+                veyra_service::model::ModelProvider::Codex
+                    | veyra_service::model::ModelProvider::ClaudeCode
+            ) =>
+        {
+            None
+        }
         Some(settings) => Some(ModelRuntime::from_settings(settings)?),
         None => None,
     };
@@ -96,6 +117,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = server::bind(&config)?;
     let state = AppState::new(config, broker, model, risk)
+        .with_runtime_config(runtime_config)
+        .with_credential_vault(vault)
         .with_market(market)
         .with_calendar(calendar)
         .with_autopilot(autopilot)
@@ -105,6 +128,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_audit(audit.as_ref().map(|runtime| (**runtime).clone()));
 
     // Counters and baselines resume before the first tick can move them.
+    restore_subscription_credentials(&state, &runtime_state).await;
+    // A subscription engine needs credentials from durable storage. Build it
+    // only after restoration, before the budget snapshot is resumed.
+    let pending = std::collections::BTreeMap::new();
+    if let Ok(staged) = veyra_service::runtime_config::validate(state.runtime_config(), &pending)
+        && let Err(error) = veyra_service::runtime_config::adopt(&state, staged)
+    {
+        tracing::warn!(%error, "model configuration remains unavailable at startup");
+    }
     restore_runtime_state(&state, &runtime_state).await;
 
     // A panic in a spawned task kills that task quietly: the autopilot can stop
@@ -256,6 +288,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn restore_subscription_credentials(state: &AppState, runtime: &RuntimeState) {
+    let Some(vault) = state.credential_vault() else {
+        return;
+    };
+    for provider in [
+        veyra_service::subscription_auth::SubscriptionProvider::Codex,
+        veyra_service::subscription_auth::SubscriptionProvider::ClaudeCode,
+    ] {
+        let key = match provider {
+            veyra_service::subscription_auth::SubscriptionProvider::Codex => {
+                StateKey::SubscriptionCodex
+            }
+            veyra_service::subscription_auth::SubscriptionProvider::ClaudeCode => {
+                StateKey::SubscriptionClaudeCode
+            }
+        };
+        let Some(stored) = runtime.load(key).await else {
+            continue;
+        };
+        let secret = match vault.open_text(&stored) {
+            Ok(Some(secret)) => secret,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    provider = provider.as_str(),
+                    %error,
+                    "stored subscription credential could not be opened"
+                );
+                continue;
+            }
+        };
+        match serde_json::from_str::<veyra_service::subscription_auth::SubscriptionCredential>(
+            &secret,
+        ) {
+            Ok(credential) => match credential.validate_for(provider) {
+                Ok(()) => state.subscription_auth().set_credential(credential),
+                Err(error) => tracing::warn!(
+                    provider = provider.as_str(),
+                    %error,
+                    "stored subscription credential is unusable"
+                ),
+            },
+            Err(error) => tracing::warn!(
+                provider = provider.as_str(),
+                %error,
+                "stored subscription credential is malformed"
+            ),
+        }
+    }
+}
+
 /// Restores durable counters and baselines. Unusable values log and fall back
 /// to in-memory defaults rather than blocking startup.
 async fn restore_runtime_state(state: &AppState, runtime: &RuntimeState) {
@@ -273,19 +356,28 @@ async fn restore_runtime_state(state: &AppState, runtime: &RuntimeState) {
                         settings = restored,
                         "resumed live settings saved by the console"
                     ),
-                    Err(error) => tracing::warn!(
-                        %error,
-                        "stored settings could not be applied; running on the environment baseline"
-                    ),
+                    Err(error) => {
+                        // The overlay remains selected even when its provider
+                        // cannot be rebuilt. Disable the engine rather than
+                        // silently making decisions with an older provider.
+                        state.set_model(None);
+                        tracing::warn!(
+                            %error,
+                            "stored settings could not be applied; model is disabled"
+                        );
+                    }
                 },
                 // A stored value this build no longer accepts must not stop the
                 // service from starting; the baseline is always valid.
-                Err(rejected) => tracing::warn!(
-                    field = %rejected.name,
-                    reason = %rejected.reason,
-                    overlay = %overlay,
-                    "stored settings are unusable; running on the environment baseline"
-                ),
+                Err(rejected) => {
+                    state.set_model(None);
+                    tracing::warn!(
+                        field = %rejected.name,
+                        reason = %rejected.reason,
+                        overlay = %overlay,
+                        "stored settings are unusable; model is disabled"
+                    );
+                }
             }
         }
     }

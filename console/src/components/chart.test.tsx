@@ -391,6 +391,49 @@ describe('ChartPanel · market', () => {
 })
 
 describe('ChartPanel · view menu', () => {
+  it('lets keyboard users inspect exact chart values and clears the readout on blur', () => {
+    renderChart({ mode: 'market', series: series([1.1, 1.2, 1.3]) })
+    fireEvent.focus(svg())
+    expect(tip()?.textContent).toContain('1.3')
+    fireEvent.keyDown(svg(), { key: 'ArrowLeft' })
+    expect(tip()?.textContent).toContain('1.2')
+    fireEvent.keyDown(svg(), { key: 'Home' })
+    expect(tip()?.textContent).toContain('1.1')
+    fireEvent.keyDown(svg(), { key: 'ArrowLeft' })
+    expect(tip()?.textContent).toContain('1.1')
+    fireEvent.keyDown(svg(), { key: 'End' })
+    expect(tip()?.textContent).toContain('1.3')
+    expect(document.querySelector('[aria-live="polite"]')?.textContent).toContain('1.3')
+    fireEvent.blur(svg())
+    expect(tip()).toBeNull()
+  })
+
+  it('opens from the keyboard and moves focus through the menu without selecting', () => {
+    const { onModeChange } = renderChart()
+    const button = screen.getByRole('button', { name: 'Performance' })
+    fireEvent.keyDown(button, { key: 'ArrowDown' })
+    const items = screen.getAllByRole('menuitemradio')
+    expect(document.activeElement).toBe(items[0])
+    fireEvent.keyDown(items[0], { key: 'ArrowUp' })
+    expect(document.activeElement).toBe(items[2])
+    fireEvent.keyDown(items[2], { key: 'Home' })
+    expect(document.activeElement).toBe(items[0])
+    fireEvent.keyDown(items[0], { key: 'End' })
+    expect(document.activeElement).toBe(items[2])
+    fireEvent.keyDown(items[2], { key: 'ArrowDown' })
+    expect(document.activeElement).toBe(items[0])
+    expect(onModeChange).not.toHaveBeenCalled()
+  })
+
+  it('dismisses when focus moves outside the menu', () => {
+    renderChart()
+    fireEvent.click(screen.getByRole('button', { name: 'Performance' }))
+    const next = screen.getByRole('button', { name: '7D' })
+    act(() => next.focus())
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(document.activeElement).toBe(next)
+  })
+
   it('opens a menu of views with the current one checked', () => {
     renderChart({ trades: growthTrades, balance: 37 })
     const button = screen.getByRole('button', { name: 'Performance' })

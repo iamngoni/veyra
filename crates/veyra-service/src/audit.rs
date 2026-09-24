@@ -163,6 +163,26 @@ pub trait AuditTrail: Send + Sync + fmt::Debug + 'static {
     /// Returns [`AuditError`] when the store is unavailable.
     async fn recent(&self, limit: u32) -> Result<Vec<AuditRow>, AuditError>;
 
+    /// Returns recent decision and position events, newest first. A busy EA
+    /// emits many command acknowledgements between position reviews, so a
+    /// general recent page cannot establish the latest holding rationale.
+    ///
+    /// # Errors
+    /// Returns [`AuditError`] when the trail cannot be read.
+    async fn recent_decisions(&self, limit: u32) -> Result<Vec<AuditRow>, AuditError> {
+        let rows = self.recent(10_000).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.kind.as_str(),
+                    "proposal_evaluated" | "position_closed" | "command_failed"
+                )
+            })
+            .take(limit as usize)
+            .collect())
+    }
+
     /// Reads actual balance observations for exactly one account, oldest first.
     ///
     /// # Errors
@@ -654,6 +674,27 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind, "broker_snapshot");
         assert_eq!(rows[1].payload["command_id"], "abc");
+    }
+
+    #[actix_web::test]
+    async fn decision_history_survives_a_burst_of_command_acknowledgements() {
+        let trail = MemoryTrail::default();
+        trail
+            .record(AuditEvent::new(
+                AuditKind::ProposalEvaluated,
+                json!({"outcome": "held", "rationale": "The bracket remains valid."}),
+            ))
+            .await
+            .expect("record hold");
+        for _ in 0..250 {
+            trail
+                .record(AuditEvent::new(AuditKind::CommandCompleted, json!({})))
+                .await
+                .expect("record acknowledgement");
+        }
+        let rows = trail.recent_decisions(35).await.expect("read decisions");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].payload["outcome"], "held");
     }
 
     #[actix_web::test]

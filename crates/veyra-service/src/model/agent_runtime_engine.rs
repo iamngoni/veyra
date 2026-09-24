@@ -9,15 +9,23 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use agent_runtime::{
-    Agent as RuntimeAgent, AgentProviderKind, Llm, ModelTiers, ProviderError, ResponseFormat,
-    RetryPolicy,
+    Agent as RuntimeAgent, AgentProviderKind, ChatMessage, EventSink, Llm, ModelTiers,
+    ProviderError, ResponseFormat, RetryPolicy, RuntimeEvent, Tool, ToolCall, ToolDefinition,
+    ToolOutput, ToolRegistry, ToolSessionOutcome,
 };
 use async_trait::async_trait;
+use serde_json::json;
 
 use crate::model::settings::{ModelSettings, TierModels};
 use crate::model::{
     DecisionAnswer, DecisionEngine, DecisionRequest, ModelError, ModelProvider, ModelTier,
+    ReadOnlyTool, ReadOnlyToolDefinition, ToolProgressSink,
 };
+
+/// Maximum serialized observation returned to a model-directed tool session.
+/// This bounds prompt growth when a broker reports a large position book or
+/// an audit backend returns unexpectedly verbose payloads.
+const MAX_TOOL_RESULT_CHARS: usize = 12_000;
 
 /// Structured-decision adapter over `agent-runtime`.
 pub struct AgentRuntimeEngine {
@@ -46,6 +54,79 @@ impl fmt::Debug for AgentRuntimeEngine {
 struct InlineAgent {
     instructions: String,
     model: String,
+}
+
+/// Adapts a provider-neutral observation tool to agent-runtime's tool trait.
+/// Tool failures become bounded JSON observations so the model can explain
+/// stale or unavailable state without retrying through an execution path.
+pub(crate) struct RuntimeReadOnlyTool {
+    pub(crate) tool: Arc<dyn ReadOnlyTool>,
+    pub(crate) definition: ToolDefinition,
+}
+
+#[async_trait]
+impl Tool<()> for RuntimeReadOnlyTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(&self, _context: (), call: &ToolCall) -> anyhow::Result<ToolOutput> {
+        let content = match self.tool.execute(call.arguments.clone()).await {
+            Ok(value) => value,
+            Err(reason) => json!({ "available": false, "reason": reason }),
+        };
+        let content = match serde_json::to_string(&content) {
+            Ok(serialized) if serialized.chars().count() <= MAX_TOOL_RESULT_CHARS => content,
+            Ok(_) => json!({
+                "available": false,
+                "reason": "tool_result_too_large",
+                "max_chars": MAX_TOOL_RESULT_CHARS,
+            }),
+            Err(_) => json!({
+                "available": false,
+                "reason": "tool_result_not_serializable",
+            }),
+        };
+        Ok(ToolOutput { content })
+    }
+}
+
+/// Bridges agent-runtime lifecycle events to the service's SSE-facing sink.
+pub(crate) struct RuntimeProgress<'a> {
+    pub(crate) sink: &'a mut dyn ToolProgressSink,
+}
+
+#[async_trait]
+impl EventSink for RuntimeProgress<'_> {
+    async fn emit(&mut self, event: RuntimeEvent) -> anyhow::Result<()> {
+        match event {
+            RuntimeEvent::ToolStarted { call } => {
+                self.sink
+                    .tool_started(&call.id, &call.name, &call.arguments)
+                    .await;
+            }
+            RuntimeEvent::ToolCompleted { call, output } => {
+                let available = output
+                    .content
+                    .get("available")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                self.sink
+                    .tool_completed(&call.id, &call.name, &output.content, available)
+                    .await;
+            }
+            RuntimeEvent::AssistantStarted { .. } | RuntimeEvent::AssistantDelta { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn runtime_definition(definition: ReadOnlyToolDefinition) -> ToolDefinition {
+    ToolDefinition {
+        name: definition.name,
+        description: definition.description,
+        input_schema: definition.input_schema,
+    }
 }
 
 impl RuntimeAgent for InlineAgent {
@@ -79,12 +160,29 @@ impl AgentRuntimeEngine {
         client: Option<agent_runtime::SharedHttpClient>,
     ) -> Result<Self, ModelError> {
         let kind = match settings.provider() {
+            ModelProvider::Codex | ModelProvider::ClaudeCode => {
+                return Err(ModelError::Construction {
+                    reason: "subscription provider requires subscription runtime".to_owned(),
+                });
+            }
+            ModelProvider::OpenAi => AgentProviderKind::OpenAi,
+            ModelProvider::Anthropic => AgentProviderKind::Anthropic,
             ModelProvider::OpenRouter => AgentProviderKind::OpenRouter,
+            ModelProvider::Groq => AgentProviderKind::Groq,
+            ModelProvider::DeepSeek => AgentProviderKind::DeepSeek,
+            ModelProvider::Xai => AgentProviderKind::Xai,
+            ModelProvider::Mistral => AgentProviderKind::Mistral,
+            ModelProvider::Kimi => AgentProviderKind::Kimi,
+            ModelProvider::Ollama => AgentProviderKind::Ollama,
+            ModelProvider::Custom => AgentProviderKind::Custom("custom".to_owned()),
         };
 
         let mut builder = Llm::builder()
             .provider(kind)
-            .api_key(settings.api_key().expose());
+            // agent-runtime requires a string at construction time. Ollama
+            // ignores this header and is the only provider accepted without a
+            // configured key; hosted providers were checked by settings.
+            .api_key(settings.api_key().map_or("", |key| key.expose()));
 
         if let Some(base_url) = settings.base_url() {
             builder = builder.base_url(base_url);
@@ -110,7 +208,9 @@ impl AgentRuntimeEngine {
         // Attribution is keyed on the URL: the provider creates no app entry
         // without it, so the title and visibility headers only carry meaning
         // when it is present.
-        if let Some(referer) = settings.http_referer() {
+        if settings.provider() == ModelProvider::OpenRouter
+            && let Some(referer) = settings.http_referer()
+        {
             builder = builder.header("HTTP-Referer", referer);
             if let Some(title) = settings.app_title() {
                 builder = builder.header("X-OpenRouter-Title", title);
@@ -212,6 +312,60 @@ impl DecisionEngine for AgentRuntimeEngine {
 
     fn last_successful_model(&self) -> Option<String> {
         Self::remembered(&self.last_successful_model)
+    }
+
+    async fn answer_with_tools(
+        &self,
+        request: DecisionRequest,
+        tools: Vec<Arc<dyn ReadOnlyTool>>,
+        progress: &mut dyn ToolProgressSink,
+    ) -> Result<DecisionAnswer, ModelError> {
+        if tools.is_empty() {
+            return self.answer(request).await;
+        }
+
+        let model = self.tiers.resolve(request.tier).to_owned();
+        Self::remember(&self.last_attempted_model, &model);
+        let mut registry = ToolRegistry::new();
+        for tool in tools {
+            let definition = runtime_definition(tool.definition());
+            registry.register(RuntimeReadOnlyTool { tool, definition });
+        }
+
+        let mut runtime_progress = RuntimeProgress { sink: progress };
+        let history = [ChatMessage::user(request.input)];
+        let outcome = self
+            .llm
+            .execute_tool_session(
+                agent_runtime::ToolSessionRequest {
+                    model: &model,
+                    decision_system_prompt: &request.instructions,
+                    followup_system_prompt: &request.instructions,
+                    history: &history,
+                    tool_registry: &registry,
+                    tool_context: (),
+                    max_tool_calls: 8,
+                },
+                &mut runtime_progress,
+            )
+            .await
+            .map_err(|error| ModelError::Request {
+                reason: safe_failure_reason(&error),
+            })?;
+
+        let message = match outcome {
+            ToolSessionOutcome::Direct { message, .. }
+            | ToolSessionOutcome::ToolBacked { message, .. } => message,
+        };
+        if message.trim().is_empty() {
+            return Err(ModelError::Request {
+                reason: "provider returned an empty tool-session answer".to_owned(),
+            });
+        }
+        Self::remember(&self.last_successful_model, &model);
+        Ok(DecisionAnswer {
+            value: json!({ "answer": message }),
+        })
     }
 
     async fn answer(&self, request: DecisionRequest) -> Result<DecisionAnswer, ModelError> {
@@ -533,6 +687,67 @@ mod tests {
         assert!(debug.contains("AgentRuntimeEngine"), "debug: {debug}");
         assert!(debug.contains("OpenRouter"), "debug: {debug}");
         assert!(!debug.contains("test-key-12345678"), "debug: {debug}");
+    }
+
+    #[test]
+    fn provider_selection_maps_to_agent_runtime_without_vendor_model_fallbacks() {
+        for (raw, expected) in [
+            ("openai", AgentProviderKind::OpenAi),
+            ("anthropic", AgentProviderKind::Anthropic),
+            ("openrouter", AgentProviderKind::OpenRouter),
+            ("groq", AgentProviderKind::Groq),
+            ("deepseek", AgentProviderKind::DeepSeek),
+            ("xai", AgentProviderKind::Xai),
+            ("mistral", AgentProviderKind::Mistral),
+            ("kimi", AgentProviderKind::Kimi),
+            ("ollama", AgentProviderKind::Ollama),
+        ] {
+            let (fast, balanced, reasoning) = if raw == "openrouter" {
+                (
+                    "vendor/native-fast",
+                    "vendor/native-balanced",
+                    "vendor/native-reasoning",
+                )
+            } else {
+                ("native-fast", "native-balanced", "native-reasoning")
+            };
+            let settings = ModelSettings::from_source(|name| {
+                Ok(match name {
+                    "VEYRA_MODEL_PROVIDER" => raw,
+                    "VEYRA_MODEL_API_KEY" => "test-key-12345678",
+                    "VEYRA_MODEL_FAST" => fast,
+                    "VEYRA_MODEL_BALANCED" => balanced,
+                    "VEYRA_MODEL_REASONING" => reasoning,
+                    _ => return Err(ConfigError::MissingEnvironmentVariable { name }),
+                }
+                .to_owned())
+            })
+            .expect("settings parse")
+            .expect("model configured");
+            let engine =
+                AgentRuntimeEngine::build_with_client(&settings, None).expect("engine builds");
+            assert_eq!(engine.llm.provider_kind(), expected);
+        }
+
+        let settings = ModelSettings::from_source(|name| {
+            Ok(match name {
+                "VEYRA_MODEL_PROVIDER" => "custom",
+                "VEYRA_MODEL_API_KEY" => "test-key-12345678",
+                "VEYRA_MODEL_BASE_URL" => "https://llm.example.test/v1",
+                "VEYRA_MODEL_FAST" | "VEYRA_MODEL_BALANCED" | "VEYRA_MODEL_REASONING" => {
+                    "native-model"
+                }
+                _ => return Err(ConfigError::MissingEnvironmentVariable { name }),
+            }
+            .to_owned())
+        })
+        .expect("settings parse")
+        .expect("model configured");
+        let engine = AgentRuntimeEngine::build_with_client(&settings, None).expect("build");
+        assert_eq!(
+            engine.llm.provider_kind(),
+            AgentProviderKind::Custom("custom".to_owned())
+        );
     }
 
     #[actix_web::test]

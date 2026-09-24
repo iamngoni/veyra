@@ -13,14 +13,14 @@
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  font-size: 11px;
   line-height: 20px;
   white-space: nowrap;
 }
 
 .ap-state .dot {
-  width: 12px;
-  height: 12px;
+  width: 6px;
+  height: 6px;
 }
 
 .ap-rows {
@@ -30,7 +30,8 @@
 
 .ap-row {
   display: grid;
-  grid-template-columns: 110px minmax(0, 1fr);
+  grid-template-columns: 88px minmax(0, 1fr);
+  column-gap: 8px;
   align-items: baseline;
   padding: 12px 0 9px;
   border-top: 1px solid var(--color-line);
@@ -43,7 +44,7 @@
 
 .ap-row dt {
   color: var(--color-ink-muted);
-  font-size: 14px;
+  font-size: 12px;
   line-height: 20px;
 }
 
@@ -53,7 +54,7 @@
   flex-direction: column;
   margin: 0;
   color: var(--color-ink);
-  font-size: 14px;
+  font-size: 12px;
   line-height: 20px;
 }
 
@@ -96,8 +97,8 @@
 .act-row {
   display: grid;
   /* Time, the timeline rule, the state dot, then the text. */
-  grid-template-columns: 56px 37px minmax(0, 1fr);
-  padding: 15px 0 14px;
+  grid-template-columns: 42px 24px minmax(0, 1fr);
+  padding: 13px 0;
   border-top: 1px solid var(--color-line);
 }
 
@@ -106,9 +107,9 @@
 }
 
 .act-time {
-  border-right: 1px solid var(--color-line);
+
   color: var(--color-ink-muted);
-  font-size: 14px;
+  font-size: 12px;
   line-height: 22px;
 }
 
@@ -116,12 +117,12 @@
   display: flex;
   height: 22px;
   align-items: center;
-  padding-left: 10px;
+  padding-left: 7px;
 }
 
 .act-mark .dot {
-  width: 12px;
-  height: 12px;
+  width: 6px;
+  height: 6px;
 }
 
 .act-text {
@@ -132,7 +133,8 @@
   margin: 0;
   overflow: hidden;
   color: var(--color-ink);
-  font-size: 15px;
+  font-size: 12px;
+  font-weight: 500;
   line-height: 22px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -143,7 +145,7 @@
   margin: 2px 0 0;
   overflow: hidden;
   color: var(--color-ink-muted);
-  font-size: 13.5px;
+  font-size: 11px;
   line-height: 19px;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
@@ -163,7 +165,7 @@
 }
 
 .rc-row {
-  padding: 16px 0 17px;
+  padding: 14px 0;
   border-top: 1px solid var(--color-line);
 }
 
@@ -185,7 +187,7 @@
   gap: 6px;
   margin: 0;
   color: var(--color-ink);
-  font-size: 16px;
+  font-size: 12px;
   font-weight: 500;
   line-height: 22px;
 }
@@ -199,10 +201,10 @@
 }
 
 .rc-desc {
-  margin: 7px 0 0;
+  margin: 5px 0 0;
   color: var(--color-ink-muted);
-  font-size: 14px;
-  line-height: 21px;
+  font-size: 12px;
+  line-height: 19px;
   text-wrap: pretty;
 }
 
@@ -239,7 +241,7 @@
 
 .rc-cancel,
 .rc-apply {
-  min-height: 28px;
+  min-height: 32px;
   padding: 0 6px;
   border-radius: 4px;
   font-size: 13px;
@@ -285,3 +287,10 @@
   font-size: 13px;
   line-height: 18px;
 }
+
+.ap-state { padding: 0 6px; border: 1px solid var(--color-line); border-radius: 4px; }
+.ap-row { border-color: var(--color-line-soft); }
+.ap-note { overflow-wrap: anywhere; }
+.rc-title .hint-mark .icon { width: 15px !important; height: 15px !important; }
+.rc-confirm { border: 1px solid var(--color-line-strong); }
+.act-title { overflow-wrap: anywhere; }
