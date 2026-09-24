@@ -48,7 +48,11 @@ impl<'a> Args<'a> {
     }
 
     fn get(&self, name: &str) -> Option<&'a Value> {
-        self.object.get(name).filter(|value| !value.is_null())
+        // Models often send `null` or `""` for an optional argument they mean
+        // to leave unset; both read as absent rather than as a bad value.
+        self.object.get(name).filter(|value| {
+            !value.is_null() && !value.as_str().is_some_and(|text| text.trim().is_empty())
+        })
     }
 
     /// Optional integer within `min..=max`.
@@ -296,5 +300,14 @@ mod tests {
         let args = Args::new("decision_history", &typed, &["kinds", "days"]).expect("keys");
         assert!(args.text_list("kinds", 2).is_err(), "not a list");
         assert!(args.days().is_err(), "not an integer");
+    }
+    #[test]
+    fn blank_and_null_optional_arguments_read_as_absent() {
+        let blank = json!({"symbol": "", "since": "  ", "outcome": null});
+        let args =
+            Args::new("closed_trades", &blank, &["symbol", "since", "outcome"]).expect("keys");
+        assert!(args.symbol().expect("blank symbol is absent").is_none());
+        assert!(args.text("since").expect("blank text is absent").is_none());
+        assert!(args.text("outcome").expect("null is absent").is_none());
     }
 }
