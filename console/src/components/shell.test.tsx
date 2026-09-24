@@ -4,7 +4,7 @@
  */
 
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { AutopilotStatus, Status } from '../lib/api'
 import { Sidebar, Topbar, type NavTab } from './shell'
@@ -209,6 +209,65 @@ describe('Sidebar', () => {
     const { container } = render(<Sidebar tabs={tabs} active="overview" onSelect={() => {}} />)
     expect(screen.queryByRole('img')).toBeNull()
     expect(container.querySelectorAll('.shell-sidebar > *')).toHaveLength(1)
+  })
+
+  it('draws every view icon as a stroked outline, never a filled shape', () => {
+    const all: ReadonlyArray<NavTab> = [
+      ...tabs,
+      { id: 'risk', label: 'Risk', icon: 'risk' },
+      { id: 'trace', label: 'Trace', icon: 'trace' },
+      { id: 'diagnostics', label: 'Diagnostics', icon: 'diagnostics' },
+    ]
+    const { container } = render(<Sidebar tabs={all} active="overview" onSelect={() => {}} />)
+    const icons = container.querySelectorAll('.shell-nav-item svg.icon')
+    expect(icons).toHaveLength(6)
+    for (const icon of icons) {
+      expect(icon.children.length).toBeGreaterThan(0)
+      expect(icon.querySelector('[fill], [stroke]')).toBeNull()
+    }
+  })
+})
+
+describe('Sidebar as a sideways strip', () => {
+  const scrollIntoView = vi.fn()
+  let overflow = 0
+
+  beforeEach(() => {
+    overflow = 0
+    scrollIntoView.mockClear()
+    // jsdom has no layout: fake the strip's widths and the scroll call.
+    Object.defineProperty(HTMLElement.prototype, 'scrollWidth', { configurable: true, get: () => 300 + overflow })
+    Object.defineProperty(HTMLElement.prototype, 'clientWidth', { configurable: true, get: () => 300 })
+    Element.prototype.scrollIntoView = scrollIntoView
+  })
+
+  afterEach(() => {
+    delete (HTMLElement.prototype as { scrollWidth?: number }).scrollWidth
+    delete (HTMLElement.prototype as { clientWidth?: number }).clientWidth
+    delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView
+  })
+
+  it('scrolls a view opened from elsewhere into sight', () => {
+    overflow = 200
+    const { rerender } = render(<Sidebar tabs={tabs} active="overview" onSelect={() => {}} />)
+    scrollIntoView.mockClear()
+    rerender(<Sidebar tabs={tabs} active="settings" onSelect={() => {}} />)
+    expect(scrollIntoView).toHaveBeenCalledTimes(1)
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest' })
+    expect(scrollIntoView.mock.contexts[0]).toBe(screen.getByRole('button', { name: 'Settings' }))
+  })
+
+  it('leaves the rail alone when every view already fits', () => {
+    const { rerender } = render(<Sidebar tabs={tabs} active="overview" onSelect={() => {}} />)
+    rerender(<Sidebar tabs={tabs} active="settings" onSelect={() => {}} />)
+    expect(scrollIntoView).not.toHaveBeenCalled()
+  })
+
+  it('scrolls nothing when no view is current', () => {
+    overflow = 200
+    render(<Sidebar tabs={tabs} active="missing" onSelect={() => {}} />)
+    expect(screen.getByRole('navigation', { name: 'Main' }).querySelector('[aria-current]')).toBeNull()
+    expect(scrollIntoView).not.toHaveBeenCalled()
   })
 })
 

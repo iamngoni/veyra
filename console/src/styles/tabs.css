@@ -569,10 +569,24 @@
   font-size: 13px;
 }
 
-.tab-control-head label {
+/* The label and its info mark stay together on the left; a long label
+   shortens rather than pushing the mark or the aside onto another line. */
+.tab-control-label {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.tab-control-name {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.tab-control-label .hint {
+  flex: 0 0 auto;
 }
 
 .tab-control-aside {
@@ -684,6 +698,31 @@
   gap: 16px 20px;
 }
 
+/* A setting's help opens above its head and always grows away from the panel
+   edge nearest it: a left-column tip starts at the label and runs right, over
+   the gutter; a right-column tip ends at the mark and runs left. Neither can
+   pass the panel's right edge however long the label or narrow the column. */
+.tab-group-fields .tab-control-head {
+  position: relative;
+}
+
+.tab-group-fields .tab-control-head .hint {
+  position: static;
+}
+
+.tab-group-fields .hint-tip {
+  left: 0;
+}
+
+.tab-group-fields > .tab-control:nth-child(even) .tab-control-head .hint {
+  position: relative;
+}
+
+.tab-group-fields > .tab-control:nth-child(even) .hint-tip {
+  right: -10px;
+  left: auto;
+}
+
 /* Pinned to the viewport's bottom edge while the panel is in view, so a
    change made far down the list is applied without scrolling back. */
 .tab-settings-foot {
@@ -750,6 +789,18 @@
   .tab-form,
   .tab-group-fields {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* One column: every tip starts at the field's left edge and fits it. */
+  .tab-group-fields > .tab-control:nth-child(even) .tab-control-head .hint {
+    position: static;
+  }
+
+  .tab-group-fields .hint-tip,
+  .tab-group-fields > .tab-control:nth-child(even) .hint-tip {
+    right: auto;
+    left: 0;
+    max-width: min(280px, 100%);
   }
 
   .tab-control.is-span,

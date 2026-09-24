@@ -558,21 +558,29 @@ function ViewMenu({ current, items }: { current: ReactNode; items: MenuItem[] })
   )
 }
 
-/** Measured content width of the plot container, following resizes. */
-function useWidth() {
+/**
+ * Measured size of the plot container, following resizes. The stylesheet
+ * owns the box: a fixed height by default, the space left over where the
+ * overview fills the window. Unmeasured (a test DOM), the width falls back
+ * and the height is reported as zero.
+ */
+function useSize() {
   const ref = useRef<HTMLDivElement>(null)
-  const [width, setWidth] = useState(0)
+  const [size, setSize] = useState({ width: 0, height: 0 })
   useLayoutEffect(() => {
     const element = ref.current!
-    const measure = () => setWidth(element.clientWidth)
+    const measure = () => setSize({ width: element.clientWidth, height: element.clientHeight })
     measure()
     if (typeof ResizeObserver === 'undefined') return
     const observer = new ResizeObserver(measure)
     observer.observe(element)
     return () => observer.disconnect()
   }, [])
-  return { ref, width: width || FALLBACK_WIDTH }
+  return { ref, width: size.width || FALLBACK_WIDTH, height: size.height }
 }
+
+/** Shortest plot drawn from a measured box; below it the default applies. */
+const MIN_PLOT_HEIGHT = 120
 
 /**
  * The overview chart panel. Performance (balance growth from closed Veyra
@@ -604,8 +612,8 @@ export function ChartPanel(props: {
   now?: number
 }) {
   const { mode, series, onModeChange } = props
-  const { ref, width } = useWidth()
-  const height = width < NARROW ? 200 : 252
+  const { ref, width, height: box } = useSize()
+  const height = box - AXIS_BAND >= MIN_PLOT_HEIGHT ? box - AXIS_BAND : width < NARROW ? 200 : 252
   const view = mode === 'performance' ? performanceView(props, props.now ?? Date.now()) : marketView(props)
 
   const shown = props.symbol ?? series?.symbol
@@ -648,7 +656,7 @@ export function ChartPanel(props: {
       <div className="chart-stats">
         {view.state === 'ready' ? view.stats : view.state === 'loading' ? <Skeleton width={300} height={14} /> : null}
       </div>
-      <div className="chart-plot" ref={ref} style={{ height: height + AXIS_BAND }}>
+      <div className="chart-plot" ref={ref}>
         {view.state === 'ready' ? (
           <LinePlot key={mode} spec={view.plot} width={width} height={height} />
         ) : view.state === 'loading' ? (

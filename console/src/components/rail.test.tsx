@@ -206,9 +206,12 @@ const trade = (ticket: number, closeMs: number, fields: Partial<ClosedTrade> = {
   ...fields,
 })
 
-/** The rendered rows as `time | title | detail`, top to bottom. */
+/**
+ * The preview rows as `time | title | detail`, top to bottom. Up to six rows
+ * are rendered for layouts with room; the stylesheet shows the first three.
+ */
 const digest = (container: HTMLElement) =>
-  [...container.querySelectorAll('.act-row')].map((row) =>
+  [...container.querySelectorAll('.act-row')].slice(0, 3).map((row) =>
     [row.querySelector('time')?.textContent, row.querySelector('.act-title')?.textContent, row.querySelector('.act-detail')?.textContent ?? '']
       .join(' | ')
       .trim(),
@@ -240,7 +243,8 @@ describe('RecentActivity', () => {
     const { container } = render(<RecentActivity events={events} connected onViewAll={vi.fn()} />)
 
     const rows = container.querySelectorAll('.act-row')
-    expect(rows).toHaveLength(3)
+    // Every event that matters is offered; the layout decides how many show.
+    expect(rows).toHaveLength(4)
     const [first, second, third] = [...rows] as HTMLElement[]
 
     expect(within(first).getByText('17:56').getAttribute('dateTime')).toBe(new Date(at(17, 56)).toISOString())
@@ -257,7 +261,8 @@ describe('RecentActivity', () => {
     expect(within(third).getByText('Command failed')).toBeTruthy()
     expect(third.querySelector('.dot.is-bad')).toBeTruthy()
 
-    expect(screen.queryByText('older than the preview')).toBeNull()
+    // The fourth is rendered for taller layouts; the preview is the first three.
+    expect(within(rows[3] as HTMLElement).getByText('older than the preview')).toBeTruthy()
     expect(screen.queryByText('Reconnecting')).toBeNull()
   })
 
@@ -314,7 +319,7 @@ describe('RecentActivity', () => {
       '17:56 | No trade | EURUSD — flat market',
       '14:05 | Position closed | USDJPY Long 0.10 · −1.50',
     ])
-    const dots = [...container.querySelectorAll('.act-row .dot')].map((dot) => dot.className)
+    const dots = [...container.querySelectorAll('.act-row .dot')].slice(0, 3).map((dot) => dot.className)
     expect(dots).toEqual(['dot is-ok', 'dot is-idle', 'dot is-bad'])
     const [first] = [...container.querySelectorAll('.act-row time')]
     expect(first.getAttribute('dateTime')).toBe(new Date(at(18, 30)).toISOString())
@@ -394,6 +399,96 @@ describe('RecentActivity', () => {
   })
 })
 
+describe('RecentActivity row fit', () => {
+  const originals = {
+    clientHeight: Object.getOwnPropertyDescriptor(Element.prototype, 'clientHeight')!,
+    offsetHeight: Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight')!,
+    offsetTop: Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetTop')!,
+  }
+  /** Lays the list out as `listHeight` tall with rows of `rowHeight`, the first `shown` of them displayed. */
+  const layout = (listHeight: number, rowHeight: number, shown = Infinity) => {
+    const index = (element: Element) => Array.from(element.parentElement?.children ?? []).indexOf(element)
+    Object.defineProperty(Element.prototype, 'clientHeight', {
+      configurable: true,
+      get() {
+        return (this as Element).classList.contains('act-list') ? listHeight : 0
+      },
+    })
+    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+      configurable: true,
+      get() {
+        const element = this as HTMLElement
+        return element.classList.contains('act-row') && index(element) < shown ? rowHeight : 0
+      },
+    })
+    Object.defineProperty(HTMLElement.prototype, 'offsetTop', {
+      configurable: true,
+      get() {
+        const element = this as HTMLElement
+        return element.classList.contains('act-row') ? index(element) * rowHeight : 0
+      },
+    })
+  }
+  const feed = Array.from({ length: 6 }, (_, index) =>
+    event('proposal_evaluated', at(17, 50 - index), { outcome: 'no_trade', reason: `row ${index}` }),
+  )
+  const clipped = (container: HTMLElement) =>
+    [...container.querySelectorAll('.act-row')].map((row) => row.classList.contains('is-clipped'))
+
+  afterEach(() => {
+    Object.defineProperty(Element.prototype, 'clientHeight', originals.clientHeight)
+    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', originals.offsetHeight)
+    Object.defineProperty(HTMLElement.prototype, 'offsetTop', originals.offsetTop)
+    vi.unstubAllGlobals()
+  })
+
+  it('hides whole rows that would be cut off by a bounded list', () => {
+    layout(200, 80)
+    const { container } = render(<RecentActivity events={feed} connected onViewAll={vi.fn()} />)
+    expect(clipped(container)).toEqual([false, false, true, true, true, true])
+  })
+
+  it('stops counting at rows the stylesheet leaves out', () => {
+    layout(1000, 80, 3)
+    const { container } = render(<RecentActivity events={feed} connected onViewAll={vi.fn()} />)
+    expect(clipped(container)).toEqual([false, false, false, true, true, true])
+  })
+
+  it('always keeps the newest row, even in a list too short for it', () => {
+    layout(40, 80)
+    const { container } = render(<RecentActivity events={feed} connected onViewAll={vi.fn()} />)
+    expect(clipped(container)).toEqual([false, true, true, true, true, true])
+  })
+
+  it('re-measures when the list is resized, and lets go on unmount', () => {
+    const observed: Element[] = []
+    const disconnect = vi.fn()
+    let resize: (() => void) | undefined
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        constructor(callback: () => void) {
+          resize = callback
+        }
+        observe(element: Element) {
+          observed.push(element)
+        }
+        disconnect = disconnect
+      },
+    )
+    layout(1000, 80)
+    const { container, unmount } = render(<RecentActivity events={feed} connected onViewAll={vi.fn()} />)
+    expect(observed[0]?.className).toBe('act-list')
+    expect(clipped(container).filter(Boolean)).toHaveLength(0)
+
+    layout(170, 80)
+    act(() => resize?.())
+    expect(clipped(container)).toEqual([false, false, true, true, true, true])
+    unmount()
+    expect(disconnect).toHaveBeenCalled()
+  })
+})
+
 describe('RiskControls', () => {
   const killSwitch = () => screen.getByRole('switch', { name: 'Kill switch' }) as HTMLButtonElement
   const bypass = () => screen.getByRole('switch', { name: 'Judge bypass' }) as HTMLButtonElement
@@ -415,7 +510,8 @@ describe('RiskControls', () => {
     const { rerender } = render(<RiskControls policy={policy} onApply={vi.fn()} />)
     expect(screen.getByText('Blocks new orders; open positions stay open.')).toBeTruthy()
     expect(screen.getByText('Trading pauses when the judge cannot answer.')).toBeTruthy()
-    expect(screen.getByRole('img', { name: 'Lets trading continue while the judge cannot answer.' }).getAttribute('title')).toBe(
+    const hint = screen.getByRole('button', { name: 'About Judge bypass' })
+    expect(document.getElementById(hint.getAttribute('aria-describedby')!)?.textContent).toBe(
       'Lets trading continue while the judge cannot answer.',
     )
 

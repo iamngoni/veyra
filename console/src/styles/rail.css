@@ -77,9 +77,20 @@
 }
 
 .act-list {
+  /* Offsets for the row fit are measured against the list itself. */
+  position: relative;
   margin: 0 16px;
   padding: 0 0 10px;
   list-style: none;
+}
+
+/* The preview; a window-filling layout shows as many whole rows as fit. */
+.act-row:nth-child(n + 4) {
+  display: none;
+}
+
+.act-row.is-clipped {
+  visibility: hidden;
 }
 
 .act-row {
@@ -179,13 +190,11 @@
   line-height: 22px;
 }
 
-.rc-info {
-  display: inline-flex;
+.rc-title .hint-mark {
   color: var(--color-ink-muted);
-  cursor: help;
 }
 
-.rc-info .icon {
+.rc-title .hint-mark .icon {
   stroke-width: 1.4;
 }
 

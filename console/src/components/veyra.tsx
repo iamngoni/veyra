@@ -41,7 +41,7 @@ import {
   signedAmount,
 } from '../lib/format'
 import { auditTimeMs, clockTime, relativeTime, usePaged } from '../lib/hooks'
-import { Dot, Icon, Panel, Segmented, Skeleton, Toggle, signTone, type Tone } from './ui'
+import { Dot, Hint, Icon, Panel, Segmented, Skeleton, Toggle, signTone, type Tone } from './ui'
 
 /* ---------- local primitives ---------- */
 
@@ -629,18 +629,52 @@ function patchFromDraft(draft: PolicyDraft): { patch: RiskPolicyPatch } | { erro
   return { patch }
 }
 
+/**
+ * A control's head: the label, an info mark after it when there is help to
+ * give, and an aside held to the right. `htmlFor` makes the label a real
+ * `<label>` for a native input; switches and fixed values name themselves.
+ */
+function ControlHead({
+  label,
+  htmlFor,
+  help,
+  aside,
+}: {
+  label: string
+  htmlFor?: string
+  /** What the setting does, shown from the info mark. */
+  help?: string
+  aside?: ReactNode
+}) {
+  return (
+    <div className="tab-control-head">
+      <span className="tab-control-label">
+        {htmlFor ? (
+          <label htmlFor={htmlFor} className="tab-control-name">
+            {label}
+          </label>
+        ) : (
+          <span className="tab-control-name">{label}</span>
+        )}
+        {help ? <Hint text={help} label={label} /> : null}
+      </span>
+      {aside ? <span className="tab-control-aside">{aside}</span> : null}
+    </div>
+  )
+}
+
 /** Label above, optional marker beside it, control below. */
 function Control({
   id,
   label,
-  title,
+  help,
   span = false,
   aside,
   children,
 }: {
   id: string
   label: string
-  title?: string
+  help?: string
   /** Take two columns (long lists). */
   span?: boolean
   /** Right-aligned beside the label, e.g. an override marker. */
@@ -649,12 +683,7 @@ function Control({
 }) {
   return (
     <div className={`tab-control${span ? ' is-span' : ''}`}>
-      <div className="tab-control-head">
-        <label htmlFor={id} title={title}>
-          {label}
-        </label>
-        {aside ? <span className="tab-control-aside">{aside}</span> : null}
-      </div>
+      <ControlHead label={label} htmlFor={id} help={help} aside={aside} />
       {children}
     </div>
   )
@@ -671,7 +700,7 @@ function TextControl({
   disabled = false,
   dirty = false,
   aside,
-  title,
+  help,
 }: {
   label: string
   /** Rides on the element as `data-field`, so one handler serves every input. */
@@ -684,11 +713,11 @@ function TextControl({
   /** Changed but not yet applied. */
   dirty?: boolean
   aside?: ReactNode
-  title?: string
+  help?: string
 }) {
   const id = useId()
   return (
-    <Control id={id} label={label} title={title} span={span} aside={aside}>
+    <Control id={id} label={label} help={help} span={span} aside={aside}>
       <input
         id={id}
         className={`tab-input${dirty ? ' is-dirty' : ''}`}
@@ -1451,6 +1480,94 @@ const SETTING_GROUPS: Array<{ title: string; prefixes: string[]; names: string[]
 const LIVE_GROUPS = new Set(['Execution', 'Autopilot', 'Profit harvesting', 'Model'])
 
 /**
+ * What each setting controls, shown on its label's info mark.
+ *
+ * Every sentence restates the service's own parser and `.env.example`: the
+ * unit, the accepted range where there is one, and what an empty value falls
+ * back to. "Risk units" are multiples of a trade's entry risk, its distance
+ * from entry to the original stop.
+ */
+const SETTING_HELP: Record<string, string> = {
+  VEYRA_TRADING_ENABLED:
+    'Lets the service send orders to the terminal, closes and stop moves included; off, none are sent. The terminal must also allow live orders.',
+  VEYRA_AUTOPILOT_ENABLED:
+    'Runs the autonomous loop: each cycle it reviews open positions and may propose one trade, which the risk policy must approve.',
+  VEYRA_AUTOPILOT_SYMBOL:
+    "The one instrument the autopilot trades; empty uses the terminal's chart symbol. Leave empty when Symbols is set.",
+  VEYRA_AUTOPILOT_SYMBOLS:
+    'Comma-separated instruments, up to 16, the autopilot chooses from, opening at most one per cycle. Use this or Symbol, not both.',
+  VEYRA_AUTOPILOT_TIMEFRAME:
+    'Candle size the autopilot reads market data and judgements on. Defaults to H4, four-hour candles.',
+  VEYRA_AUTOPILOT_BARS: 'Closed candles the autopilot reads per instrument each cycle, 10–240; empty means 48.',
+  VEYRA_AUTOPILOT_TIER:
+    'Model tier that proposes and reviews trades: Fast is the cheapest, Reasoning the strongest. Defaults to Balanced.',
+  VEYRA_AUTOPILOT_INTERVAL_SECS:
+    'Seconds between autopilot cycles, 30–86400; empty means 300. Stop and profit checks run on the same cadence.',
+  VEYRA_AUTOPILOT_JEV:
+    'Auto asks the Jev judgement service for direction, trend and momentum reads when it is set up; Off never asks.',
+  VEYRA_AUTOPILOT_MIN_HOLD_SECS:
+    'Minimum age, in seconds, before the autopilot may close a position; empty means 300, 0 turns the guard off.',
+  VEYRA_AUTOPILOT_ENTRY_MOVE_ATR:
+    'Mid-candle move, as a fraction of the average range (ATR), that prompts a fresh entry check; empty means 0.25, 0 waits for new candles.',
+  VEYRA_AUTOPILOT_BREAKEVEN_R:
+    'Moves the stop to the entry price once a trade is this many risk units in profit (1 = the stop distance); empty or 0 is off.',
+  VEYRA_AUTOPILOT_TRAIL_R:
+    'Once a trade is this many risk units in profit, keeps the stop that far behind the best price; empty or 0 is off.',
+  VEYRA_AUTOPILOT_PROFIT_HARVEST:
+    'Protects profit before take profit: once armed it trails the stop, and closes a trade still in profit that gives back too much of its peak.',
+  VEYRA_AUTOPILOT_HARVEST_ARM_R:
+    'Move in favour, in risk units (1 = the stop distance), needed before harvesting arms; empty means 0.2.',
+  VEYRA_AUTOPILOT_HARVEST_TRAIL_R:
+    'How far the stop is kept behind the best price once armed, in risk units, no more than Arm R; empty means 0.2.',
+  VEYRA_AUTOPILOT_HARVEST_MIN_PROFIT:
+    'Net open profit in account currency, after spread, swap and commission, needed before harvesting arms; empty means 0.50.',
+  VEYRA_AUTOPILOT_HARVEST_GIVEBACK:
+    'Share of its best profit a trade may give back before it is closed, 0.05–0.95; empty means 0.35.',
+  VEYRA_AUTOPILOT_HARVEST_MIN_HOLD_SECS:
+    'Minimum age, in seconds, before harvesting may act on a position; empty means 300.',
+  VEYRA_AUTOPILOT_HARVEST_REENTRY_COOLDOWN_SECS:
+    'Seconds after a close before the same symbol may be entered again; empty means 900. Re-entry also needs fresh price movement.',
+  VEYRA_MODEL_FAST:
+    'Model for the Fast tier, meant to be the cheapest, as an OpenRouter id such as openai/gpt-4.1-mini.',
+  VEYRA_MODEL_BALANCED: "Model for the Balanced tier, the autopilot's default, as an OpenRouter id (vendor/model).",
+  VEYRA_MODEL_REASONING: 'Model for the Reasoning tier, meant to be the strongest, as an OpenRouter id (vendor/model).',
+  VEYRA_MODEL_FALLBACKS:
+    "Models tried in order when a tier's own model cannot answer (out of credits, rate limited, rejected). Comma-separated, up to 4.",
+  VEYRA_MODEL_FAST_FALLBACKS:
+    'Fallback models for the Fast tier only, replacing the shared list there; empty uses the shared list.',
+  VEYRA_MODEL_BALANCED_FALLBACKS:
+    'Fallback models for the Balanced tier only, replacing the shared list there; empty uses the shared list.',
+  VEYRA_MODEL_REASONING_FALLBACKS:
+    'Fallback models for the Reasoning tier only, replacing the shared list there; empty uses the shared list.',
+  VEYRA_MODEL_MAX_CALLS_PER_HOUR:
+    'Most model calls allowed per hour; beyond it, calls are refused until the window resets. Empty or 0 means unlimited.',
+  VEYRA_MODEL_MAX_CALLS_PER_DAY:
+    'Most model calls allowed per day; beyond it, calls are refused until the window resets. Empty or 0 means unlimited.',
+  VEYRA_MODEL_COMPEL_STRUCTURED:
+    'Requires the model to answer in the structured format instead of merely offering it. Turn off for reasoning models, which refuse it.',
+  VEYRA_MODEL_PROVIDER: 'Service that runs the model tiers. OpenRouter is the only one supported.',
+  VEYRA_MODEL_BASE_URL: "Address of the model API; empty uses OpenRouter's standard endpoint.",
+  VEYRA_MODEL_HTTP_REFERER:
+    "Your app's URL, sent to OpenRouter for attribution. App title and App hidden only take effect when it is set.",
+  VEYRA_MODEL_APP_TITLE: 'Name shown on OpenRouter beside the attribution URL. Needs HTTP referer to be set.',
+  VEYRA_MODEL_APP_HIDDEN:
+    "Keeps the attributed app out of OpenRouter's public rankings. OpenRouter locks this on the first request it receives.",
+  VEYRA_JEV_PROVIDER: 'Service that answers the judgement questions. TypeSafe is the only one supported.',
+  VEYRA_JEV_BASE_URL: 'Address of the judgement API; empty uses the TypeSafe default, https://api.typesafe.ai.',
+  VEYRA_JEV_MODEL: 'Judgement model alias sent with every request; empty means jev-latest.',
+  VEYRA_MARKET_PROVIDER:
+    "Where candles come from: ea reads closed candles from the terminal's EA. Not set turns market data off.",
+  VEYRA_MARKET_EA_AWAIT_SECS:
+    'Seconds to wait for candles from the terminal before they count as unavailable, 5–120; empty means 20. Keep it above 15.',
+  VEYRA_RECONCILE_SECS:
+    "Seconds between automatic refreshes of the broker's account state, up to 3600; empty means 30, 0 turns them off.",
+  VEYRA_AUDIT_RETENTION_DAYS:
+    'Days of audit history to keep, up to 3650; older events are pruned hourly. Empty means 30, 0 keeps everything.',
+  VEYRA_ALERT_WEBHOOK:
+    'URL that receives stack alerts as a JSON post (Slack, Discord and ntfy work). Empty writes them to the local log instead.',
+}
+
+/**
  * How a setting is edited when its accepted values are a closed set.
  *
  * The service's parser stays the only judge of a value; these only choose a
@@ -1514,8 +1631,8 @@ const LABEL_WORDS: Record<string, string> = {
 
 /**
  * A setting's name as a label: `VEYRA_AUTOPILOT_TRAIL_R` under Autopilot reads
- * `Trail R`, and a trailing `SECS` becomes a unit. The raw name stays on the
- * label's tooltip, so it can still be found in `.env`.
+ * `Trail R`, and a trailing `SECS` becomes a unit. What the setting does is
+ * the label's help (`SETTING_HELP`), not its raw name.
  */
 function settingLabel(name: string, prefixes: readonly string[]): string {
   let key = name.replace(/^VEYRA_/, '')
@@ -1534,7 +1651,7 @@ function settingLabel(name: string, prefixes: readonly string[]): string {
 /** A flag: label above, the shared ON/OFF switch below. */
 function SwitchSetting({
   label,
-  title,
+  help,
   checked,
   disabled,
   dirty,
@@ -1542,7 +1659,7 @@ function SwitchSetting({
   onFlip,
 }: {
   label: string
-  title: string
+  help?: string
   checked: boolean
   disabled: boolean
   dirty: boolean
@@ -1551,10 +1668,7 @@ function SwitchSetting({
 }) {
   return (
     <div className="tab-control">
-      <div className="tab-control-head">
-        <span title={title}>{label}</span>
-        {aside ? <span className="tab-control-aside">{aside}</span> : null}
-      </div>
+      <ControlHead label={label} help={help} aside={aside} />
       <div className={`tab-setting-switch${dirty ? ' is-dirty' : ''}`}>
         <Toggle checked={checked} label={label} tone="ok" disabled={disabled} onClick={onFlip} />
       </div>
@@ -1565,7 +1679,7 @@ function SwitchSetting({
 /** A closed set: a menu that holds only values the service accepts. */
 function ChoiceSetting({
   label,
-  title,
+  help,
   field,
   value,
   options,
@@ -1575,7 +1689,7 @@ function ChoiceSetting({
   onChange,
 }: {
   label: string
-  title: string
+  help?: string
   field: string
   value: string
   options: ReadonlyArray<{ value: string; label: string }>
@@ -1589,7 +1703,7 @@ function ChoiceSetting({
   // is kept as its own entry rather than silently replaced.
   const choices = options.some((option) => option.value === value) ? options : [...options, { value, label: value }]
   return (
-    <Control id={id} label={label} title={title} aside={aside}>
+    <Control id={id} label={label} help={help} aside={aside}>
       <span className="tab-select">
         <select
           id={id}
@@ -1612,13 +1726,10 @@ function ChoiceSetting({
 }
 
 /** A setting with a single supported value: stated, not offered as a choice. */
-function FixedSetting({ label, title, value, aside }: { label: string; title: string; value: string; aside?: ReactNode }) {
+function FixedSetting({ label, help, value, aside }: { label: string; help?: string; value: string; aside?: ReactNode }) {
   return (
     <div className="tab-control">
-      <div className="tab-control-head">
-        <span title={title}>{label}</span>
-        {aside ? <span className="tab-control-aside">{aside}</span> : null}
-      </div>
+      <ControlHead label={label} help={help} aside={aside} />
       <div className="tab-setting-fixed">{value || 'Not set'}</div>
     </div>
   )
@@ -1731,6 +1842,7 @@ export function LiveSettingsPanel({
             <div className="tab-group-fields">
               {names.map((name) => {
                 const label = settingLabel(name, group.prefixes)
+                const help = SETTING_HELP[name]
                 const kind = SETTING_KINDS[name]
                 const aside = settings[name].overridden ? (
                   <>
@@ -1751,7 +1863,7 @@ export function LiveSettingsPanel({
                     <SwitchSetting
                       key={name}
                       label={label}
-                      title={name}
+                      help={help}
                       checked={settingValue(name, effective(name)) === 'true'}
                       disabled={busy}
                       dirty={isDirty(name)}
@@ -1765,7 +1877,7 @@ export function LiveSettingsPanel({
                     <ChoiceSetting
                       key={name}
                       label={label}
-                      title={name}
+                      help={help}
                       field={name}
                       value={settingValue(name, effective(name))}
                       options={kind.options}
@@ -1778,14 +1890,14 @@ export function LiveSettingsPanel({
                 }
                 if (kind?.kind === 'fixed') {
                   return (
-                    <FixedSetting key={name} label={label} title={name} value={settingValue(name, effective(name))} aside={aside} />
+                    <FixedSetting key={name} label={label} help={help} value={settingValue(name, effective(name))} aside={aside} />
                   )
                 }
                 return (
                   <TextControl
                     key={name}
                     label={label}
-                    title={name}
+                    help={help}
                     field={name}
                     value={effective(name)}
                     disabled={busy}

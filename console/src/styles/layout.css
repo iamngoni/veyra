@@ -88,3 +88,168 @@
     margin-bottom: 12px;
   }
 }
+
+/* ---------- overview fits the window ----------
+ *
+ * On a desktop-sized window the overview is sized to the viewport instead of
+ * the page growing past it: the chart takes whatever height is left in the
+ * main column and the activity list whatever is left in the rail, so both
+ * columns end on the same line and nothing needs scrolling. When the window
+ * is too short for even the minimum sizes, the main area scrolls on its own
+ * while the bar and navigation stay put.
+ */
+@media (min-width: 1081px) and (min-height: 640px) {
+  .app.is-fit {
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
+  }
+
+  .app.is-fit .app-body {
+    min-height: 0;
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .app.is-fit .app-main {
+    display: flex;
+    min-height: 0;
+    flex-direction: column;
+    overflow-y: auto;
+    padding-bottom: 20px;
+  }
+
+  .app.is-fit .overview {
+    flex: 1 0 auto;
+    align-items: stretch;
+  }
+
+  .app.is-fit .overview-main > .chart {
+    display: flex;
+    min-height: 250px;
+    flex: 1 1 0;
+    flex-direction: column;
+  }
+
+  .app.is-fit .chart-plot {
+    height: auto;
+    min-height: 150px;
+    flex: 1 1 0;
+  }
+
+  .app.is-fit .overview-rail > .act-panel {
+    min-height: 150px;
+    flex: 1 1 0;
+  }
+
+  .app.is-fit .act-panel .panel-body {
+    display: flex;
+    min-height: 0;
+    flex-direction: column;
+  }
+
+  .app.is-fit .act-panel .act-list {
+    min-height: 0;
+    flex: 1 1 0;
+    overflow: hidden;
+  }
+
+  .app.is-fit .act-row:nth-child(n + 4) {
+    display: grid;
+  }
+}
+
+/* A shorter desktop window trades some padding for room, so the whole
+   overview still fits a laptop screen. */
+@media (min-width: 1081px) and (max-height: 999px) {
+  .app.is-fit .app-main {
+    padding-top: 10px;
+    padding-bottom: 16px;
+  }
+
+  .app.is-fit .page-title {
+    margin-bottom: 8px;
+    font-size: 26px;
+  }
+
+  .app.is-fit .overview,
+  .app.is-fit .overview-main,
+  .app.is-fit .overview-rail {
+    gap: 12px;
+  }
+
+  .app.is-fit .kpi-card {
+    min-height: 88px;
+    padding-top: 9px;
+    padding-bottom: 8px;
+  }
+
+  .app.is-fit .kpi-value {
+    margin-top: 2px;
+    font-size: 25px;
+  }
+
+  .app.is-fit .pos-panel .panel-head,
+  .app.is-fit .perf-panel .panel-head {
+    min-height: 48px;
+    padding-top: 12px;
+    padding-bottom: 6px;
+  }
+
+  .app.is-fit .pos-table th {
+    height: 34px;
+  }
+
+  .app.is-fit .pos-table td {
+    height: 42px;
+  }
+
+  .app.is-fit .perf-body {
+    padding-bottom: 12px;
+  }
+
+  .app.is-fit .perf-value {
+    margin-top: 2px;
+    font-size: 23px;
+    line-height: 28px;
+  }
+
+  .app.is-fit .ap-panel .panel-head.is-divided,
+  .app.is-fit .act-panel .panel-head.is-divided,
+  .app.is-fit .rc-panel .panel-head.is-divided {
+    min-height: 50px;
+    padding-top: 12px;
+    padding-bottom: 10px;
+  }
+
+  .app.is-fit .act-row {
+    padding-top: 11px;
+    padding-bottom: 10px;
+  }
+
+  .app.is-fit .ap-row {
+    padding-top: 9px;
+    padding-bottom: 7px;
+  }
+
+  .app.is-fit .rc-row {
+    padding-top: 12px;
+    padding-bottom: 13px;
+  }
+}
+
+/* Shorter still, the page heading only repeats the highlighted navigation
+   item, so it gives its line to the content; screen readers keep it. */
+@media (min-width: 1081px) and (min-height: 640px) and (max-height: 879px) {
+  .app.is-fit .page-title {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .app.is-fit .app-main {
+    padding-top: 12px;
+  }
+}

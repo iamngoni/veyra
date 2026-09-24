@@ -347,6 +347,53 @@ button:disabled {
   color: var(--color-ink);
 }
 
+/* Info mark with a styled tooltip (see Hint in components/ui.tsx). */
+.hint {
+  position: relative;
+  display: inline-flex;
+  vertical-align: middle;
+}
+
+.hint-mark {
+  display: inline-flex;
+  border-radius: 50%;
+  color: var(--color-ink-faint);
+}
+
+.hint-mark:hover,
+.hint-mark:focus-visible {
+  color: var(--color-ink);
+}
+
+.hint-tip {
+  position: absolute;
+  z-index: 40;
+  bottom: calc(100% + 8px);
+  left: -10px;
+  width: max-content;
+  max-width: min(280px, calc(100vw - 48px));
+  padding: 8px 11px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 6px;
+  background: var(--color-surface-1);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 0.22);
+  color: var(--color-ink);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.45;
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: normal;
+  pointer-events: none;
+  /* Out of layout until shown: a hidden tip must not widen the page. */
+  display: none;
+}
+
+.hint:hover .hint-tip,
+.hint-mark:focus-visible + .hint-tip {
+  display: block;
+}
+
 /* A quiet caption voice for field labels. */
 .label {
   color: var(--color-ink-muted);

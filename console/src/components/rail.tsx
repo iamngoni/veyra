@@ -7,11 +7,11 @@
  * switches only ever request a change through an inline confirmation.
  */
 
-import { useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 
 import type { ClosedTrade, FeedEvent, RiskPolicy, RiskPolicyPatch, Status } from '../lib/api'
 import { activityDetail, activityTitle, activityTone, isRoutine, signedAmount } from '../lib/format'
-import { Dot, Icon, Panel, Skeleton, Toggle, type Tone } from './ui'
+import { Dot, Hint, Panel, Skeleton, Toggle, type Tone } from './ui'
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
@@ -71,6 +71,7 @@ export function AutopilotCard({
   return (
     <Panel
       title="Autopilot"
+      className="ap-panel"
       divided
       actions={
         state ? (
@@ -137,6 +138,43 @@ const PLUMBING = new Set(['agent_turn', 'agent_tool_called', 'command_queued', '
 
 /** How many rows the overview previews; the Activity tab has the rest. */
 const PREVIEW_ROWS = 3
+
+/** Most rows offered when the layout gives the list room for more. */
+const MOST_ROWS = 6
+
+/**
+ * How many rows of a list fit inside it, re-measured as it resizes.
+ *
+ * Where the overview fills the window, the list is as tall as the space left
+ * in the rail, so rows that would be cut off are hidden whole rather than
+ * sliced. Elsewhere the stylesheet shows the preview count and every
+ * rendered row fits. Without layout (a test DOM) nothing is measured.
+ */
+function useFittingRows(signature: string) {
+  const ref = useRef<HTMLOListElement>(null)
+  const [fit, setFit] = useState(MOST_ROWS)
+  useLayoutEffect(() => {
+    const list = ref.current
+    if (!list) return
+    const measure = () => {
+      const limit = list.clientHeight
+      if (limit === 0) return
+      let count = 0
+      for (const row of Array.from(list.children) as HTMLElement[]) {
+        // A row the stylesheet leaves out has no box, and neither do the rest.
+        if (row.offsetHeight === 0 || row.offsetTop + row.offsetHeight > limit + 1) break
+        count++
+      }
+      setFit(Math.max(1, count))
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(measure)
+    observer.observe(list)
+    return () => observer.disconnect()
+  }, [signature])
+  return { ref, fit }
+}
 
 /** `17:56` for a moment today, `23 Sep` for any other day. */
 function dayOrTime(ms: number, now: number): string {
@@ -221,12 +259,14 @@ export function RecentActivity({
   ]
     // Stable, so a feed row wins a tie with a trade row.
     .sort((left, right) => right.atMs - left.atMs)
-    .slice(0, PREVIEW_ROWS)
+    .slice(0, MOST_ROWS)
   const now = Date.now()
+  const { ref, fit } = useFittingRows(rows.map((row) => row.key).join('|'))
 
   return (
     <Panel
       title="Recent activity"
+      className="act-panel"
       divided
       actions={
         <>
@@ -253,9 +293,9 @@ export function RecentActivity({
       ) : rows.length === 0 ? (
         <p className="panel-empty act-empty">{connected ? 'No recent activity' : 'Reconnecting'}</p>
       ) : (
-        <ol className="act-list">
-          {rows.map((row) => (
-            <li key={row.key} className="act-row">
+        <ol className="act-list" ref={ref}>
+          {rows.map((row, index) => (
+            <li key={row.key} className={`act-row${index >= fit ? ' is-clipped' : ''}`}>
               <time className="act-time" dateTime={new Date(row.atMs).toISOString()}>
                 {dayOrTime(row.atMs, now)}
               </time>
@@ -327,7 +367,7 @@ export function RiskControls({
   const degraded = jevHealthy === false
 
   return (
-    <Panel title="Risk controls" divided>
+    <Panel title="Risk controls" className="rc-panel" divided>
       <div className="rc-list">
         <RiskSwitch
           title="Kill switch"
@@ -411,11 +451,7 @@ function RiskSwitch({
       <div className="rc-head">
         <h3 className="rc-title">
           {title}
-          {info ? (
-            <span className="rc-info" role="img" aria-label={info} title={info}>
-              <Icon name="info" size={25} />
-            </span>
-          ) : null}
+          {info ? <Hint text={info} label={title} size={22} /> : null}
         </h3>
         <Toggle checked={checked} label={title} tone={tone} disabled={disabled} onClick={onRequest} />
       </div>

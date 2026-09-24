@@ -151,6 +151,8 @@ beforeEach(() => {
     server: 'ICMarketsSC-MT4',
     symbol: 'EURUSD',
     ageSecs: 1,
+    // The broker clock runs two hours ahead of UTC, as the live venue does.
+    serverTime: Math.floor(Date.now() / 1000) - 1 + 7200,
     balance: 1000,
     equity: 1000,
     freeMargin: 1000,
@@ -218,11 +220,14 @@ describe('Dashboard', () => {
   })
 
   it('reaches every operational panel through the sidebar', async () => {
-    render(<Dashboard />)
+    const { container } = render(<Dashboard />)
     await screen.findByText('Equity')
+    // Only the overview is laid out to fit the window.
+    expect(container.querySelector('.app')?.className).toBe('app is-fit')
 
     openTab('Activity')
     expect(screen.getByRole('heading', { name: /Commands/ })).toBeTruthy()
+    expect(container.querySelector('.app')?.className).toBe('app')
 
     openTab('Risk')
     expect(await screen.findByText('Balance')).toBeTruthy()

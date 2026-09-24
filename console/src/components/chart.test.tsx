@@ -19,6 +19,7 @@ afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
   delete (HTMLElement.prototype as { clientWidth?: number }).clientWidth
+  delete (HTMLElement.prototype as { clientHeight?: number }).clientHeight
 })
 
 const HOUR = 3_600_000
@@ -145,6 +146,31 @@ describe('ChartPanel · performance', () => {
 
     unmount()
     expect(observers[0].disconnect).toHaveBeenCalled()
+  })
+
+  it('fills the height the layout gives the plot, down to a floor', () => {
+    let height = 400
+    Object.defineProperty(HTMLElement.prototype, 'clientWidth', { configurable: true, get: () => 900 })
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => height })
+    const observers: Array<() => void> = []
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        constructor(callback: () => void) {
+          observers.push(callback)
+        }
+        observe() {}
+        disconnect() {}
+      },
+    )
+    renderChart({ trades: growthTrades, balance: 37 })
+    // The whole box: the plot plus the x-axis band beneath it.
+    expect(svg().getAttribute('height')).toBe('400')
+
+    // Too little room for a readable plot: the default size applies instead.
+    height = 100
+    act(() => observers[0]())
+    expect(svg().getAttribute('height')).toBe('294')
   })
 
   it('draws a flat line at the balance when nothing closed in the window', () => {

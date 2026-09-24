@@ -106,7 +106,9 @@
   flex-direction: column;
   align-self: start;
   overflow-y: auto;
-  padding-top: 15px;
+  /* Items sit inset from both edges; the first one tops out level with the
+     page title beside it. */
+  padding: 10px 6px 24px;
   border-right: 1px solid var(--color-line-strong);
   background: var(--color-surface-0);
 }
@@ -115,48 +117,61 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding-bottom: 24px;
+  /* As a sideways strip it glides to a view opened from elsewhere. */
+  scroll-behavior: smooth;
 }
 
 .shell-nav-item {
   display: flex;
-  height: 44px;
+  height: 40px;
   width: 100%;
   flex: 0 0 auto;
   align-items: center;
-  gap: 14px;
-  padding: 0 0 0 21px;
+  gap: 10px;
+  /* Even on both sides of the longest label, Diagnostics. */
+  padding: 0 9px;
+  border-radius: 6px;
   color: var(--color-ink-muted);
-  font-size: 13px;
-  font-weight: 500;
+  font-size: 14px;
   line-height: 1;
   text-align: left;
   white-space: nowrap;
   transition: color 120ms ease, background-color 120ms ease;
 }
 
+/* Stroked to the weight of the label's stems. */
 .shell-nav-item .icon {
-  width: 24px;
-  height: 24px;
-  stroke-width: 1.7;
+  width: 18px;
+  height: 18px;
+  stroke-width: 1.75;
 }
 
-.shell-nav-item:hover {
-  color: var(--color-ink);
+/* Touch screens keep :hover after a tap, so only a pointer gets the fill. */
+@media (hover: hover) {
+  .shell-nav-item:hover {
+    background: var(--color-surface-3);
+    color: var(--color-ink);
+  }
 }
 
+/* Amber on its dim tint: the same active state as the range buttons. */
 .shell-nav-item[aria-current="page"] {
-  background: var(--color-surface-2);
-  box-shadow: inset 4px 0 0 var(--color-warn);
+  background: var(--color-warn-dim);
   color: var(--color-warn);
+  font-weight: 500;
 }
 
-/* The rail clips overflow, so the focus ring is drawn inside the item. */
+/* The ring follows the item's corners rather than the global 4px. */
 .shell-nav-item:focus-visible {
-  outline-offset: -2px;
+  border-radius: 6px;
+  outline-offset: 0;
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .shell-nav {
+    scroll-behavior: auto;
+  }
+
   .shell-nav-item {
     transition: none;
   }
@@ -239,16 +254,17 @@
     position: static;
     height: auto;
     overflow: visible;
-    padding-top: 0;
+    padding: 0;
     border-right: 0;
     border-bottom: 1px solid var(--color-line-strong);
   }
 
+  /* The strip's edges line up with the content column below it. */
   .shell-nav {
     flex-direction: row;
-    gap: 0;
     overflow-x: auto;
-    padding: 0 13px;
+    padding: 6px 25px;
+    scroll-padding-inline: 25px;
     scrollbar-width: none;
   }
 
@@ -257,19 +273,10 @@
   }
 
   .shell-nav-item {
+    height: 36px;
     width: auto;
     gap: 8px;
     padding: 0 12px;
-  }
-
-  .shell-nav-item .icon {
-    width: 20px;
-    height: 20px;
-  }
-
-  .shell-nav-item[aria-current="page"] {
-    background: none;
-    box-shadow: inset 0 -2px 0 var(--color-warn);
   }
 }
 
@@ -297,6 +304,7 @@
   }
 
   .shell-nav {
-    padding: 0 4px;
+    padding-inline: 16px;
+    scroll-padding-inline: 16px;
   }
 }

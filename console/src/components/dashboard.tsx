@@ -4,7 +4,7 @@
  * the area modules; this file only wires data to them.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { ChartPanel, MARKET_BARS, type ChartMode, type MarketTimeframe, type PerformanceRange } from './chart'
 import { KpiRow, OpenPositions, PerformanceSummary } from './overview'
@@ -23,6 +23,7 @@ import {
   TracePanel,
 } from './veyra'
 import { api, type LogLevel } from '../lib/api'
+import { accountInUtc, brokerOffsetSecs, seriesInUtc, tradesInUtc } from '../lib/broker-time'
 import { useEventFeed, useLogFeed, usePoll, useTheme } from '../lib/hooks'
 
 const TABS = [
@@ -122,9 +123,24 @@ export function Dashboard() {
     }
   }
 
-  // The year-long window is a slow venue request; ranges it does not need are
-  // drawn from the 30-day window as soon as that one answers.
-  const chartTrades = history ?? (chartRange <= 30 ? performance : undefined)
+  // Ranges inside 30 days draw from the 30-day window, which answers sooner and
+  // refreshes more often, so the chart and the 30-day summary always agree.
+  // Longer ranges need the year-long window.
+  const chartTrades = chartRange <= 30 ? (performance ?? history) : history
+
+  // Broker stamps (closes, opens, bars) run on the broker's clock; everything
+  // below sees true instants. Until a snapshot gives the offset they are held
+  // back rather than drawn hours out of place.
+  const offset = brokerOffsetSecs(account, Date.now())
+  const utc = useMemo(() => {
+    if (offset === undefined) return {}
+    return {
+      recentTrades: (performance ?? history) && tradesInUtc((performance ?? history)!.trades, offset),
+      chartTrades: chartTrades && tradesInUtc(chartTrades.trades, offset),
+      account: account && accountInUtc(account, offset),
+      series: series && seriesInUtc(series, offset),
+    }
+  }, [offset, performance, history, chartTrades, account, series])
 
   const symbols = status?.autopilot?.symbols.length
     ? status.autopilot.symbols
@@ -133,7 +149,8 @@ export function Dashboard() {
       : []
 
   return (
-    <div className="app">
+    // The overview is laid out to fit the window; the other views scroll.
+    <div className={`app${tab === 'overview' ? ' is-fit' : ''}`}>
       <Topbar status={status} theme={theme} onToggleTheme={toggle} onOpenSettings={() => setTab('settings')} />
 
       <div className="app-body">
@@ -145,7 +162,7 @@ export function Dashboard() {
           {tab === 'overview' ? (
             <div className="overview">
               <div className="overview-main">
-                <KpiRow account={account} error={accountError} trades={performance?.trades ?? history?.trades} />
+                <KpiRow account={account} error={accountError} trades={utc.recentTrades} />
                 <ChartPanel
                   mode={chartMode}
                   onModeChange={setChartMode}
@@ -156,14 +173,14 @@ export function Dashboard() {
                   symbol={symbol}
                   symbols={symbols}
                   onSymbolChange={setSymbol}
-                  trades={chartTrades?.trades}
+                  trades={utc.chartTrades}
                   tradesTruncated={chartTrades?.truncated}
                   tradesError={historyError}
                   balance={account?.balance}
-                  series={series}
+                  series={utc.series}
                   seriesError={marketError}
                 />
-                <OpenPositions account={account} harvestEnabled={Boolean(status?.autopilot?.profit_harvest)} />
+                <OpenPositions account={utc.account ?? account} harvestEnabled={Boolean(status?.autopilot?.profit_harvest)} />
                 <PerformanceSummary performance={performance} error={performanceError} balance={account?.balance} />
               </div>
               <aside className="overview-rail" aria-label="Autopilot and controls">
@@ -171,7 +188,7 @@ export function Dashboard() {
                 {/* Before the first answer there is nothing to reconnect to. */}
                 <RecentActivity
                   events={notable}
-                  trades={performance?.trades ?? history?.trades}
+                  trades={utc.recentTrades}
                   connected={connected || !settled}
                   loading={!settled && !(performance ?? history)}
                   onViewAll={() => setTab('activity')}

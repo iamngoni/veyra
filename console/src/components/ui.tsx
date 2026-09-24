@@ -7,6 +7,7 @@
  * matching class names; nothing here branches on theme.
  */
 
+import { useId } from 'react'
 import type { ReactNode } from 'react'
 
 export type Tone = 'ok' | 'warn' | 'bad' | 'idle' | 'off'
@@ -103,6 +104,25 @@ export function Toggle({
   )
 }
 
+/**
+ * An info mark whose explanation appears on hover or keyboard focus, styled
+ * with the console's tokens instead of the browser's delayed native tooltip.
+ * The text is also the mark's accessible description.
+ */
+export function Hint({ text, label, size = 15 }: { text: string; label: string; size?: number }) {
+  const id = useId()
+  return (
+    <span className="hint">
+      <button type="button" className="hint-mark" aria-label={`About ${label}`} aria-describedby={id}>
+        <Icon name="info" size={size} />
+      </button>
+      <span role="tooltip" id={id} className="hint-tip">
+        {text}
+      </span>
+    </span>
+  )
+}
+
 /** Row of mutually exclusive buttons (ranges, timeframes). */
 export function Segmented<T extends string | number>({
   options,
@@ -149,30 +169,29 @@ export type IconName =
 
 /** 20×20 outline icons drawn on a 24 grid, stroked with the current colour. */
 const ICONS: Record<IconName, ReactNode> = {
-  overview: <path d="M12 3.5 21.5 12h-2v8.5h-15V12h-2z" />,
+  // The six views share one family: outlines only, inside a 16–18 unit box.
+  overview: (
+    <path d="M4 10.2 12 3.8l8 6.4v9.3a1 1 0 0 1-1 1h-3.75v-5.25a1 1 0 0 0-1-1h-2.5a1 1 0 0 0-1 1v5.25H5a1 1 0 0 1-1-1z" />
+  ),
   activity: (
     <>
-      <rect x="3.5" y="14" width="4" height="6" rx=".5" fill="currentColor" stroke="none" />
-      <rect x="10" y="9" width="4" height="11" rx=".5" fill="currentColor" stroke="none" />
-      <rect x="16.5" y="4" width="4" height="16" rx=".5" fill="currentColor" stroke="none" />
+      <path d="M4 4v15a1 1 0 0 0 1 1h15" />
+      <path d="M8.5 16.5v-4M13 16.5v-8M17.5 16.5v-6" />
     </>
   ),
-  risk: <path d="M12 3 19.5 5.8v5.4c0 4.6-3.1 8.2-7.5 9.8-4.4-1.6-7.5-5.2-7.5-9.8V5.8z" />,
+  risk: <path d="M12 3.5 19 6.25v5.25c0 4.35-2.9 7.6-7 9-4.1-1.4-7-4.65-7-9V6.25z" />,
   trace: (
     <>
-      <rect x="5" y="3.5" width="14" height="17" rx="1.5" />
-      <path d="M8.5 8.5h7" />
-      <path d="M8.5 12h7" />
-      <path d="M8.5 15.5h2.5M15 15.5h.5" />
+      <rect x="5" y="3.5" width="14" height="17" rx="2" />
+      <path d="M9 8.5h6M9 12h6M9 15.5h3.5" />
     </>
   ),
-  diagnostics: <path d="M2.5 12h4l2.5-6 5 12 2.5-6h5" />,
+  diagnostics: <path d="M3.5 12h3L9 6l6 12 2.5-6h3" />,
   settings: (
     <>
-      <path d="M4 8h16" />
-      <path d="M4 16h16" />
-      <circle cx="9" cy="8" r="2.2" />
-      <circle cx="15" cy="16" r="2.2" />
+      <path d="M4 8h3M11 8h9M4 16h9M17 16h3" />
+      <circle cx="9" cy="8" r="2" />
+      <circle cx="15" cy="16" r="2" />
     </>
   ),
   gear: (

@@ -157,9 +157,17 @@
 
 .chart-plot {
   position: relative;
+  /* Plot plus the x-axis band (see AXIS_BAND); the layout may stretch it. */
+  height: 294px;
   margin-top: 10px;
   overflow: hidden;
   border-radius: 0 0 6px 6px;
+}
+
+@container chart (max-width: 560px) {
+  .chart-plot {
+    height: 242px;
+  }
 }
 
 .chart-svg {

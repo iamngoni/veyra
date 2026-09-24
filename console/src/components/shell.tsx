@@ -3,6 +3,8 @@
  * and the left navigation rail.
  */
 
+import { useEffect, useRef } from 'react'
+
 import type { Status } from '../lib/api'
 import type { Theme } from '../lib/hooks'
 import { systemPosture, type PostureTone } from '../lib/posture'
@@ -97,9 +99,18 @@ export function Sidebar({
   active: string
   onSelect: (id: string) => void
 }) {
+  const navRef = useRef<HTMLElement>(null)
+  // On a narrow screen the rail is a sideways strip, and a view can open from
+  // elsewhere (the settings gear, "View all") with its tab scrolled out of
+  // sight. Bring it back so the strip always shows where you are.
+  useEffect(() => {
+    const nav = navRef.current as HTMLElement
+    if (nav.scrollWidth <= nav.clientWidth) return
+    nav.querySelector('[aria-current="page"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [active])
   return (
     <div className="shell-sidebar">
-      <nav className="shell-nav" aria-label="Main">
+      <nav ref={navRef} className="shell-nav" aria-label="Main">
         {tabs.map((tab) => (
           <button
             key={tab.id}

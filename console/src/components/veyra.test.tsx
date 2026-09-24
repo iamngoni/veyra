@@ -12,7 +12,16 @@ import { useState } from 'react'
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type { Account, AuditPage, CommandRecord, FeedEvent, LogRecord, MarketSessions, Status } from '../lib/api'
+import type {
+  Account,
+  AuditPage,
+  CommandRecord,
+  FeedEvent,
+  LiveSetting,
+  LogRecord,
+  MarketSessions,
+  Status,
+} from '../lib/api'
 import { VEYRA_MAGIC } from '../lib/api'
 import { auditTimeMs } from '../lib/hooks'
 import {
@@ -1136,12 +1145,72 @@ describe('LiveSettingsPanel', () => {
     expect(screen.getByLabelText('Min hold (s)')).toBe(field('VEYRA_AUTOPILOT_HARVEST_MIN_HOLD_SECS'))
     expect(screen.getByLabelText('Fallbacks')).toBe(field('VEYRA_MODEL_FALLBACKS'))
     expect(screen.getByLabelText('Market EA await (s)')).toBe(field('VEYRA_MARKET_EA_AWAIT_SECS'))
-    // The raw name stays findable for the .env file.
-    expect(screen.getByText('Trail R').getAttribute('title')).toBe('VEYRA_AUTOPILOT_TRAIL_R')
     expect(field('VEYRA_AUTOPILOT_TRAIL_R').placeholder).toBe('Not set')
     expect(screen.getAllByText('Applies on restart')).toHaveLength(1)
     // Groups with nothing to show are left out entirely.
     expect(screen.queryByText('Housekeeping')).toBeNull()
+  })
+
+  it('explains what each setting does from a mark beside its label, not its variable name', () => {
+    const { container } = render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} />)
+    const help = (label: string) => {
+      const mark = screen.getByRole('button', { name: `About ${label}` })
+      return document.getElementById(mark.getAttribute('aria-describedby')!)?.textContent
+    }
+    expect(help('Trading enabled')).toBe(
+      'Lets the service send orders to the terminal, closes and stop moves included; off, none are sent. The terminal must also allow live orders.',
+    )
+    expect(help('Profit harvest')).toBe(
+      'Protects profit before take profit: once armed it trails the stop, and closes a trade still in profit that gives back too much of its peak.',
+    )
+    expect(help('Min hold (s)')).toBe('Minimum age, in seconds, before harvesting may act on a position; empty means 300.')
+    expect(help('Trail R')).toBe(
+      'Once a trade is this many risk units in profit, keeps the stop that far behind the best price; empty or 0 is off.',
+    )
+    expect(help('Fallbacks')).toBe(
+      "Models tried in order when a tier's own model cannot answer (out of credits, rate limited, rejected). Comma-separated, up to 4.",
+    )
+    expect(help('Market EA await (s)')).toBe(
+      'Seconds to wait for candles from the terminal before they count as unavailable, 5–120; empty means 20. Keep it above 15.',
+    )
+
+    // One mark per setting, straight after its label; the aside stays apart.
+    const heads = [...container.querySelectorAll('.tab-control-head')]
+    expect(heads).toHaveLength(Object.keys(settings).length)
+    for (const head of heads) {
+      expect(head.firstElementChild?.className).toBe('tab-control-label')
+      expect([...head.firstElementChild!.children].map((child) => child.className)).toEqual(['tab-control-name', 'hint'])
+    }
+    expect(screen.getByText('Overridden').closest('.tab-control-aside')?.previousElementSibling?.className).toBe(
+      'tab-control-label',
+    )
+    // The variable name is no longer anyone's tooltip.
+    const titles = [...container.querySelectorAll('[title]')].map((element) => element.getAttribute('title'))
+    expect(titles.filter((title) => title?.includes('VEYRA_'))).toEqual([])
+  })
+
+  it('has help for every setting it groups', () => {
+    // A settings map that answers for any name renders every grouped setting,
+    // so a setting added to a group without help fails here.
+    const grouped = new Set<string>()
+    const everything = new Proxy({} as Record<string, LiveSetting>, {
+      get: (_, name) => {
+        if (typeof name !== 'string' || !name.startsWith('VEYRA_')) return undefined
+        grouped.add(name)
+        return { value: '', overridden: false }
+      },
+    })
+    const { container } = render(<LiveSettingsPanel settings={everything} onApply={vi.fn()} />)
+    const controls = [...container.querySelectorAll('.tab-control')]
+    expect(controls.length).toBe(grouped.size)
+    expect(controls.length).toBeGreaterThan(40)
+
+    const name = (control: Element) => control.querySelector('.tab-control-name')?.textContent
+    expect(controls.filter((control) => !control.querySelector('.hint')).map(name)).toEqual([])
+    const texts = controls.map((control) => control.querySelector('.hint-tip')?.textContent ?? '')
+    // Short plain sentences, each its own, and never a variable name.
+    expect(texts.filter((text) => text.length > 140 || !text.endsWith('.') || text.includes('VEYRA_'))).toEqual([])
+    expect(new Set(texts).size).toBe(texts.length)
   })
 
   it('sends only the fields that actually changed', async () => {
