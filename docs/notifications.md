@@ -4,7 +4,7 @@ Veyra can message you when something needs your attention, or just to keep
 you informed. It sends to every channel you switch on: email, Telegram,
 Discord, Slack, ntfy, Pushover, and any webhook.
 
-Everything is set up in the console: **Settings → Notifications**. You need the
+Everything is set up in the console's **Notifications** tab. You need the
 operator token (`VEYRA_CONSOLE_ADMIN_TOKEN` in `.env`) to save, because the
 channel settings include secrets. Secrets are encrypted before they are
 stored and are never shown again; the console only shows the last four

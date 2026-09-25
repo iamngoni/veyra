@@ -37,6 +37,7 @@ const TABS = [
   { id: 'risk', label: 'Risk', icon: 'risk' },
   { id: 'trace', label: 'Trace', icon: 'trace' },
   { id: 'diagnostics', label: 'Diagnostics', icon: 'diagnostics' },
+  { id: 'notifications', label: 'Notifications', icon: 'notifications' },
   { id: 'settings', label: 'Settings', icon: 'settings' },
 ] as const satisfies ReadonlyArray<NavTab>
 
@@ -319,12 +320,15 @@ export function Dashboard() {
                 onApply={applyConfig}
                 onRefresh={() => void refetchConfig()}
               />
-              <NotificationsPanel
-                settings={notifications}
-                error={notificationsError}
-                onRefresh={() => void refetchNotifications()}
-              />
             </div>
+          ) : null}
+
+          {tab === 'notifications' ? (
+            <NotificationsPanel
+              settings={notifications}
+              error={notificationsError}
+              onRefresh={() => void refetchNotifications()}
+            />
           ) : null}
         </main>
       </div>

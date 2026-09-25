@@ -110,7 +110,7 @@ set -a && source .env && set +a
   compiling if the terminal should stay disarmed during verification.
 - Console on `http://127.0.0.1:3000` shows the stream; queue one snapshot:
   `curl -X POST http://127.0.0.1:8080/commands/account_snapshot`.
-- Set up a channel under **Settings → Notifications**, press **Send test**,
+- Set up a channel in the console's **Notifications** tab, press **Send test**,
   and confirm the watchdog logs `watchdog started` to
   `~/Library/Logs/veyra/alert.err.log` (see `docs/notifications.md`).
 

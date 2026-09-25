@@ -62,7 +62,7 @@ What exists and what has been proven live:
   positions, account state, recorded decisions, and model health. It has no
   order, close, or modify tool.
 - **Notifications** to email, Telegram, Discord, Slack, ntfy, Pushover, or any
-  webhook, set up in the console with a guide per channel. Breaker trips,
+  webhook, set up in the console's Notifications tab with a guide per channel. Breaker trips,
   halts, a stale broker link, drift, failed orders, model trouble, opened and
   closed trades, and a daily summary, each switchable. Delivery is a
   background fan-out that never blocks trading, and a separate watchdog

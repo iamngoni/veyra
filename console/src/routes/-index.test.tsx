@@ -404,12 +404,15 @@ describe('Dashboard', () => {
     expect((await screen.findByRole('alert')).textContent).toContain('setting rejected')
   })
 
-  it('shows notifications under settings and reads them again after a change', async () => {
+  it('shows notifications on their own tab and reads them again after a change', async () => {
     mocks.updateNotifications.mockResolvedValue(notificationSettings(false))
     render(<Dashboard />)
     await screen.findByText('Equity')
     openTab('Settings')
-    await screen.findByRole('heading', { name: 'Notifications' })
+    await screen.findByRole('heading', { level: 2, name: 'Live settings' })
+    expect(screen.queryByRole('heading', { level: 2, name: 'Notifications' })).toBeNull()
+    openTab('Notifications')
+    await screen.findByRole('heading', { level: 2, name: 'Notifications' })
     const polls = mocks.notifications.mock.calls.length
     fireEvent.change(screen.getByLabelText('Operator token'), { target: { value: 'op-token' } })
     fireEvent.click(screen.getByRole('switch', { name: 'Order failed' }))

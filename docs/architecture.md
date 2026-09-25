@@ -273,7 +273,7 @@ What deliberately stays volatile: the **pending command queue** (replaying undel
 
 `console/` is a TanStack Start application served by a supervised Vite preview on `http://127.0.0.1:3000`. It reads only the loopback control surface, proxying `/api` so the browser never needs cross-origin access. There is no authentication: keep it on loopback.
 
-The sidebar shows status pills (terminal live/stale, EA armed/disarmed, trading enabled/disabled, autopilot cadence) and seven pages:
+The sidebar shows status pills (terminal live/stale, EA armed/disarmed, trading enabled/disabled, autopilot cadence) and eight pages:
 
 | Page | Shows |
 | --- | --- |
@@ -283,6 +283,7 @@ The sidebar shows status pills (terminal live/stale, EA armed/disarmed, trading 
 | Risk | Effective gate policy (symbols, caps, risk/drawdown brakes, net-exposure cap, news blackout, ATR stop floor, execution state) with an inline editor; the account (balance, equity, margin, leverage, owner by magic 77041 vs manual); and the market session (below) |
 | Trace | The durable audit trail from `/audit` |
 | Diagnostics | Autopilot configuration and Jev/model-budget usage, the model route, top `/metrics` counters, and the `/logs` tail with a level filter |
+| Notifications | Channels (email, Telegram, Discord, Slack, ntfy, Pushover, webhook) with setup guides and test sends, per-event switches, the daily-summary hour, and recent deliveries, from `/notifications` |
 | Settings | The live settings overlay from `/config`, model credentials, and subscription connections |
 
 A read-only assistant (`POST /assistant/chat`) sits beside every page. It streams each retrieval it runs over positions, account state, recorded decisions, and model health, and it has no order, close, or modify tool.

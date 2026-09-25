@@ -191,6 +191,7 @@ export type IconName =
   | 'risk'
   | 'trace'
   | 'diagnostics'
+  | 'notifications'
   | 'settings'
   | 'gear'
   | 'sun'
@@ -227,6 +228,12 @@ const ICONS: Record<IconName, ReactNode> = {
     </>
   ),
   diagnostics: <path d="M3.5 12h3L9 6l6 12 2.5-6h3" />,
+  notifications: (
+    <>
+      <path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15z" />
+      <path d="M10 20.5a2 2 0 0 0 4 0" />
+    </>
+  ),
   settings: (
     <>
       <path d="M4 8h3M11 8h9M4 16h9M17 16h3" />

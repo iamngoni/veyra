@@ -571,7 +571,7 @@ function TokenField({ value, inputRef, onChange }: { value: string; inputRef: Re
   return (
     <div className="notify-token">
       <label htmlFor={id}>Operator token</label>
-      <Hint label="Operator token" text="Required to change notifications or send a test. Kept only until you leave Settings." />
+      <Hint label="Operator token" text="Required to change notifications or send a test. Kept only until you leave this tab." />
       <input
         id={id}
         ref={inputRef}

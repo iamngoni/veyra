@@ -593,7 +593,7 @@ closed, a loss limit reached, the connection dropping, repeated failures. It
 can send to email, Telegram, Discord, Slack, ntfy (free phone notifications),
 Pushover, or any webhook, and to several at once.
 
-Once the console is running, open **Settings → Notifications**, pick a
+Once the console is running, open the **Notifications** tab, pick a
 channel, follow its "How to set up" steps, save, and press **Send test**.
 [docs/notifications.md](docs/notifications.md) has the same guides and the
 full list of events.
