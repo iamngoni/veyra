@@ -18,7 +18,7 @@ checks every prerequisite it can read; run it on the target first.
 | Veyra service (Rust) | EA channel on 7801, diagnostics on 8080, autopilot | `cc.antonlabs.veyra.service` (KeepAlive) |
 | PostgreSQL 17 | audit trail (required once `VEYRA_DATABASE_URL` is set) | Homebrew service |
 | Console (TanStack Start) | operations UI on `http://127.0.0.1:3000` | `cc.antonlabs.veyra.console` (KeepAlive) |
-| Alert probe | webhook notifications, every two minutes | `cc.antonlabs.veyra.alerts` |
+| Outage watchdog | reports the service not responding, through the console's notification channels | `cc.antonlabs.veyra.alerts` (KeepAlive) |
 | Log rotation, backups | bounded logs, daily verified `pg_dump` | `cc.antonlabs.veyra.logrotate`, `cc.antonlabs.veyra.backup` |
 
 Everything is loopback-only except the tunnel, which carries only the EA
@@ -110,8 +110,9 @@ set -a && source .env && set +a
   compiling if the terminal should stay disarmed during verification.
 - Console on `http://127.0.0.1:3000` shows the stream; queue one snapshot:
   `curl -X POST http://127.0.0.1:8080/commands/account_snapshot`.
-- Set `VEYRA_ALERT_WEBHOOK` and confirm the probe logs to
-  `~/Library/Logs/veyra/alert.out.log` (or delivers to the webhook).
+- Set up a channel under **Settings → Notifications**, press **Send test**,
+  and confirm the watchdog logs `watchdog started` to
+  `~/Library/Logs/veyra/alert.err.log` (see `docs/notifications.md`).
 
 Arming live trading is a deliberate, two-step act. The EA must have
 `InAllowLiveOrders` on (compiled from `VEYRA_EA_ALLOW_LIVE`, default `true`, and

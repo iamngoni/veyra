@@ -61,17 +61,15 @@ What exists and what has been proven live:
 - A **read-only assistant** in the console that answers from retained
   positions, account state, recorded decisions, and model health. It has no
   order, close, or modify tool.
-- **Alerting** without a vendor: a supervised probe watches readiness, the
-  two execution controls, repeated autopilot failures, reconciliation drift,
-  executed opens, and closed positions — enriched with the realized fill from
-  the venue history, so a close reports what it actually banked (`Trade
-  closed — win: USDJPY … net +1.36`). Findings are pushed to
-  `VEYRA_ALERT_WEBHOOK`: Slack and Discord webhooks get the shared JSON
-  shape, an ntfy topic URL gets a titled notification (warnings arrive
-  high-priority with a warning tag). Without a webhook it logs to
-  `~/Library/Logs/veyra`.
+- **Notifications** to email, Telegram, Discord, Slack, ntfy, Pushover, or any
+  webhook, set up in the console with a guide per channel. Breaker trips,
+  halts, a stale broker link, drift, failed orders, model trouble, opened and
+  closed trades, and a daily summary, each switchable. Delivery is a
+  background fan-out that never blocks trading, and a separate watchdog
+  reports when the service itself is down. See
+  [docs/notifications.md](docs/notifications.md).
 - 24/7 supervision: launchd agents for the terminal, tunnel, service, console,
-  alert probe, hourly log rotation, and daily verified audit backups (kept
+  outage watchdog, hourly log rotation, and daily verified audit backups (kept
   locally and uploaded off-machine to R2) with crash restart on the service,
   tunnel, and console (ADR 0005).
 - Durable audit trail in PostgreSQL (SQLx migrations, append-only

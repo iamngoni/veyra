@@ -62,6 +62,26 @@ services:
     networks:
       - backend
 
+  # Reports outages of the service itself through the notification providers
+  # configured in the console. Same image, `watchdog` mode; it must not wait
+  # for the service to be healthy, because reporting that is its job.
+  watchdog:
+    <<: *service-security
+    image: veyra-veyra
+    pull_policy: never
+    command: ["watchdog"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      VEYRA_DATABASE_URL: postgres://veyra:${VEYRA_POSTGRES_PASSWORD}@postgres:5432/veyra
+      VEYRA_WATCHDOG_URL: http://veyra:8080
+    depends_on:
+      postgres:
+        condition: service_started
+    networks:
+      - backend
+
   console:
     <<: *service-security
     build:

@@ -44,6 +44,9 @@ and reopens the app when it disappears.
   - `cc.antonlabs.veyra.alerts` runs every two minutes, comparing the stack
     against the previous run and pushing findings to `VEYRA_ALERT_WEBHOOK`
     (logged under `~/Library/Logs/veyra` when unset).
+    *Superseded (2026-09-26):* the service now sends notifications itself,
+    and this label runs `veyra-service watchdog`, which only reports the
+    service being down. See `docs/notifications.md`.
 - Secrets stay in `.env` (0600); plists carry only absolute paths.
 - Logs go to `~/Library/Logs/veyra/{service,tunnel,terminal,logrotate,backup}.{out,err}.log`,
   and the logrotate agent keeps them bounded.

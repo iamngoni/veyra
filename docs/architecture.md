@@ -30,13 +30,13 @@ Status at a glance (see `README.md` and `docs/roadmap.md` for evidence):
 | Piece | Role | Where |
 | --- | --- | --- |
 | Service (`veyra-service`) | configuration, risk gate, command queue, autopilot, HTTP surface | Rust 2024 + Actix Web + Tokio, `crates/veyra-service` |
-| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/account/balance-history`, `/market/candles`, `/market/spec`, `/market/sessions`, `/calendar`, `/performance`, `/trades`, `/reconciliation`, `/risk/policy`, `/config`, `/assistant/chat`, `/model/credential`, `/model/subscriptions*`, `/model/cooldowns*` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
+| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/account/balance-history`, `/market/candles`, `/market/spec`, `/market/sessions`, `/calendar`, `/performance`, `/trades`, `/reconciliation`, `/risk/policy`, `/config`, `/assistant/chat`, `/model/credential`, `/model/subscriptions*`, `/model/cooldowns*`, `/notifications*` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
 | EA channel listener | token-authenticated `POST /ea/poll` carrying heartbeats and the command queue | `127.0.0.1:7801` by default (`VEYRA_EA_BIND_*`); an explicit `VEYRA_EA_ALLOW_NON_LOOPBACK=true` opt-in permits an unpublished isolated container bind |
 | MT4 terminal + `VeyraProbe` EA | holds the broker session, polls the channel, executes acknowledged commands, reports dry runs while disarmed | `ea/VeyraProbe.mq4` inside MetaTrader 4 (Wine) |
 | Cloudflare tunnel | `veyra.antonlabs.cc` → `127.0.0.1:7801` — the EA channel only | launchd agent, `KeepAlive` |
 | PostgreSQL | append-only `audit_events` and `runtime_state` via SQLx (`crates/veyra-service/migrations/`: 0001 audit events, 0002 runtime state, later migrations add indexes) | `VEYRA_DATABASE_URL`; unreachable configured database fails startup |
 | Console | operations UI reading the loopback service through its own `/api` proxy | TanStack Start + React + Tailwind, `127.0.0.1:3000` |
-| launchd agents | terminal, tunnel, service, console, alert probe, log rotation, audit backups | `scripts/launchd/`, `scripts/install-launchd.sh` |
+| launchd agents | terminal, tunnel, service, console, outage watchdog, log rotation, audit backups | `scripts/launchd/`, `scripts/install-launchd.sh` |
 
 ```mermaid
 flowchart LR
@@ -101,6 +101,10 @@ Rules that hold across all of them:
 - The `ea` market provider refuses to build without an active broker command channel, because it reads candles through it.
 - The broker contract covers reporting *and* the command channel: `BrokerLink` exposes `enqueue_order_check` / `enqueue_open_order` / `enqueue_close_order` / `enqueue_modify_order` / `enqueue_rates` / `enqueue_symbol_spec`, `command` / `await_command` / `recent_commands`, and the retained account snapshot. `control.rs`, `reconciliation.rs`, `market/`, and `trading/autopilot.rs` depend on the trait alone, so a new venue is one implementation module plus selector arms — no caller edits. A test-only second implementation in `broker/mod.rs` holds that seam in place.
 - `/status` reports the active provider identifiers (including the calendar), the broker link state, both switches, the autopilot settings, the model budget, and the effective risk policy. `GET /calendar?hours=1-168` lists the upcoming events the entry path sees.
+
+### Notification channels
+
+Notifications (`notify/`) are the one integration where several providers are active at once and are chosen in the console rather than by an environment variable, so they are a closed `ProviderKind` enum instead of a trait selected at startup. The boundary is the same: every wire format lives in `notify/providers.rs` behind one `send` function, and nothing else in the service knows a channel exists. Sources only call `Notifier::notify`, which filters and `try_send`s onto a bounded queue and never waits; one worker fans each notification out to every enabled channel concurrently, with retries for transient failures. Two read-only watchers produce the notifications: one follows the audit feed (fills, closes, failed orders, drift), the other samples health every 30 s and reports transitions (breakers, halts, broker link, model trouble) plus the daily summary. `veyra-service watchdog` is a separate process that reports the service itself being down. Operator guide: [notifications.md](notifications.md).
 
 ### Adding a provider
 
@@ -184,7 +188,7 @@ One append-only PostgreSQL table (`audit_events`: id, timestamp, kind, JSONB pay
 Read routes on the loopback surface:
 
 - **`GET /events`** — the live feed: an in-memory ring of the 512 most recent events with a monotonic sequence cursor. No cursor returns the buffered tail; a cursor long-polls up to `wait_ms` (max 25 s), checking every 250 ms. The durable trail remains the source of truth; the ring is just a fast reader.
-- **`GET /metrics`** — process-lifetime counters derived from the same stream: `event.<kind>`, `proposal.<outcome>`, and `command.<event>.<kind>`, plus `feedLatest`. Cheap for dashboards and the alert probe; resets with the process.
+- **`GET /metrics`** — process-lifetime counters derived from the same stream: `event.<kind>`, `proposal.<outcome>`, and `command.<event>.<kind>`, plus `feedLatest`. Cheap for dashboards; resets with the process.
 - **`GET /audit?limit=`** — newest rows straight from PostgreSQL, newest first.
 - **`GET /reconciliation`** — every order in the retained snapshot classified as Veyra-managed or unknown, with the snapshot age and a `reconciled`/`drift` verdict (or `unavailable`, `stale`, or `no_snapshot` when the channel or a snapshot is missing).
 
@@ -260,6 +264,8 @@ Counters and baselines that must survive restarts live in one Postgres table, `r
 | `runtime_config` | the live settings overlay saved from the console | every runtime section, before serving |
 | `model_secret` | the console-saved model API key, encrypted | the model engine |
 | `subscription_codex`, `subscription_claude_code` | encrypted ChatGPT (Codex) and Claude Code subscription credentials | the subscription engine |
+| `notify_prefs` | notification switches, enabled channels, and their non-secret settings | the notifier and the watchdog |
+| `notify_secrets` | notification channel credentials, encrypted | the notifier and the watchdog |
 
 What deliberately stays volatile: the **pending command queue** (replaying undelivered commands after downtime would risk stale orders — the venue, not the queue, is the source of truth), the **event and log rings** (`/events`, `/logs` — the audit trail is the durable record), and **`/metrics` counters** (process-lifetime views derived from the stream; the audit table can answer the same questions durably with SQL). Writes are best-effort: storage trouble logs a warning and the trading path continues, because a lost counter must never stop the bot. Unusable stored values (a hand-edited or stale row) log and fall back to the in-memory default; an unreadable `risk_policy` row fails startup loudly rather than silently reverting operator intent.
 

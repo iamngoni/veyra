@@ -586,19 +586,20 @@ important ones:
 Start small: `0.01` lots and one open trade. `.env.example` explains every
 other setting.
 
-### Alerts (recommended)
+### Notifications (recommended)
 
 Veyra can message you when something important happens: trades opened or
-closed, the connection dropping, repeated failures. Point it at a Slack or
-Discord webhook, or at an [ntfy](https://ntfy.sh) topic for phone
-notifications:
+closed, a loss limit reached, the connection dropping, repeated failures. It
+can send to email, Telegram, Discord, Slack, ntfy (free phone notifications),
+Pushover, or any webhook, and to several at once.
 
-```dotenv
-VEYRA_ALERT_WEBHOOK=https://ntfy.sh/your-private-topic-name
-```
+Once the console is running, open **Settings → Notifications**, pick a
+channel, follow its "How to set up" steps, save, and press **Send test**.
+[docs/notifications.md](docs/notifications.md) has the same guides and the
+full list of events.
 
-Alerts are sent by a small checker that runs as part of the 24/7 setup
-(Stage E).
+A small watchdog, started as part of the 24/7 setup (Stage E), also tells you
+if Veyra itself stops responding.
 
 ### The autopilot
 

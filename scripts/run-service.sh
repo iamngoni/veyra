@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Runs the Veyra service in a supervised context (LaunchAgent or terminal).
+# Arguments pass through, so `run-service.sh watchdog` runs the outage
+# watchdog with the same environment.
 #
 # launchd cannot read dotenv files, so this wrapper sources .env for the
 # process environment and execs the release binary, letting the supervised PID
@@ -25,4 +27,4 @@ set -a
 . "$ENV_FILE"
 set +a
 
-exec "$BINARY"
+exec "$BINARY" "$@"

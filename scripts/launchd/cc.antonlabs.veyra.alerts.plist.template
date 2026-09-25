@@ -2,22 +2,32 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <!--
-  Every two minutes, watches the stack through the loopback control surface and
-  pushes transitions and trade events to VEYRA_ALERT_WEBHOOK. With no webhook
-  configured, findings land in ~/Library/Logs/veyra/alert.out.log instead.
+  Outage watchdog: `veyra-service watchdog` probes the service's /ready and
+  reports when it stops answering or loses its database, through the
+  notification providers configured in the console (docs/notifications.md).
+  Everything else is notified by the service itself.
 -->
 <dict>
     <key>Label</key>
     <string>cc.antonlabs.veyra.alerts</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>__ROOT__/scripts/alert-probe.py</string>
+        <string>__ROOT__/scripts/run-service.sh</string>
+        <string>watchdog</string>
     </array>
-    <key>StartInterval</key>
-    <integer>120</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>VEYRA_WATCHDOG_URL</key>
+        <string>http://127.0.0.1:8080</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__ROOT__</string>
     <key>RunAtLoad</key>
-    <false/>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>StandardOutPath</key>
     <string>__HOME__/Library/Logs/veyra/alert.out.log</string>
     <key>StandardErrorPath</key>
