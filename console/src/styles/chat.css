@@ -180,3 +180,54 @@
   .assistant-drawer { animation: none; }
   .assistant-launcher { transition: none; }
 }
+
+/* The working line: pulsing glyph, a shimmer sweeping the word, elapsed time. */
+.assistant-thinking {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin: 8px 0 0;
+  font-size: 13px;
+}
+
+.assistant-thinking-glyph {
+  display: inline-block;
+  width: 12px;
+  color: var(--color-accent-text);
+  text-align: center;
+}
+
+.assistant-thinking-word {
+  background: linear-gradient(
+    90deg,
+    var(--color-accent-text) 0%,
+    var(--color-accent-text) 40%,
+    var(--color-ink) 50%,
+    var(--color-accent-text) 60%,
+    var(--color-accent-text) 100%
+  );
+  background-size: 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  font-weight: 510;
+  animation: assistant-shimmer 1.8s linear infinite;
+}
+
+.assistant-thinking-time {
+  color: var(--color-ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes assistant-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: -150% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .assistant-thinking-word {
+    animation: none;
+    color: var(--color-accent-text);
+    background: none;
+  }
+}

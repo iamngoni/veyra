@@ -24,6 +24,86 @@ type Message = {
   at: number
 }
 
+/**
+ * What the assistant is "doing" while it works: a playful trading gerund that
+ * changes every few seconds, in the spirit of a CLI spinner. Purely cosmetic;
+ * the real tool activity is listed above it and the service's own status is
+ * kept for screen readers.
+ */
+export const THINKING_WORDS = [
+  'Pip-counting',
+  'Candle-reading',
+  'Chart-whispering',
+  'Tape-reading',
+  'Wick-watching',
+  'Trend-sniffing',
+  'Spread-squinting',
+  'Ledger-diving',
+  'Backtesting',
+  'Reconciling',
+  'Compounding',
+  'Rebalancing',
+  'Hedging',
+  'Stop-trailing',
+  'Break-evening',
+  'Profit-harvesting',
+  'Drawdown-dodging',
+  'Margin-minding',
+  'Volatility-taming',
+  'Bull-wrangling',
+  'Bear-proofing',
+  'Whale-watching',
+  'FOMO-resisting',
+  'Gap-minding',
+  'Slippage-fearing',
+  'Leverage-respecting',
+  'Mean-reverting',
+  'Momentum-surfing',
+  'Divergence-hunting',
+  'Fibonacci-ing',
+  'Liquidity-sipping',
+  'Tick-chasing',
+  'Timestamp-wrangling',
+  'Broker-pinging',
+  'Risk-gating',
+  'Diamond-handing',
+  'Bottom-fishing',
+  'Sentiment-sniffing',
+  'Correlating',
+  'Candlesticking',
+] as const
+
+const THINKING_GLYPHS = ['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢']
+const THINKING_TICK_MS = 150
+/** Ticks per word: the word changes every three seconds. */
+const TICKS_PER_WORD = 20
+
+/** The animated "working" line shown while an answer is on its way. */
+export function ThinkingLine({ startedAt, status }: { startedAt: number; status?: string }) {
+  const [tick, setTick] = useState(0)
+  const [offset] = useState(() => Math.floor(Math.random() * THINKING_WORDS.length))
+  useEffect(() => {
+    const timer = setInterval(() => setTick((value) => value + 1), THINKING_TICK_MS)
+    return () => clearInterval(timer)
+  }, [])
+  const word = THINKING_WORDS[(offset + Math.floor(tick / TICKS_PER_WORD)) % THINKING_WORDS.length]
+  const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+  return (
+    <p className="assistant-thinking" role="status">
+      <span className="assistant-thinking-glyph" aria-hidden="true">
+        {THINKING_GLYPHS[tick % THINKING_GLYPHS.length]}
+      </span>
+      <span className="assistant-thinking-word" aria-hidden="true">
+        {word}…
+      </span>
+      <span className="assistant-thinking-time" aria-hidden="true">
+        ({elapsed}s)
+      </span>
+      <span className="sr-only">{status ?? 'Working'}</span>
+    </p>
+  )
+}
+
 /** Quiet wall-clock label beside an author, e.g. `10:42 AM` — never a date; the
  *  whole conversation is one tab's session. */
 function messageClock(atMs: number): string {
@@ -269,7 +349,11 @@ export function AssistantChat() {
                     })}
                   </ol>
                 ) : null}
-                {message.status ? <p className="assistant-status">{message.status}</p> : null}
+                {!message.done ? (
+                  <ThinkingLine startedAt={message.at} status={message.status} />
+                ) : message.status ? (
+                  <p className="assistant-status">{message.status}</p>
+                ) : null}
                 {message.text ? message.role === 'assistant' && !message.error ? (
                   <div className="assistant-answer assistant-markdown">
                     <Markdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS} skipHtml>

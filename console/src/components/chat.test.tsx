@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, within } from '@testing-librar
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { streamAssistant, type AssistantEvent } from '../lib/api'
-import { AssistantChat } from './chat'
+import { AssistantChat, THINKING_WORDS, ThinkingLine } from './chat'
 
 vi.mock('../lib/api', () => ({ streamAssistant: vi.fn() }))
 
@@ -235,6 +235,33 @@ it('shows an interim status label while the assistant works', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Ask Veyra' }))
   fireEvent.click(screen.getByRole('button', { name: /What changed recently/ }))
   expect(await screen.findByText('Done.')).toBeTruthy()
+})
+
+it('shows a rotating working line with elapsed time, keeping the real status for screen readers', () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-09-25T10:00:00Z'))
+  const random = vi.spyOn(Math, 'random').mockReturnValue(0)
+  try {
+    const { container } = render(<ThinkingLine startedAt={Date.now()} status="Reading open positions" />)
+    const word = () => container.querySelector('.assistant-thinking-word')?.textContent
+    const time = () => container.querySelector('.assistant-thinking-time')?.textContent
+    expect(word()).toBe(`${THINKING_WORDS[0]}…`)
+    expect(time()).toBe('(0s)')
+    expect(screen.getByRole('status').textContent).toContain('Reading open positions')
+
+    // Every three seconds the word moves on; the glyph and clock keep ticking.
+    act(() => vi.advanceTimersByTime(3_000))
+    expect(word()).toBe(`${THINKING_WORDS[1]}…`)
+    expect(time()).toBe('(3s)')
+  } finally {
+    random.mockRestore()
+    vi.useRealTimers()
+  }
+})
+
+it('says it is working when the service has not named a status yet', () => {
+  render(<ThinkingLine startedAt={Date.now()} />)
+  expect(screen.getByRole('status').textContent).toContain('Working')
 })
 
 it('ignores an empty question and a second one while one is already pending', async () => {
