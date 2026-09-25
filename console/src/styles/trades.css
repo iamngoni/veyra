@@ -1,0 +1,197 @@
+/* Trades area: the closed-trade book (trd-). Owned by components/trades.tsx.
+ *
+ * Built on the same hairline table as open positions (overview.css's pos-*):
+ * the table keeps its columns and scrolls sideways inside the panel on
+ * narrow screens rather than wrapping prices into unreadable cells. */
+
+.trd-summary {
+  color: var(--color-ink-muted);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+.trd-truncated {
+  font-size: var(--text-sm);
+}
+
+.trd-panel .panel-empty {
+  padding-top: 0;
+}
+
+.trd-loading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-1) var(--panel-inset) var(--panel-inset);
+}
+
+/* ---------- table ---------- */
+
+.trd-scroll {
+  position: relative;
+  overflow-x: auto;
+  padding-bottom: var(--space-1);
+}
+
+.trd-scroll:focus-visible {
+  outline-offset: -2px;
+}
+
+.trd-table {
+  width: 100%;
+  min-width: 720px;
+  border-collapse: collapse;
+  font-size: var(--text-base);
+}
+
+.trd-col-closed { width: 13%; }
+.trd-col-symbol { width: 9%; }
+.trd-col-side { width: 7%; }
+.trd-col-lots { width: 6.5%; }
+.trd-col-prices { width: 15%; }
+.trd-col-held { width: 9%; }
+.trd-col-net { width: 9%; }
+.trd-col-r { width: 7%; }
+.trd-col-reason { width: 17.5%; }
+.trd-col-actions { width: 6.5%; }
+
+.trd-table th,
+.trd-table td {
+  padding: 0 var(--space-2);
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.trd-table :is(th, td):first-child {
+  padding-left: var(--panel-inset);
+}
+
+/* Lots, prices, held, net and R are read as figures; right-aligned so
+   decimals stack. */
+.trd-table :is(th, td):nth-child(n + 4):nth-child(-n + 8) {
+  text-align: right;
+}
+
+.trd-table th {
+  height: 32px;
+  color: var(--color-ink-faint);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-align: left;
+  box-shadow: inset 0 -1px 0 var(--color-line-soft);
+}
+
+.trd-table td {
+  height: 36px;
+}
+
+.trd-row:not(:first-child) > td {
+  border-top: 1px solid var(--color-line-soft);
+}
+
+.trd-row {
+  transition: background-color var(--duration-fast) var(--ease-out);
+}
+
+.trd-row:hover,
+.trd-row:focus-within,
+.trd-row.is-expanded,
+.trd-row.is-expanded + .trd-detail {
+  background: var(--color-hover);
+}
+
+.trd-table td:first-child {
+  font-weight: var(--weight-medium);
+}
+
+.trd-prices {
+  color: var(--color-ink-muted);
+}
+
+.trd-reason {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-ink-muted);
+  white-space: nowrap;
+}
+
+.trd-reason .dot {
+  width: 6px;
+  height: 6px;
+}
+
+.trd-table td.trd-actions {
+  padding: 0 var(--space-3) 0 0;
+  text-align: right;
+}
+
+/* The disclosure appears with its row (hover or keyboard focus) and stays
+   while that row is open. Touch screens have no hover, so it always shows. */
+.trd-more {
+  width: var(--control-sm);
+  height: var(--control-sm);
+  vertical-align: middle;
+  opacity: 0;
+}
+
+.trd-row:hover .trd-more,
+.trd-row:focus-within .trd-more,
+.trd-more[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.trd-more .icon {
+  transition: transform var(--duration) var(--ease-out);
+}
+
+.trd-more[aria-expanded="true"] {
+  color: var(--color-ink);
+}
+
+.trd-more[aria-expanded="true"] .icon {
+  transform: rotate(180deg);
+}
+
+@media (hover: none) {
+  .trd-more {
+    opacity: 1;
+  }
+}
+
+/* ---------- detail drawer ---------- */
+
+.trd-table .trd-detail > td {
+  height: auto;
+  padding: 0 var(--panel-inset) 10px;
+}
+
+.trd-rationale {
+  margin: 0 0 8px;
+  color: var(--color-ink);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+
+.trd-detail-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-6);
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: 18px;
+}
+
+.trd-detail-list > div {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.trd-detail-list dt {
+  color: var(--color-ink-faint);
+}
+
+.trd-detail-list dd {
+  margin: 0;
+  color: var(--color-ink);
+}

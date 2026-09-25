@@ -1,108 +1,24 @@
 //! Clock alignment and time windows for assistant observations.
 //!
-//! MetaTrader stamps order and position times (`openTime`, `closeTime`,
-//! `openedAt`) with the broker server clock, not UTC. The retained account
-//! snapshot carries a `serverTime` reading (the terminal host's `TimeLocal()`,
-//! which matches the server clock on the supported deployment — an explicit
-//! assumption, reported with every conversion) together with the instant
-//! Veyra received it. The broker offset is therefore
-//! `round((serverTime − received) / 900) × 900` seconds: every real UTC
-//! offset is a multiple of 15 minutes, and rounding absorbs transport delay.
-//! Offsets beyond ±14 h are refused rather than trusted.
-//!
-//! The operator's own UTC offset is separate. It only changes presentation
-//! and what `today` / `yesterday` mean; with no offset, days are UTC days.
-//! Everything here is pure except [`BrokerClock::from_state`], which reads
-//! the retained snapshot and never contacts the venue.
+//! The broker-clock estimation itself ([`BrokerClock`]) is shared with the
+//! `/trades` route and lives in [`crate::broker_clock`]; this module adds
+//! the assistant-specific presentation on top: naive broker-clock text,
+//! human durations, and the operator's own UTC offset, which only changes
+//! presentation and what `today` / `yesterday` mean (with no offset, days
+//! are UTC days). Everything here is pure except [`BrokerClock::from_state`],
+//! which reads the retained snapshot and never contacts the venue.
 
 use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, UtcOffset};
 
-use crate::AppState;
+pub(super) use crate::broker_clock::{BrokerClock, unix_secs, utc_text};
+use crate::broker_clock::{civil_text, offset_label};
 
-/// Granularity real UTC offsets use.
-const OFFSET_STEP_SECS: i64 = 900;
-/// Largest plausible distance between the broker clock and UTC.
-const MAX_BROKER_OFFSET_SECS: i64 = 14 * 3_600;
 /// Largest operator offset accepted, in minutes (UTC−14:00 through UTC+14:00).
 pub(super) const MAX_OPERATOR_OFFSET_MINUTES: i64 = 14 * 60;
 /// Milliseconds in one (offset-fixed) day.
 pub(super) const DAY_MS: i64 = 86_400_000;
-
-/// Estimated broker-server clock offset from UTC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct BrokerClock {
-    offset_secs: i64,
-}
-
-impl BrokerClock {
-    /// Estimates the offset from one `serverTime` reading and the UTC instant
-    /// the snapshot carrying it was received.
-    ///
-    /// # Errors
-    /// Returns a bounded reason when the reading is missing or the rounded
-    /// offset exceeds ±14 hours.
-    pub(super) fn estimate(server_time: i64, received_utc_secs: i64) -> Result<Self, String> {
-        if server_time <= 0 {
-            return Err(
-                "broker_clock_unknown: the account snapshot carries no server time".to_owned(),
-            );
-        }
-        let drift = server_time.saturating_sub(received_utc_secs);
-        let offset_secs = drift
-            .saturating_add(OFFSET_STEP_SECS / 2)
-            .div_euclid(OFFSET_STEP_SECS)
-            .saturating_mul(OFFSET_STEP_SECS);
-        if offset_secs.abs() > MAX_BROKER_OFFSET_SECS {
-            return Err(format!(
-                "broker_clock_implausible: serverTime differs from UTC by {drift} s, beyond ±14 h"
-            ));
-        }
-        Ok(Self { offset_secs })
-    }
-
-    /// Estimates the offset from the retained account snapshot.
-    ///
-    /// # Errors
-    /// Returns a bounded reason when no broker or snapshot is available or
-    /// the reading is implausible.
-    pub(super) fn from_state(state: &AppState) -> Result<Self, String> {
-        let link = state
-            .broker()
-            .ok_or_else(|| "broker_unavailable".to_owned())?
-            .link();
-        let snapshot = link.last_account().ok_or_else(|| {
-            "broker_clock_unknown: no account snapshot has been received yet".to_owned()
-        })?;
-        let now = state.now();
-        let age_secs = link
-            .last_account_age(now)
-            .map(|age| i64::try_from(age.as_secs()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
-        let received = unix_secs(now)?.saturating_sub(age_secs);
-        Self::estimate(snapshot.server_time, received)
-    }
-
-    /// Offset in seconds; positive when the broker clock runs ahead of UTC.
-    pub(super) fn offset_secs(self) -> i64 {
-        self.offset_secs
-    }
-
-    /// Converts a broker-clock Unix reading to real Unix seconds (UTC).
-    pub(super) fn to_utc_secs(self, broker_secs: i64) -> i64 {
-        broker_secs.saturating_sub(self.offset_secs)
-    }
-
-    /// Evidence block describing the conversion for the model.
-    pub(super) fn describe(self) -> Value {
-        json!({
-            "utc_offset": offset_label(self.offset_secs()),
-            "utc_offset_secs": self.offset_secs(),
-            "basis": "broker server time from the latest account snapshot vs its receipt time, rounded to 15 minutes; broker times below are converted to UTC"
-        })
-    }
-}
 
 /// Evidence block for a conversion that could not be established.
 pub(super) fn unknown_clock(reason: &str) -> Value {
@@ -215,17 +131,6 @@ fn local_day_start_ms(now_ms: i64, operator: OperatorOffset, days_back: i64) -> 
     start.unix_timestamp().checked_mul(1_000)
 }
 
-/// Current Unix seconds of a wall-clock instant.
-///
-/// # Errors
-/// Returns a bounded reason when the clock precedes the epoch.
-pub(super) fn unix_secs(at: std::time::SystemTime) -> Result<i64, String> {
-    let elapsed = at
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "clock_before_epoch".to_owned())?;
-    i64::try_from(elapsed.as_secs()).map_err(|_| "clock_out_of_range".to_owned())
-}
-
 /// Current Unix milliseconds of a wall-clock instant.
 ///
 /// # Errors
@@ -241,33 +146,9 @@ fn datetime(ms: i64) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
 }
 
-fn civil_text(at: OffsetDateTime) -> String {
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        at.year(),
-        u8::from(at.month()),
-        at.day(),
-        at.hour(),
-        at.minute(),
-        at.second()
-    )
-}
-
-/// RFC 3339 UTC text at second precision, or `None` when unrepresentable.
-pub(super) fn utc_text(ms: i64) -> Option<String> {
-    datetime(ms).map(|at| format!("{}Z", civil_text(at)))
-}
-
 /// Broker-clock reading as naive civil text (no zone: it is not UTC).
 pub(super) fn broker_text(broker_secs: i64) -> Option<String> {
     datetime(broker_secs.saturating_mul(1_000)).map(civil_text)
-}
-
-/// `+HH:MM` / `-HH:MM` label for an offset in seconds.
-fn offset_label(offset_secs: i64) -> String {
-    let sign = if offset_secs < 0 { '-' } else { '+' };
-    let minutes = offset_secs.abs() / 60;
-    format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 /// Compact human duration such as `2h 16m` or `3d 4h`.

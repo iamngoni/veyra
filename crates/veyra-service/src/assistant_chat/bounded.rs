@@ -22,12 +22,10 @@ const LOOSER_TEXT_TIERS: [usize; 2] = [MAX_TEXT_CHARS, 500];
 /// Tightest text bound; below it rows are dropped instead.
 const TIGHTEST_TEXT_CHARS: usize = 240;
 
-/// Clips `text` to `max` characters, marking a cut with `…`.
+/// Clips `text` to `max` characters, marking a cut with `…`. Shared with
+/// `/trades` in [`crate::text::clip`].
 pub(super) fn clip(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        None => text.to_owned(),
-        Some((cut, _)) => format!("{}…", &text[..cut]),
-    }
+    crate::text::clip(text, max)
 }
 
 /// Serialized length of `value` in characters.

@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   logs: vi.fn(),
   audit: vi.fn(),
   config: vi.fn(),
+  trades: vi.fn(),
   updatePolicy: vi.fn(),
   updateConfig: vi.fn(),
 }))
@@ -40,6 +41,7 @@ vi.mock('../lib/api', () => ({
     audit: mocks.audit,
     config: mocks.config,
     balanceHistory: mocks.balanceHistory,
+    trades: mocks.trades,
     updatePolicy: mocks.updatePolicy,
     updateConfig: mocks.updateConfig,
   },
@@ -183,6 +185,35 @@ beforeEach(() => {
     fresh: false,
   })
   mocks.metrics.mockResolvedValue({ service: 'veyra', version: '0.1.0', counters: { 'event.proposal_evaluated': 3 }, feedLatest: 12 })
+  mocks.trades.mockResolvedValue({
+    days: 30,
+    truncated: false,
+    total: 1,
+    brokerOffsetSecs: 7200,
+    summary: { count: 1, wins: 1, losses: 0, breakeven: 0, net: 1.36 },
+    trades: [
+      {
+        ticket: 10654166,
+        symbol: 'USDJPY',
+        side: 'long',
+        lots: 0.01,
+        openedAtMs: Date.now() - 7_200_000,
+        closedAtMs: Date.now() - 3_600_000,
+        openPrice: 158.1,
+        closePrice: 158.3,
+        stopLoss: 157.9,
+        takeProfit: 158.4,
+        net: 1.36,
+        profit: 1.36,
+        swap: 0,
+        commission: 0,
+        rMultiple: 0.68,
+        closeReason: 'take_profit',
+        closeDetail: null,
+        entryRationale: 'USDJPY carried the cleanest aligned bullish case.',
+      },
+    ],
+  })
   mocks.events.mockImplementation(() => new Promise(() => undefined))
   mocks.logs.mockResolvedValue({ logs: [], latest: 0 })
   mocks.audit.mockResolvedValue({ status: 'ok', provider: 'postgres', events: [] })
@@ -229,6 +260,10 @@ describe('Dashboard', () => {
     expect(screen.getByRole('heading', { name: /Commands/ })).toBeTruthy()
     expect(container.querySelector('.app')?.className).toBe('app')
 
+    openTab('Trades')
+    expect(await screen.findByRole('heading', { level: 2, name: 'Trades' })).toBeTruthy()
+    expect(screen.getByText('USDJPY')).toBeTruthy()
+
     openTab('Risk')
     expect(await screen.findByText('Balance')).toBeTruthy()
     expect(screen.getByRole('heading', { name: 'Risk policy' })).toBeTruthy()
@@ -252,6 +287,20 @@ describe('Dashboard', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'D1' }))
     await waitFor(() => expect(mocks.candles).toHaveBeenCalledWith(120, 'D1', 'EURUSD'))
+  })
+
+  it('refetches trades at once when the range changes, on its own poll from the chart range', async () => {
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+    openTab('Trades')
+    await screen.findByRole('heading', { level: 2, name: 'Trades' })
+    await waitFor(() => expect(mocks.trades).toHaveBeenCalledWith(30))
+
+    fireEvent.click(screen.getByRole('button', { name: '7D' }))
+    await waitFor(() => expect(mocks.trades).toHaveBeenCalledWith(7))
+
+    fireEvent.click(screen.getByRole('button', { name: '1Y' }))
+    await waitFor(() => expect(mocks.trades).toHaveBeenCalledWith(365))
   })
 
   it('routes the activity digest, the gear and the theme toggle', async () => {

@@ -1047,6 +1047,63 @@ pub async fn performance(
     }
 }
 
+/// Query for `GET /trades`.
+#[derive(Debug, Deserialize)]
+pub struct TradesQuery {
+    /// Days of account history to include (1-365); defaults to 30.
+    pub days: Option<u32>,
+}
+
+#[get("/trades")]
+/// Returns closed Veyra trades with why each one closed.
+///
+/// Read-only: queues the same `order_history` command `/performance` uses,
+/// for the Veyra magic number, with the same 20 s await, 1-365 day window,
+/// and 256-order terminal cap. [`crate::trades::build`] then joins each
+/// fill with the audit trail's journal-linking evidence (the entry decision,
+/// any recorded stop moves, and any recorded close) to classify why it
+/// closed; nothing here enqueues a second command or reaches an order path.
+pub async fn trades(state: Data<AppState>, query: web::Query<TradesQuery>) -> HttpResponse {
+    let Some(link) = command_link(&state) else {
+        return HttpResponse::ServiceUnavailable().json(json!({ "error": "broker_unavailable" }));
+    };
+    let days = query.days.unwrap_or(OrderHistoryRequest::DEFAULT_DAYS);
+    let request = match OrderHistoryRequest::new(days, ORDER_MAGIC) {
+        Ok(request) => request,
+        Err(error) => {
+            return HttpResponse::BadRequest()
+                .json(json!({ "error": "invalid_window", "reason": error.to_string() }));
+        }
+    };
+    let id = link.enqueue_order_history(request);
+    match link.await_command(id, Duration::from_secs(20)).await {
+        CommandState::Completed {
+            payload: CommandPayload::OrderHistory(history),
+        } => {
+            let report = crate::trades::build(&state, &history).await;
+            HttpResponse::Ok().json(json!({
+                "days": days,
+                "truncated": history.truncated,
+                "total": history.total,
+                "brokerOffsetSecs": report.broker_offset_secs,
+                "summary": report.summary,
+                "trades": report.trades
+            }))
+        }
+        CommandState::Completed { .. } => HttpResponse::BadGateway().json(json!({
+            "error": "history_failed",
+            "reason": "history command completed with a different payload"
+        })),
+        CommandState::Failed { reason } => {
+            HttpResponse::BadGateway().json(json!({ "error": "history_failed", "reason": reason }))
+        }
+        CommandState::Pending => HttpResponse::BadGateway().json(json!({
+            "error": "history_failed",
+            "reason": "history command still pending after the await window"
+        })),
+    }
+}
+
 /// Query for the economic calendar window.
 #[derive(Debug, Deserialize)]
 pub struct CalendarQuery {
@@ -2372,6 +2429,253 @@ mod tests {
                 test::TestRequest::get().uri("/performance").to_request(),
             )
             .await
+        });
+        let mut command = None;
+        for _ in 0..40 {
+            let response = test::call_service(
+                &ea_app,
+                test::TestRequest::post()
+                    .uri("/ea/poll")
+                    .set_payload(hello.to_string())
+                    .to_request(),
+            )
+            .await;
+            let body: Value = test::read_body_json(response).await;
+            if body["t"] == "cmd" {
+                command = Some(body);
+                break;
+            }
+            actix_web::rt::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let command = command.expect("history command delivered again");
+        let failure = serde_json::json!({
+            "t": "ack",
+            "token": "test-token-1234567890",
+            "id": command["id"],
+            "ok": false,
+            "error": "history unavailable"
+        });
+        let response = test::call_service(
+            &ea_app,
+            test::TestRequest::post()
+                .uri("/ea/poll")
+                .set_payload(failure.to_string())
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let response = failing.await.expect("task joins");
+        assert_eq!(response.status(), 502);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "history_failed");
+        assert_eq!(body["reason"], "history unavailable");
+    }
+
+    #[actix_web::test]
+    async fn trades_route_requires_a_broker_and_a_valid_window() {
+        let unlinked = test::init_service(create_app(build_state(None, false))).await;
+        let response = test::call_service(
+            &unlinked,
+            test::TestRequest::get().uri("/trades").to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 503);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "broker_unavailable");
+
+        let (state, _) = audited_state(None);
+        let typed = test::init_service(create_app(state)).await;
+        let response = test::call_service(
+            &typed,
+            test::TestRequest::get().uri("/trades?days=0").to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"], "invalid_window");
+    }
+
+    #[actix_web::test]
+    async fn trades_route_classifies_closes_and_reports_a_gateway_failure() {
+        let (state, trail) = audited_state(None);
+        let link = state.broker().expect("broker").ea_link().expect("ea link");
+
+        // Ticket 10655087 has a recorded entry and an autopilot close: the
+        // agent_close reason must win even though its close price also sits
+        // on the recorded stop.
+        let open_id = "5a3f5c1e-2b1d-4a57-9d27-9b0d2f7e8a10".to_owned();
+        trail.record_at(
+            time::OffsetDateTime::now_utc() - time::Duration::minutes(20),
+            crate::audit::AuditEvent::new(
+                crate::audit::AuditKind::ProposalEvaluated,
+                serde_json::json!({
+                    "outcome": "queued",
+                    "command_id": open_id,
+                    "rationale": "GBPUSD has the strongest aligned bearish evidence",
+                    "stop_loss": 1.3265,
+                    "take_profit": 1.3162
+                }),
+            ),
+        );
+        trail.record_at(
+            time::OffsetDateTime::now_utc() - time::Duration::minutes(19),
+            crate::audit::AuditEvent::new(
+                crate::audit::AuditKind::CommandCompleted,
+                serde_json::json!({
+                    "kind": "open_order",
+                    "command_id": open_id,
+                    "result": {"ticket": 10_655_087}
+                }),
+            ),
+        );
+        trail.record_at(
+            time::OffsetDateTime::now_utc() - time::Duration::minutes(1),
+            crate::audit::AuditEvent::new(
+                crate::audit::AuditKind::ProposalEvaluated,
+                serde_json::json!({
+                    "outcome": "close_queued",
+                    "origin": "autopilot_review",
+                    "ticket": 10_655_087,
+                    "rationale": "thesis invalidated"
+                }),
+            ),
+        );
+
+        // One history round trip: the route queues, the EA answers.
+        let ea_app = test::init_service(crate::broker::ea::create_ea_app(link.clone())).await;
+        let route_state = state.clone();
+        let task = actix_web::rt::spawn(async move {
+            let app = test::init_service(create_app(route_state)).await;
+            test::call_service(
+                &app,
+                test::TestRequest::get().uri("/trades?days=7").to_request(),
+            )
+            .await
+        });
+        let hello = serde_json::json!({
+            "t": "hb",
+            "token": "test-token-1234567890",
+            "acct": 94168,
+            "server": "IFCMarkets-Real",
+            "symbol": "EURUSD",
+            "connected": true,
+            "tradeAllowed": true,
+            "orders": 0,
+            "lots": 0.0
+        });
+        let mut command = None;
+        for _ in 0..40 {
+            let response = test::call_service(
+                &ea_app,
+                test::TestRequest::post()
+                    .uri("/ea/poll")
+                    .set_payload(hello.to_string())
+                    .to_request(),
+            )
+            .await;
+            let body: Value = test::read_body_json(response).await;
+            if body["t"] == "cmd" {
+                command = Some(body);
+                break;
+            }
+            actix_web::rt::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let command = command.expect("history command delivered");
+        assert_eq!(command["kind"], "order_history");
+        assert_eq!(command["history"]["days"], 7);
+
+        let ack = serde_json::json!({
+            "t": "ack",
+            "token": "test-token-1234567890",
+            "id": command["id"],
+            "ok": true,
+            "data": {
+                "orders": [
+                    {
+                        "ticket": 10_655_087,
+                        "symbol": "GBPUSD",
+                        "kind": "sell",
+                        "lots": 0.01,
+                        "openPrice": 1.32123,
+                        "closePrice": 1.3265,
+                        "openTime": 1_790_271_000_i64,
+                        "closeTime": 1_790_341_680_i64,
+                        "profit": -5.31,
+                        "swap": 0.0,
+                        "commission": 0.0,
+                        "magic": 77041
+                    },
+                    {
+                        "ticket": 10_650_830,
+                        "symbol": "USDJPY",
+                        "kind": "buy",
+                        "lots": 0.01,
+                        "openPrice": 156.198,
+                        "closePrice": 156.41,
+                        "openTime": 1_789_699_082_i64,
+                        "closeTime": 1_789_707_257_i64,
+                        "profit": 1.36,
+                        "swap": 0.0,
+                        "commission": 0.0,
+                        "magic": 77041
+                    }
+                ],
+                "total": 2,
+                "truncated": false
+            }
+        });
+        let response = test::call_service(
+            &ea_app,
+            test::TestRequest::post()
+                .uri("/ea/poll")
+                .set_payload(ack.to_string())
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+
+        let response = task.await.expect("task joins");
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["days"], 7);
+        assert_eq!(body["total"], 2);
+        assert_eq!(body["truncated"], false);
+        // No account_snapshot was ever completed, so the broker offset (and
+        // therefore the UTC conversion) is unknown.
+        assert!(body["brokerOffsetSecs"].is_null());
+        assert_eq!(body["summary"]["count"], 2);
+        assert_eq!(body["summary"]["wins"], 1);
+        assert_eq!(body["summary"]["losses"], 1);
+        assert_eq!(body["summary"]["net"], -3.95);
+
+        // Newest close first.
+        assert_eq!(body["trades"][0]["ticket"], 10_655_087);
+        assert_eq!(body["trades"][0]["side"], "short");
+        assert_eq!(body["trades"][0]["closeReason"], "agent_close");
+        assert_eq!(body["trades"][0]["closeDetail"], "thesis invalidated");
+        assert_eq!(
+            body["trades"][0]["entryRationale"],
+            "GBPUSD has the strongest aligned bearish evidence"
+        );
+        assert_eq!(body["trades"][0]["stopLoss"], 1.3265);
+        assert_eq!(body["trades"][0]["takeProfit"], 1.3162);
+        assert_eq!(body["trades"][0]["rMultiple"], -1.0);
+        assert_eq!(body["trades"][0]["openedAtMs"], 1_790_271_000_000_i64);
+        assert_eq!(body["trades"][0]["closedAtMs"], 1_790_341_680_000_i64);
+
+        // No journal evidence at all: closes unclassified.
+        assert_eq!(body["trades"][1]["ticket"], 10_650_830);
+        assert_eq!(body["trades"][1]["closeReason"], "unknown");
+        assert!(body["trades"][1]["entryRationale"].is_null());
+        assert!(body["trades"][1]["stopLoss"].is_null());
+        assert!(body["trades"][1]["rMultiple"].is_null());
+
+        // A terminal that fails the request is a gateway failure, exactly as
+        // for /performance.
+        let route_state = state.clone();
+        let failing = actix_web::rt::spawn(async move {
+            let app = test::init_service(create_app(route_state)).await;
+            test::call_service(&app, test::TestRequest::get().uri("/trades").to_request()).await
         });
         let mut command = None;
         for _ in 0..40 {

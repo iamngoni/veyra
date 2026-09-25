@@ -10,6 +10,7 @@ pub mod assistant_chat;
 pub mod audit;
 pub mod balance;
 pub mod broker;
+pub mod broker_clock;
 pub mod calendar;
 pub mod config;
 pub mod control;
@@ -28,6 +29,9 @@ pub mod server;
 pub mod state;
 pub mod store;
 pub mod subscription_auth;
+pub mod text;
+pub mod trade_journal;
+pub mod trades;
 pub mod trading;
 
 use std::sync::Arc;

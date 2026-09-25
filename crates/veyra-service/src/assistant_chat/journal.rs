@@ -9,8 +9,6 @@
 //! order, close, or modification. Recorded text (reasons, rationales,
 //! errors) is clipped and every list is fitted to the output ceiling.
 
-use std::collections::BTreeSet;
-
 use serde_json::{Map, Value, json};
 
 use super::args::Args;
@@ -23,9 +21,9 @@ use super::history::{fetch_history, side, trade_row};
 use crate::AppState;
 use crate::audit::{AuditKind, AuditQuery, AuditRow, parse_trail_time};
 use crate::broker::{
-    CommandId, CommandKind, CommandPayload, CommandState, ORDER_MAGIC, OrderHistoryRequest,
-    PositionPayload,
+    CommandKind, CommandPayload, CommandState, ORDER_MAGIC, OrderHistoryRequest, PositionPayload,
 };
+use crate::trade_journal::{STORY_KINDS, STORY_ROWS};
 
 /// Kinds `decision_history` searches when the model names none.
 const DECISION_KINDS: [AuditKind; 3] = [
@@ -34,21 +32,9 @@ const DECISION_KINDS: [AuditKind; 3] = [
     AuditKind::CommandFailed,
 ];
 
-/// Kinds that can mention one position or one of its commands.
-const STORY_KINDS: [AuditKind; 5] = [
-    AuditKind::ProposalEvaluated,
-    AuditKind::PositionClosed,
-    AuditKind::CommandQueued,
-    AuditKind::CommandCompleted,
-    AuditKind::CommandFailed,
-];
-
 /// Default and largest `decision_history` page.
 const DEFAULT_DECISION_ROWS: i64 = 20;
 const MAX_DECISION_ROWS: i64 = 50;
-
-/// Rows each `position_story` query may read.
-const STORY_ROWS: u32 = 120;
 
 /// Latest hold reviews kept verbatim in a story; older ones are counted.
 const STORY_HELD_REVIEWS: usize = 3;
@@ -419,42 +405,6 @@ pub(super) async fn positions(state: &AppState, arguments: &Value) -> Result<Val
     Ok(fit_list(envelope, "positions", rows))
 }
 
-/// Command ids named by the rows, in first-seen order.
-fn command_ids(rows: &[AuditRow]) -> Vec<String> {
-    let mut ids = Vec::new();
-    for row in rows {
-        if let Some(id) = row.payload.get("command_id").and_then(Value::as_str)
-            && CommandId::parse(id).is_some()
-            && !ids.iter().any(|known: &String| known == id)
-        {
-            ids.push(id.to_owned());
-        }
-    }
-    ids
-}
-
-/// Whether a completed-command row reports `ticket` as its fill.
-fn is_open_fill(row: &AuditRow, ticket: i64) -> bool {
-    row.kind == "command_completed"
-        && row.payload.get("kind").and_then(Value::as_str) == Some("open_order")
-        && row
-            .payload
-            .get("result")
-            .and_then(|result| result.get("ticket"))
-            .and_then(Value::as_i64)
-            == Some(ticket)
-}
-
-/// Sort key: parsed trail time, then the raw text for unparseable rows.
-fn chronological(rows: &mut [AuditRow]) {
-    rows.sort_by(|left, right| {
-        parse_trail_time(&left.at)
-            .cmp(&parse_trail_time(&right.at))
-            .then_with(|| left.at.cmp(&right.at))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-}
-
 /// `position_story`: one ticket's entry decision, adjustments, command
 /// outcomes, and close, oldest first.
 ///
@@ -479,49 +429,13 @@ pub(super) async fn position_story(state: &AppState, arguments: &Value) -> Resul
 
     // Everything that names the ticket, then everything that names one of
     // its commands: the entry decision carries only the open command's id.
-    let mut rows = trail
-        .query(
-            &AuditQuery::new(&STORY_KINDS, STORY_ROWS)
-                .and_then(|query| query.with_ticket(ticket))
-                .map_err(query_error)?,
-        )
+    let episode = crate::trade_journal::ticket_episode(trail, &STORY_KINDS, STORY_ROWS, ticket)
         .await
         .map_err(audit_error)?;
-    let open_commands: Vec<String> = command_ids(
-        &rows
-            .iter()
-            .filter(|row| is_open_fill(row, ticket))
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
-    let linked_ids = command_ids(&rows);
-    if !linked_ids.is_empty() {
-        let ids: Vec<String> = linked_ids
-            .into_iter()
-            .take(crate::audit::MAX_QUERY_COMMAND_IDS)
-            .collect();
-        let linked = trail
-            .query(
-                &AuditQuery::new(&STORY_KINDS, STORY_ROWS)
-                    .and_then(|query| query.with_command_ids(&ids))
-                    .map_err(query_error)?,
-            )
-            .await
-            .map_err(audit_error)?;
-        rows.extend(linked);
-    }
-    let mut seen = BTreeSet::new();
-    rows.retain(|row| seen.insert(row.id.clone()));
-    chronological(&mut rows);
+    let rows = episode.rows;
+    let open_commands = episode.open_commands;
 
-    let entry = rows.iter().find(|row| {
-        row.kind == "proposal_evaluated"
-            && row
-                .payload
-                .get("command_id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| open_commands.iter().any(|open| open == id))
-    });
+    let entry = crate::trade_journal::entry_decision(&rows, &open_commands);
     let open_queued = rows.iter().find(|row| {
         row.kind == "command_queued"
             && row
@@ -953,50 +867,8 @@ mod tests {
             event["result"].is_string(),
             "oversized results are clipped text"
         );
-        assert!(is_open_fill(
-            &row(
-                "t",
-                "command_completed",
-                json!({"kind": "open_order", "result": {"ticket": 5}})
-            ),
-            5
-        ));
-        assert!(!is_open_fill(&completed, 6));
-    }
-
-    #[test]
-    fn command_ids_are_valid_unique_and_ordered() {
-        let rows = vec![
-            row(
-                "a",
-                "command_queued",
-                json!({"command_id": "5a3f5c1e-2b1d-4a57-9d27-9b0d2f7e8a10"}),
-            ),
-            row("b", "command_queued", json!({"command_id": "not-a-uuid"})),
-            row(
-                "c",
-                "command_completed",
-                json!({"command_id": "5a3f5c1e-2b1d-4a57-9d27-9b0d2f7e8a10"}),
-            ),
-            row("d", "command_failed", json!({})),
-        ];
-        assert_eq!(
-            command_ids(&rows),
-            vec!["5a3f5c1e-2b1d-4a57-9d27-9b0d2f7e8a10".to_owned()]
-        );
-        let mut unordered = vec![
-            row("2026-09-24T06:00:00.000Z", "b", json!({})),
-            row("2026-09-24 05:00:00+00", "a", json!({})),
-            row("garbage", "c", json!({})),
-        ];
-        chronological(&mut unordered);
-        assert_eq!(
-            unordered
-                .iter()
-                .map(|row| row.kind.as_str())
-                .collect::<Vec<_>>(),
-            vec!["c", "a", "b"],
-            "unparseable times sort first, the rest chronologically"
-        );
+        // `is_open_fill`, `command_ids`, and `chronological` are the shared
+        // ticket-linking primitives now covered by their own tests in
+        // `crate::trade_journal`.
     }
 }

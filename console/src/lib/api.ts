@@ -261,6 +261,62 @@ export type Performance = {
   truncated: boolean
 }
 
+/** Why a closed Veyra trade left the book, as `/trades` reports it. */
+export type CloseReason =
+  | 'take_profit'
+  | 'stop_loss'
+  | 'break_even_stop'
+  | 'trailing_stop'
+  | 'harvest_stop'
+  | 'harvest_close'
+  | 'agent_close'
+  | 'manual_close'
+  | 'unknown'
+
+/**
+ * One closed trade from `/trades`, newest first as the service serves them.
+ * Times are true unix milliseconds; the service has already reconciled the
+ * broker's clock, so nothing here needs `lib/broker-time`.
+ */
+export type ClosedTradeRow = {
+  ticket: number
+  symbol: string
+  side: 'long' | 'short'
+  lots: number
+  openedAtMs: number
+  closedAtMs: number
+  openPrice: number
+  closePrice: number
+  /** Absolute price; zero when the trade carried no stop. */
+  stopLoss: number | null
+  /** Absolute price; zero when the trade carried no target. */
+  takeProfit: number | null
+  /** Profit, swap and commission combined — what closing it realized. */
+  net: number
+  profit: number
+  swap: number
+  commission: number
+  /** Realized result in multiples of the entry risk; null without one to measure against. */
+  rMultiple: number | null
+  closeReason: CloseReason
+  /** The agent's close rationale or the harvest detail; null otherwise. */
+  closeDetail: string | null
+  /** The model's stated case for the entry; null for a trade it did not open. */
+  entryRationale: string | null
+}
+
+export type TradesSummary = { count: number; wins: number; losses: number; breakeven: number; net: number }
+
+/** Closed-trade history for one lookback window, from `/trades`. */
+export type TradesPage = {
+  days: number
+  truncated: boolean
+  total: number
+  brokerOffsetSecs: number | null
+  summary: TradesSummary
+  trades: ClosedTradeRow[]
+}
+
 /** Levels the service log tail accepts, most severe first. */
 export type LogLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace'
 
@@ -591,6 +647,8 @@ export const api = {
     ),
   balanceHistory: (days = 30) => get<BalanceHistory>(`/account/balance-history?days=${days}`),
   performance: (days = 30) => get<Performance>(`/performance?days=${days}`),
+  /** Closed trades over one lookback window (1–365 days), newest first. */
+  trades: (days = 30) => get<TradesPage>(`/trades?days=${days}`),
   sessions: () => get<MarketSessions>('/market/sessions'),
   events: (after: number | undefined, waitMs = 15000, limit = 200) =>
     get<Feed>(after === undefined ? `/events?limit=${limit}` : `/events?after=${after}&wait_ms=${waitMs}&limit=${limit}`),

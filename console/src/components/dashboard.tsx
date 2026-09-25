@@ -12,6 +12,7 @@ import { KpiRow, OpenPositions, PerformanceSummary } from './overview'
 import { AutopilotCard, RecentActivity, RiskControls } from './rail'
 import { LiveSettingsPanel } from './settings'
 import { Sidebar, Topbar, type NavTab } from './shell'
+import { TradesPanel, type TradesRange } from './trades'
 import {
   AccountPanel,
   ActivityFeed,
@@ -31,6 +32,7 @@ import { useEventFeed, useLogFeed, usePoll, useTheme } from '../lib/hooks'
 const TABS = [
   { id: 'overview', label: 'Overview', icon: 'overview' },
   { id: 'activity', label: 'Activity', icon: 'activity' },
+  { id: 'trades', label: 'Trades', icon: 'trades' },
   { id: 'risk', label: 'Risk', icon: 'risk' },
   { id: 'trace', label: 'Trace', icon: 'trace' },
   { id: 'diagnostics', label: 'Diagnostics', icon: 'diagnostics' },
@@ -79,6 +81,15 @@ export function Dashboard() {
     seriesKey.current = key
     void refetchSeries()
   }, [symbol, timeframe, refetchSeries])
+
+  const [tradesRange, setTradesRange] = useState<TradesRange>(30)
+  const { data: trades, error: tradesError, refetch: refetchTrades } = usePoll(() => api.trades(tradesRange), 60000)
+  const tradesRangeRef = useRef(tradesRange)
+  useEffect(() => {
+    if (tradesRangeRef.current === tradesRange) return
+    tradesRangeRef.current = tradesRange
+    void refetchTrades()
+  }, [tradesRange, refetchTrades])
 
   // Judge health is not reported directly, so it is inferred from the failure
   // counter moving between polls. Cumulative totals alone cannot say whether
@@ -240,6 +251,10 @@ export function Dashboard() {
               <ActivityFeed events={events} connected={connected} focus={focus} onFocusChange={setFocus} />
               <CommandsPanel commands={commands?.commands} />
             </div>
+          ) : null}
+
+          {tab === 'trades' ? (
+            <TradesPanel page={trades} error={tradesError} range={tradesRange} onRangeChange={setTradesRange} />
           ) : null}
 
           {tab === 'risk' ? (

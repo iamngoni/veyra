@@ -62,6 +62,7 @@ describe('api', () => {
     await api.performance(7)
     await api.sessions()
     await api.audit(50)
+    await api.trades(7)
 
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       '/api/status',
@@ -74,6 +75,7 @@ describe('api', () => {
       '/api/performance?days=7',
       '/api/market/sessions',
       '/api/audit?limit=50',
+      '/api/trades?days=7',
     ])
     for (const call of fetchMock.mock.calls) {
       expect(call[1]?.headers).toEqual({ accept: 'application/json' })
@@ -98,12 +100,51 @@ describe('api', () => {
     await api.balanceHistory()
     await api.performance()
     await api.audit()
+    await api.trades()
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       '/api/commands?limit=25',
       '/api/account/balance-history?days=30',
       '/api/performance?days=30',
       '/api/audit?limit=200',
+      '/api/trades?days=30',
     ])
+  })
+
+  it('resolves a trades page as served', async () => {
+    const page = {
+      days: 30,
+      truncated: false,
+      total: 1,
+      brokerOffsetSecs: 7200,
+      summary: { count: 1, wins: 1, losses: 0, breakeven: 0, net: 1.36 },
+      trades: [
+        {
+          ticket: 10655087,
+          symbol: 'GBPUSD',
+          side: 'short',
+          lots: 0.01,
+          openedAtMs: 1_790_271_000_000,
+          closedAtMs: 1_790_341_680_000,
+          openPrice: 1.32123,
+          closePrice: 1.3265,
+          stopLoss: 1.3265,
+          takeProfit: 1.3162,
+          net: -5.31,
+          profit: -5.31,
+          swap: 0,
+          commission: 0,
+          rMultiple: -1,
+          closeReason: 'stop_loss',
+          closeDetail: null,
+          entryRationale: 'GBPUSD has the strongest aligned bearish evidence…',
+        },
+      ],
+    }
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(page))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(api.trades(30)).resolves.toEqual(page)
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/trades?days=30')
+    expect(fetchMock.mock.calls[0][1]).toEqual({ signal: undefined, headers: { accept: 'application/json' } })
   })
 
   it('defaults command and candle windows', async () => {

@@ -38,6 +38,7 @@ pub fn create_app(
         .service(crate::control::market_sessions)
         .service(crate::control::calendar_events)
         .service(crate::control::performance)
+        .service(crate::control::trades)
         .service(crate::control::audit_log)
         .service(crate::control::request_account_snapshot)
         .service(crate::control::command_status)

@@ -187,6 +187,7 @@ export function Segmented<T extends string | number>({
 export type IconName =
   | 'overview'
   | 'activity'
+  | 'trades'
   | 'risk'
   | 'trace'
   | 'diagnostics'
@@ -210,6 +211,12 @@ const ICONS: Record<IconName, ReactNode> = {
     <>
       <path d="M4 4v15a1 1 0 0 0 1 1h15" />
       <path d="M8.5 16.5v-4M13 16.5v-8M17.5 16.5v-6" />
+    </>
+  ),
+  trades: (
+    <>
+      <path d="M5 8h13m-4.5-4L18 8l-4.5 4" />
+      <path d="M19 16H6m4.5 4L6 16l4.5-4" />
     </>
   ),
   risk: <path d="M12 3.5 19 6.25v5.25c0 4.35-2.9 7.6-7 9-4.1-1.4-7-4.65-7-9V6.25z" />,
