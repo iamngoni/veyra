@@ -145,7 +145,12 @@ chmod 600 .env
 `.env` will hold passwords and keys. Git already ignores it, so it won't be
 uploaded by accident. Never paste it into a chat or an email.
 
-Open it in TextEdit:
+As it comes, the file has everything optional switched off: no MetaTrader,
+no AI model, no database, and trading off. The service starts with it
+unchanged, so there's nothing to fill in yet. Each later stage tells you
+which lines to fill in.
+
+To open the file later, use TextEdit:
 
 ```sh
 open -e .env
@@ -154,52 +159,7 @@ open -e .env
 (Files starting with a dot are hidden in Finder; this command opens it
 anyway. Any plain-text editor works.)
 
-### 4.2 Fill in the three things the template leaves blank
-
-The template has three connections switched on but with no keys filled in.
-Until each is either filled in or switched off, the service stops straight
-away with an error naming the missing setting. For a first run:
-
-**1. Give the MT4 add-on a password.** You'll need this in Stage C anyway.
-Run this in Terminal; it prints a long random string:
-
-```sh
-openssl rand -hex 24
-```
-
-Copy the output and paste it after `VEYRA_EA_TOKEN=` in `.env`, so the line
-looks like `VEYRA_EA_TOKEN=3f9c…` (with your own string).
-
-**2. Switch off the AI model for now.** Find these two lines and delete
-everything after the `=`:
-
-```dotenv
-VEYRA_MODEL_PROVIDER=
-VEYRA_MODEL_FALLBACKS=
-```
-
-**3. Switch off Jev for now.** Same again for these three lines:
-
-```dotenv
-VEYRA_JEV_PROVIDER=
-VEYRA_JEV_BASE_URL=
-VEYRA_JEV_MODEL=
-```
-
-While you're in there, check these safety lines read `false`:
-
-```dotenv
-VEYRA_TRADING_ENABLED=false
-VEYRA_AUTOPILOT_ENABLED=false
-VEYRA_EA_ALLOW_LIVE=false
-```
-
-The template ships with `VEYRA_EA_ALLOW_LIVE=true`. Change it to `false` now;
-Stage F explains when to turn it back on.
-
-Save the file.
-
-### 4.3 Start the service
+### 4.2 Start the service
 
 ```sh
 set -a; source .env; set +a
@@ -215,7 +175,7 @@ When it's running you'll see lines of text that start with
 `{"timestamp":…`. Those are its logs. Leave this window open. To stop the
 service, click into the window and press `Ctrl C`.
 
-### 4.4 Check it's alive
+### 4.3 Check it's alive
 
 Open a **new Terminal tab** (`⌘ T`), go to the project folder, and run:
 
@@ -232,12 +192,13 @@ also open these addresses in your browser:
 | <http://127.0.0.1:8080/ready> | Can it do its job? Lists the broker link and the database. |
 | <http://127.0.0.1:8080/status> | The full picture: which connections are set up, the safety limits, the trading switches. No passwords are shown. |
 
-At this stage `/ready` says `"status":"degraded"` with `"broker":"stale"`.
-**That's expected**: MT4 isn't connected yet. It changes in Stage C.
+At this stage `/ready` says `"status":"ready"`, with `"broker":"unconfigured"`
+(MetaTrader isn't set up yet; that's Stage C) and `"audit":"disabled"` (no
+database yet; that's Stage B).
 
 `127.0.0.1` means "this computer". Nobody else can reach these addresses.
 
-### 4.5 Start the console
+### 4.4 Start the console
 
 In another new Terminal tab:
 
@@ -288,7 +249,7 @@ VEYRA_DATABASE_URL=postgres://localhost/veyra
 ```
 
 **Restart the service**: press `Ctrl C` in its tab, then run the two start
-commands from [4.3](#43-start-the-service) again. Veyra creates its tables
+commands from [4.2](#42-start-the-service) again. Veyra creates its tables
 automatically the first time. <http://127.0.0.1:8080/ready> should now show
 `"audit":"ok"`.
 
@@ -329,7 +290,29 @@ Install MetaTrader 4 for Mac (your broker usually provides a download) so it
 ends up in `/Applications/MetaTrader 4.app`. Open it once and log in to your
 account.
 
-### 6.2 Set up the tunnel
+### 6.2 Switch on Veyra's MetaTrader link
+
+The add-on proves who it is with a password that you make up and that both
+sides know. Run this in Terminal; it prints a long random string:
+
+```sh
+openssl rand -hex 24
+```
+
+In `.env`, set these two lines, pasting your string after `VEYRA_EA_TOKEN=`:
+
+```dotenv
+VEYRA_BROKER_PROVIDER=ea
+VEYRA_EA_TOKEN=paste-your-string-here
+```
+
+Restart the service (`Ctrl C` in its tab, then the two commands from
+[4.2](#42-start-the-service)). It now also listens for the add-on on port
+7801, on this computer only. <http://127.0.0.1:8080/ready> says
+`"status":"degraded"` with `"broker":"stale"` until MT4 checks in. That's
+expected; it changes at the end of this stage.
+
+### 6.3 Set up the tunnel
 
 Install the tunnel tool and log in to Cloudflare (a browser window opens;
 choose your domain):
@@ -392,7 +375,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://ea.yourdomain.com/ea/po
 rejected it because it was empty. A number in the `500`s means the tunnel
 isn't running or can't reach the service.
 
-### 6.3 Work around a MetaTrader-on-Mac quirk
+### 6.4 Work around a MetaTrader-on-Mac quirk
 
 MetaTrader for Mac runs inside a compatibility layer (Wine) that can't fall
 back from the newer IPv6 kind of internet address to the older IPv4 kind.
@@ -422,15 +405,16 @@ and your tunnel name, for example:
 
 Save with `Ctrl O`, then `Enter`, and exit with `Ctrl X`.
 
-### 6.4 Build the add-on and install it into MT4
+### 6.5 Build the add-on and install it into MT4
 
-In `.env`, set the address the add-on should call, and keep live orders off
-for now:
+In `.env`, set the address the add-on should call:
 
 ```dotenv
 VEYRA_EA_URL=https://ea.yourdomain.com/ea/poll
-VEYRA_EA_ALLOW_LIVE=false
 ```
+
+Leave `VEYRA_EA_ALLOW_LIVE=false` as it is, so the add-on can't place real
+orders yet. Stage F covers turning it on.
 
 Then build it. This fills your address, password, and live-orders choice into
 the add-on and installs it into MT4:
@@ -452,7 +436,7 @@ the usual place, or hasn't been opened once yet.
 > in MetaEditor, and press Compile. Don't commit that edited copy: it contains
 > your password.
 
-### 6.5 Allow the add-on in MT4 and attach it
+### 6.6 Allow the add-on in MT4 and attach it
 
 In MetaTrader 4:
 
@@ -473,7 +457,7 @@ messages appear in the **Experts** tab of the Terminal panel at the bottom
 **Whenever you rebuild the add-on, restart MT4** (or remove it from the
 chart and drag it on again). MT4 keeps using the old copy otherwise.
 
-### 6.6 Check the connection
+### 6.7 Check the connection
 
 Within a few seconds:
 
@@ -514,6 +498,15 @@ VEYRA_MODEL_BALANCED=vendor/middle-model
 VEYRA_MODEL_REASONING=vendor/careful-model
 ```
 
+If you pick a "thinking" model and every decision fails with an error about
+tool choice, add `VEYRA_MODEL_COMPEL_STRUCTURED=false`: those models refuse
+to be forced into the fixed format, but still follow it when offered.
+
+OpenRouter isn't the only option. OpenAI, Anthropic, Groq, DeepSeek, xAI,
+Mistral, Kimi, Z.AI, a local Ollama, or a ChatGPT or Claude subscription
+connected in the console all work too. The comments above
+`VEYRA_MODEL_PROVIDER` in `.env.example` list them.
+
 Put a ceiling on spending, so a mistake can't run up a bill:
 
 ```dotenv
@@ -521,9 +514,9 @@ VEYRA_MODEL_MAX_CALLS_PER_HOUR=60
 VEYRA_MODEL_MAX_CALLS_PER_DAY=500
 ```
 
-`VEYRA_MODEL_FALLBACKS` lists backup models to try when the main one fails.
-The template's list is set up for the maintainer's OpenRouter account. Leave
-it empty unless you've checked those models are allowed on yours.
+`VEYRA_MODEL_FALLBACKS` lists up to four backup models to try when the main
+one fails, separated by commas. It's optional; `.env.example` shows an
+example.
 
 To prove the model answers correctly (this makes one real, paid request):
 
@@ -538,13 +531,11 @@ a mistake, not as "off".
 
 ### Jev (optional)
 
-Put back the three lines you emptied in Stage A and add your key:
+Fill in your key. The other Jev lines can stay empty; they then use the
+standard values.
 
 ```dotenv
 VEYRA_JEV_API_KEY=your-jev-key
-VEYRA_JEV_PROVIDER=typesafe
-VEYRA_JEV_BASE_URL=https://api.typesafe.ai
-VEYRA_JEV_MODEL=jev-latest
 ```
 
 Once Jev is set up, the autopilot pauses whenever Jev is unavailable instead
@@ -562,12 +553,17 @@ VEYRA_MARKET_PROVIDER=ea
 
 ### News calendar
 
-Makes Veyra aware of scheduled economic news, and blocks new trades around
-high-impact events. It isn't in the template, so add this line yourself:
+Makes Veyra aware of scheduled economic news, and blocks new trades for an
+instrument from 30 minutes before to 30 minutes after a high-impact event that
+affects it. It needs no account or key:
 
 ```dotenv
 VEYRA_CALENDAR_PROVIDER=forexfactory
 ```
+
+`VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES` changes the 30 minutes. If the
+calendar can't be reached, Veyra refuses new trades rather than trading
+without knowing what news is coming.
 
 ### Safety limits
 
@@ -581,10 +577,13 @@ important ones:
 | `VEYRA_RISK_MAX_TOTAL_LOTS` | Largest total size across all open trades. |
 | `VEYRA_RISK_MAX_OPEN_ORDERS` | Most trades open at once. |
 | `VEYRA_RISK_SESSION_HOURS_UTC` | Only trade between these hours (UTC), for example `7-21`. |
+| `VEYRA_RISK_MAX_DAILY_LOSS_PERCENT` | Stop opening trades for the rest of the day once the account is down this much since the day began (default 10%). |
 | `VEYRA_RISK_KILL_SWITCH` | `true` blocks every trade, immediately. |
 
 Start small: `0.01` lots and one open trade. `.env.example` explains every
-other setting.
+other setting, including the per-trade risk cap, the drawdown limit, and what
+happens to open trades over the weekend. Most limits can also be changed
+while running, in the console's **Risk** tab.
 
 ### Notifications (recommended)
 
@@ -593,8 +592,29 @@ closed, a loss limit reached, the connection dropping, repeated failures. It
 can send to email, Telegram, Discord, Slack, ntfy (free phone notifications),
 Pushover, or any webhook, and to several at once.
 
-Once the console is running, open the **Notifications** tab, pick a
-channel, follow its "How to set up" steps, save, and press **Send test**.
+Notifications include passwords for those services, so Veyra stores them
+encrypted. That needs the database (Stage B) and two values in `.env`: an
+encryption key, and an operator password you type into the console to save
+changes. Generate each with the command next to it and paste it in:
+
+```sh
+openssl rand -base64 32
+```
+
+```sh
+openssl rand -hex 32
+```
+
+```dotenv
+VEYRA_CONSOLE_SECRET_KEY=paste-the-first-output-here
+VEYRA_CONSOLE_ADMIN_TOKEN=paste-the-second-output-here
+```
+
+Keep the encryption key the same from then on: if it changes, Veyra can no
+longer read what it saved. Restart the service.
+
+Then open the console's **Notifications** tab, pick a channel, follow its
+"How to set up" steps, save, and press **Send test**.
 [docs/notifications.md](docs/notifications.md) has the same guides and the
 full list of events.
 
@@ -631,8 +651,8 @@ restart the Mac. For unattended running, use the Mac setup below.
 
 This uses macOS's built-in background-job system (launchd). It keeps the
 service, tunnel, and console running, restarts them if they crash, opens MT4
-when you log in, sends alerts, trims logs hourly, and backs the database up
-daily.
+when you log in, runs a watchdog that tells you if Veyra stops responding,
+trims logs hourly, and backs the database up daily.
 
 It expects everything from Stages B and C to be in place, set up the way
 this guide did it: PostgreSQL 17 from Homebrew, `cloudflared` from Homebrew,
@@ -721,7 +741,7 @@ mistake can't move money on its own.
 
 | Switch | Where | Effect when off |
 | --- | --- | --- |
-| **Service switch** | `VEYRA_TRADING_ENABLED` in `.env`, or changed while running (below) | The service refuses to send any order. |
+| **Service switch** | The **Execution** switch in the console's **Settings** tab, or `VEYRA_TRADING_ENABLED` in `.env` | The service refuses to send any order. |
 | **Add-on switch** | `VEYRA_EA_ALLOW_LIVE` when building the add-on, or the add-on's `InAllowLiveOrders` setting in MT4 (right-click the chart → Expert Advisors → Properties → Inputs) | MT4 checks each order and reports what *would* have happened, without placing it. |
 
 On top of that, the instrument must be listed in `VEYRA_RISK_SYMBOLS` and
@@ -733,17 +753,18 @@ pass every other safety limit.
       sense.
 - [ ] You're on a demo account, or you accept the risk on a real one.
 - [ ] Sizes are small (`0.01` lots, one open trade).
-- [ ] Alerts reach you.
+- [ ] Notifications reach you.
 - [ ] Only one copy of Veyra can reach this account.
 - [ ] You know how to stop it (below).
 
 **To switch on:**
 
 1. Set `VEYRA_EA_ALLOW_LIVE=true`, rebuild the add-on
-   ([6.4](#64-build-the-add-on-and-install-it-into-mt4)), and restart MT4. In
+   ([6.5](#65-build-the-add-on-and-install-it-into-mt4)), and restart MT4. In
    the add-on's window in MT4, tick **Allow live trading** on the Common tab.
-2. Turn on the service switch. Either set `VEYRA_TRADING_ENABLED=true` in
-   `.env` and restart the service, or change it while it runs:
+2. Turn on the service switch: the **Execution** switch in the console's
+   **Settings** tab. Or set `VEYRA_TRADING_ENABLED=true` in `.env` and
+   restart the service, or change it while it runs with:
 
    ```sh
    curl -X POST http://127.0.0.1:8080/config -H 'Content-Type: application/json' -d '{"VEYRA_TRADING_ENABLED": true}'
@@ -760,20 +781,20 @@ true` marks the ones that no longer follow `.env`.
 **Profit protection is on by default.** While the autopilot runs with
 trading on, `VEYRA_AUTOPILOT_PROFIT_HARVEST` moves stop-losses on open
 trades and closes a trade that is giving back its profit. It can be turned
-off while running with the same `/config` command, using
-`{"VEYRA_AUTOPILOT_PROFIT_HARVEST": false}`.
+off while running, under **Profit harvesting** in the console's **Settings**
+tab.
 
 ### Emergency stop
 
 Any one of these stops new trades. Fastest first:
 
-1. Turn on the **kill switch** in the console's Risk controls, or run:
+1. Turn on the **kill switch** in the console's **Risk** tab, or run:
 
    ```sh
    curl -X POST http://127.0.0.1:8080/risk/policy -H 'Content-Type: application/json' -d '{"killSwitch": true}'
    ```
 
-2. Turn off the service switch (the `/config` command above, with `false`).
+2. Turn off the **Execution** switch in the console's **Settings** tab.
 3. In MT4, remove VeyraProbe from the chart, or turn off AutoTrading.
 4. Stop everything: `./scripts/install-launchd.sh --uninstall`.
 
@@ -820,7 +841,7 @@ cargo build --release
 
 Re-running the installer restarts every background job with the new
 versions. If `ea/VeyraProbe.mq4` changed, rebuild the add-on
-([6.4](#64-build-the-add-on-and-install-it-into-mt4)) and restart MT4.
+([6.5](#65-build-the-add-on-and-install-it-into-mt4)) and restart MT4.
 Database changes apply automatically when the service starts.
 
 ---
@@ -877,10 +898,12 @@ It prints one line starting with `Error:`. That line names the problem.
 | Message contains | What it means | Fix |
 | --- | --- | --- |
 | `"VEYRA_BIND_HOST"` | The settings weren't loaded in this Terminal window. | Run `set -a; source .env; set +a` first, from the project folder. |
-| `"VEYRA_EA_TOKEN"` | The MT4 add-on password is empty, or has invalid characters. | Fill it in ([4.2](#42-fill-in-the-three-things-the-template-leaves-blank)). It must be 16–128 letters, digits, `-` or `_`. |
-| `"VEYRA_BROKER_PROVIDER"` | Some broker lines are filled in but the provider line is empty. | Set `VEYRA_BROKER_PROVIDER=ea`. |
+| `"VEYRA_EA_TOKEN"` | The MT4 add-on password is empty, or has invalid characters. | Fill it in ([6.2](#62-switch-on-veyras-metatrader-link)). It must be 16–128 letters, digits, `-` or `_`. |
+| `"VEYRA_BROKER_PROVIDER"` | Some `VEYRA_EA_…` lines are filled in but the provider line is empty. | Set `VEYRA_BROKER_PROVIDER=ea`, or empty the other lines. |
 | `"VEYRA_MODEL_API_KEY"` | Some AI model lines are filled in but not the key. | Add the key, or empty every `VEYRA_MODEL_…` line. |
 | `"VEYRA_JEV_API_KEY"` | Some Jev lines are filled in but not the key. | Add the key, or empty every `VEYRA_JEV_…` line. |
+| `console credential storage requires VEYRA_DATABASE_URL` | The encryption key and operator password are set, but there's no database. | Set up the database (Stage B), or empty both lines. |
+| `VEYRA_CONSOLE_SECRET_KEY and VEYRA_CONSOLE_ADMIN_TOKEN must both be configured` | Only one of the two is set, or the password is too short. | Set both, using the commands in Stage D's Notifications section. |
 | `InvalidEnvironmentVariable` | A setting has a value Veyra doesn't accept. The message names it and says what's allowed. | Correct that line. `.env.example` explains each one. |
 | `Storage` … `connect failed` | The database isn't running, or `VEYRA_DATABASE_URL` is wrong. | `brew services start postgresql@17`, and check the URL. |
 | `Address already in use` | Another program, or another copy of Veyra, is using the port. | Stop the other copy. If the 24/7 setup is installed, it's already running. |
@@ -899,9 +922,9 @@ Look at the other words on that line:
 
 - **`VeyraProbe webrequest error=4060`**: MT4 isn't allowed to contact the
   address. Add your tunnel address in Tools → Options → Expert Advisors
-  ([6.5](#65-allow-the-add-on-in-mt4-and-attach-it)).
+  ([6.6](#66-allow-the-add-on-in-mt4-and-attach-it)).
 - **Other `webrequest error=` numbers, straight away** on a Mac: add the
-  IPv4 line to `/etc/hosts` ([6.3](#63-work-around-a-metatrader-on-mac-quirk)).
+  IPv4 line to `/etc/hosts` ([6.4](#64-work-around-a-metatrader-on-mac-quirk)).
 - **No errors, but the service never shows MT4 as connected**: the add-on was
   probably built with a different `VEYRA_EA_TOKEN` than the service is using,
   and the service is turning it away. Rebuild the add-on and restart MT4.

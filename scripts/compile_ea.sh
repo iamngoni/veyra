@@ -7,21 +7,21 @@
 # committed. VEYRA_EA_URL defaults to the loopback endpoint; set it to the
 # tunnel URL (https://veyra.antonlabs.cc/ea/poll) when the terminal reaches
 # Veyra through Cloudflare instead of localhost. VEYRA_EA_ALLOW_LIVE defaults
-# to true: this terminal exists to trade, and the service-side controls
-# (VEYRA_TRADING_ENABLED and the kill switch, both live) are the ones an
-# operator reaches for. The script prints which one it compiled.
+# to false, so a fresh setup compiles an EA that only reports dry runs; set it
+# to true once live trading is approved. The script prints which one it
+# compiled.
 # Run: `set -a; source .env; set +a; ./scripts/compile_ea.sh`
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TOKEN="${VEYRA_EA_TOKEN:?VEYRA_EA_TOKEN must be set (source .env first)}"
 URL="${VEYRA_EA_URL:-http://127.0.0.1:7801/ea/poll}"
-# Defaults to armed. This is the compiled-in default for the EA's
+# Defaults to disarmed. This is the compiled-in default for the EA's
 # InAllowLiveOrders input, not the last word on it: the input stays editable in
 # the terminal's EA properties without recompiling, and the service still has
-# to agree before any command reaches the terminal. Disarming here is for a
-# terminal that must never place an order whatever the service says.
-ALLOW_LIVE="${VEYRA_EA_ALLOW_LIVE:-true}"
+# to agree before any command reaches the terminal. Arming is an explicit
+# choice, so an unset or forgotten value never produces a live EA.
+ALLOW_LIVE="${VEYRA_EA_ALLOW_LIVE:-false}"
 case "$ALLOW_LIVE" in
   true|false) ;;
   *) echo "VEYRA_EA_ALLOW_LIVE must be true or false" >&2; exit 1 ;;

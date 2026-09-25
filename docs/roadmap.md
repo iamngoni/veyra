@@ -200,7 +200,7 @@
 - [x] Two independent controls in front of real money: the service refuses to
       queue execution unless `VEYRA_TRADING_ENABLED=true`, and the terminal
       refuses to trade unless its `InAllowLiveOrders` input is on (compiled
-      default from `VEYRA_EA_ALLOW_LIVE`, which defaults to `true`; editable
+      default from `VEYRA_EA_ALLOW_LIVE`, which defaults to `false`; editable
       in the EA inputs).
 
 ## Phase 6 — console

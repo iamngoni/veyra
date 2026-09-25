@@ -105,10 +105,10 @@ See [`docs/architecture.md`](docs/architecture.md) and [`docs/roadmap.md`](docs/
 
 ## Runtime
 
-A fresh copy of `.env.example` does not start as-is: it enables the EA, model,
-and Jev sections without their secrets, and each fails closed. The
-[getting-started guide](GETTING_STARTED.md#42-fill-in-the-three-things-the-template-leaves-blank)
-lists the lines to fill in or clear.
+An unedited copy of `.env.example` starts with every optional integration off.
+Each section is turned on by filling it in; a partly filled section fails
+closed at startup and names the missing setting. The
+[getting-started guide](GETTING_STARTED.md) turns them on one stage at a time.
 
 ```sh
 set -a; source .env; set +a
@@ -214,8 +214,8 @@ One-time terminal setup:
 1. `./scripts/compile_ea.sh` (reads `VEYRA_EA_TOKEN` from `.env`; set
    `VEYRA_EA_URL` to the tunnel endpoint when using Cloudflare). The EA's
    `InAllowLiveOrders` input is compiled from `VEYRA_EA_ALLOW_LIVE`, which
-   defaults to `true`; set it to `false` for a terminal that must never trade.
-   The input stays editable in the EA properties.
+   defaults to `false` (dry runs only); set it to `true` once live trading is
+   approved. The input stays editable in the EA properties.
 2. MT4 → Options → Expert Advisors: enable automated trading, and add the
    endpoint URL (for example `https://veyra.antonlabs.cc/ea/poll`) to the
    WebRequest allowlist. Listing the exact URL is the habit that has held on

@@ -106,8 +106,8 @@ set -a && source .env && set +a
   polling (`broker: connected`).
 - `curl http://127.0.0.1:8080/status` → providers correct and
   `trading_enabled: false`. `ea_live_orders` reflects `VEYRA_EA_ALLOW_LIVE` at
-  EA compile time, which defaults to `true`; set it to `false` before
-  compiling if the terminal should stay disarmed during verification.
+  EA compile time, which defaults to `false`, so the terminal stays disarmed
+  during verification unless it was compiled with `true`.
 - Console on `http://127.0.0.1:3000` shows the stream; queue one snapshot:
   `curl -X POST http://127.0.0.1:8080/commands/account_snapshot`.
 - Set up a channel in the console's **Notifications** tab, press **Send test**,
@@ -115,8 +115,8 @@ set -a && source .env && set +a
   `~/Library/Logs/veyra/alert.err.log` (see `docs/notifications.md`).
 
 Arming live trading is a deliberate, two-step act. The EA must have
-`InAllowLiveOrders` on (compiled from `VEYRA_EA_ALLOW_LIVE`, default `true`, and
-editable in the EA inputs). Then arm the service switch from the console or
+`InAllowLiveOrders` on (compiled from `VEYRA_EA_ALLOW_LIVE=true`, default `false`,
+and editable in the EA inputs). Then arm the service switch from the console or
 with `POST /config {"VEYRA_TRADING_ENABLED": true}`. A setting saved from the
 console is persisted and wins over `.env` after a restart, so check `GET
 /config` for `overridden` before relying on `.env`. Read the roadmap's
