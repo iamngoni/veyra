@@ -1,21 +1,68 @@
-MIT License
+Veyra Personal Use License
 
-Copyright (c) 2026 Ngonidzashe Mangudya
+Copyright (c) 2026 Ngonidzashe Mangudya. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software and its associated documentation, source code, binaries, and
+other materials (the "Software") are made available under the following terms.
+By using, copying, or modifying the Software, you agree to these terms.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Permitted use
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+   You may view, download, build, run, and modify the Software solely for your
+   own personal, non-commercial use.
+
+2. Prohibited use without a signed agreement
+
+   Any use not expressly permitted in Section 1 is prohibited unless you have
+   first obtained explicit approval from the copyright holder through a
+   written agreement signed by the copyright holder. Prohibited uses include,
+   without limitation:
+
+   a. any commercial use, including use by or on behalf of a business,
+      organization, or employer, or use that generates revenue or other
+      commercial advantage;
+   b. operating the Software, or any part of it, to trade on behalf of any
+      person other than yourself, or managing third-party funds with it;
+   c. offering the Software, or any part of it, as a hosted, managed, or
+      software-as-a-service product;
+   d. copying, publishing, distributing, sublicensing, selling, or otherwise
+      making the Software or any modified version of it available to others;
+   e. incorporating the Software, or any substantial part of it, into another
+      product, service, or project.
+
+3. Notices
+
+   You must keep this license and the copyright notice intact in every copy or
+   modified version of the Software that you hold.
+
+4. Termination
+
+   Any breach of these terms automatically terminates your permission to use
+   the Software. On termination you must stop using the Software and destroy
+   all copies in your possession.
+
+5. Reservation of rights
+
+   No rights are granted except those expressly stated in this license. All
+   other rights, including all intellectual property rights, are reserved by
+   the copyright holder.
+
+6. No financial advice
+
+   The Software can place real orders with a brokerage account. It does not
+   provide financial advice and does not guarantee profitable trading. You are
+   solely responsible for any trading activity, losses, or regulatory
+   obligations arising from your use of it.
+
+7. Disclaimer of warranty and limitation of liability
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHOR OR COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, TRADING LOSSES,
+   OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+To request permission for any use not covered by Section 1, contact the
+copyright holder through https://github.com/iamngoni.

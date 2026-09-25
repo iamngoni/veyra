@@ -1,6 +1,12 @@
 # Veyra
 
-Veyra is the foundation for an autonomous, provider-neutral trading service built with Rust and Actix Web. It will orchestrate a configured LLM runtime, Jev-style structured decisions, broker execution, durable risk and reconciliation logic, and a web console.
+Veyra is an autonomous, provider-neutral trading service built with Rust and
+Actix Web. It combines a configured LLM runtime, Jev structured judgements,
+broker execution, and durable risk and reconciliation logic. Every order passes
+through a deterministic risk gate, and operators use a web console to monitor
+the service.
+
+![Veyra console overview: equity, performance chart, open positions, and the read-only assistant](docs/images/console-overview.png)
 
 **New here?** [`GETTING_STARTED.md`](GETTING_STARTED.md) walks through
 everything from cloning the repository to a supervised, 24/7 install, one
@@ -8,7 +14,7 @@ stage at a time and in plain language.
 
 ## Current status
 
-This repository contains the first tested, safe service slice:
+What exists and what has been proven live:
 
 - Typed runtime configuration parsed into refined types.
 - Read-only `/health`, `/ready`, and `/status` HTTP endpoints.
@@ -43,9 +49,18 @@ This repository contains the first tested, safe service slice:
   free margin, and its stop must clear the current spread, the broker's
   minimum stop level, and a console-editable ATR(14) noise floor
   (`minStopAtrFraction`, default 0.25) — otherwise nothing is queued.
+- **Deterministic position management**: break-even, trailing-stop, and
+  profit-harvest policies run on their own cadence across every managed
+  position, moving stops only in the favourable direction through the same
+  staged `modify_order` / close path (see
+  [`docs/architecture.md`](docs/architecture.md)).
 - An **operations console** (TanStack Start) on `http://127.0.0.1:3000`:
-  account and positions with their stops, a streaming activity feed, recent
-  commands, and the current market window.
+  account equity and a balance-history chart, open positions with stops, time
+  held, and a close action, closed trades with why each closed, a streaming
+  activity feed, risk controls, decision traces, diagnostics, and settings.
+- A **read-only assistant** in the console that answers from retained
+  positions, account state, recorded decisions, and model health. It has no
+  order, close, or modify tool.
 - **Alerting** without a vendor: a supervised probe watches readiness, the
   two execution controls, repeated autopilot failures, reconciliation drift,
   executed opens, and closed positions — enriched with the realized fill from
@@ -68,8 +83,10 @@ This repository contains the first tested, safe service slice:
 - GitHub Actions quality workflow.
 - Architecture and roadmap documentation.
 
-Trading is disabled by construction: no code path can execute an order yet, and
-credentials never reach the service — the MT4 terminal owns the session.
+Real orders require two deliberate acts: the service switch
+(`VEYRA_TRADING_ENABLED=true`) and an EA compiled with
+`InAllowLiveOrders = true`. Until both are set, execution stops at a dry run.
+Broker credentials never reach the service; the MT4 terminal owns the session.
 
 ## Architecture direction
 
@@ -81,8 +98,10 @@ credentials never reach the service — the MT4 terminal owns the session.
   is selected by `VEYRA_BROKER_PROVIDER` at startup. The first implementation is
   the MQL4 EA control channel (loopback HTTP, token-authenticated); a hosted
   bridge or direct API can be added later without touching callers.
-- **Persistence:** PostgreSQL/SQLx when durable state is introduced.
-- **Console:** TanStack Start + TypeScript + React + Tailwind + shadcn/ui when the UI begins.
+- **Persistence:** PostgreSQL/SQLx for the append-only audit trail, balance
+  history, and position-management state.
+- **Console:** TanStack Start + TypeScript + React + Tailwind + shadcn/ui,
+  proxying `/api` to the loopback service.
 
 See [`docs/architecture.md`](docs/architecture.md) and [`docs/roadmap.md`](docs/roadmap.md).
 
@@ -187,6 +206,9 @@ cargo test --all-targets
 cargo coverage
 ```
 
+`scripts/check.sh` runs all of them; `scripts/smoke.sh` exercises the real
+binary, including shutdown.
+
 ## EA channel operation (MT4)
 
 One-time terminal setup:
@@ -244,3 +266,13 @@ cargo test --test ea_channel_live -- --ignored --nocapture
 ## Safety
 
 Veyra is intended to operate an existing brokerage account only after explicit risk controls, credentials, reconciliation, and staged testing are in place. It does not provide financial advice and does not guarantee profitable trading.
+
+## License
+
+Copyright © 2026 Ngonidzashe Mangudya. All rights reserved.
+
+Veyra is source-available, not open source. You may use it for your own
+personal, non-commercial purposes only. Any other use, including commercial
+use, redistribution, hosting it for others, or building a product or service on
+it, requires explicit approval through an agreement signed by the copyright
+holder. See [`LICENSE`](LICENSE) for the full terms.
