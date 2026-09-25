@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs every local quality gate: the Rust workspace and the console.
 #
-# CI runs the same steps (see .github/workflows/rust.yml); this script exists
+# CI runs the same steps (see .github/workflows/quality.yml); this script exists
 # so a change can be verified with one command before it is pushed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
