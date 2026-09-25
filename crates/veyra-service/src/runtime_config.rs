@@ -91,7 +91,6 @@ const SETTABLE: &[&str] = &[
     // ---- Housekeeping ----
     "VEYRA_RECONCILE_SECS",
     "VEYRA_AUDIT_RETENTION_DAYS",
-    "VEYRA_ALERT_WEBHOOK",
 ];
 
 /// Whether a setting carries a credential.

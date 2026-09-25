@@ -19,6 +19,7 @@ pub mod jev;
 pub mod logs;
 pub mod market;
 pub mod model;
+pub mod notify;
 pub mod observability;
 pub mod performance;
 pub mod reconciliation;
@@ -90,6 +91,8 @@ pub struct AppState {
     rotation: Arc<AtomicUsize>,
     equity_guard: Arc<EquityGuard>,
     order_admission: Arc<tokio::sync::Mutex<()>>,
+    /// Operator notification queue; a disabled notifier drops everything.
+    notifier: crate::notify::Notifier,
 }
 
 impl AppState {
@@ -130,7 +133,19 @@ impl AppState {
             rotation: Arc::new(AtomicUsize::new(0)),
             equity_guard: Arc::new(EquityGuard::new()),
             order_admission: Arc::new(tokio::sync::Mutex::new(())),
+            notifier: crate::notify::Notifier::disabled(),
         }
+    }
+
+    /// Attaches the notifier whose worker was spawned at startup.
+    pub fn with_notifier(mut self, notifier: crate::notify::Notifier) -> Self {
+        self.notifier = notifier;
+        self
+    }
+
+    /// The operator notification queue. Never blocks; see [`crate::notify`].
+    pub fn notifier(&self) -> &crate::notify::Notifier {
+        &self.notifier
     }
 
     /// Attaches the configured market-data integration, if any.

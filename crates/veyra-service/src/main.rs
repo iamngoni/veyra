@@ -1,6 +1,7 @@
 //! Minimal process wiring: fail before listening if configuration, logging, or
 //! broker settings are invalid, then serve the diagnostic surface plus any
 //! provider-required loopback listener. This binary has no execution path.
+//! `veyra-service watchdog` instead runs the external outage reporter.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,9 +24,14 @@ use veyra_service::{AppState, config::ServiceConfig, observability, server};
 
 #[actix_web::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ServiceConfig::from_env()?;
     let logs = LogBuffer::new(logs::DEFAULT_CAPACITY);
     observability::init(logs.clone())?;
+    // `veyra-service watchdog` runs the separate outage reporter instead of
+    // the service; see `notify::watchdog`.
+    if std::env::args().nth(1).as_deref() == Some("watchdog") {
+        return veyra_service::notify::watchdog::run().await;
+    }
+    let config = ServiceConfig::from_env()?;
 
     // The database opens before anything reads runtime state: durable
     // counters, baselines, and the operator's live risk policy are restored
@@ -49,6 +55,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if vault.is_some() && !runtime_state.enabled() {
         return Err("console credential storage requires VEYRA_DATABASE_URL".into());
     }
+    // Notifications need the vault (provider secrets are sealed) and the
+    // database; without them the notifier accepts and drops everything.
+    let (notifier, notify_worker) =
+        veyra_service::notify::Notifier::new(vault.is_some() && runtime_state.enabled())?;
+    if let Some(vault) = &vault {
+        notifier.set_config(veyra_service::notify::routes::load(&runtime_state, vault).await?);
+    }
+    actix_web::rt::spawn(notify_worker.run());
+
     let runtime_config = veyra_service::runtime_config::RuntimeConfig::new();
     if let Some(vault) = &vault
         && let Some(stored) = runtime_state.load_required(StateKey::ModelSecret).await?
@@ -125,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_jev(jev)
         .with_logs(logs)
         .with_runtime_state(runtime_state.clone())
+        .with_notifier(notifier)
         .with_audit(audit.as_ref().map(|runtime| (**runtime).clone()));
 
     // Counters and baselines resume before the first tick can move them.
@@ -186,6 +202,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
             .await;
     }
+
+    // Notification sources: read-only watchers of the audit feed and of
+    // health transitions. They only queue messages; delivery never blocks.
+    veyra_service::notify::events::spawn(&state);
 
     // Keep broker state fresh for the close/modify guards and the
     // reconciliation view while the terminal is polling.

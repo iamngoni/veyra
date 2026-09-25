@@ -40,6 +40,10 @@ pub enum StateKey {
     SubscriptionCodex,
     /// Encrypted Claude Code subscription credential.
     SubscriptionClaudeCode,
+    /// Notification settings (events, enabled providers, non-secret fields).
+    NotifyPrefs,
+    /// Encrypted notification provider credentials.
+    NotifySecrets,
 }
 
 impl StateKey {
@@ -56,6 +60,8 @@ impl StateKey {
             Self::ModelSecret => "model_secret",
             Self::SubscriptionCodex => "subscription_codex",
             Self::SubscriptionClaudeCode => "subscription_claude_code",
+            Self::NotifyPrefs => "notify_prefs",
+            Self::NotifySecrets => "notify_secrets",
         }
     }
 }
@@ -286,6 +292,8 @@ mod tests {
         assert_eq!(StateKey::EquityBaselines.as_str(), "equity_baselines");
         assert_eq!(StateKey::StopBasis.as_str(), "stop_basis");
         assert_eq!(StateKey::RiskPolicy.as_str(), "risk_policy");
+        assert_eq!(StateKey::NotifyPrefs.as_str(), "notify_prefs");
+        assert_eq!(StateKey::NotifySecrets.as_str(), "notify_secrets");
     }
 
     #[actix_web::test]

@@ -443,11 +443,16 @@ pub async fn clear_model_cooldowns(state: Data<AppState>) -> HttpResponse {
     }))
 }
 
-fn credential_rejection(request: &HttpRequest, state: &AppState) -> Option<HttpResponse> {
+/// Refuses a secret-changing request without a vault or a valid operator
+/// token (`x-veyra-admin-token`); `None` means the request may proceed.
+pub(crate) fn credential_rejection(
+    request: &HttpRequest,
+    state: &AppState,
+) -> Option<HttpResponse> {
     let Some(vault) = state.credential_vault() else {
         return Some(HttpResponse::ServiceUnavailable().json(json!({
             "error": "credential_store_unavailable",
-            "reason": "Configure console secret storage before saving a model key."
+            "reason": "Configure console secret storage before saving credentials."
         })));
     };
     let supplied = request
