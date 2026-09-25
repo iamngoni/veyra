@@ -4,7 +4,7 @@
  * the area modules; this file only wires data to them.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { ChartPanel, MARKET_BARS, type ChartMode, type MarketTimeframe, type PerformanceRange } from './chart'
 import { AssistantChat } from './chat'
@@ -83,13 +83,22 @@ export function Dashboard() {
   }, [symbol, timeframe, refetchSeries])
 
   const [tradesRange, setTradesRange] = useState<TradesRange>(30)
-  const { data: trades, error: tradesError, refetch: refetchTrades } = usePoll(() => api.trades(tradesRange), 60000)
-  const tradesRangeRef = useRef(tradesRange)
+  const [tradesPage, setTradesPage] = useState(1)
+  const { data: trades, error: tradesError, refetch: refetchTrades } = usePoll(
+    () => api.trades(tradesRange, tradesPage),
+    60000,
+  )
+  const tradesKey = useRef(`${tradesRange}:${tradesPage}`)
   useEffect(() => {
-    if (tradesRangeRef.current === tradesRange) return
-    tradesRangeRef.current = tradesRange
+    const key = `${tradesRange}:${tradesPage}`
+    if (tradesKey.current === key) return
+    tradesKey.current = key
     void refetchTrades()
-  }, [tradesRange, refetchTrades])
+  }, [tradesRange, tradesPage, refetchTrades])
+  const changeTradesRange = useCallback((range: TradesRange) => {
+    setTradesRange(range)
+    setTradesPage(1)
+  }, [])
 
   // Judge health is not reported directly, so it is inferred from the failure
   // counter moving between polls. Cumulative totals alone cannot say whether
@@ -254,7 +263,13 @@ export function Dashboard() {
           ) : null}
 
           {tab === 'trades' ? (
-            <TradesPanel page={trades} error={tradesError} range={tradesRange} onRangeChange={setTradesRange} />
+            <TradesPanel
+              page={trades}
+              error={tradesError}
+              range={tradesRange}
+              onRangeChange={changeTradesRange}
+              onPageChange={setTradesPage}
+            />
           ) : null}
 
           {tab === 'risk' ? (

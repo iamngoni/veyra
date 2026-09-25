@@ -39,6 +39,9 @@ const page = (overrides: Partial<TradesPage> = {}): TradesPage => ({
   days: 30,
   truncated: false,
   total: 1,
+  page: 1,
+  pageSize: 20,
+  pageCount: 1,
   brokerOffsetSecs: 7200,
   summary: { count: 1, wins: 0, losses: 1, breakeven: 0, net: -5.31 },
   trades: [trade()],
@@ -86,7 +89,7 @@ describe('reason labels and tones', () => {
       <TradesPanel
         page={page({ trades, summary: { count: trades.length, wins: 2, losses: 4, breakeven: 0, net: 0 } })}
         range={30}
-        onRangeChange={() => {}}
+        onRangeChange={() => {}} onPageChange={() => {}}
       />,
     )
     cases.forEach(({ label, tone }, index) => {
@@ -100,7 +103,7 @@ describe('reason labels and tones', () => {
 
 describe('TradesPanel formatting', () => {
   it('shows the closed time, side, lots, prices, held time, net and R', () => {
-    render(<TradesPanel page={page()} range={30} onRangeChange={() => {}} />)
+    render(<TradesPanel page={page()} range={30} onRangeChange={() => {}} onPageChange={() => {}} />)
     const dataRow = row()
     expect(within(dataRow).getByText('25 Sep 15:08')).toBeTruthy()
     expect(within(dataRow).getByText('GBPUSD')).toBeTruthy()
@@ -121,7 +124,7 @@ describe('TradesPanel formatting', () => {
       <TradesPanel
         page={page({ trades: [trade({ side: 'long', net: 12.4, rMultiple: 1.5 })] })}
         range={30}
-        onRangeChange={() => {}}
+        onRangeChange={() => {}} onPageChange={() => {}}
       />,
     )
     const dataRow = row()
@@ -135,7 +138,7 @@ describe('TradesPanel formatting', () => {
       <TradesPanel
         page={page({ trades: [trade({ net: 0, rMultiple: null })] })}
         range={30}
-        onRangeChange={() => {}}
+        onRangeChange={() => {}} onPageChange={() => {}}
       />,
     )
     const dataRow = row()
@@ -145,7 +148,7 @@ describe('TradesPanel formatting', () => {
   })
 
   it('reads an R multiple of exactly zero as unsigned', () => {
-    render(<TradesPanel page={page({ trades: [trade({ rMultiple: 0 })] })} range={30} onRangeChange={() => {}} />)
+    render(<TradesPanel page={page({ trades: [trade({ rMultiple: 0 })] })} range={30} onRangeChange={() => {}} onPageChange={() => {}} />)
     expect(within(row()).getByText('0.00R')).toBeTruthy()
   })
 
@@ -154,7 +157,7 @@ describe('TradesPanel formatting', () => {
       <TradesPanel
         page={page({ trades: [trade({ openPrice: 158, closePrice: 159, stopLoss: 0, takeProfit: 0 })] })}
         range={30}
-        onRangeChange={() => {}}
+        onRangeChange={() => {}} onPageChange={() => {}}
       />,
     )
     const dataRow = row()
@@ -167,7 +170,7 @@ describe('TradesPanel formatting', () => {
       <TradesPanel
         page={page({ summary: { count: 48, wins: 45, losses: 3, breakeven: 0, net: 27.56 } })}
         range={30}
-        onRangeChange={() => {}}
+        onRangeChange={() => {}} onPageChange={() => {}}
       />,
     )
     const summary = document.querySelector('.trd-summary') as HTMLElement
@@ -180,7 +183,7 @@ describe('TradesPanel formatting', () => {
       <TradesPanel
         page={page({ summary: { count: 10, wins: 4, losses: 4, breakeven: 2, net: -3.2 } })}
         range={30}
-        onRangeChange={() => {}}
+        onRangeChange={() => {}} onPageChange={() => {}}
       />,
     )
     const summary = document.querySelector('.trd-summary') as HTMLElement
@@ -197,7 +200,7 @@ describe('row expansion', () => {
           trades: [trade({ closeDetail: 'Harvest stop trailed to lock in profit.', swap: -0.4, commission: -0.1 })],
         })}
         range={30}
-        onRangeChange={() => {}}
+        onRangeChange={() => {}} onPageChange={() => {}}
       />,
     )
     const toggle = screen.getByRole('button', { name: 'Details for GBPUSD short' })
@@ -225,7 +228,7 @@ describe('row expansion', () => {
       <TradesPanel
         page={page({ trades: [trade({ entryRationale: null, closeDetail: null })] })}
         range={30}
-        onRangeChange={() => {}}
+        onRangeChange={() => {}} onPageChange={() => {}}
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Details for GBPUSD short' }))
@@ -239,7 +242,7 @@ describe('row expansion', () => {
       <TradesPanel
         page={page({ trades: [trade({ stopLoss: 0, takeProfit: 0 })] })}
         range={30}
-        onRangeChange={() => {}}
+        onRangeChange={() => {}} onPageChange={() => {}}
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Details for GBPUSD short' }))
@@ -251,7 +254,7 @@ describe('row expansion', () => {
 describe('range switching', () => {
   it('marks the active range and reports a change', () => {
     const onRangeChange = vi.fn()
-    render(<TradesPanel page={page()} range={90} onRangeChange={onRangeChange} />)
+    render(<TradesPanel page={page()} range={90} onRangeChange={onRangeChange} onPageChange={() => {}} />)
     const group = screen.getByRole('group', { name: 'Range' })
     expect(within(group).getByRole('button', { name: '90D' }).getAttribute('aria-pressed')).toBe('true')
     expect(within(group).getByRole('button', { name: '30D' }).getAttribute('aria-pressed')).toBe('false')
@@ -266,40 +269,70 @@ describe('range switching', () => {
 
 describe('loading, error, empty and truncated states', () => {
   it('shows a loading skeleton before the first page arrives', () => {
-    const { container } = render(<TradesPanel range={30} onRangeChange={() => {}} />)
+    const { container } = render(<TradesPanel range={30} onRangeChange={() => {}} onPageChange={() => {}} />)
     expect(container.querySelectorAll('.trd-loading .skeleton').length).toBeGreaterThan(0)
     expect(screen.queryByRole('table')).toBeNull()
   })
 
   it('reads Unavailable when the poll failed', () => {
-    render(<TradesPanel error="HTTP 500" range={30} onRangeChange={() => {}} />)
+    render(<TradesPanel error="HTTP 500" range={30} onRangeChange={() => {}} onPageChange={() => {}} />)
     const unavailable = screen.getByText('Unavailable')
     expect(unavailable.className).toContain('tone-bad')
     expect(screen.queryByRole('table')).toBeNull()
   })
 
   it('reads Unavailable over a stale page when a later poll fails', () => {
-    render(<TradesPanel page={page()} error="HTTP 500" range={30} onRangeChange={() => {}} />)
+    render(<TradesPanel page={page()} error="HTTP 500" range={30} onRangeChange={() => {}} onPageChange={() => {}} />)
     expect(screen.getByText('Unavailable')).toBeTruthy()
     expect(screen.queryByRole('table')).toBeNull()
   })
 
   it('shows an empty message when the range has no closed trades', () => {
-    render(<TradesPanel page={page({ trades: [] })} range={7} onRangeChange={() => {}} />)
+    render(<TradesPanel page={page({ trades: [] })} range={7} onRangeChange={() => {}} onPageChange={() => {}} />)
     expect(screen.getByText('No closed trades in this range')).toBeTruthy()
     expect(screen.queryByRole('table')).toBeNull()
   })
 
   it('shows a quiet truncated chip only when the service truncated the window', () => {
-    const { rerender } = render(<TradesPanel page={page({ truncated: true })} range={30} onRangeChange={() => {}} />)
+    const { rerender } = render(<TradesPanel page={page({ truncated: true })} range={30} onRangeChange={() => {}} onPageChange={() => {}} />)
     expect(screen.getByText('Truncated').className).toContain('tone-warn')
 
-    rerender(<TradesPanel page={page({ truncated: false })} range={30} onRangeChange={() => {}} />)
+    rerender(<TradesPanel page={page({ truncated: false })} range={30} onRangeChange={() => {}} onPageChange={() => {}} />)
     expect(screen.queryByText('Truncated')).toBeNull()
   })
 
   it('names the trades panel', () => {
-    render(<TradesPanel page={page()} range={30} onRangeChange={() => {}} />)
+    render(<TradesPanel page={page()} range={30} onRangeChange={() => {}} onPageChange={() => {}} />)
     expect(screen.getByRole('heading', { name: 'Trades' })).toBeTruthy()
+  })
+})
+
+describe('TradesPanel paging', () => {
+  it('shows no pager when the range fits on one page', () => {
+    render(<TradesPanel page={page()} range={30} onRangeChange={() => {}} onPageChange={() => {}} />)
+    expect(screen.queryByRole('button', { name: 'Next page' })).toBeNull()
+  })
+
+  it('reports the window position and asks for the neighbouring pages', () => {
+    const onPageChange = vi.fn()
+    const trades = [trade({ ticket: 21 }), trade({ ticket: 22 })]
+    render(
+      <TradesPanel
+        page={page({
+          page: 2,
+          pageSize: 20,
+          pageCount: 3,
+          trades,
+          summary: { count: 42, wins: 40, losses: 2, breakeven: 0, net: 12 },
+        })}
+        range={30}
+        onRangeChange={() => {}}
+        onPageChange={onPageChange}
+      />,
+    )
+    expect(screen.getByText('21–22 of 42')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Previous page' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    expect(onPageChange.mock.calls).toEqual([[1], [3]])
   })
 })

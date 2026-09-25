@@ -189,6 +189,9 @@ beforeEach(() => {
     days: 30,
     truncated: false,
     total: 1,
+    page: 1,
+    pageSize: 20,
+    pageCount: 1,
     brokerOffsetSecs: 7200,
     summary: { count: 1, wins: 1, losses: 0, breakeven: 0, net: 1.36 },
     trades: [
@@ -289,18 +292,37 @@ describe('Dashboard', () => {
     await waitFor(() => expect(mocks.candles).toHaveBeenCalledWith(120, 'D1', 'EURUSD'))
   })
 
+  it('pages trades and returns to the first page when the range changes', async () => {
+    const served = await mocks.trades()
+    mocks.trades.mockResolvedValue({
+      ...served,
+      pageCount: 2,
+      summary: { ...served.summary, count: 21 },
+    })
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+    openTab('Trades')
+    await screen.findByRole('heading', { level: 2, name: 'Trades' })
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Next page' }))
+    await waitFor(() => expect(mocks.trades).toHaveBeenCalledWith(30, 2))
+
+    fireEvent.click(screen.getByRole('button', { name: '7D' }))
+    await waitFor(() => expect(mocks.trades).toHaveBeenCalledWith(7, 1))
+  })
+
   it('refetches trades at once when the range changes, on its own poll from the chart range', async () => {
     render(<Dashboard />)
     await screen.findByText('Equity')
     openTab('Trades')
     await screen.findByRole('heading', { level: 2, name: 'Trades' })
-    await waitFor(() => expect(mocks.trades).toHaveBeenCalledWith(30))
+    await waitFor(() => expect(mocks.trades).toHaveBeenCalledWith(30, 1))
 
     fireEvent.click(screen.getByRole('button', { name: '7D' }))
-    await waitFor(() => expect(mocks.trades).toHaveBeenCalledWith(7))
+    await waitFor(() => expect(mocks.trades).toHaveBeenCalledWith(7, 1))
 
     fireEvent.click(screen.getByRole('button', { name: '1Y' }))
-    await waitFor(() => expect(mocks.trades).toHaveBeenCalledWith(365))
+    await waitFor(() => expect(mocks.trades).toHaveBeenCalledWith(365, 1))
   })
 
   it('routes the activity digest, the gear and the theme toggle', async () => {

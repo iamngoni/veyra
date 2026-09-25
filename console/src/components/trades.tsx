@@ -14,6 +14,7 @@ import { useState, type ReactNode } from 'react'
 import type { CloseReason, ClosedTradeRow, TradesPage, TradesSummary } from '../lib/api'
 import { signedAmount } from '../lib/format'
 import { Dot, Icon, Panel, Segmented, Skeleton, signTone, type Tone } from './ui'
+import { Pager } from './veyra'
 
 export type TradesRange = 7 | 30 | 90 | 365
 
@@ -212,17 +213,24 @@ function TradesSummaryLine({ summary }: { summary: TradesSummary }) {
   )
 }
 
-/** The closed-trade book: a range control, a compact summary and one row per trade. */
+/**
+ * The closed-trade book: a range control, a compact summary for the whole
+ * range, and one page of rows. The service pages the list because each row's
+ * close reason costs an audit lookup.
+ */
 export function TradesPanel({
   page,
   error,
   range,
   onRangeChange,
+  onPageChange,
 }: {
   page?: TradesPage
   error?: string
   range: TradesRange
   onRangeChange: (range: TradesRange) => void
+  /** Asks for another 1-based page. */
+  onPageChange: (page: number) => void
 }) {
   const [expanded, setExpanded] = useState<number>()
   const trades = page?.trades ?? []
@@ -280,6 +288,15 @@ export function TradesPanel({
             ))}
           </tbody>
         </table>
+        <Pager
+          page={page.page - 1}
+          pages={page.pageCount}
+          start={(page.page - 1) * page.pageSize}
+          count={trades.length}
+          total={page.summary.count}
+          onPrevious={() => onPageChange(page.page - 1)}
+          onNext={() => onPageChange(page.page + 1)}
+        />
       </div>
     )
   }

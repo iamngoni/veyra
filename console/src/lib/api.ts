@@ -312,6 +312,11 @@ export type TradesPage = {
   days: number
   truncated: boolean
   total: number
+  /** 1-based page this response holds. */
+  page: number
+  pageSize: number
+  /** Pages in the window at `pageSize`; 0 with no trades. */
+  pageCount: number
   brokerOffsetSecs: number | null
   summary: TradesSummary
   trades: ClosedTradeRow[]
@@ -647,8 +652,9 @@ export const api = {
     ),
   balanceHistory: (days = 30) => get<BalanceHistory>(`/account/balance-history?days=${days}`),
   performance: (days = 30) => get<Performance>(`/performance?days=${days}`),
-  /** Closed trades over one lookback window (1–365 days), newest first. */
-  trades: (days = 30) => get<TradesPage>(`/trades?days=${days}`),
+  /** One page of closed trades over a lookback window (1–365 days), newest first. */
+  trades: (days = 30, page = 1, pageSize = 20) =>
+    get<TradesPage>(`/trades?days=${days}&page=${page}&pageSize=${pageSize}`),
   sessions: () => get<MarketSessions>('/market/sessions'),
   events: (after: number | undefined, waitMs = 15000, limit = 200) =>
     get<Feed>(after === undefined ? `/events?limit=${limit}` : `/events?after=${after}&wait_ms=${waitMs}&limit=${limit}`),

@@ -9,6 +9,11 @@
 //! the entry decision that opened it and any recorded stop moves or closes —
 //! nothing here enqueues a second command or touches an order path.
 //!
+//! Results are paginated ([`TradePage`]). The summary always covers the whole
+//! window, but journal evidence is looked up only for the requested page's
+//! trades. Each lookup is a separate audit query, so the page size bounds
+//! how much audit reading one request does.
+//!
 //! Limitation, stated rather than hidden: the audit trail records that a
 //! stop moved and which policy moved it, but never the resulting numeric
 //! level (the terminal only ever reports a modify's retcode and ticket, not
@@ -27,8 +32,64 @@ use crate::audit::{AuditRow, AuditRuntime};
 use crate::broker::{ClosedTradePayload, OrderHistoryPayload, PositionKind};
 use crate::broker_clock::BrokerClock;
 
-/// Largest trade list one response returns.
-const MAX_TRADES: usize = 256;
+/// Trades per page when the request names no size.
+pub const DEFAULT_PAGE_SIZE: u32 = 20;
+
+/// Largest page one response returns.
+pub const MAX_PAGE_SIZE: u32 = 100;
+
+/// Why a requested page was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TradePageError {
+    /// Pages are numbered from 1.
+    #[error("page must be 1 or greater")]
+    Page,
+    /// The page size is outside `1..=`[`MAX_PAGE_SIZE`].
+    #[error("pageSize must be from 1 through 100")]
+    PageSize,
+}
+
+/// A validated 1-based page of the newest-first trade list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TradePage {
+    number: u32,
+    size: u32,
+}
+
+impl TradePage {
+    /// Validates an optional page number (default 1) and page size (default
+    /// [`DEFAULT_PAGE_SIZE`]).
+    ///
+    /// # Errors
+    /// Returns [`TradePageError`] for page 0 or a size outside
+    /// `1..=`[`MAX_PAGE_SIZE`].
+    pub fn new(number: Option<u32>, size: Option<u32>) -> Result<Self, TradePageError> {
+        let number = number.unwrap_or(1);
+        let size = size.unwrap_or(DEFAULT_PAGE_SIZE);
+        if number == 0 {
+            return Err(TradePageError::Page);
+        }
+        if size == 0 || size > MAX_PAGE_SIZE {
+            return Err(TradePageError::PageSize);
+        }
+        Ok(Self { number, size })
+    }
+
+    /// The 1-based page number.
+    pub fn number(self) -> u32 {
+        self.number
+    }
+
+    /// Trades per page.
+    pub fn size(self) -> u32 {
+        self.size
+    }
+
+    /// Index of this page's first trade, saturating for absurd page numbers.
+    fn offset(self) -> usize {
+        usize::try_from((u64::from(self.number) - 1) * u64::from(self.size)).unwrap_or(usize::MAX)
+    }
+}
 
 /// Longest `entryRationale` / `closeDetail` string returned.
 const MAX_TEXT_CHARS: usize = 600;
@@ -122,7 +183,7 @@ pub struct TradeSummary {
 }
 
 /// Assembled report body, minus the request echo (`days`, `total`,
-/// `truncated`) the route already holds.
+/// `truncated`, page number and size) the route already holds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TradesReport {
     /// Estimated broker-clock offset from UTC, in seconds; `None` without a
@@ -130,7 +191,11 @@ pub struct TradesReport {
     pub broker_offset_secs: Option<i64>,
     /// Counts and net result across every returned trade.
     pub summary: TradeSummary,
-    /// Closed trades, newest first, at most [`MAX_TRADES`].
+    /// Pages in the window at the requested size; 0 when there are no
+    /// trades.
+    pub page_count: u32,
+    /// The requested page of closed trades, newest first; empty past the
+    /// last page.
     pub trades: Vec<TradeRecord>,
 }
 
@@ -396,25 +461,31 @@ fn build_record(
     }
 }
 
-/// Builds the full report from validated history and already-resolved
+/// Builds one page of the report from validated history and already-resolved
 /// evidence (the broker clock and, optionally, the audit trail). Kept apart
 /// from [`build`] so classification is testable without an [`AppState`].
 async fn build_with(
     clock: Option<BrokerClock>,
     audit: Option<&AuditRuntime>,
     history: &OrderHistoryPayload,
+    page: TradePage,
 ) -> TradesReport {
-    let mut trades = history.orders.clone();
+    let mut trades: Vec<&ClosedTradePayload> = history.orders.iter().collect();
     trades.sort_by(|left, right| {
         right
             .close_time
             .cmp(&left.close_time)
             .then(right.ticket.cmp(&left.ticket))
     });
-    trades.truncate(MAX_TRADES);
+    let page_count = u32::try_from(trades.len().div_ceil(page.size() as usize)).unwrap_or(u32::MAX);
+    let on_page: Vec<&ClosedTradePayload> = trades
+        .into_iter()
+        .skip(page.offset())
+        .take(page.size() as usize)
+        .collect();
 
-    let mut records = Vec::with_capacity(trades.len());
-    for trade in &trades {
+    let mut records = Vec::with_capacity(on_page.len());
+    for trade in on_page {
         let evidence = ticket_evidence(audit, trade.ticket).await;
         records.push(build_record(trade, clock, evidence));
     }
@@ -429,20 +500,26 @@ async fn build_with(
             breakeven: report.breakeven,
             net: report.net_profit,
         },
+        page_count,
         trades: records,
     }
 }
 
-/// Builds the `/trades` report for validated history: the broker-clock
-/// offset from the retained account snapshot (`None` without one), the
-/// realized-performance summary, and each trade with its close reason.
+/// Builds one `/trades` page for validated history: the broker-clock offset
+/// from the retained account snapshot (`None` without one), the
+/// realized-performance summary for the whole window, and each trade on
+/// `page` with its close reason.
 ///
 /// Never fails: an unavailable broker clock or audit trail degrades the
 /// affected fields to `None` / `"unknown"` rather than rejecting the
 /// request, matching `/performance`'s own tolerance for a missing trail.
-pub async fn build(state: &AppState, history: &OrderHistoryPayload) -> TradesReport {
+pub async fn build(
+    state: &AppState,
+    history: &OrderHistoryPayload,
+    page: TradePage,
+) -> TradesReport {
     let clock = BrokerClock::from_state(state).ok();
-    build_with(clock, state.audit(), history).await
+    build_with(clock, state.audit(), history, page).await
 }
 
 #[cfg(test)]
@@ -693,7 +770,13 @@ mod tests {
             commission: 0.0,
             magic: crate::broker::ORDER_MAGIC,
         };
-        let report = build_with(Some(clock), Some(&audit), &history(vec![trade])).await;
+        let report = build_with(
+            Some(clock),
+            Some(&audit),
+            &history(vec![trade]),
+            TradePage::new(None, None).expect("default page"),
+        )
+        .await;
         assert_eq!(report.broker_offset_secs, Some(7_200));
         assert_eq!(report.summary.count, 1);
         assert_eq!(report.summary.losses, 1);
@@ -713,13 +796,70 @@ mod tests {
         assert_eq!(record.closed_at_ms, (1_790_341_680 - 7_200) * 1_000);
     }
 
+    #[test]
+    fn trade_page_defaults_and_rejects_out_of_range_values() {
+        let page = TradePage::new(None, None).expect("defaults");
+        assert_eq!((page.number(), page.size()), (1, DEFAULT_PAGE_SIZE));
+        assert_eq!(page.offset(), 0);
+        let third = TradePage::new(Some(3), Some(MAX_PAGE_SIZE)).expect("max size");
+        assert_eq!(third.offset(), 200);
+        assert_eq!(TradePage::new(Some(0), None), Err(TradePageError::Page));
+        assert_eq!(TradePage::new(None, Some(0)), Err(TradePageError::PageSize));
+        assert_eq!(
+            TradePage::new(None, Some(MAX_PAGE_SIZE + 1)),
+            Err(TradePageError::PageSize)
+        );
+    }
+
+    #[actix_web::test]
+    async fn build_with_pages_newest_first_and_summarises_the_whole_window() {
+        let orders = (1..=5)
+            .map(|ticket| {
+                let mut order = trade(ticket, PositionKind::Buy, 1.0, 1.01);
+                order.close_time = ticket * 100;
+                order
+            })
+            .collect();
+        let history = history(orders);
+        let page = |number| TradePage::new(Some(number), Some(2)).expect("page");
+        let tickets = |report: &TradesReport| {
+            report
+                .trades
+                .iter()
+                .map(|trade| trade.ticket)
+                .collect::<Vec<_>>()
+        };
+
+        let first = build_with(None, None, &history, page(1)).await;
+        assert_eq!(tickets(&first), vec![5, 4]);
+        assert_eq!(first.page_count, 3);
+        assert_eq!(first.summary.count, 5, "summary covers every page");
+
+        let last = build_with(None, None, &history, page(3)).await;
+        assert_eq!(tickets(&last), vec![1]);
+
+        let past = build_with(None, None, &history, page(4)).await;
+        assert!(past.trades.is_empty(), "past the last page is empty");
+        assert_eq!(past.page_count, 3);
+
+        let empty = build_with(None, None, &self::history(Vec::new()), page(1)).await;
+        assert_eq!(empty.page_count, 0);
+        assert!(empty.trades.is_empty());
+    }
+
     #[actix_web::test]
     async fn build_with_is_bounded_and_ordered_without_an_audit_trail() {
         let mut older = trade(1, PositionKind::Buy, 1.0, 1.01);
         older.close_time = 100;
         let mut newer = trade(2, PositionKind::Buy, 1.0, 1.01);
         newer.close_time = 200;
-        let report = build_with(None, None, &history(vec![older, newer])).await;
+        let report = build_with(
+            None,
+            None,
+            &history(vec![older, newer]),
+            TradePage::new(None, None).expect("default page"),
+        )
+        .await;
         assert_eq!(report.broker_offset_secs, None);
         assert_eq!(
             report

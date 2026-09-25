@@ -1049,9 +1049,14 @@ pub async fn performance(
 
 /// Query for `GET /trades`.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TradesQuery {
     /// Days of account history to include (1-365); defaults to 30.
     pub days: Option<u32>,
+    /// 1-based page of the newest-first list; defaults to 1.
+    pub page: Option<u32>,
+    /// Trades per page (1-100); defaults to 20.
+    pub page_size: Option<u32>,
 }
 
 #[get("/trades")]
@@ -1060,12 +1065,20 @@ pub struct TradesQuery {
 /// Read-only: queues the same `order_history` command `/performance` uses,
 /// for the Veyra magic number, with the same 20 s await, 1-365 day window,
 /// and 256-order terminal cap. [`crate::trades::build`] then joins each
-/// fill with the audit trail's journal-linking evidence (the entry decision,
+/// fill on the requested page (`page`, `pageSize`) with the audit trail's
+/// journal-linking evidence (the entry decision,
 /// any recorded stop moves, and any recorded close) to classify why it
 /// closed; nothing here enqueues a second command or reaches an order path.
 pub async fn trades(state: Data<AppState>, query: web::Query<TradesQuery>) -> HttpResponse {
     let Some(link) = command_link(&state) else {
         return HttpResponse::ServiceUnavailable().json(json!({ "error": "broker_unavailable" }));
+    };
+    let page = match crate::trades::TradePage::new(query.page, query.page_size) {
+        Ok(page) => page,
+        Err(error) => {
+            return HttpResponse::BadRequest()
+                .json(json!({ "error": "invalid_page", "reason": error.to_string() }));
+        }
     };
     let days = query.days.unwrap_or(OrderHistoryRequest::DEFAULT_DAYS);
     let request = match OrderHistoryRequest::new(days, ORDER_MAGIC) {
@@ -1080,11 +1093,14 @@ pub async fn trades(state: Data<AppState>, query: web::Query<TradesQuery>) -> Ht
         CommandState::Completed {
             payload: CommandPayload::OrderHistory(history),
         } => {
-            let report = crate::trades::build(&state, &history).await;
+            let report = crate::trades::build(&state, &history, page).await;
             HttpResponse::Ok().json(json!({
                 "days": days,
                 "truncated": history.truncated,
                 "total": history.total,
+                "page": page.number(),
+                "pageSize": page.size(),
+                "pageCount": report.page_count,
                 "brokerOffsetSecs": report.broker_offset_secs,
                 "summary": report.summary,
                 "trades": report.trades
@@ -2493,6 +2509,18 @@ mod tests {
         assert_eq!(response.status(), 400);
         let body: Value = test::read_body_json(response).await;
         assert_eq!(body["error"], "invalid_window");
+
+        for uri in [
+            "/trades?page=0",
+            "/trades?pageSize=0",
+            "/trades?pageSize=101",
+        ] {
+            let response =
+                test::call_service(&typed, test::TestRequest::get().uri(uri).to_request()).await;
+            assert_eq!(response.status(), 400, "{uri}");
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"], "invalid_page", "{uri}");
+        }
     }
 
     #[actix_web::test]
@@ -2640,6 +2668,9 @@ mod tests {
         assert_eq!(body["days"], 7);
         assert_eq!(body["total"], 2);
         assert_eq!(body["truncated"], false);
+        assert_eq!(body["page"], 1);
+        assert_eq!(body["pageSize"], 20);
+        assert_eq!(body["pageCount"], 1);
         // No account_snapshot was ever completed, so the broker offset (and
         // therefore the UTC conversion) is unknown.
         assert!(body["brokerOffsetSecs"].is_null());

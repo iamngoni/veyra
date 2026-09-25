@@ -75,7 +75,7 @@ describe('api', () => {
       '/api/performance?days=7',
       '/api/market/sessions',
       '/api/audit?limit=50',
-      '/api/trades?days=7',
+      '/api/trades?days=7&page=1&pageSize=20',
     ])
     for (const call of fetchMock.mock.calls) {
       expect(call[1]?.headers).toEqual({ accept: 'application/json' })
@@ -106,7 +106,7 @@ describe('api', () => {
       '/api/account/balance-history?days=30',
       '/api/performance?days=30',
       '/api/audit?limit=200',
-      '/api/trades?days=30',
+      '/api/trades?days=30&page=1&pageSize=20',
     ])
   })
 
@@ -115,6 +115,9 @@ describe('api', () => {
       days: 30,
       truncated: false,
       total: 1,
+      page: 1,
+      pageSize: 20,
+      pageCount: 1,
       brokerOffsetSecs: 7200,
       summary: { count: 1, wins: 1, losses: 0, breakeven: 0, net: 1.36 },
       trades: [
@@ -143,7 +146,7 @@ describe('api', () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(page))
     vi.stubGlobal('fetch', fetchMock)
     await expect(api.trades(30)).resolves.toEqual(page)
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/trades?days=30')
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/trades?days=30&page=1&pageSize=20')
     expect(fetchMock.mock.calls[0][1]).toEqual({ signal: undefined, headers: { accept: 'application/json' } })
   })
 
