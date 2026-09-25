@@ -334,6 +334,7 @@ async fn execution_revalidates_the_latest_book_after_an_earlier_approval() {
     }))
     .expect("draft");
     let initial = AccountFacts {
+        news: Default::default(),
         trade_allowed: true,
         open_orders: 0,
         open_lots: 0.0,

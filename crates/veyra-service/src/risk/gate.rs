@@ -25,6 +25,24 @@ const APPROVAL_HISTORY: usize = 128;
 /// Slack allowed when comparing summed lot volumes.
 const EXPOSURE_EPSILON: f64 = 1e-9;
 
+/// Scheduled high-impact news for the draft's instrument, as the caller found
+/// it in the economic calendar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NewsWindow {
+    /// No calendar is configured or the blackout is disabled (0 minutes), or
+    /// the caller did not look. Nothing to enforce.
+    #[default]
+    Unchecked,
+    /// The calendar answered and nothing high-impact is inside the window.
+    Clear,
+    /// A high-impact event for one of the instrument's currencies is inside
+    /// the blackout window.
+    Blackout,
+    /// A calendar is configured but could not answer. Trading blind through
+    /// a data outage is what the blackout exists to prevent, so this rejects.
+    Unavailable,
+}
+
 /// Facts the gate needs from the venue, assembled by the caller from a fresh
 /// link report. Nothing here is inferred: when the caller cannot supply fresh
 /// facts, it passes `None` and the gate rejects.
@@ -57,6 +75,9 @@ pub struct AccountFacts {
     pub day_drawdown_percent: Option<f64>,
     /// Percentage below the highest equity since startup, when tracked.
     pub peak_drawdown_percent: Option<f64>,
+    /// The news blackout for the draft's instrument. Filled on the order
+    /// admission path, so every entry (autopilot or manual) is checked.
+    pub news: NewsWindow,
 }
 
 /// Stable rejection codes; additions are backwards-compatible for consumers
@@ -96,6 +117,11 @@ pub enum RiskCode {
     PeakDrawdownLimitReached,
     /// The net directional exposure would exceed the factor cap.
     FactorExposureAboveLimit,
+    /// A high-impact news release for the instrument is inside the blackout.
+    NewsBlackout,
+    /// The configured economic calendar could not be read; entries fail
+    /// closed until it answers.
+    NewsUnavailable,
 }
 
 impl RiskCode {
@@ -118,6 +144,8 @@ impl RiskCode {
             Self::DailyLossLimitReached => "daily_loss_limit",
             Self::PeakDrawdownLimitReached => "peak_drawdown_limit",
             Self::FactorExposureAboveLimit => "factor_exposure_above_limit",
+            Self::NewsBlackout => "news_blackout",
+            Self::NewsUnavailable => "news_unavailable",
         }
     }
 
@@ -150,6 +178,10 @@ impl RiskCode {
                 "open exposure plus the requested volume exceeds the total cap"
             }
             Self::DuplicateIntent => "an identical intent was approved inside the duplicate window",
+            Self::NewsBlackout => "a high-impact news release is inside the blackout window",
+            Self::NewsUnavailable => {
+                "the economic calendar is unavailable, so news cannot be ruled out"
+            }
         }
     }
 }
@@ -324,6 +356,11 @@ impl RiskGate {
         if !account.trade_allowed {
             return Err(RiskCode::TradingNotAllowed);
         }
+        match account.news {
+            NewsWindow::Blackout => return Err(RiskCode::NewsBlackout),
+            NewsWindow::Unavailable => return Err(RiskCode::NewsUnavailable),
+            NewsWindow::Unchecked | NewsWindow::Clear => {}
+        }
         let spec = account
             .symbol_specs
             .iter()
@@ -491,6 +528,7 @@ mod tests {
 
     fn facts_with(open_orders: u32, open_lots: f64) -> Option<AccountFacts> {
         Some(AccountFacts {
+            news: Default::default(),
             trade_allowed: true,
             open_orders,
             open_lots,
@@ -503,6 +541,44 @@ mod tests {
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
         })
+    }
+
+    #[test]
+    fn news_blackouts_and_calendar_outages_reject_entries() {
+        let gate = RiskGate::new(policy());
+        let wednesday = UNIX_EPOCH + Duration::from_secs(1_767_787_200);
+        let with_news = |news| {
+            facts(0).map(|mut facts| {
+                facts.news = news;
+                facts
+            })
+        };
+        assert_eq!(
+            expect_rejection(gate.preview(&draft(0.1), with_news(NewsWindow::Blackout), wednesday))
+                .code(),
+            RiskCode::NewsBlackout
+        );
+        assert_eq!(
+            expect_rejection(gate.preview(
+                &draft(0.1),
+                with_news(NewsWindow::Unavailable),
+                wednesday
+            ))
+            .code(),
+            RiskCode::NewsUnavailable
+        );
+        for news in [NewsWindow::Unchecked, NewsWindow::Clear] {
+            assert!(
+                matches!(
+                    gate.preview(&draft(0.1), with_news(news), wednesday),
+                    RiskDecision::Approved(_)
+                ),
+                "{news:?} must not block"
+            );
+        }
+        assert_eq!(RiskCode::NewsBlackout.as_str(), "news_blackout");
+        assert_eq!(RiskCode::NewsUnavailable.as_str(), "news_unavailable");
+        assert!(RiskCode::NewsUnavailable.detail().contains("calendar"));
     }
 
     #[test]
@@ -639,6 +715,7 @@ mod tests {
 
     fn facts_test(open_orders: u32) -> AccountFacts {
         AccountFacts {
+            news: Default::default(),
             trade_allowed: true,
             open_orders,
             open_lots: 0.0,
@@ -857,6 +934,7 @@ mod tests {
             RiskCode::AccountStateUnavailable
         );
         let closed_account = Some(AccountFacts {
+            news: Default::default(),
             trade_allowed: false,
             open_orders: 0,
             open_lots: 0.0,

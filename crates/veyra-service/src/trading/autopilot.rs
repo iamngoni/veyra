@@ -6827,6 +6827,7 @@ mod tests {
         // EURUSD already carries the venue's live close for an open position;
         // GBPUSD has none, so only it should take the candle's price.
         let facts = AccountFacts {
+            news: Default::default(),
             trade_allowed: true,
             open_orders: 1,
             open_lots: 0.01,

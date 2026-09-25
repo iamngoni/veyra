@@ -2998,6 +2998,63 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn the_admission_path_reads_the_news_window_for_the_draft() {
+        use crate::risk::gate::NewsWindow;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        let eurusd = Symbol::parse("EURUSD").expect("symbol");
+        let audnzd = Symbol::parse("AUDNZD").expect("symbol");
+        let calendar = |events: Vec<CalendarEvent>, fail: bool| {
+            Some(CalendarRuntime::from_feed(Arc::new(StubCalendar {
+                events,
+                fail,
+            })))
+        };
+        let gated = |minutes: u64| {
+            AppState::new(
+                config(),
+                None,
+                None,
+                RiskGate::new(RiskPolicy::default().with_calendar_blackout(minutes)),
+            )
+        };
+        let nfp = CalendarEvent::new("Non-Farm Employment Change", "USD", Impact::High, now + 600)
+            .expect("event");
+        let later = CalendarEvent::new("ECB Rate Decision", "EUR", Impact::High, now + 7_200)
+            .expect("event");
+
+        assert_eq!(
+            crate::routes::news_window(&gated(30), &eurusd).await,
+            NewsWindow::Unchecked,
+            "no calendar configured"
+        );
+        let disabled = gated(0).with_calendar(calendar(vec![nfp.clone()], false));
+        assert_eq!(
+            crate::routes::news_window(&disabled, &eurusd).await,
+            NewsWindow::Unchecked,
+            "a zero window disables the check"
+        );
+        let state = gated(30).with_calendar(calendar(vec![nfp, later], false));
+        assert_eq!(
+            crate::routes::news_window(&state, &eurusd).await,
+            NewsWindow::Blackout,
+            "NFP in ten minutes blocks a USD pair"
+        );
+        assert_eq!(
+            crate::routes::news_window(&state, &audnzd).await,
+            NewsWindow::Clear,
+            "no AUD or NZD release in the window"
+        );
+        let failing = gated(30).with_calendar(calendar(Vec::new(), true));
+        assert_eq!(
+            crate::routes::news_window(&failing, &eurusd).await,
+            NewsWindow::Unavailable
+        );
+    }
+
+    #[actix_web::test]
     async fn command_status_flattens_completed_symbol_specs() {
         let (state, _) = audited_state(Some(StubFeed { fail: false }));
         let link = state.broker().expect("broker").ea_link().expect("ea link");

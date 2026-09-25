@@ -322,6 +322,7 @@ mod tests {
 
     fn facts() -> Option<AccountFacts> {
         Some(AccountFacts {
+            news: Default::default(),
             trade_allowed: true,
             open_orders: 0,
             open_lots: 0.0,

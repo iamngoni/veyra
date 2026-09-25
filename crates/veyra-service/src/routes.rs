@@ -345,9 +345,54 @@ pub async fn evaluate_intent(
     HttpResponse::Ok().json(decision)
 }
 
-/// Adds the requested instrument's live venue contract to fresh account facts.
-/// A failed lookup is left absent: built-in FX/metal valuation can still run,
-/// while every name-only CFD/crypto valuation fails closed in the gate.
+/// Checks the economic calendar for a high-impact release affecting `symbol`
+/// inside the policy's blackout window. Without a calendar, or with the
+/// blackout set to 0 minutes, there is nothing to enforce.
+pub(crate) async fn news_window(
+    state: &AppState,
+    symbol: &crate::broker::Symbol,
+) -> crate::risk::gate::NewsWindow {
+    use crate::risk::gate::NewsWindow;
+    let minutes = state.risk().policy().calendar_blackout_minutes();
+    let Some(calendar) = state.calendar() else {
+        return NewsWindow::Unchecked;
+    };
+    if minutes == 0 {
+        return NewsWindow::Unchecked;
+    }
+    let now = state
+        .now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let span = i64::try_from(minutes.saturating_mul(60)).unwrap_or(i64::MAX);
+    // `events` is half-open, so reach one second past the window's end.
+    match calendar
+        .feed()
+        .events(
+            now.saturating_sub(span),
+            now.saturating_add(span).saturating_add(1),
+        )
+        .await
+    {
+        Ok(events) => {
+            if crate::calendar::blackout(&events, symbol.as_str(), now, minutes).is_some() {
+                NewsWindow::Blackout
+            } else {
+                NewsWindow::Clear
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "calendar unavailable for the news blackout check");
+            NewsWindow::Unavailable
+        }
+    }
+}
+
+/// Adds the requested instrument's live venue contract and its news window to
+/// fresh account facts. A failed contract lookup is left absent: built-in
+/// FX/metal valuation can still run, while every name-only CFD/crypto
+/// valuation fails closed in the gate. A failed calendar read fails closed.
 pub(crate) async fn account_facts_for_draft(
     state: &AppState,
     draft: &TradeIntentDraft,
@@ -360,10 +405,12 @@ pub(crate) async fn account_facts_for_draft(
     } else {
         None
     };
+    let news = news_window(state, draft.symbol()).await;
     let mut facts = account_facts(state).await?;
     if let Some(spec) = spec {
         facts.symbol_specs.push(spec);
     }
+    facts.news = news;
     Some(facts)
 }
 
@@ -451,6 +498,7 @@ pub(crate) async fn account_facts(state: &AppState) -> Option<AccountFacts> {
         None => (None, None),
     };
     Some(AccountFacts {
+        news: Default::default(),
         trade_allowed: snapshot.trade_allowed(),
         open_orders,
         open_lots: snapshot.open_lots(),
