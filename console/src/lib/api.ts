@@ -491,6 +491,126 @@ function boundedAssistantHistory(history: AssistantTurn[]): AssistantTurn[] {
  */
 export type RuntimeConfigPatch = Record<string, string | number | boolean | null>
 
+/** Occurrences the service can notify about, in the order the console lists them. */
+export const NOTIFICATION_EVENTS = [
+  'breaker_tripped',
+  'trading_halted',
+  'broker_link',
+  'reconciliation_drift',
+  'order_failed',
+  'model_trouble',
+  'service_down',
+  'trade_opened',
+  'trade_closed',
+  'daily_summary',
+] as const
+
+export type NotificationEvent = (typeof NOTIFICATION_EVENTS)[number]
+
+/** Delivery channels, in the order the console lists them. */
+export const NOTIFICATION_PROVIDERS = ['email', 'telegram', 'discord', 'slack', 'ntfy', 'pushover', 'webhook'] as const
+
+export type NotificationProviderId = (typeof NOTIFICATION_PROVIDERS)[number]
+
+/** A write-only notification credential: whether one is saved, never its value. */
+export type NotificationSecret = { set: boolean; hint: string | null }
+
+/**
+ * One channel as the service reports it. An absent key in `fields` is unset;
+ * `secrets` report presence and at most the last four characters.
+ */
+export type NotificationProvider = {
+  enabled: boolean
+  fields: Record<string, string>
+  secrets: Record<string, NotificationSecret>
+}
+
+/** One delivery attempt, newest first. */
+export type DeliveryRecord = {
+  atMs: number
+  provider: string
+  event: string
+  title: string
+  ok: boolean
+  attempts: number
+  /** Why it failed; null on success. */
+  detail: string | null
+}
+
+export type NotificationSettings = {
+  /** False without a credential store and database; nothing can be saved. */
+  available: boolean
+  summaryHourUtc: number
+  events: Record<NotificationEvent, boolean>
+  providers: Record<NotificationProviderId, NotificationProvider>
+  status: { pending: number; dropped: number; delivered: number; failed: number }
+  recent: DeliveryRecord[]
+}
+
+/**
+ * Partial update to the notification settings; omitted keys are kept and
+ * `null` (or an empty string) clears a field or secret.
+ */
+export type NotificationPatch = {
+  summaryHourUtc?: number
+  events?: Partial<Record<NotificationEvent, boolean>>
+  providers?: Partial<
+    Record<
+      NotificationProviderId,
+      {
+        enabled?: boolean
+        fields?: Record<string, string | null>
+        secrets?: Record<string, string | null>
+      }
+    >
+  >
+}
+
+/** A field the service refused, e.g. `providers.telegram.chatId`: `required`. */
+export type Rejection = { field: string; reason: string }
+
+/** A refused notification change; `rejected` names each bad field. */
+export class NotificationError extends Error {
+  readonly rejected: Rejection[]
+
+  constructor(message: string, rejected: Rejection[] = []) {
+    super(message)
+    this.name = 'NotificationError'
+    this.rejected = rejected
+  }
+}
+
+/** An authenticated notification request; throws `NotificationError` on refusal. */
+async function notificationRequest<T>(path: string, method: 'PUT' | 'POST', token: string, body: unknown): Promise<T> {
+  const response = await fetch(`${BASE}${path}`, {
+    method,
+    headers: { accept: 'application/json', 'content-type': 'application/json', 'x-veyra-admin-token': token },
+    body: JSON.stringify(body),
+  })
+  const payload = (await response.json().catch(() => null)) as
+    | (T & { error?: string; reason?: string; rejected?: Rejection[] })
+    | null
+  if (!response.ok) {
+    const rejected = payload?.rejected ?? []
+    const message = rejected.length
+      ? rejected.map((edit) => `${edit.field}: ${edit.reason.replaceAll('_', ' ')}`).join('; ')
+      : (payload?.reason ?? payload?.error?.replaceAll('_', ' ') ?? `Request failed (${response.status})`)
+    throw new NotificationError(message, rejected)
+  }
+  if (!payload) throw new NotificationError('The service did not confirm the change.')
+  return payload
+}
+
+/** Saves a notification patch; resolves to the settings now in force. */
+export function updateNotifications(token: string, patch: NotificationPatch): Promise<NotificationSettings> {
+  return notificationRequest<NotificationSettings>('/notifications', 'PUT', token, patch)
+}
+
+/** Sends a test message through a channel's saved settings. */
+export function testNotification(token: string, provider: NotificationProviderId): Promise<{ ok: boolean }> {
+  return notificationRequest<{ ok: boolean }>('/notifications/test', 'POST', token, { provider })
+}
+
 const BASE = '/api'
 
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -664,6 +784,8 @@ export const api = {
   audit: (limit = 200) => get<AuditPage>(`/audit?limit=${limit}`),
   updatePolicy: (patch: RiskPolicyPatch) => post<RiskPolicy>('/risk/policy', patch),
   config: () => get<RuntimeConfig>('/config'),
+  /** Notification settings, delivery counters and recent deliveries. */
+  notifications: () => get<NotificationSettings>('/notifications'),
   updateConfig: (patch: RuntimeConfigPatch) =>
     post<{ changed: string[]; settings: Record<string, LiveSetting> }>('/config', patch),
   /** Returns every benched model to the route at once. */

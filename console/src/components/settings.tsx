@@ -91,7 +91,7 @@ const SETTING_GROUPS: Array<{ title: string; prefixes: string[]; names: string[]
   {
     title: 'Housekeeping',
     prefixes: [],
-    names: ['VEYRA_RECONCILE_SECS', 'VEYRA_AUDIT_RETENTION_DAYS', 'VEYRA_ALERT_WEBHOOK'],
+    names: ['VEYRA_RECONCILE_SECS', 'VEYRA_AUDIT_RETENTION_DAYS'],
   },
 ]
 
@@ -186,8 +186,6 @@ const SETTING_HELP: Record<string, string> = {
     "Seconds between automatic refreshes of the broker's account state, up to 3600; empty means 30, 0 turns them off.",
   VEYRA_AUDIT_RETENTION_DAYS:
     'Days of audit history to keep, up to 3650; older events are pruned hourly. Empty means 30, 0 keeps everything.',
-  VEYRA_ALERT_WEBHOOK:
-    'URL that receives stack alerts as a JSON post (Slack, Discord and ntfy work). Empty writes them to the local log instead.',
 }
 
 /**

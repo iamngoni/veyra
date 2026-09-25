@@ -6,7 +6,16 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { api, changeModelCredential, streamAssistant, subscriptions, type AssistantEvent } from './api'
+import {
+  api,
+  changeModelCredential,
+  NotificationError,
+  streamAssistant,
+  subscriptions,
+  testNotification,
+  updateNotifications,
+  type AssistantEvent,
+} from './api'
 
 function jsonResponse(body: unknown, status = 200): Response {
   return {
@@ -63,6 +72,7 @@ describe('api', () => {
     await api.sessions()
     await api.audit(50)
     await api.trades(7)
+    await api.notifications()
 
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       '/api/status',
@@ -76,6 +86,7 @@ describe('api', () => {
       '/api/market/sessions',
       '/api/audit?limit=50',
       '/api/trades?days=7&page=1&pageSize=20',
+      '/api/notifications',
     ])
     for (const call of fetchMock.mock.calls) {
       expect(call[1]?.headers).toEqual({ accept: 'application/json' })
@@ -384,6 +395,61 @@ describe('api', () => {
     it('refuses an ok response with no confirming body', async () => {
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => null } as unknown as Response))
       await expect(subscriptions.remove('codex', 't')).rejects.toThrow('The service did not confirm the connection change.')
+    })
+  })
+  describe('notifications', () => {
+    it('saves a patch with PUT and the operator token', async () => {
+      const settings = { available: true }
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse(settings))
+      vi.stubGlobal('fetch', fetchMock)
+      const patch = { events: { trade_opened: false }, providers: { telegram: { secrets: { botToken: null } } } }
+      await expect(updateNotifications('operator-token', patch)).resolves.toEqual(settings)
+      expect(fetchMock.mock.calls[0]).toEqual([
+        '/api/notifications',
+        {
+          method: 'PUT',
+          headers: { accept: 'application/json', 'content-type': 'application/json', 'x-veyra-admin-token': 'operator-token' },
+          body: JSON.stringify(patch),
+        },
+      ])
+    })
+
+    it('sends a test with POST naming the provider', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true }))
+      vi.stubGlobal('fetch', fetchMock)
+      await expect(testNotification('operator-token', 'telegram')).resolves.toEqual({ ok: true })
+      expect(fetchMock.mock.calls[0]).toMatchObject([
+        '/api/notifications/test',
+        { method: 'POST', headers: { 'x-veyra-admin-token': 'operator-token' }, body: JSON.stringify({ provider: 'telegram' }) },
+      ])
+    })
+
+    it('keeps every rejected field, then falls back to the reason, the error code and the status', async () => {
+      const rejected = [
+        { field: 'providers.telegram.chatId', reason: 'required' },
+        { field: 'providers.webhook.url', reason: 'must_be_https' },
+      ]
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(jsonResponse({ error: 'invalid_notifications', rejected }, 400))
+        .mockResolvedValueOnce(jsonResponse({ error: 'notification_failed', reason: 'HTTP 401: Unauthorized' }, 502))
+        .mockResolvedValueOnce(jsonResponse({ error: 'invalid_operator_token' }, 401))
+        .mockResolvedValueOnce({ ok: false, status: 500, json: async () => { throw new SyntaxError('html') } } as unknown as Response)
+      vi.stubGlobal('fetch', fetchMock)
+
+      const first = await updateNotifications('t', {}).catch((error: unknown) => error)
+      expect(first).toBeInstanceOf(NotificationError)
+      expect((first as NotificationError).rejected).toEqual(rejected)
+      expect((first as NotificationError).message).toBe('providers.telegram.chatId: required; providers.webhook.url: must be https')
+      await expect(testNotification('t', 'telegram')).rejects.toThrow('HTTP 401: Unauthorized')
+      const third = await updateNotifications('t', {}).catch((error: unknown) => error)
+      expect((third as NotificationError).message).toBe('invalid operator token')
+      expect((third as NotificationError).rejected).toEqual([])
+      await expect(updateNotifications('t', {})).rejects.toThrow('Request failed (500)')
+    })
+
+    it('refuses an ok response with no body', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => null } as unknown as Response))
+      await expect(updateNotifications('t', {})).rejects.toThrow('The service did not confirm the change.')
     })
   })
 })

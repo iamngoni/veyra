@@ -1,0 +1,100 @@
+/* Notifications (components/notifications.tsx). Builds on the settings
+   groups in tabs.css and the connection rows in provider.css. */
+
+/* The operator token sits in the panel head: one input for the whole section. */
+.notify-token {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-ink-muted);
+  font-size: var(--text-sm);
+}
+.notify-token input.tab-input { width: 200px; height: var(--control-md); margin-left: 4px; }
+
+.notify-unavailable { margin: 0 var(--panel-inset) 12px; }
+
+.notify-body { display: grid; min-width: 0; gap: 8px; }
+
+/* Events: two columns of name, info mark and switch. */
+.notify-events {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 24px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.notify-event {
+  display: flex;
+  min-width: 0;
+  min-height: 40px;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--color-line-soft);
+  color: var(--color-ink);
+  font-size: var(--text-base);
+}
+.notify-event .tab-control-label { flex: 1 1 auto; }
+.notify-hour { flex: 0 0 auto; }
+.notify-hour select.tab-input { width: 92px; height: var(--control-md); }
+
+/* Channels: one row each, the editor opening beneath its row. */
+.notify-channels.tab-list { padding: 0; }
+.notify-channel-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 6px 16px;
+  min-height: 42px;
+}
+.notify-channel-row strong { color: var(--color-ink); font-size: 13px; font-weight: var(--weight-medium); }
+
+.notify-editor {
+  display: grid;
+  gap: 14px;
+  margin: 0 0 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: var(--color-surface-2);
+}
+.notify-fields { grid-column: auto; }
+.notify-editor-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+
+.notify-secret { display: flex; min-height: var(--control-lg); align-items: center; gap: 12px; }
+.notify-secret-state { color: var(--color-ink); font-size: var(--text-base); font-variant-numeric: tabular-nums; }
+
+.notify-message { margin: 0; color: var(--color-ink-muted); font-size: 12px; overflow-wrap: anywhere; }
+.notify-message:empty { display: none; }
+
+.notify-guide ol { display: grid; gap: 6px; margin: 0; padding-left: 18px; color: var(--color-ink-muted); font-size: 12px; line-height: 1.5; }
+.notify-guide a { color: var(--color-accent-text); }
+.notify-guide code { font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
+
+/* Deliveries: time, channel, title, outcome on one line. */
+.notify-counters { display: inline-flex; align-items: center; gap: 6px; }
+.notify-deliveries.tab-list { padding: 0; }
+.notify-delivery {
+  display: grid;
+  grid-template-columns: auto 72px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 36px;
+  font-size: 13px;
+}
+.notify-delivery .tab-time { font-size: 13px; }
+.notify-delivery-provider { color: var(--color-ink-muted); }
+.notify-delivery-title { overflow: hidden; color: var(--color-ink); text-overflow: ellipsis; white-space: nowrap; }
+.notify-delivery-state { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+
+@media (max-width: 960px) {
+  .notify-token input.tab-input { width: 160px; }
+}
+@media (max-width: 660px) {
+  .notify-events { grid-template-columns: minmax(0, 1fr); }
+  .notify-editor { padding: 13px; }
+  .notify-token { flex-wrap: wrap; }
+  .notify-token input.tab-input { width: 100%; margin-left: 0; font-size: 16px; }
+  .notify-delivery { grid-template-columns: auto minmax(0, 1fr) auto; row-gap: 2px; padding: 6px 0; }
+  .notify-delivery-provider { display: none; }
+}

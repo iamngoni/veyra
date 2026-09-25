@@ -23,10 +23,18 @@ const mocks = vi.hoisted(() => ({
   trades: vi.fn(),
   updatePolicy: vi.fn(),
   updateConfig: vi.fn(),
+  notifications: vi.fn(),
+  updateNotifications: vi.fn(),
 }))
 
-vi.mock('../lib/api', () => ({
+vi.mock('../lib/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/api')>()
+  return {
   VEYRA_MAGIC: 77041,
+  NOTIFICATION_EVENTS: actual.NOTIFICATION_EVENTS,
+  NOTIFICATION_PROVIDERS: actual.NOTIFICATION_PROVIDERS,
+  NotificationError: actual.NotificationError,
+  updateNotifications: mocks.updateNotifications,
   LOG_LEVELS: ['error', 'warn', 'info', 'debug', 'trace'],
   api: {
     status: mocks.status,
@@ -44,8 +52,10 @@ vi.mock('../lib/api', () => ({
     trades: mocks.trades,
     updatePolicy: mocks.updatePolicy,
     updateConfig: mocks.updateConfig,
+    notifications: mocks.notifications,
   },
-}))
+  }
+})
 
 import { Dashboard } from '../components/dashboard'
 
@@ -227,9 +237,34 @@ beforeEach(() => {
     },
     live_sections: ['trading'],
   })
+  mocks.notifications.mockResolvedValue(notificationSettings(true))
   mocks.updatePolicy.mockReset()
   mocks.updateConfig.mockReset()
+  mocks.updateNotifications.mockReset()
 })
+
+/** Notification settings with every event set to `on` and no channel set up. */
+function notificationSettings(on: boolean) {
+  const none = { set: false, hint: null }
+  return {
+    available: true,
+    summaryHourUtc: 18,
+    events: Object.fromEntries(
+      ['breaker_tripped', 'trading_halted', 'broker_link', 'reconciliation_drift', 'order_failed', 'model_trouble', 'service_down', 'trade_opened', 'trade_closed', 'daily_summary'].map((event) => [event, on]),
+    ),
+    providers: {
+      email: { enabled: false, fields: {}, secrets: { password: none } },
+      telegram: { enabled: false, fields: {}, secrets: { botToken: none } },
+      discord: { enabled: false, fields: {}, secrets: { webhookUrl: none } },
+      slack: { enabled: false, fields: {}, secrets: { webhookUrl: none } },
+      ntfy: { enabled: false, fields: {}, secrets: { topic: none, accessToken: none } },
+      pushover: { enabled: false, fields: {}, secrets: { appToken: none, userKey: none } },
+      webhook: { enabled: false, fields: {}, secrets: { url: none, bearerToken: none } },
+    },
+    status: { pending: 0, dropped: 0, delivered: 0, failed: 0 },
+    recent: [],
+  }
+}
 
 describe('Dashboard', () => {
   /** Moves to a view through the sidebar, mirroring what an operator clicks. */
@@ -367,6 +402,20 @@ describe('Dashboard', () => {
     fireEvent.click(screen.getByRole('switch', { name: 'Trading enabled' }))
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
     expect((await screen.findByRole('alert')).textContent).toContain('setting rejected')
+  })
+
+  it('shows notifications under settings and reads them again after a change', async () => {
+    mocks.updateNotifications.mockResolvedValue(notificationSettings(false))
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+    openTab('Settings')
+    await screen.findByRole('heading', { name: 'Notifications' })
+    const polls = mocks.notifications.mock.calls.length
+    fireEvent.change(screen.getByLabelText('Operator token'), { target: { value: 'op-token' } })
+    fireEvent.click(screen.getByRole('switch', { name: 'Order failed' }))
+    await screen.findByText('Order failed off.')
+    expect(mocks.updateNotifications).toHaveBeenCalledWith('op-token', { events: { order_failed: false } })
+    await waitFor(() => expect(mocks.notifications.mock.calls.length).toBeGreaterThan(polls))
   })
 
   it('marks the judge degraded after a failed usage update', async () => {

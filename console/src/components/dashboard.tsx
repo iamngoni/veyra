@@ -10,6 +10,7 @@ import { ChartPanel, MARKET_BARS, type ChartMode, type MarketTimeframe, type Per
 import { AssistantChat } from './chat'
 import { KpiRow, OpenPositions, PerformanceSummary } from './overview'
 import { AutopilotCard, RecentActivity, RiskControls } from './rail'
+import { NotificationsPanel } from './notifications'
 import { LiveSettingsPanel } from './settings'
 import { Sidebar, Topbar, type NavTab } from './shell'
 import { TradesPanel, type TradesRange } from './trades'
@@ -59,6 +60,11 @@ export function Dashboard() {
   // Settings change only when someone changes them, so this polls slowly and
   // is refetched immediately after an edit.
   const { data: liveConfig, refetch: refetchConfig } = usePoll(api.config, 60000)
+  const {
+    data: notifications,
+    error: notificationsError,
+    refetch: refetchNotifications,
+  } = usePoll(api.notifications, 60000)
   const [traceKind, setTraceKind] = useState('all')
   const { theme, toggle } = useTheme()
   const [tab, setTab] = useState<TabId>('overview')
@@ -305,13 +311,20 @@ export function Dashboard() {
           ) : null}
 
           {tab === 'settings' ? (
-            <LiveSettingsPanel
-              settings={liveConfig?.settings}
-              secretStatus={liveConfig?.secrets?.VEYRA_MODEL_API_KEY}
-              secretStore={liveConfig?.secret_store}
-              onApply={applyConfig}
-              onRefresh={() => void refetchConfig()}
-            />
+            <div className="tab-stack">
+              <LiveSettingsPanel
+                settings={liveConfig?.settings}
+                secretStatus={liveConfig?.secrets?.VEYRA_MODEL_API_KEY}
+                secretStore={liveConfig?.secret_store}
+                onApply={applyConfig}
+                onRefresh={() => void refetchConfig()}
+              />
+              <NotificationsPanel
+                settings={notifications}
+                error={notificationsError}
+                onRefresh={() => void refetchNotifications()}
+              />
+            </div>
           ) : null}
         </main>
       </div>
