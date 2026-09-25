@@ -256,13 +256,26 @@ impl AuditTrail for Store {
 /// ticket on `payload.ticket` or `payload.result.ticket`, command-id set
 /// membership, exact outcome, and the half-open `since <= at < until` window.
 /// Times are returned as RFC 3339 UTC with milliseconds.
+///
+/// A ticket or command-id filter matches only a handful of rows, so it runs
+/// inside a fenced subquery (`offset 0`) and is sorted afterwards. Otherwise
+/// the planner walks the timestamp index expecting to fill the limit early,
+/// which reads the whole table when only a few rows match. Fenced, it uses
+/// the ticket and command-id indexes (migration 0005).
 fn filtered_query(query: &AuditQuery) -> QueryBuilder<'static, Postgres> {
-    let mut builder = QueryBuilder::new(
+    let narrow = query.ticket().is_some() || !query.command_ids().is_empty();
+    let mut builder = QueryBuilder::new(if narrow {
+        "select id, at, kind, payload from (\
+         select id::text as id, \
+         to_char(at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as at, \
+         kind, payload, audit_events.at as at_ts, audit_events.id as row_id \
+         from audit_events where kind = any("
+    } else {
         "select id::text as id, \
          to_char(at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as at, \
          kind, payload \
-         from audit_events where kind = any(",
-    );
+         from audit_events where kind = any("
+    });
     builder.push_bind(
         query
             .kinds()
@@ -302,10 +315,14 @@ fn filtered_query(query: &AuditQuery) -> QueryBuilder<'static, Postgres> {
         builder.push_bind(until as f64 / 1_000.0);
         builder.push("::double precision)");
     }
-    // Qualifying these columns keeps PostgreSQL from resolving `at` and `id`
-    // to the text aliases in the SELECT list, which would bypass the native
-    // timestamp index and sort every candidate row.
-    builder.push(" order by audit_events.at desc, audit_events.id desc limit ");
+    if narrow {
+        builder.push(" offset 0) hits order by hits.at_ts desc, hits.row_id desc limit ");
+    } else {
+        // Qualifying these columns keeps PostgreSQL from resolving `at` and
+        // `id` to the text aliases in the SELECT list, which would bypass the
+        // native timestamp index and sort every candidate row.
+        builder.push(" order by audit_events.at desc, audit_events.id desc limit ");
+    }
     builder.push_bind(i64::from(query.limit()));
     builder
 }
@@ -365,12 +382,47 @@ mod tests {
             assert!(sql.contains(clause), "missing `{clause}` in {sql}");
         }
         assert!(
-            sql.ends_with(" order by audit_events.at desc, audit_events.id desc limit $9"),
+            sql.starts_with("select id, at, kind, payload from (select id::text as id, "),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with(" offset 0) hits order by hits.at_ts desc, hits.row_id desc limit $9"),
             "{sql}"
         );
         assert!(
             !sql.contains("USDJPY") && !sql.contains("10654130") && !sql.contains("held"),
             "values are bound, never spliced: {sql}"
+        );
+    }
+
+    #[test]
+    fn filtered_query_fences_only_ticket_and_command_id_lookups() {
+        let kinds = [AuditKind::CommandCompleted];
+        let by_symbol = AuditQuery::new(&kinds, 20)
+            .and_then(|query| query.with_symbol("eurusd"))
+            .expect("query");
+        let sql = filtered_query(&by_symbol).sql().to_owned();
+        assert!(!sql.contains("offset 0"), "{sql}");
+        assert!(sql.ends_with("order by audit_events.at desc, audit_events.id desc limit $3"));
+
+        let by_ticket = AuditQuery::new(&kinds, 20)
+            .and_then(|query| query.with_ticket(7))
+            .expect("query");
+        assert!(
+            filtered_query(&by_ticket)
+                .sql()
+                .contains(" offset 0) hits ")
+        );
+
+        let by_command = AuditQuery::new(&kinds, 20)
+            .and_then(|query| {
+                query.with_command_ids(&["5a3f5c1e-2b1d-4a57-9d27-9b0d2f7e8a10".to_owned()])
+            })
+            .expect("query");
+        assert!(
+            filtered_query(&by_command)
+                .sql()
+                .contains(" offset 0) hits ")
         );
     }
 }
