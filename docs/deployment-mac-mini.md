@@ -53,7 +53,10 @@ external drive. Do not send it through chat or email.
 
 The database contains the audit trail and durable runtime state, including
 JeV/model usage counters, equity baselines, stop basis, and the console-edited
-risk policy. It does not contain the MT4 terminal session or provider secrets.
+risk policy, plus profit-harvest state and live-settings overrides. It may
+also hold model and subscription credentials saved from the console, encrypted
+with `VEYRA_CONSOLE_SECRET_KEY`; transfer that key with `.env` or they cannot be
+decrypted. It does not contain the MT4 terminal session.
 
 Also transfer these items securely, separately from Git:
 
@@ -155,6 +158,11 @@ VEYRA_TRADING_ENABLED=false
 VEYRA_EA_ALLOW_LIVE=false
 ```
 
+A restored database can carry live settings saved from the console, and those
+win over `.env`. After the service starts, check `GET /config` for
+`overridden: true` on `VEYRA_TRADING_ENABLED` and `VEYRA_AUTOPILOT_ENABLED`,
+and clear any override with `POST /config {"VEYRA_TRADING_ENABLED": null}`.
+
 Build and run the checks:
 
 ```sh
@@ -180,7 +188,9 @@ VEYRA_EA_ALLOW_LIVE=true
 ```
 
 Recompile/reinstall the EA if its live-order input is compile-time injected,
-then restart the service and terminal. Never run both old and new machines
+then restart the service and terminal. If a console override of
+`VEYRA_TRADING_ENABLED` exists, arm it from the console instead; `.env` does
+not win over it. Never run both old and new machines
 armed against the same account.
 
 ## Docker: yes, with MT4 on the host
@@ -195,7 +205,8 @@ the tunnel and service share a private Docker network. In that layout:
 - PostgreSQL uses a named persistent volume;
 - `cloudflared` routes `veyra.antonlabs.cc` to `http://veyra:7801`;
 - the console proxies `/api` to `http://veyra:8080` inside the Compose network;
-- only the console is optionally published to the Mac loopback interface;
+- no service publishes a host port; the console is reached through the
+  existing Traefik proxy network at its private, Tailscale-addressed hostname;
 - MT4 remains native on macOS and continues calling
   `https://veyra.antonlabs.cc/ea/poll`.
 

@@ -13,6 +13,9 @@ npm run build        # production build into dist/
 
 `VEYRA_API_TARGET` points the proxy at another service host (default
 `http://127.0.0.1:8080`). The console renders what the loopback control
-surface exposes: status, account and positions, the streaming activity feed
-(`/events`), command lifecycle, and the market window. It is loopback-only by
-design; exposing it beyond this machine requires authentication first.
+surface exposes, across seven pages: Overview, Activity, Trades (closed trades,
+paginated), Risk, Trace (audit trail), Diagnostics (autopilot, model route,
+metrics, agent log), and Settings (live `/config` overlay), plus a read-only
+assistant. It has no authentication of its own: keep it on loopback or a
+private network such as Tailscale. `VEYRA_CONSOLE_ALLOWED_HOSTS` adds host
+names the dev and preview servers accept.

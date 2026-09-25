@@ -42,7 +42,9 @@ channel. The console and diagnostics are never exposed publicly.
 1. Confirm a fresh backup exists:
    `ls -lt "$HOME/Library/Application Support/veyra/backups" | head -3`
 2. Copy `.env` securely (password manager, `scp` over SSH — never email or a
-   chat). The EA token, model key, and Jev key live there; rotate them after
+   chat). The EA token, model key, Jev key, and `VEYRA_CONSOLE_SECRET_KEY`
+   live there (without that key, model and subscription credentials saved from
+   the console cannot be decrypted); rotate them after
    transfer if the channel was not trusted. The trading password is never
    stored anywhere.
 3. Note the terminal setup: chart symbol/timeframe (EURUSD H4 here) and the
@@ -102,17 +104,22 @@ set -a && source .env && set +a
 
 - `curl http://127.0.0.1:8080/ready` → `ready` within a minute of the terminal
   polling (`broker: connected`).
-- `curl http://127.0.0.1:8080/status` → providers correct, `trading_enabled:
-  false`, `ea_live_orders: false` (the safe defaults until you arm).
+- `curl http://127.0.0.1:8080/status` → providers correct and
+  `trading_enabled: false`. `ea_live_orders` reflects `VEYRA_EA_ALLOW_LIVE` at
+  EA compile time, which defaults to `true`; set it to `false` before
+  compiling if the terminal should stay disarmed during verification.
 - Console on `http://127.0.0.1:3000` shows the stream; queue one snapshot:
   `curl -X POST http://127.0.0.1:8080/commands/account_snapshot`.
 - Set `VEYRA_ALERT_WEBHOOK` and confirm the probe logs to
   `~/Library/Logs/veyra/alert.out.log` (or delivers to the webhook).
 
-Arming live trading is a deliberate, two-step act: set
-`VEYRA_EA_ALLOW_LIVE=true` and `VEYRA_TRADING_ENABLED=true` in `.env`,
-recompile the EA, and restart the service and terminal agents. Read the
-roadmap's staged-rollout checklist first.
+Arming live trading is a deliberate, two-step act. The EA must have
+`InAllowLiveOrders` on (compiled from `VEYRA_EA_ALLOW_LIVE`, default `true`, and
+editable in the EA inputs). Then arm the service switch from the console or
+with `POST /config {"VEYRA_TRADING_ENABLED": true}`. A setting saved from the
+console is persisted and wins over `.env` after a restart, so check `GET
+/config` for `overridden` before relying on `.env`. Read the roadmap's
+staged-rollout checklist first.
 
 ## Cutover (avoid two bots on one account)
 

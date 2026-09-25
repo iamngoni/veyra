@@ -30,10 +30,11 @@ for i in 1 2 3 4 5; do cargo test --test model_live -- --ignored --nocapture; do
 
 ## Autopilot tick
 
-- One tick costs one Jev call, one model call, and one `rates` round trip to
-  the terminal (through the tunnel). Ticks log a few seconds after their
-  interval fires, consistent with the sums above.
-- At the live 60 s cadence the loop can spend up to 1440 model calls and 1440
-  judgement calls per day when positioned continuously; the call budget
-  (`VEYRA_MODEL_MAX_CALLS_PER_HOUR` / `_PER_DAY`) bounds accidents, not
-  normal use.
+- One tick costs a `rates` and a `symbol_spec` round trip per candidate
+  symbol (through the tunnel), one Jev call per candidate whose newest candle
+  has no cached judgement, and one to eight model calls per decision (the
+  agent loop's `MAX_STEPS`). Ticks log a few seconds after their interval
+  fires, consistent with the sums above.
+- The default cadence is 300 s (`VEYRA_AUTOPILOT_INTERVAL_SECS`). The call
+  budget (`VEYRA_MODEL_MAX_CALLS_PER_HOUR` / `_PER_DAY`) is the real bound on
+  model spend; size it for up to eight calls per decision.

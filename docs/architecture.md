@@ -30,11 +30,11 @@ Status at a glance (see `README.md` and `docs/roadmap.md` for evidence):
 | Piece | Role | Where |
 | --- | --- | --- |
 | Service (`veyra-service`) | configuration, risk gate, command queue, autopilot, HTTP surface | Rust 2024 + Actix Web + Tokio, `crates/veyra-service` |
-| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/market/candles`, `/market/spec`, `/market/sessions`, `/calendar`, `/performance`, `/reconciliation` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
+| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/account/balance-history`, `/market/candles`, `/market/spec`, `/market/sessions`, `/calendar`, `/performance`, `/trades`, `/reconciliation`, `/risk/policy`, `/config`, `/assistant/chat`, `/model/credential`, `/model/subscriptions*`, `/model/cooldowns*` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
 | EA channel listener | token-authenticated `POST /ea/poll` carrying heartbeats and the command queue | `127.0.0.1:7801` by default (`VEYRA_EA_BIND_*`); an explicit `VEYRA_EA_ALLOW_NON_LOOPBACK=true` opt-in permits an unpublished isolated container bind |
 | MT4 terminal + `VeyraProbe` EA | holds the broker session, polls the channel, executes acknowledged commands, reports dry runs while disarmed | `ea/VeyraProbe.mq4` inside MetaTrader 4 (Wine) |
 | Cloudflare tunnel | `veyra.antonlabs.cc` → `127.0.0.1:7801` — the EA channel only | launchd agent, `KeepAlive` |
-| PostgreSQL | append-only `audit_events` via SQLx (`migrations/0001_audit_events.sql`) | `VEYRA_DATABASE_URL`; unreachable configured database fails startup |
+| PostgreSQL | append-only `audit_events` and `runtime_state` via SQLx (`crates/veyra-service/migrations/`: 0001 audit events, 0002 runtime state, later migrations add indexes) | `VEYRA_DATABASE_URL`; unreachable configured database fails startup |
 | Console | operations UI reading the loopback service through its own `/api` proxy | TanStack Start + React + Tailwind, `127.0.0.1:3000` |
 | launchd agents | terminal, tunnel, service, console, alert probe, log rotation, audit backups | `scripts/launchd/`, `scripts/install-launchd.sh` |
 
@@ -90,7 +90,7 @@ Every integration follows the same five-part shape: **a narrow trait + a provide
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Broker | `VEYRA_BROKER_PROVIDER` | `ea` | `BrokerLink` (`broker/mod.rs`) with the neutral command/report types in `broker/command.rs` | `BrokerProvider` | `broker/settings.rs` (`BrokerSettings::from_source`) | `BrokerRuntime::from_settings` (`broker/mod.rs`) | `broker/ea.rs` (`EaLink`, implementing `BrokerLink`) |
 | Market data | `VEYRA_MARKET_PROVIDER` | `ea` | `MarketFeed` (`market/mod.rs`) | `MarketProvider` | `market/settings.rs` (`MarketSettings::from_source`) | `MarketRuntime::from_settings` (`market/mod.rs`) | `market/ea.rs` (`EaMarketFeed`) |
-| Decision model | `VEYRA_MODEL_PROVIDER` | `openrouter` | `DecisionEngine` (`model/mod.rs`) | `ModelProvider` | `model/settings.rs` (`ModelSettings::from_source`) | `ModelRuntime::from_settings` (`model/mod.rs`) | `model/agent_runtime_engine.rs` (`AgentRuntimeEngine`), wrapped in `BudgetedEngine` (`model/budget.rs`) |
+| Decision model | `VEYRA_MODEL_PROVIDER` | `openrouter` | `DecisionEngine` (`model/mod.rs`) | `ModelProvider` | `model/settings.rs` (`ModelSettings::from_source`) | `ModelRuntime::from_settings` (`model/mod.rs`) | `model/agent_runtime_engine.rs` (`AgentRuntimeEngine`) for API providers and `model/subscription_engine.rs` (`SubscriptionEngine`) for ChatGPT/Claude subscriptions, routed by `PreferredEngine` (`model/preferred.rs`) and wrapped in `BudgetedEngine` (`model/budget.rs`) |
 | Judgements | `VEYRA_JEV_PROVIDER` | `typesafe` | `SemanticJudge` (`jev/mod.rs`) | `JevProvider` | `jev/settings.rs` (`JevSettings::from_source`) | `JevRuntime::from_settings` (`jev/mod.rs`) | `jev/http.rs` (`HttpJev`); contract types in `jev/contract.rs` |
 | Economic calendar | `VEYRA_CALENDAR_PROVIDER` | `forexfactory` | `EventCalendar` (`calendar/mod.rs`) | `CalendarProvider` | `calendar/settings.rs` (`CalendarSettings::from_source`) | `CalendarRuntime::from_settings` (`calendar/mod.rs`) | `calendar/forexfactory.rs` (`ForexfactoryCalendar`, weekly JSON export, cached) |
 | Audit trail | `VEYRA_DATABASE_URL` enables it | `postgres` | `AuditTrail` (`audit.rs`) | `AuditProvider` | — (URL is the switch) | `main.rs`: `Store::connect` + embedded migrations | `store.rs` (`Store`) |
@@ -117,7 +117,7 @@ The decision loop and deterministic position-management loop each run once per `
 1. **Preconditions.** Autopilot enabled, model + market + broker configured, link fresh, account facts available, and a candidate menu: the configured `VEYRA_AUTOPILOT_SYMBOLS` list (or a single `VEYRA_AUTOPILOT_SYMBOL`; setting both is a configuration error), plus the symbols of any open Veyra positions, de-duplicated and capped at sixteen. An empty list falls back to the terminal's chart symbol. Any failure → `Skipped`, no cost.
 2. **Market candles.** For every candidate, `MarketFeed` queues a read-only `rates` command and awaits its acknowledgement; the EA returns closed bars oldest-first (forming bar excluded) from `iOpen/iHigh/iLow/iClose/iVolume`, and the service re-validates OHLC sanity, ordering, symbol, and timeframe into a `CandleSeries`. A candidate whose data is unavailable is dropped for this tick instead of failing the rest; only an empty menu aborts.
 3. **Contracts and scheduled news.** Before the entry decision, `MarketFeed::symbol_spec` queues a read-only `symbol_spec` command per candidate so the model sees the venue's own contract, and a configured `EventCalendar` supplies the next 24 hours of scheduled events for the menu. A candidate whose contract is unavailable is still reviewed but its entries are rejected as unverifiable rather than queued blind; a configured calendar that cannot answer aborts the entry sweep (`unavailable`), because trading blind through a data outage is what the blackout exists to prevent.
-4. **Jev judgements (when configured, `VEYRA_AUTOPILOT_JEV=auto`).** For every candidate with data, three typed questions over a compact market narrative — direction (`choice`), trending (`noul`), momentum (`score`) — are validated against the request that produced them and reduced to a per-asset JSON summary. Judgements are inputs code may consult; they grant no execution authority, and a configured judge that fails aborts the tick.
+4. **Jev judgements (when configured, `VEYRA_AUTOPILOT_JEV=auto`).** For every candidate with data, three typed questions over a compact market narrative — direction (`choice`), trending (`noul`), momentum (`score`) — are validated against the request that produced them and reduced to a per-asset JSON summary. Judgements are inputs code may consult; they grant no execution authority. A configured judge that fails aborts the tick unless the owner has set `VEYRA_RISK_ALLOW_TRADING_WITHOUT_JEV=true` (console: Judge bypass), in which case that tick continues without any judgements.
 5. **Independent deterministic management.** Break-even, trailing, and profit-harvest policies run across **all** managed positions on their own cadence. A due action is staged immediately without waiting for the market/model decision sweep to finish.
 6. **Position review.** One managed position per tick is reviewed, rotating through the open book; the model answers through the decision loop (below) with `hold` or `close` for its ticket plus a short `rationale`, and a close goes through the shared staged close with a minimum-hold and age check. A `hold` falls through to the entry decision. The rationale and the reviewed asset's judgements are journaled with the decision. Inside the pre-close window the same review carries the weekend question (below), and a weekend verdict also settles that position's candle review so one closed bar is never asked twice.
 7. **Entry path — the AI picks from the menu.** Through the decision loop (below), the model receives every candidate's recent candles, its judgements, its venue contract (spread, stop level, lot band and step, margin per lot, swap rates), ATR(14), the upcoming events for its currencies, any position already open on that asset, and the account facts including free margin and margin level. The prompt asks it to decide per instrument whether conditions justify a trade; it may answer `none` (skipping is normal and expected — every asset is reconsidered next tick) or open exactly one instrument from the menu as a bracketed market order. The prompt requires `stop_loss` and `take_profit`, and always asks for a short `rationale` explaining the choice (or the skip). `normalize_proposal` drops exactly three execution-neutral phrasings (an echoed `price` on a market order, an over-long `comment`, a stray `intent` beside `action: "none"`); everything else must pass strict parsing into a `TradeIntentDraft`. The rationale is sanitised (`parse_rationale`: trimmed, control characters stripped, 280-character bound) and journaled with the chosen asset's judgements — it never influences execution.
@@ -171,7 +171,10 @@ One append-only PostgreSQL table (`audit_events`: id, timestamp, kind, JSONB pay
 | `command_completed` | A validated ack completes (`kind`, bounded result summary) |
 | `command_failed` | A failed acknowledgement is processed, or an acknowledgement arrives for a command the queue already marked failed (for example a timeout) |
 | `broker_snapshot` | A validated `account_snapshot` ack is retained |
+| `balance_observed` | A validated, broker-reported account balance was observed (feeds the balance-history chart) |
 | `agent_tool_called` | The decision loop executed one read-only tool (tool, bounded arguments and result, step, rationale) |
+| `agent_turn` | One model turn of the decision loop: exactly what the model was shown and what it answered |
+| `failure` | A panic, or an error that would otherwise exist only in the in-memory log ring |
 | `risk_policy_updated` | The live risk policy was replaced from the control surface (full resulting policy attached) |
 | `runtime_config_updated` | One or more live settings were changed from the control surface (changed names and the resulting overlay attached) |
 | `proposal_evaluated` | Every autopilot decision attempt (`outcome`: `no_trade`, `rejected`, `approved_dry_run`, `queued`, `unavailable`, `held`, `close_queued`, `close_rejected`, `stop_rejected`, `break_even`, `trailing_stop`, …). Entry and review decisions carry the model's `rationale` and, when a judge is configured, the chosen asset's `judgements`, so the why is queryable next to the what |
@@ -222,7 +225,7 @@ The surrounding guards:
 
 ## Live policy control
 
-Environment variables are the **startup baseline**. Two things stay there permanently and cannot be set over the control surface: **secrets** (anything ending `_API_KEY`, `_TOKEN`, or `_SECRET` — matched on shape, so a credential added later is refused by default) and **boot-only infrastructure** (bind addresses, the database URL, the deployment label), which cannot take effect without rebinding sockets or reconnecting pools. Accepting one of those would report a success that never happened.
+Environment variables are the **startup baseline**. Two things stay there permanently and cannot be set through `/config`: **secrets** (anything ending `_API_KEY`, `_TOKEN`, or `_SECRET` — matched on shape, so a credential added later is refused by default) and **boot-only infrastructure** (bind addresses, the database URL, the deployment label), which cannot take effect without rebinding sockets or reconnecting pools. Accepting one of those would report a success that never happened. The model API key and subscription sign-ins are the exception by design: they use a separate path (`/model/credential`, `/model/subscriptions/*`) that requires the operator token, encrypts the value with `VEYRA_CONSOLE_SECRET_KEY`, and never returns it.
 
 Everything else is editable while the service runs, through the **risk policy** and the **live settings overlay**:
 
@@ -253,6 +256,10 @@ Counters and baselines that must survive restarts live in one Postgres table, `r
 | `equity_baselines` | UTC day anchor, day-open equity, peak equity | drawdown breakers |
 | `stop_basis` | per-ticket entry-risk memory | break-even/trailing planner |
 | `risk_policy` | the effective policy as an apply-able snapshot patch | the live `RiskGate` policy |
+| `profit_harvest` | per-ticket high-water marks, armed state, same-symbol cooldowns, and pending entry baselines | profit-harvest management |
+| `runtime_config` | the live settings overlay saved from the console | every runtime section, before serving |
+| `model_secret` | the console-saved model API key, encrypted | the model engine |
+| `subscription_codex`, `subscription_claude_code` | encrypted ChatGPT (Codex) and Claude Code subscription credentials | the subscription engine |
 
 What deliberately stays volatile: the **pending command queue** (replaying undelivered commands after downtime would risk stale orders — the venue, not the queue, is the source of truth), the **event and log rings** (`/events`, `/logs` — the audit trail is the durable record), and **`/metrics` counters** (process-lifetime views derived from the stream; the audit table can answer the same questions durably with SQL). Writes are best-effort: storage trouble logs a warning and the trading path continues, because a lost counter must never stop the bot. Unusable stored values (a hand-edited or stale row) log and fall back to the in-memory default; an unreadable `risk_policy` row fails startup loudly rather than silently reverting operator intent.
 
@@ -260,22 +267,21 @@ What deliberately stays volatile: the **pending command queue** (replaying undel
 
 `console/` is a TanStack Start application served by a supervised Vite preview on `http://127.0.0.1:3000`. It reads only the loopback control surface, proxying `/api` so the browser never needs cross-origin access. There is no authentication: keep it on loopback.
 
-| Panel | Shows |
-| --- | --- |
-| Status pills | Terminal live/stale, EA armed/disarmed, trading enabled/disabled, autopilot cadence, audit provider, environment |
-| Account | Balance, equity, free margin, margin level, leverage, open orders, open lots, open P/L, server/login/symbol, freshness |
-| Market | 48 closed H4 candles via `/market/candles`: sparkline, last close, window change, last high/low — plus the trading week from `/market/sessions`: open/rollover/closed, the next open, close, pause or resume in UTC, whether *our* entry policy is admitting entries, which held instruments are exposed while the market is closed, and — inside the final two hours before Friday's close — the weekend checkpoint countdown and what the active preference will do to the book |
-| Autopilot | Enabled, cadence, timeframe, window, model tier, Jev mode, symbol menu, stop policies, model-budget usage, and the service's own Jev call/token counters |
-| Activity | `/events` cursor feed (streaming indicator); "focus" mode hides routine snapshots and read-only commands |
-| Positions | Ticket, symbol, side, lots, entry, SL, TP, swap, P/L, and owner (Veyra by magic 77041 vs manual); truncation flag |
-| Performance | Realized wins/losses/win rate, net P/L, profit factor, average win/loss, and per-symbol totals over the closed Veyra orders in the window |
-| Commands | Recent command lifecycle (`pending`/`completed`/`failed`) with bounded summaries |
-| Risk | The effective gate policy plus both switch states |
-| Risk | Effective gate policy: symbols, caps, risk/drawdown brakes, net-exposure cap, news blackout minutes, ATR stop floor, execution/terminal state — with an inline editor for live changes |
-| Metrics | Top counters from `/metrics` and the feed sequence |
-| Agent log | `/logs` tail with a level filter (`error`…`trace`), polled every 2 s; shows the tracing target, message, and structured fields |
+The sidebar shows status pills (terminal live/stale, EA armed/disarmed, trading enabled/disabled, autopilot cadence) and seven pages:
 
-**Trading-week state.** `GET /market/sessions` (read-only, computed from the clock) reports the standard FX/metals week — opens Sunday 21:00 UTC, closes Friday 21:00 UTC, daily rollover pause 21:00-22:00 UTC Monday through Thursday — alongside the entry policy that actually gates the bot: the rollover blackout (20:45-22:15 UTC), Friday's 19:00 UTC entry cutoff, Sunday's 23:00 UTC reopen, and the configured session window. The console's Market panel renders both, and names the held instruments when the market is closed so it is obvious what rests on broker-side stops until the week resumes.
+| Page | Shows |
+| --- | --- |
+| Overview | Equity, open P/L, exposure and free-margin KPIs; a chart with Performance (balance history) and Market (up to 120 closed candles, M15/H1/H4/D1/W1, symbol picker) modes; open positions with stops, time held, profit-harvest state, and a close action; the realized performance summary; the autopilot card; recent activity; and the kill-switch and judge-bypass controls |
+| Activity | `/events` cursor feed (streaming indicator; "focus" mode hides routine snapshots and read-only commands) and the recent command lifecycle (`pending`/`completed`/`failed`) |
+| Trades | Closed Veyra trades from `/trades`, paginated, with why each one closed |
+| Risk | Effective gate policy (symbols, caps, risk/drawdown brakes, net-exposure cap, news blackout, ATR stop floor, execution state) with an inline editor; the account (balance, equity, margin, leverage, owner by magic 77041 vs manual); and the market session (below) |
+| Trace | The durable audit trail from `/audit` |
+| Diagnostics | Autopilot configuration and Jev/model-budget usage, the model route, top `/metrics` counters, and the `/logs` tail with a level filter |
+| Settings | The live settings overlay from `/config`, model credentials, and subscription connections |
+
+A read-only assistant (`POST /assistant/chat`) sits beside every page. It streams each retrieval it runs over positions, account state, recorded decisions, and model health, and it has no order, close, or modify tool.
+
+**Trading-week state.** `GET /market/sessions` (read-only, computed from the clock) reports the standard FX/metals week — opens Sunday 21:00 UTC, closes Friday 21:00 UTC, daily rollover pause 21:00-22:00 UTC Monday through Thursday — alongside the entry policy that actually gates the bot: the rollover blackout (20:45-22:15 UTC), Friday's 19:00 UTC entry cutoff, Sunday's 23:00 UTC reopen, and the configured session window. The console's Market session panel on the Risk page renders both, and names the held instruments when the market is closed so it is obvious what rests on broker-side stops until the week resumes.
 
 **Weekend posture.** The two hours between Friday's 19:00 UTC entry cutoff and the 21:00 UTC close are the one stretch where the bot can still act on a standard-session position but can no longer open one, so that window is where that part of the book's weekend exposure is settled. Symbols in `weekendSymbols` are excluded because their live venue remains authoritative. `weekendPositions` (a console-editable risk-policy field, default `agent`) decides how: `agent` gives every affected open position one weekend review — the same hold/close schema with the gap-versus-swap trade-off stated and the close time in the prompt — `flatten` queues a close for every affected position without a model call, and `hold` leaves the book and its candle reviews exactly as they were. The checkpoint is keyed to the close instant rather than a candle, so it runs even on timeframes whose last bar predates the window, and it runs while the market is still open so a staged close can actually execute; once the week has closed the checkpoint does not run at all, because nothing could fill it. Verdicts are journaled under the `autopilot_weekend` origin, and the session route reports the preference plus the countdown so the console can state what is about to happen to the book.
 
@@ -286,12 +292,12 @@ What deliberately stays volatile: the **pending command queue** (replaying undel
 
 ## Known limits
 
-- **One position, one action at a time.** The risk cap defaults to one open order (`VEYRA_RISK_MAX_OPEN_ORDERS=1`) and the autopilot takes at most one action (stop move, review, or entry) per tick; it rotates across up to sixteen configured instruments (`VEYRA_AUTOPILOT_SYMBOLS`), and what may actually trade is still bounded by `VEYRA_RISK_SYMBOLS`.
-- **H4 by default.** The supervised configuration runs H4 (`VEYRA_AUTOPILOT_TIMEFRAME`, console candles fixed at H4 in `console/src/lib/api.ts`). Other timeframes exist in the contract (`M1`…`MN1`) but are not what is exercised today.
+- **One position, one action at a time.** The risk cap defaults to one open order (`VEYRA_RISK_MAX_OPEN_ORDERS=1`) and the decision sweep takes at most one review or entry action per tick (deterministic stop and profit-harvest management runs separately across every managed position); it rotates across up to sixteen configured instruments (`VEYRA_AUTOPILOT_SYMBOLS`), and what may actually trade is still bounded by `VEYRA_RISK_SYMBOLS`.
+- **H4 by default.** The supervised configuration runs H4 (`VEYRA_AUTOPILOT_TIMEFRAME`; the console chart defaults to H4 and lets the operator pick M15/H1/H4/D1/W1). Other timeframes exist in the contract (`M1`…`MN1`) but are not what is exercised today.
 - **EA-specific wire transport.** Command channels are provider-neutral (`BrokerLink` + `broker/command.rs`), but the only implemented transport today is the EA poll loop in `broker/ea.rs`; the `ea_link()` accessor remains for its transport and tests, and no other venue implementation exists yet.
-- **No console authentication.** The console and `/account` expose owner-facing money state on loopback only; exposing either beyond loopback requires authentication first.
+- **No console authentication.** The console and `/account` expose owner-facing money state. Keep them on loopback or a private network such as Tailscale; anything wider requires authentication first.
 - **Always-on deployment pending.** Supervision runs on one local Mac; a durable 24/7 host/VPS, managed secrets, remote monitoring, and a versioned deployment pipeline are open roadmap items.
-- **One implementation per provider today** (`ea`, `openrouter`, `typesafe`, `postgres`); the abstraction is the extension point, not a menu of built-ins.
+- **One implementation for most integrations.** Broker, market data, judge, calendar, and audit each have one (`ea`, `ea`, `typesafe`, `forexfactory`, `postgres`); the abstraction is the extension point. The model layer is the exception: it supports many API providers plus ChatGPT and Claude subscriptions.
 
 ## Where to change things
 
@@ -303,11 +309,11 @@ What deliberately stays volatile: the **pending command queue** (replaying undel
 | New judgement provider | `jev/mod.rs` (enum + factory arm), `jev/settings.rs` arms, new transport module alongside `jev/http.rs`; contract types live in `jev/contract.rs` |
 | Different audit storage | Implement `AuditTrail` (see `audit.rs` and `store.rs`) and swap the construction in `main.rs` |
 | New symbols | `VEYRA_RISK_SYMBOLS` + `VEYRA_AUTOPILOT_SYMBOLS` (up to 16, comma-separated; `VEYRA_AUTOPILOT_SYMBOL` remains the single-symbol form). CFDs/crypto/indices additionally require usable live tick economics; add genuinely weekend-traded instruments to `VEYRA_RISK_WEEKEND_SYMBOLS`. |
-| New timeframe | `VEYRA_AUTOPILOT_TIMEFRAME`; update the console's fixed H4 call in `console/src/lib/api.ts` if the UI should follow |
+| New timeframe | `VEYRA_AUTOPILOT_TIMEFRAME`; the console's timeframe picker (`MarketTimeframe` in `console/src/components/chart.tsx`) lists the chart choices |
 | More positions | `VEYRA_RISK_MAX_OPEN_ORDERS` and `VEYRA_RISK_MAX_TOTAL_LOTS`, plus the candidate menu in `VEYRA_AUTOPILOT_SYMBOLS`/`VEYRA_RISK_SYMBOLS`; the AI chooses at most one instrument per tick and skips unsuitable ones, one position per asset is enforced by the gate |
 | New risk limit | `risk/mod.rs` (policy parse + `summary`) and `risk/gate.rs` (fixed check order), plus gate tests; valuation maths lives in `risk/valuation.rs` and the equity baselines in `risk/guard.rs` |
 | New terminal command | `broker/command.rs` (`CommandKind`, request/payload types, validation), `broker/ea.rs` (wire mapping + ack handling), `ea/VeyraProbe.mq4`, and the caller in `control.rs`/`autopilot.rs` |
-| Console behaviour | `console/src/components/veyra.tsx`, typed client `console/src/lib/api.ts`, feed hooks `console/src/lib/hooks.ts`, formatting rules `console/src/lib/format.ts` |
+| Console behaviour | pages and polling in `console/src/components/dashboard.tsx`, panels in `veyra.tsx`, `overview.tsx`, `trades.tsx`, `settings.tsx`, `chart.tsx`, `chat.tsx`, and `rail.tsx`, typed client `console/src/lib/api.ts`, feed hooks `console/src/lib/hooks.ts`, formatting rules `console/src/lib/format.ts` |
 | Log capture and tail | Buffer and level parsing in `logs.rs`, tracing tee in `observability.rs`, route contract in `routes.rs` (`GET /logs`), console panel in `console/src/components/veyra.tsx` |
 | Deployment / supervision | `docs/deployment.md`, `scripts/launchd/*`, `scripts/install-launchd.sh` |
 

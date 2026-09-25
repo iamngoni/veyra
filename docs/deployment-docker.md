@@ -47,6 +47,11 @@ VEYRA_EA_ALLOW_LIVE=false
 VEYRA_AUTOPILOT_ENABLED=false
 ```
 
+A restored database can carry live settings saved from the console, and those
+win over `.env`. After the service starts, check `GET /config` for
+`overridden: true` on `VEYRA_TRADING_ENABLED` and `VEYRA_AUTOPILOT_ENABLED`,
+and clear any override with `POST /config {"VEYRA_TRADING_ENABLED": null}`.
+
 Do not start the tunnel profile during initial verification. The old machine
 continues to own the named tunnel until final cutover.
 
@@ -140,9 +145,12 @@ localhost, because cloudflared and Veyra are separate containers.
 6. Launch host-native MT4 and confirm successful polls, `/ready`, `/status`, and
    console activity.
 7. Arm only after explicit approval and after confirming the old machine cannot
-   trade the account. Set `VEYRA_TRADING_ENABLED=true`,
-   `VEYRA_EA_ALLOW_LIVE=true`, and `VEYRA_AUTOPILOT_ENABLED=true` in `.env`,
-   then recreate the Veyra container.
+   trade the account. Recompile the host EA with `VEYRA_EA_ALLOW_LIVE=true`
+   (or turn on `InAllowLiveOrders` in the EA inputs) and restart MT4; the
+   container never reads that variable. Then set `VEYRA_TRADING_ENABLED=true`
+   and `VEYRA_AUTOPILOT_ENABLED=true` in `.env` and recreate the Veyra
+   container, or arm them from the console. Check `GET /config` for
+   overrides, since a console-saved value wins over `.env`.
 
 Rollback is the reverse: keep the new switches false, stop the Docker tunnel,
 stop the new MT4 terminal, and restart the old stack from its retained database.

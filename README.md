@@ -83,9 +83,9 @@ What exists and what has been proven live:
 - GitHub Actions quality workflow.
 - Architecture and roadmap documentation.
 
-Real orders require two deliberate acts: the service switch
-(`VEYRA_TRADING_ENABLED=true`) and an EA compiled with
-`InAllowLiveOrders = true`. Until both are set, execution stops at a dry run.
+Real orders require two controls: the service switch
+(`VEYRA_TRADING_ENABLED=true`) and the EA's `InAllowLiveOrders` input. Until
+both are on, execution stops at a dry run.
 Broker credentials never reach the service; the MT4 terminal owns the session.
 
 ## Architecture direction
@@ -214,8 +214,10 @@ binary, including shutdown.
 One-time terminal setup:
 
 1. `./scripts/compile_ea.sh` (reads `VEYRA_EA_TOKEN` from `.env`; set
-   `VEYRA_EA_URL` to the tunnel endpoint when using Cloudflare). Live order
-   placement additionally requires compiling with `InAllowLiveOrders = true`.
+   `VEYRA_EA_URL` to the tunnel endpoint when using Cloudflare). The EA's
+   `InAllowLiveOrders` input is compiled from `VEYRA_EA_ALLOW_LIVE`, which
+   defaults to `true`; set it to `false` for a terminal that must never trade.
+   The input stays editable in the EA properties.
 2. MT4 → Options → Expert Advisors: enable automated trading, and add the
    endpoint URL (for example `https://veyra.antonlabs.cc/ea/poll`) to the
    WebRequest allowlist. Listing the exact URL is the habit that has held on
@@ -246,8 +248,8 @@ unknown and reports drift, and every command is pollable through
 `GET /commands/{id}`.
 
 Staged execution: with the service switch on, the terminal still validates the
-request and reports a dry run until the EA is recompiled with
-`InAllowLiveOrders = true` — two deliberate acts before real money moves.
+request and reports a dry run while the EA's `InAllowLiveOrders` input is off,
+so real money moves only when both controls are on.
 
 Platform notes (see docs/decisions/0002):
 

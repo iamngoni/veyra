@@ -6,18 +6,20 @@ Veyra is designed as an unattended trading service rather than a chat applicatio
 2. **Context collectors** maintain typed market/account/session state.
 3. **Decision adapters** request structured outputs from the configured model (`DecisionEngine`) and calibrated judgements from Jev (`SemanticJudge`).
 4. **Risk gate** validates proposed orders against hard limits and session rules.
-5. **Broker adapter** carries read-only commands and broker-side validation today; execution will accept only risk-approved operations.
+5. **Broker adapter** carries read-only commands, broker-side validation, and gate-approved open, close, and modify orders.
 6. **Reconciler** verifies actual broker state and persists durable outcomes.
 
-## Non-goals for this slice
+## Boundaries
 
-- No order execution: every broker-facing command is read-only or a validation
-  (`order_check`), and nothing can place an order.
+- Orders execute only after the risk gate approves them and both execution
+  controls are armed (`VEYRA_TRADING_ENABLED` and the EA's
+  `InAllowLiveOrders`).
 - No vendor lock-in: integrations stay behind swappable contracts
-  (`BrokerLink`, `DecisionEngine`, `SemanticJudge`).
-- No deployment environment or 24/7 host yet; see the roadmap's deployment
-  phase.
-- No frontend yet.
+  (`BrokerLink`, `DecisionEngine`, `SemanticJudge`, `MarketFeed`).
+- The console assistant is read-only and cannot place, close, or modify
+  orders.
+- Supervised launchd and hybrid Docker deployments are described in
+  `docs/deployment*.md`.
 
 ## Operating goal
 

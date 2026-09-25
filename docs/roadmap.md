@@ -36,7 +36,8 @@
       enforces `VEYRA_MODEL_MAX_CALLS_PER_HOUR` / `_PER_DAY` (0 = unlimited)
       over any engine implementation, and `GET /status` reports the current
       usage against the limits.
-- [x] Model decisions never reach execution directly (no execution exists).
+- [x] Model decisions never reach execution directly; only gate-approved
+      intents are staged.
 
 ## Phase 3 — Jev decision adapter
 
@@ -137,7 +138,9 @@
       without changing any default.
 - [x] Durable runtime state (`runtime_state` in Postgres): judge usage,
       model-budget windows, drawdown baselines, stop-policy memory, and the
-      live risk policy all survive service restarts and reboots; volatile by
+      live risk policy all survive service restarts and reboots, as do
+      profit-harvest state, live-settings overrides, and encrypted console
+      credentials; volatile by
       design are the pending command queue, event/log rings, and `/metrics`
       views (the audit trail is the durable record).
 - [x] Realized performance: a read-only `order_history` command returns the
@@ -175,12 +178,13 @@
 ## Phase 5 — deterministic risk and control
 
 - [x] Typed trade intents parsed at the boundary; a draft carries no identity
-      until the gate approves it, and no execution path exists.
+      until the gate approves it.
 - [x] Deterministic, fail-closed gate: kill switch, instrument allowlist, UTC
       session window, per-order volume cap, open-order cap, duplicate
       suppression.
 - [x] Model proposals run through the gate (`trading::pipeline`); rejections
-      are normal outcomes and approvals are never queued or executed.
+      are normal outcomes, and approvals are queued only through the staged
+      execution path behind both execution controls.
 - [x] Non-executing `POST /intents/evaluate` on the loopback diagnostics
       listener, backed by live link state.
 - [x] `VEYRA_RISK_*` configuration with restrictive defaults; malformed values
@@ -195,7 +199,9 @@
       the rules that were in force when it was made.
 - [x] Two independent controls in front of real money: the service refuses to
       queue execution unless `VEYRA_TRADING_ENABLED=true`, and the terminal
-      refuses to trade unless recompiled with `InAllowLiveOrders = true`.
+      refuses to trade unless its `InAllowLiveOrders` input is on (compiled
+      default from `VEYRA_EA_ALLOW_LIVE`, which defaults to `true`; editable
+      in the EA inputs).
 
 ## Phase 6 — console
 
@@ -203,8 +209,13 @@
       activity feed (`/events` cursor long-poll), command lifecycle, market
       window, autopilot and control state — supervised as a launchd agent.
 - [ ] Authentication and authorization for access beyond loopback.
-- [ ] Decision, risk, and incident views beyond the activity feed.
-- [ ] Frontend unit, integration, type-check, build, and coverage gates.
+- [x] Decision, risk, and incident views beyond the activity feed: Trades
+      (closed trades with close reasons, paginated), Risk, Trace (audit
+      trail), and Diagnostics pages.
+- [x] Frontend unit, integration, type-check, build, and coverage gates
+      (95% thresholds, run in CI and `scripts/check.sh`).
+- [x] Read-only console assistant grounded in positions, account state,
+      recorded decisions, and model health; it has no order tools.
 
 ## Phase 7 — deployment
 
@@ -235,6 +246,9 @@
       (`VEYRA_BACKUP_R2_BUCKET`) through the authenticated `wrangler` CLI —
       proven live (byte-identical retrieval of an uploaded dump, launchd-path
       run included), with a freshness marker the alert probe watches.
+- [x] Hybrid Docker profile (`compose.yaml`): service, PostgreSQL, tunnel,
+      and console in Compose with MT4 native on the host, plus Docker backup,
+      restore, and terminal-watch scripts (`docs/deployment-docker.md`).
 - [ ] Durable 24/7 host or VPS, managed secrets, and remote monitoring.
 - [ ] Versioned deployment pipeline.
 - [ ] Staged rollout: local → paper account → minimal live exposure only after explicit owner approval.
