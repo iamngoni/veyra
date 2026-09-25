@@ -456,6 +456,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
         field?: string
         reason?: string
         rejected?: Array<{ field: string; reason: string }>
+        error?: string
       }
       if (payload.field && payload.reason) detail = `${payload.field}: ${payload.reason}`
       // A settings patch reports every bad field at once, so the message names
@@ -463,6 +464,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
       else if (payload.rejected?.length) {
         detail = payload.rejected.map((edit) => `${edit.field}: ${edit.reason}`).join('; ')
       } else if (payload.reason) detail = payload.reason
+      else if (payload.error) detail = payload.error.replaceAll('_', ' ')
     } catch {
       // Keep the status-only detail when the body is not JSON.
     }
@@ -602,6 +604,9 @@ export const api = {
     post<{ changed: string[]; settings: Record<string, LiveSetting> }>('/config', patch),
   /** Returns every benched model to the route at once. */
   clearCooldowns: () => post<{ cleared: number; model_cooldowns: ModelCooldown[] }>('/model/cooldowns/clear', {}),
+  /** Queues a market close for one Veyra-owned position; the terminal re-validates it. */
+  closePosition: (ticket: number) =>
+    post<{ command: string; command_id: string; ticket: number; status: string }>('/intents/close', { ticket }),
 }
 
 export const VEYRA_MAGIC = 77041

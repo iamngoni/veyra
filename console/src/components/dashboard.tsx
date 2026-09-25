@@ -41,7 +41,7 @@ type TabId = (typeof TABS)[number]['id']
 
 export function Dashboard() {
   const { data: status, refetch: refetchStatus } = usePoll(api.status, 5000)
-  const { data: account, error: accountError } = usePoll(api.account, 5000)
+  const { data: account, error: accountError, refetch: refetchAccount } = usePoll(api.account, 5000)
   const { data: commands } = usePoll(() => api.commands(25), 10000)
   const { data: performance, error: performanceError } = usePoll(api.performance, 30000)
   // The growth chart and today's realized change read the longest window once
@@ -107,6 +107,18 @@ export function Dashboard() {
       // Reflect the new policy at once instead of leaving a stale reading on
       // screen until the next poll.
       void refetchStatus()
+      return undefined
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  // A manual close goes through the service's single close path: Veyra-owned
+  // tickets only, refused while trading is off, re-validated by the terminal.
+  const closePosition = async (ticket: number) => {
+    try {
+      await api.closePosition(ticket)
+      void refetchAccount()
       return undefined
     } catch (error) {
       return error instanceof Error ? error.message : String(error)
@@ -200,7 +212,12 @@ export function Dashboard() {
                   series={utc.series}
                   seriesError={marketError}
                 />
-                <OpenPositions account={utc.account ?? account} harvestEnabled={Boolean(status?.autopilot?.profit_harvest)} />
+                <OpenPositions
+                  account={utc.account ?? account}
+                  harvestEnabled={Boolean(status?.autopilot?.profit_harvest)}
+                  tradingEnabled={status?.trading_enabled ?? false}
+                  onClose={closePosition}
+                />
                 <PerformanceSummary performance={performance} error={performanceError} balance={account?.balance} />
               </div>
               <aside className="overview-rail" aria-label="Autopilot and controls">

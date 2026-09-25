@@ -130,16 +130,17 @@
   font-size: var(--text-base);
 }
 
-.pos-col-symbol { width: 11.5%; }
-.pos-col-side { width: 8.5%; }
-.pos-col-lots { width: 8%; }
-.pos-col-entry { width: 10.5%; }
-.pos-col-current { width: 10.5%; }
-.pos-col-sl { width: 10.5%; }
-.pos-col-tp { width: 10.5%; }
-.pos-col-pl { width: 12%; }
-.pos-col-harvest { width: 13%; }
-.pos-col-actions { width: 5%; }
+.pos-col-symbol { width: 10%; }
+.pos-col-side { width: 7%; }
+.pos-col-lots { width: 6.5%; }
+.pos-col-entry { width: 9%; }
+.pos-col-current { width: 9%; }
+.pos-col-sl { width: 9%; }
+.pos-col-tp { width: 9%; }
+.pos-col-pl { width: 9.5%; }
+.pos-col-opened { width: 13%; }
+.pos-col-harvest { width: 11.5%; }
+.pos-col-actions { width: 6.5%; }
 
 .pos-table th,
 .pos-table td {
@@ -216,7 +217,8 @@
 
 /* The disclosure appears with its row (hover or keyboard focus) and stays
    while that row is open. Touch screens have no hover, so it always shows. */
-.pos-more {
+.pos-more,
+.pos-close {
   width: var(--control-sm);
   height: var(--control-sm);
   vertical-align: middle;
@@ -225,7 +227,9 @@
 
 .pos-row:hover .pos-more,
 .pos-row:focus-within .pos-more,
-.pos-more[aria-expanded="true"] {
+.pos-more[aria-expanded="true"],
+.pos-row:hover .pos-close,
+.pos-row:focus-within .pos-close {
   opacity: 1;
 }
 
@@ -242,7 +246,8 @@
 }
 
 @media (hover: none) {
-  .pos-more {
+  .pos-more,
+  .pos-close {
     opacity: 1;
   }
 }
@@ -407,4 +412,58 @@
   .perf-sub:empty {
     display: none;
   }
+}
+
+/* Open time with time held beside it, e.g. 09:14 · 3h 12m. */
+.pos-opened {
+  white-space: nowrap;
+}
+
+.pos-held {
+  margin-left: 8px;
+  color: var(--color-ink-faint);
+}
+
+.pos-held::before {
+  margin-right: 8px;
+  content: "·";
+}
+
+/* Close sits beside the details chevron and, like it, shows on row hover. */
+.pos-table td.pos-actions {
+  white-space: nowrap;
+}
+
+.pos-close:not(:disabled):hover {
+  color: var(--color-bad);
+}
+
+.pos-confirm > td {
+  padding: 0 0 8px;
+}
+
+.pos-confirm-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--color-fill);
+  font-size: 13px;
+}
+
+.pos-confirm-error {
+  font-size: 12px;
+}
+
+.pos-confirm-actions {
+  display: inline-flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.pos-confirm-close:not(:disabled) {
+  border-color: var(--color-bad);
+  color: var(--color-bad);
 }

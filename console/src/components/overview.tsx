@@ -152,6 +152,24 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
  * `23 Sep, 14:05` in local time. Built by hand rather than through Intl, whose
  * short month for September varies by ICU version ("Sep" / "Sept").
  */
+/** Wall-clock open time: `09:14` today, `24 Sep 09:14` on any earlier day. */
+function openedClock(seconds: number, now: number): string {
+  const date = new Date(seconds * 1000)
+  const today = new Date(now)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return date.toDateString() === today.toDateString() ? clock : `${date.getDate()} ${MONTHS[date.getMonth()]} ${clock}`
+}
+
+/** How long a position has been held: `42m`, `3h 12m`, `2d 5h`. */
+export function heldFor(seconds: number, now: number): string {
+  const minutes = Math.max(0, Math.floor((now / 1000 - seconds) / 60))
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ${minutes % 60}m`
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`
+}
+
 function openedAt(seconds: number | undefined): string {
   if (!seconds) return '—'
   const date = new Date(seconds * 1000)
@@ -169,23 +187,43 @@ function harvest(position: Position, enabled: boolean): { tone: Tone; label: str
   return enabled ? { tone: 'ok', label: 'Monitoring' } : { tone: 'off', label: 'Off' }
 }
 
-const COLUMNS = ['Symbol', 'Side', 'Lots', 'Entry', 'Current', 'SL', 'TP', 'P/L', 'Profit harvest']
+const COLUMNS = ['Symbol', 'Side', 'Lots', 'Entry', 'Current', 'SL', 'TP', 'P/L', 'Opened', 'Profit harvest']
+
+/** A manual close the operator has asked for on one row. */
+type Closing = { ticket: number; phase: 'confirm' | 'pending' | 'queued'; error?: string }
 
 function PositionRow({
   position,
   harvestEnabled,
   expanded,
   onToggle,
+  now,
+  closing,
+  closable,
+  closeBlocked,
+  onRequestClose,
+  onCancelClose,
+  onConfirmClose,
 }: {
   position: Position
   harvestEnabled: boolean
   expanded: boolean
   onToggle: () => void
+  now: number
+  closing?: Closing
+  /** Veyra-owned and a close handler exists. */
+  closable: boolean
+  /** Why closing is unavailable right now, e.g. trading is disabled. */
+  closeBlocked?: string
+  onRequestClose: () => void
+  onCancelClose: () => void
+  onConfirmClose: () => void
 }) {
   const decimals = quotedDecimals(position)
   const result = positionResult(position)
   const state = harvest(position, harvestEnabled)
   const detailId = `pos-detail-${position.ticket}`
+  const side = position.kind === 'buy' ? 'long' : 'short'
   return (
     <>
       <tr className={`pos-row${expanded ? ' is-expanded' : ''}`}>
@@ -197,6 +235,18 @@ function PositionRow({
         <td>{price(position.sl, decimals)}</td>
         <td>{price(position.tp, decimals)}</td>
         <td className={signTone(result)}>{signedAmount(result)}</td>
+        <td className="pos-opened">
+          {position.openedAt ? (
+            <>
+              <time dateTime={new Date(position.openedAt * 1000).toISOString()}>{openedClock(position.openedAt, now)}</time>
+              <span className="pos-held" title="Time held">
+                {heldFor(position.openedAt, now)}
+              </span>
+            </>
+          ) : (
+            '—'
+          )}
+        </td>
         <td>
           <span className="pos-harvest">
             <Dot tone={state.tone} />
@@ -204,6 +254,18 @@ function PositionRow({
           </span>
         </td>
         <td className="pos-actions">
+          {closable ? (
+            <button
+              type="button"
+              className="icon-button pos-close"
+              aria-label={`Close ${position.symbol} ${side}`}
+              title={closeBlocked ?? 'Close at market'}
+              disabled={Boolean(closeBlocked) || closing?.phase === 'pending' || closing?.phase === 'queued'}
+              onClick={onRequestClose}
+            >
+              <Icon name="close" size={14} />
+            </button>
+          ) : null}
           <button
             type="button"
             className="icon-button pos-more"
@@ -216,6 +278,38 @@ function PositionRow({
           </button>
         </td>
       </tr>
+      {closing ? (
+        <tr className="pos-confirm">
+          <td colSpan={COLUMNS.length + 1}>
+            <div className="pos-confirm-row" role="group" aria-label={`Close ${position.symbol}`}>
+              {closing.phase === 'queued' ? (
+                <span className="tone-ok">Close queued — waiting for the terminal</span>
+              ) : (
+                <>
+                  <span>
+                    Close {position.symbol} {side} {position.lots.toFixed(2)} at market?{' '}
+                    <span className={signTone(result)}>{signedAmount(result)}</span>
+                  </span>
+                  {closing.error ? <span className="tone-bad pos-confirm-error">{closing.error}</span> : null}
+                  <span className="pos-confirm-actions">
+                    <button type="button" className="tab-button" onClick={onCancelClose} disabled={closing.phase === 'pending'}>
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      className="tab-button pos-confirm-close"
+                      onClick={onConfirmClose}
+                      disabled={closing.phase === 'pending'}
+                    >
+                      {closing.phase === 'pending' ? 'Closing…' : 'Close position'}
+                    </button>
+                  </span>
+                </>
+              )}
+            </div>
+          </td>
+        </tr>
+      ) : null}
       {expanded ? (
         <tr className="pos-detail" id={detailId}>
           <td colSpan={COLUMNS.length + 1}>
@@ -248,12 +342,28 @@ function PositionRow({
 export function OpenPositions({
   account,
   harvestEnabled,
+  onClose,
+  tradingEnabled = true,
+  now = Date.now(),
 }: {
   account?: Account
   /** Whether the profit-harvest policy is enabled for Veyra-owned positions. */
   harvestEnabled: boolean
+  /** Queues a market close; resolves to an error message or undefined. Absent hides the action. */
+  onClose?: (ticket: number) => Promise<string | undefined>
+  /** The service refuses closes while its trading switch is off. */
+  tradingEnabled?: boolean
+  /** Clock for time held; tests pin it. */
+  now?: number
 }) {
   const [expanded, setExpanded] = useState<number>()
+  const [closing, setClosing] = useState<Closing>()
+  const confirmClose = async (ticket: number) => {
+    if (!onClose) return
+    setClosing({ ticket, phase: 'pending' })
+    const failure = await onClose(ticket)
+    setClosing(failure ? { ticket, phase: 'confirm', error: failure } : { ticket, phase: 'queued' })
+  }
   const positions = account?.positions ?? []
   let body: ReactNode
   if (!account) {
@@ -278,6 +388,7 @@ export function OpenPositions({
             <col className="pos-col-sl" />
             <col className="pos-col-tp" />
             <col className="pos-col-pl" />
+            <col className="pos-col-opened" />
             <col className="pos-col-harvest" />
             <col className="pos-col-actions" />
           </colgroup>
@@ -301,6 +412,13 @@ export function OpenPositions({
                 harvestEnabled={harvestEnabled}
                 expanded={expanded === position.ticket}
                 onToggle={() => setExpanded(expanded === position.ticket ? undefined : position.ticket)}
+                now={now}
+                closing={closing?.ticket === position.ticket ? closing : undefined}
+                closable={Boolean(onClose) && position.magic === VEYRA_MAGIC}
+                closeBlocked={tradingEnabled ? undefined : 'Trading is disabled'}
+                onRequestClose={() => setClosing({ ticket: position.ticket, phase: 'confirm' })}
+                onCancelClose={() => setClosing(undefined)}
+                onConfirmClose={() => void confirmClose(position.ticket)}
               />
             ))}
           </tbody>

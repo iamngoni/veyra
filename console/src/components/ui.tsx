@@ -198,6 +198,7 @@ export type IconName =
   | 'more'
   | 'info'
   | 'check'
+  | 'close'
 
 /** Outline icons drawn on a 24 grid (16px by default), stroked with the current colour. */
 const ICONS: Record<IconName, ReactNode> = {
@@ -255,6 +256,7 @@ const ICONS: Record<IconName, ReactNode> = {
     </>
   ),
   check: <path d="m5 12.5 4.5 4.5L19 7.5" />,
+  close: <path d="M6.5 6.5l11 11M17.5 6.5l-11 11" />,
 }
 
 export function Icon({ name, className = '', size }: { name: IconName; className?: string; size?: number }) {

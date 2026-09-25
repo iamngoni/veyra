@@ -4,12 +4,12 @@
  * the service emits; the clock is pinned wherever "today" matters.
  */
 
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { Account, ClosedTrade, Performance, PerformanceReport, Position } from '../lib/api'
 import { VEYRA_MAGIC } from '../lib/api'
-import { KpiRow, OpenPositions, PerformanceSummary } from './overview'
+import { KpiRow, OpenPositions, PerformanceSummary, heldFor } from './overview'
 
 afterEach(cleanup)
 
@@ -184,6 +184,77 @@ describe('KpiRow', () => {
   })
 })
 
+describe('OpenPositions open time and manual close', () => {
+  const NOW = new Date(2026, 8, 25, 12, 30).getTime()
+  const openedToday = new Date(2026, 8, 25, 9, 14).getTime() / 1000
+  const openedEarlier = new Date(2026, 8, 23, 22, 5).getTime() / 1000
+
+  it('shows when each position opened and how long it has been held', () => {
+    render(
+      <OpenPositions
+        account={account({ positions: [position({ openedAt: openedToday }), position({ ticket: 202, symbol: 'USDCAD', openedAt: openedEarlier })] })}
+        harvestEnabled
+        now={NOW}
+      />,
+    )
+    const [, today, earlier] = screen.getAllByRole('row')
+    expect(within(today).getByText('09:14')).toBeTruthy()
+    expect(within(today).getByText('3h 16m')).toBeTruthy()
+    expect(within(earlier).getByText('23 Sep 22:05')).toBeTruthy()
+    expect(within(earlier).getByText('1d 14h')).toBeTruthy()
+  })
+
+  it('formats held time in minutes, hours and days', () => {
+    expect(heldFor(NOW / 1000 - 42 * 60, NOW)).toBe('42m')
+    expect(heldFor(NOW / 1000 + 60, NOW)).toBe('0m')
+    expect(heldFor(NOW / 1000 - 26 * 3600, NOW)).toBe('1d 2h')
+  })
+
+  it('asks before closing, and closes only after confirmation', async () => {
+    const onClose = vi.fn().mockResolvedValue(undefined)
+    render(<OpenPositions account={account({ positions: [position()] })} harvestEnabled onClose={onClose} now={NOW} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close EURUSD long' }))
+    expect(screen.getByText(/Close EURUSD long 0.50 at market\?/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByText(/at market\?/)).toBeNull()
+    expect(onClose).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close EURUSD long' }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Close position' }))
+    })
+    expect(onClose).toHaveBeenCalledWith(101)
+    expect(screen.getByText(/Close queued/)).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Close EURUSD long' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('shows a refused close and keeps the question open', async () => {
+    let settle: (value: string | undefined) => void = () => {}
+    const onClose = vi.fn(() => new Promise<string | undefined>((resolve) => { settle = resolve }))
+    render(<OpenPositions account={account({ positions: [position()] })} harvestEnabled onClose={onClose} now={NOW} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Close EURUSD long' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Close position' }))
+    expect(screen.getByRole('button', { name: 'Closing…' })).toBeTruthy()
+    await act(async () => settle('trading disabled'))
+    expect(screen.getByText('trading disabled')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Close position' })).toBeTruthy()
+  })
+
+  it('offers no close for manual positions, and none while trading is off', () => {
+    const onClose = vi.fn()
+    const { rerender } = render(
+      <OpenPositions account={account({ positions: [position({ magic: 0 })] })} harvestEnabled onClose={onClose} now={NOW} />,
+    )
+    expect(screen.queryByRole('button', { name: /^Close / })).toBeNull()
+
+    rerender(<OpenPositions account={account({ positions: [position()] })} harvestEnabled onClose={onClose} tradingEnabled={false} now={NOW} />)
+    const close = screen.getByRole('button', { name: 'Close EURUSD long' }) as HTMLButtonElement
+    expect(close.disabled).toBe(true)
+    expect(close.title).toBe('Trading is disabled')
+  })
+})
+
 describe('OpenPositions', () => {
   it('lists each position with side, precision and result', () => {
     const short = position({
@@ -212,12 +283,13 @@ describe('OpenPositions', () => {
       'SL',
       'TP',
       'P/L',
+      'Opened',
       'Profit harvest',
       'Details',
     ])
 
     const long = within(first).getAllByRole('cell').map((cell) => cell.textContent)
-    expect(long.slice(0, 9)).toEqual([
+    expect(long.slice(0, 10)).toEqual([
       'EURUSD',
       'Long',
       '0.50',
@@ -226,6 +298,7 @@ describe('OpenPositions', () => {
       '1.0740',
       '1.0920',
       '+285.00',
+      '—',
       'Monitoring',
     ])
     expect(within(first).getByText('Long').className).toContain('tone-ok')
