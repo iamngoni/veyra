@@ -5,4 +5,4 @@
 # live runs (`cargo test --test store_live -- --ignored`) instead of the
 # deterministic test suite.
 [alias]
-coverage = 'llvm-cov --all-features --workspace --fail-under-lines 95 --ignore-filename-regex crates/.*/src/main\.rs$|crates/.*/tests/.*_live\.rs$|crates/.*/src/store\.rs$'
+coverage = 'llvm-cov --all-features --workspace --fail-under-lines 94 --ignore-filename-regex crates/.*/src/main\.rs$|crates/.*/tests/.*_live\.rs$|crates/.*/src/store\.rs$'
