@@ -269,6 +269,98 @@ pub fn utc_now_parts(now: SystemTime) -> Option<(u8, u32)> {
     utc_parts(now)
 }
 
+/// Minutes before an instrument's session closes when entries stop, so a new
+/// position is never opened into a daily break or the weekend close.
+pub const SESSION_CLOSE_MARGIN_SECS: i64 = 15 * 60;
+
+/// Whether an instrument's own trading session allows an entry, from the
+/// sessions its terminal reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InstrumentSession {
+    /// No sessions reported, or the broker clock is unknown. The standard
+    /// FX/metals week still applies through [`entry_block`].
+    #[default]
+    Unknown,
+    /// Inside a session, at least [`SESSION_CLOSE_MARGIN_SECS`] before it closes.
+    Open,
+    /// Outside every session, or about to close.
+    Closed,
+}
+
+/// [`instrument_session`] with a fail-closed default: an instrument that is
+/// neither FX nor a metal (so the standard FX week does not describe it) and
+/// is not weekend-capable must report its sessions, or it counts as closed.
+/// Index CFDs therefore need EA 1.26, which reports them.
+pub fn entry_session(
+    spec: &crate::broker::SymbolSpecPayload,
+    symbol: &crate::broker::Symbol,
+    weekend_capable: bool,
+    utc_secs: i64,
+    broker_offset_secs: Option<i64>,
+) -> InstrumentSession {
+    if spec.sessions.is_empty()
+        && !weekend_capable
+        && !crate::risk::valuation::supports_static_valuation(symbol)
+    {
+        return InstrumentSession::Closed;
+    }
+    instrument_session(&spec.sessions, utc_secs, broker_offset_secs)
+}
+
+/// Decides [`InstrumentSession`] for `sessions` (server time) at `utc_secs`,
+/// given the broker's offset from UTC. Adjacent sessions (Monday ending at
+/// 24:00 and Tuesday starting at 00:00, or Saturday into Sunday) count as one,
+/// so the margin only applies before a real close.
+pub fn instrument_session(
+    sessions: &[crate::broker::TradeSession],
+    utc_secs: i64,
+    broker_offset_secs: Option<i64>,
+) -> InstrumentSession {
+    const DAY: i64 = 86_400;
+    const WEEK: i64 = 7 * DAY;
+    let Some(offset) = broker_offset_secs else {
+        return InstrumentSession::Unknown;
+    };
+    if sessions.is_empty() {
+        return InstrumentSession::Unknown;
+    }
+    let server = utc_secs.saturating_add(offset);
+    // 1970-01-01 was a Thursday: day 4 with Sunday = 0.
+    let week_second = (server.div_euclid(DAY) + 4).rem_euclid(7) * DAY + server.rem_euclid(DAY);
+
+    let mut spans: Vec<(i64, i64)> = sessions
+        .iter()
+        .map(|session| {
+            let day = i64::from(session.day) * DAY;
+            (day + i64::from(session.from), day + i64::from(session.to))
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let Some(&(_, end)) = merged
+        .iter()
+        .find(|(start, end)| *start <= week_second && week_second < *end)
+    else {
+        return InstrumentSession::Closed;
+    };
+    // A session running to the end of Saturday continues into Sunday's first
+    // session when that one starts at midnight.
+    let end = match merged.first() {
+        Some(&(0, first_end)) if end == WEEK => WEEK + first_end,
+        _ => end,
+    };
+    if week_second + SESSION_CLOSE_MARGIN_SECS <= end {
+        InstrumentSession::Open
+    } else {
+        InstrumentSession::Closed
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +554,154 @@ mod tests {
         // The weekend itself is closed.
         assert!(weekend_prep(moment(6, 12 * 60)).is_none());
         assert!(weekend_prep(moment(0, 23 * 60)).is_none());
+    }
+
+    fn session(day: u8, from_h: u32, to_h: u32) -> crate::broker::TradeSession {
+        crate::broker::TradeSession {
+            day,
+            from: from_h * 3_600,
+            to: to_h * 3_600,
+        }
+    }
+
+    #[test]
+    fn instrument_sessions_open_close_and_stop_entries_before_a_close() {
+        use super::{InstrumentSession, instrument_session};
+        // Wednesday 2026-01-07 12:00 UTC; broker clock UTC+2 -> 14:00 server.
+        let wednesday_noon = 1_767_787_200;
+        let offset = Some(7_200);
+        // US index CFD: 01:00-23:00 server time with a daily break.
+        let index: Vec<_> = (1..=5).map(|day| session(day, 1, 23)).collect();
+        assert_eq!(
+            instrument_session(&index, wednesday_noon, offset),
+            InstrumentSession::Open
+        );
+        // 22:50 server: inside the session but within 15 minutes of its close.
+        let late = wednesday_noon + 8 * 3_600 + 50 * 60;
+        assert_eq!(
+            instrument_session(&index, late, offset),
+            InstrumentSession::Closed
+        );
+        // 23:30 server: in the daily break.
+        let break_time = wednesday_noon + 9 * 3_600 + 30 * 60;
+        assert_eq!(
+            instrument_session(&index, break_time, offset),
+            InstrumentSession::Closed
+        );
+        // Saturday: no session.
+        let saturday = wednesday_noon + 3 * 86_400;
+        assert_eq!(
+            instrument_session(&index, saturday, offset),
+            InstrumentSession::Closed
+        );
+        // Unknown without sessions or without the broker clock.
+        assert_eq!(
+            instrument_session(&[], wednesday_noon, offset),
+            InstrumentSession::Unknown
+        );
+        assert_eq!(
+            instrument_session(&index, wednesday_noon, None),
+            InstrumentSession::Unknown
+        );
+    }
+
+    #[test]
+    fn back_to_back_sessions_count_as_one() {
+        use super::{InstrumentSession, instrument_session};
+        // FX-style: Monday-Thursday all day, Friday until 22:00 server time.
+        let mut fx: Vec<_> = (1..=4).map(|day| session(day, 0, 24)).collect();
+        fx.push(session(5, 0, 22));
+        // Monday 2026-01-05 23:55 (UTC+0): midnight is not a close.
+        let monday_late = 1_767_787_200 - 36 * 3_600 - 5 * 60;
+        assert_eq!(
+            instrument_session(&fx, monday_late, Some(0)),
+            InstrumentSession::Open
+        );
+        // Crypto-style: every day all day, across the week boundary.
+        let always: Vec<_> = (0..=6).map(|day| session(day, 0, 24)).collect();
+        // Saturday 2026-01-10 23:55 UTC runs on into Sunday.
+        let saturday_late = 1_767_787_200 + 3 * 86_400 + 11 * 3_600 + 55 * 60;
+        assert_eq!(
+            instrument_session(&always, saturday_late, Some(0)),
+            InstrumentSession::Open
+        );
+    }
+
+    #[test]
+    fn instruments_outside_the_fx_week_must_report_their_hours() {
+        use super::{InstrumentSession, entry_session};
+        let spec = |symbol: &str, sessions: Vec<crate::broker::TradeSession>| {
+            crate::broker::SymbolSpecPayload {
+                currency_base: None,
+                currency_profit: None,
+                sessions,
+                symbol: symbol.to_owned(),
+                digits: 1,
+                point: 0.1,
+                bid: 1.0,
+                ask: 1.1,
+                spread_points: 1,
+                stop_level_points: 0,
+                freeze_level_points: 0,
+                lot_min: 0.01,
+                lot_max: 1.0,
+                lot_step: 0.01,
+                tick_value: 0.01,
+                tick_size: 0.1,
+                margin_required: 1.0,
+                swap_long: 0.0,
+                swap_short: 0.0,
+                swap_type: 0,
+                trade_allowed: true,
+            }
+        };
+        let wednesday_noon = 1_767_787_200;
+        let index = crate::broker::Symbol::parse("SP500m").expect("symbol");
+        let fx = crate::broker::Symbol::parse("EURUSD").expect("symbol");
+        let crypto = crate::broker::Symbol::parse("BTCUSD").expect("symbol");
+        assert_eq!(
+            entry_session(
+                &spec("SP500m", Vec::new()),
+                &index,
+                false,
+                wednesday_noon,
+                Some(0)
+            ),
+            InstrumentSession::Closed,
+            "an index without reported hours fails closed"
+        );
+        assert_eq!(
+            entry_session(
+                &spec("EURUSD", Vec::new()),
+                &fx,
+                false,
+                wednesday_noon,
+                Some(0)
+            ),
+            InstrumentSession::Unknown,
+            "FX falls back to the standard week"
+        );
+        assert_eq!(
+            entry_session(
+                &spec("BTCUSD", Vec::new()),
+                &crypto,
+                true,
+                wednesday_noon,
+                Some(0)
+            ),
+            InstrumentSession::Unknown,
+            "weekend-capable instruments keep their own contract checks"
+        );
+        let hours: Vec<_> = (1..=5).map(|day| session(day, 1, 23)).collect();
+        assert_eq!(
+            entry_session(
+                &spec("SP500m", hours),
+                &index,
+                false,
+                wednesday_noon,
+                Some(0)
+            ),
+            InstrumentSession::Open
+        );
     }
 }

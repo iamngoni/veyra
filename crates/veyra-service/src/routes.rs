@@ -351,6 +351,7 @@ pub async fn evaluate_intent(
 pub(crate) async fn news_window(
     state: &AppState,
     symbol: &crate::broker::Symbol,
+    spec: Option<&crate::broker::SymbolSpecPayload>,
 ) -> crate::risk::gate::NewsWindow {
     use crate::risk::gate::NewsWindow;
     let minutes = state.risk().policy().calendar_blackout_minutes();
@@ -376,7 +377,13 @@ pub(crate) async fn news_window(
         .await
     {
         Ok(events) => {
-            if crate::calendar::blackout(&events, symbol.as_str(), now, minutes).is_some() {
+            let currencies = crate::calendar::instrument_currencies(symbol.as_str(), spec);
+            // An instrument with no known currencies (an index CFD before EA
+            // 1.26) cannot be matched to news, so it cannot be cleared either.
+            if currencies.is_empty() {
+                return NewsWindow::Unavailable;
+            }
+            if crate::calendar::blackout_for(&events, &currencies, now, minutes).is_some() {
                 NewsWindow::Blackout
             } else {
                 NewsWindow::Clear
@@ -405,9 +412,20 @@ pub(crate) async fn account_facts_for_draft(
     } else {
         None
     };
-    let news = news_window(state, draft.symbol()).await;
+    let news = news_window(state, draft.symbol(), spec.as_ref()).await;
     let mut facts = account_facts(state).await?;
     if let Some(spec) = spec {
+        let utc = state
+            .now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let offset = crate::broker_clock::BrokerClock::from_state(state)
+            .ok()
+            .map(crate::broker_clock::BrokerClock::offset_secs);
+        let weekend_capable = state.risk().policy().allows_weekend(draft.symbol());
+        facts.session =
+            crate::risk::window::entry_session(&spec, draft.symbol(), weekend_capable, utc, offset);
         facts.symbol_specs.push(spec);
     }
     facts.news = news;
@@ -499,6 +517,7 @@ pub(crate) async fn account_facts(state: &AppState) -> Option<AccountFacts> {
     };
     Some(AccountFacts {
         news: Default::default(),
+        session: Default::default(),
         trade_allowed: snapshot.trade_allowed(),
         open_orders,
         open_lots: snapshot.open_lots(),
@@ -679,7 +698,10 @@ mod tests {
         let body: serde_json::Value = actix_web::test::read_body_json(response).await;
         assert_eq!(body["killSwitch"], true);
         assert_eq!(body["maxOpenOrders"], 3);
-        assert_eq!(body["symbols"][0], "EURUSD", "symbols normalise upper-case");
+        assert_eq!(
+            body["symbols"][0], "eurusd",
+            "symbols keep the operator's spelling"
+        );
 
         let audited = trail.events().into_iter().any(|event| {
             event.kind() == AuditKind::RiskPolicyUpdated
@@ -694,7 +716,7 @@ mod tests {
             .expect("policy persisted");
         assert_eq!(saved["killSwitch"], true);
         assert_eq!(saved["maxOpenOrders"], 3);
-        assert_eq!(saved["symbols"], serde_json::json!(["EURUSD"]));
+        assert_eq!(saved["symbols"], serde_json::json!(["eurusd"]));
         assert_eq!(
             saved["maxRiskPercent"], 12.0,
             "unset fields carry the effective value"

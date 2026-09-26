@@ -1336,6 +1336,9 @@ impl MarketFeed for SpecMarket {
 
 fn spec(symbol: &str) -> crate::broker::SymbolSpecPayload {
     crate::broker::SymbolSpecPayload {
+        currency_base: None,
+        currency_profit: None,
+        sessions: Vec::new(),
         symbol: symbol.to_owned(),
         digits: 3,
         point: 0.001,

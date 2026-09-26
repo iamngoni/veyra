@@ -156,7 +156,9 @@ async fn fresh_state_with_room_approves_and_reports_order_limits() {
     let (status, decision) = evaluate(&state, market_draft("EURUSD")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(decision["decision"], "approved");
-    assert_eq!(decision["intent"]["symbol"], "EURUSD");
+    // Approved intents take the allowlist's spelling (configured here as
+    // `eurusd`); matching itself ignores case.
+    assert_eq!(decision["intent"]["symbol"], "eurusd");
     assert!(decision["intent"]["id"].as_str().is_some());
 
     // The same live account state rejects as soon as the configured cap is

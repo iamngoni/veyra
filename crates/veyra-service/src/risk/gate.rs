@@ -78,6 +78,10 @@ pub struct AccountFacts {
     /// The news blackout for the draft's instrument. Filled on the order
     /// admission path, so every entry (autopilot or manual) is checked.
     pub news: NewsWindow,
+    /// The instrument's own trading session (index cash sessions, daily
+    /// breaks), from the sessions its terminal reports. Filled on the same
+    /// path as `news`.
+    pub session: crate::risk::window::InstrumentSession,
 }
 
 /// Stable rejection codes; additions are backwards-compatible for consumers
@@ -122,6 +126,11 @@ pub enum RiskCode {
     /// The configured economic calendar could not be read; entries fail
     /// closed until it answers.
     NewsUnavailable,
+    /// The instrument's own trading session is closed or about to close.
+    InstrumentClosed,
+    /// Another instrument in the draft's correlated group already has a
+    /// position.
+    CorrelatedPositionOpen,
 }
 
 impl RiskCode {
@@ -146,6 +155,8 @@ impl RiskCode {
             Self::FactorExposureAboveLimit => "factor_exposure_above_limit",
             Self::NewsBlackout => "news_blackout",
             Self::NewsUnavailable => "news_unavailable",
+            Self::InstrumentClosed => "instrument_closed",
+            Self::CorrelatedPositionOpen => "correlated_position_open",
         }
     }
 
@@ -181,6 +192,12 @@ impl RiskCode {
             Self::NewsBlackout => "a high-impact news release is inside the blackout window",
             Self::NewsUnavailable => {
                 "the economic calendar is unavailable, so news cannot be ruled out"
+            }
+            Self::InstrumentClosed => {
+                "the instrument's trading session is closed or closes within 15 minutes"
+            }
+            Self::CorrelatedPositionOpen => {
+                "an instrument in the same correlated group already has a position"
             }
         }
     }
@@ -299,7 +316,7 @@ impl RiskGate {
                 if self.suppress_duplicate(draft, now) {
                     return Self::reject(RiskCode::DuplicateIntent);
                 }
-                RiskDecision::Approved(TradeIntent::approve(draft.clone()))
+                RiskDecision::Approved(TradeIntent::approve(self.canonical(draft)))
             }
         }
     }
@@ -315,7 +332,24 @@ impl RiskGate {
     ) -> RiskDecision {
         match self.check(draft, account, now) {
             Err(code) => Self::reject(code),
-            Ok(()) => RiskDecision::Approved(TradeIntent::approve(draft.clone())),
+            Ok(()) => RiskDecision::Approved(TradeIntent::approve(self.canonical(draft))),
+        }
+    }
+
+    /// The draft spelled as the allowlist spells its symbol, so the order
+    /// reaches the terminal under the broker's own name (`SP500m`) even when
+    /// the model or operator typed another case.
+    fn canonical(&self, draft: &TradeIntentDraft) -> TradeIntentDraft {
+        match self
+            .policy()
+            .symbols()
+            .iter()
+            .find(|allowed| *allowed == draft.symbol())
+        {
+            Some(allowed) if allowed.as_str() != draft.symbol().as_str() => {
+                draft.with_symbol_spelling(allowed.clone())
+            }
+            _ => draft.clone(),
         }
     }
 
@@ -361,10 +395,13 @@ impl RiskGate {
             NewsWindow::Unavailable => return Err(RiskCode::NewsUnavailable),
             NewsWindow::Unchecked | NewsWindow::Clear => {}
         }
+        if account.session == crate::risk::window::InstrumentSession::Closed {
+            return Err(RiskCode::InstrumentClosed);
+        }
         let spec = account
             .symbol_specs
             .iter()
-            .find(|spec| spec.symbol == draft.symbol().as_str());
+            .find(|spec| spec.symbol.eq_ignore_ascii_case(draft.symbol().as_str()));
         if spec.is_some_and(|spec| !spec.trade_allowed) {
             return Err(RiskCode::TradingNotAllowed);
         }
@@ -392,6 +429,11 @@ impl RiskGate {
         {
             return Err(RiskCode::SymbolAlreadyOpen);
         }
+        if let Some(group) = policy.correlated_group(draft.symbol())
+            && account.open_symbols.iter().any(|open| group.contains(open))
+        {
+            return Err(RiskCode::CorrelatedPositionOpen);
+        }
         if account.open_orders >= policy.max_open_orders() {
             return Err(RiskCode::OrderLimitReached);
         }
@@ -401,6 +443,11 @@ impl RiskGate {
             return Err(RiskCode::ExposureAboveLimit);
         }
         if policy.max_risk_percent() > 0.0 && draft.stop_loss().is_some() {
+            // Entry price, in order of preference: the draft's own (limit and
+            // stop orders), a price the caller vouches for, then the live
+            // quote on the side a market order would fill. Without any, the
+            // stop cannot be valued and the draft is refused rather than
+            // admitted unchecked.
             let reference = draft
                 .order()
                 .price()
@@ -411,10 +458,12 @@ impl RiskGate {
                         .iter()
                         .find(|(symbol, _)| symbol == draft.symbol())
                         .map(|(_, price)| *price)
-                });
-            if let Some(reference) = reference
-                && let Some(equity) = account.equity
-            {
+                })
+                .or_else(|| spec.and_then(|spec| fill_quote(spec, draft.side())));
+            let Some(reference) = reference else {
+                return Err(RiskCode::RiskUnverifiable);
+            };
+            if let Some(equity) = account.equity {
                 match valuation::risk_percent_with_spec(
                     draft,
                     Some(reference),
@@ -476,6 +525,16 @@ impl RiskGate {
     }
 }
 
+/// The live quote a market order on `side` would fill at: the ask for a buy,
+/// the bid for a sell. `None` for a missing, crossed, or non-finite book.
+fn fill_quote(spec: &SymbolSpecPayload, side: crate::trading::intent::Side) -> Option<f64> {
+    spec.quote_mid()?;
+    Some(match side {
+        crate::trading::intent::Side::Buy => spec.ask,
+        crate::trading::intent::Side::Sell => spec.bid,
+    })
+}
+
 /// UTC hour of an instant; instants before the epoch count as hour 0.
 fn utc_hour(now: SystemTime) -> u8 {
     let seconds = now
@@ -529,6 +588,7 @@ mod tests {
     fn facts_with(open_orders: u32, open_lots: f64) -> Option<AccountFacts> {
         Some(AccountFacts {
             news: Default::default(),
+            session: Default::default(),
             trade_allowed: true,
             open_orders,
             open_lots,
@@ -579,6 +639,115 @@ mod tests {
         assert_eq!(RiskCode::NewsBlackout.as_str(), "news_blackout");
         assert_eq!(RiskCode::NewsUnavailable.as_str(), "news_unavailable");
         assert!(RiskCode::NewsUnavailable.detail().contains("calendar"));
+    }
+
+    #[test]
+    fn a_closed_instrument_session_rejects_entries() {
+        let gate = RiskGate::new(policy());
+        let wednesday = UNIX_EPOCH + Duration::from_secs(1_767_787_200);
+        let closed = facts(0).map(|mut facts| {
+            facts.session = crate::risk::window::InstrumentSession::Closed;
+            facts
+        });
+        assert_eq!(
+            expect_rejection(gate.preview(&draft(0.1), closed, wednesday)).code(),
+            RiskCode::InstrumentClosed
+        );
+        let open = facts(0).map(|mut facts| {
+            facts.session = crate::risk::window::InstrumentSession::Open;
+            facts
+        });
+        assert!(matches!(
+            gate.preview(&draft(0.1), open, wednesday),
+            RiskDecision::Approved(_)
+        ));
+    }
+
+    #[test]
+    fn one_position_per_correlated_group() {
+        let sp = Symbol::parse("SP500m").expect("symbol");
+        let nd = Symbol::parse("Nd100m").expect("symbol");
+        let grouped = policy_with_symbols(policy(), vec![symbol(), sp.clone(), nd.clone()])
+            .with_correlated_groups(vec![vec![sp.clone(), nd.clone()]]);
+        let gate = RiskGate::new(grouped);
+        let wednesday = UNIX_EPOCH + Duration::from_secs(1_767_787_200);
+        let holding_with_spec = |symbol: &str| {
+            facts_holding(symbol).map(|mut facts| {
+                facts.symbol_specs = vec![venue_spec("Nd100m", true)];
+                facts
+            })
+        };
+        let nd_draft = TradeIntentDraft::new(
+            nd,
+            Side::Buy,
+            OrderKind::Market,
+            Volume::parse(0.1).expect("volume"),
+            None,
+            None,
+            None,
+        );
+        // Matching is by instrument, so the book's SP500M counts as SP500m.
+        assert_eq!(
+            expect_rejection(gate.preview(&nd_draft, holding_with_spec("SP500M"), wednesday))
+                .code(),
+            RiskCode::CorrelatedPositionOpen
+        );
+        // An unrelated position leaves the group rule silent.
+        assert_ne!(
+            gate.preview(&nd_draft, holding_with_spec("EURUSD"), wednesday)
+                .rejection_code(),
+            Some(RiskCode::CorrelatedPositionOpen)
+        );
+    }
+
+    #[test]
+    fn approvals_use_the_allowlist_spelling() {
+        let sp = Symbol::parse("SP500m").expect("symbol");
+        let gate = RiskGate::new(policy_with_symbols(policy(), vec![sp]));
+        let wednesday = UNIX_EPOCH + Duration::from_secs(1_767_787_200);
+        let shouted = TradeIntentDraft::new(
+            Symbol::parse("SP500M").expect("symbol"),
+            Side::Buy,
+            OrderKind::Market,
+            Volume::parse(0.1).expect("volume"),
+            None,
+            None,
+            None,
+        );
+        let mut index_facts = facts_test(0);
+        index_facts.symbol_specs = vec![venue_spec("SP500m", true)];
+        let intent = expect_approved(gate.evaluate(&shouted, Some(index_facts), wednesday));
+        assert_eq!(intent.draft().symbol().as_str(), "SP500m");
+    }
+
+    #[test]
+    fn a_market_order_without_a_known_price_is_valued_from_the_live_quote() {
+        let sp = Symbol::parse("SP500m").expect("symbol");
+        let gate =
+            RiskGate::new(policy_with_symbols(policy(), vec![sp]).with_limits(5.0, 0.0, 0.0, 0.0));
+        let wednesday = UNIX_EPOCH + Duration::from_secs(1_767_787_200);
+        let mut index_facts = facts_test(0);
+        index_facts.symbol_specs = vec![venue_spec("SP500m", true)];
+        // Ask 100 001 with tick value 0.01 per 0.01 tick: a 10-point stop on
+        // 0.1 lot risks 10 / 0.01 * 0.01 * 0.1 = 1.00, i.e. 0.1% of 1 000.
+        let near = draft_with_stop("SP500m", 0.1, 99_991.0);
+        assert!(matches!(
+            gate.preview(&near, Some(index_facts.clone()), wednesday),
+            RiskDecision::Approved(_)
+        ));
+        // 1 000 points away risks 100.00, 10% of equity, above the 5% cap.
+        let far = draft_with_stop("SP500m", 0.1, 99_001.0);
+        assert_eq!(
+            expect_rejection(gate.preview(&far, Some(index_facts.clone()), wednesday)).code(),
+            RiskCode::RiskAboveLimit
+        );
+        // A crossed book is no price at all.
+        let mut crossed = index_facts;
+        crossed.symbol_specs[0].bid = 100_002.0;
+        assert_eq!(
+            expect_rejection(gate.preview(&far, Some(crossed), wednesday)).code(),
+            RiskCode::RiskUnverifiable
+        );
     }
 
     #[test]
@@ -716,6 +885,7 @@ mod tests {
     fn facts_test(open_orders: u32) -> AccountFacts {
         AccountFacts {
             news: Default::default(),
+            session: Default::default(),
             trade_allowed: true,
             open_orders,
             open_lots: 0.0,
@@ -732,6 +902,9 @@ mod tests {
 
     fn venue_spec(name: &str, trade_allowed: bool) -> SymbolSpecPayload {
         SymbolSpecPayload {
+            currency_base: None,
+            currency_profit: None,
+            sessions: Vec::new(),
             symbol: name.to_owned(),
             digits: 2,
             point: 0.01,
@@ -793,6 +966,19 @@ mod tests {
         match decision {
             RiskDecision::Approved(intent) => intent,
             other => panic!("expected approval, got {other:?}"),
+        }
+    }
+
+    trait RejectionCode {
+        fn rejection_code(&self) -> Option<RiskCode>;
+    }
+
+    impl RejectionCode for RiskDecision {
+        fn rejection_code(&self) -> Option<RiskCode> {
+            match self {
+                RiskDecision::Rejected(rejection) => Some(rejection.code()),
+                RiskDecision::Approved(_) => None,
+            }
         }
     }
 
@@ -935,6 +1121,7 @@ mod tests {
         );
         let closed_account = Some(AccountFacts {
             news: Default::default(),
+            session: Default::default(),
             trade_allowed: false,
             open_orders: 0,
             open_lots: 0.0,
@@ -1089,12 +1276,12 @@ mod tests {
             RiskCode::RiskAboveLimit
         );
 
-        // Without any price the rule cannot run and is skipped; the caps stay
-        // the binding controls.
-        assert!(matches!(
-            gate.evaluate(&big, Some(facts_test(0)), now),
-            RiskDecision::Approved(_)
-        ));
+        // Without any price the stop cannot be valued: the draft is refused
+        // rather than admitted unchecked.
+        assert_eq!(
+            expect_rejection(gate.evaluate(&big, Some(facts_test(0)), now)).code(),
+            RiskCode::RiskUnverifiable
+        );
     }
 
     #[test]

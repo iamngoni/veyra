@@ -436,14 +436,14 @@ async fn tool_judgements(session: &AgentSession<'_>, arguments: &Value) -> Resul
     if let Some((_, summary)) = session
         .judgements
         .iter()
-        .find(|(candidate, _)| candidate.as_str() == symbol.as_str())
+        .find(|(candidate, _)| candidate.as_str().eq_ignore_ascii_case(symbol.as_str()))
     {
         return Ok(summary.clone());
     }
     let Some((_, series)) = session
         .markets
         .iter()
-        .find(|(candidate, _)| candidate.as_str() == symbol.as_str())
+        .find(|(candidate, _)| candidate.as_str().eq_ignore_ascii_case(symbol.as_str()))
     else {
         let menu = session
             .markets
@@ -468,7 +468,7 @@ async fn tool_market(session: &AgentSession<'_>, arguments: &Value) -> Result<Va
     let in_menu = session
         .markets
         .iter()
-        .any(|(candidate, _)| candidate.as_str() == symbol.as_str());
+        .any(|(candidate, _)| candidate.as_str().eq_ignore_ascii_case(symbol.as_str()));
     if !in_menu && !session.state.risk().policy().allows_symbol(&symbol) {
         return Err(format!(
             "`{}` is outside the configured symbol allowlist",
@@ -902,6 +902,7 @@ mod tests {
     fn facts() -> AccountFacts {
         AccountFacts {
             news: Default::default(),
+            session: Default::default(),
             trade_allowed: true,
             open_orders: 0,
             open_lots: 0.0,

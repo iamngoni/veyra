@@ -965,7 +965,20 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
     // indices, and any future CFD in the account currency the broker reports.
     let specs = symbol_specs(state, &markets).await;
     account.symbol_specs = specs.iter().map(|(_, spec)| spec.clone()).collect();
-    let mut entry_markets = eligible_entry_markets(&markets, &specs, &policy, state.now());
+    let broker_offset = crate::broker_clock::BrokerClock::from_state(state)
+        .ok()
+        .map(crate::broker_clock::BrokerClock::offset_secs);
+    // With a calendar and a blackout configured, only instruments whose news
+    // can be matched are offered (see `routes::news_window`).
+    let news_required = state.calendar().is_some() && policy.calendar_blackout_minutes() > 0;
+    let mut entry_markets = eligible_entry_markets(
+        &markets,
+        &specs,
+        &policy,
+        state.now(),
+        broker_offset,
+        news_required,
+    );
     let eligible_before_cooldown = !entry_markets.is_empty();
     let observations: Vec<EntryObservation<'_>> = markets
         .iter()
@@ -1159,9 +1172,12 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                         // Scheduled news decides before the venue contract:
                         // an entry inside a high-impact window is refused for
                         // the instrument's own currencies.
-                        if let Some(event) = calendar::blackout(
+                        if let Some(event) = calendar::blackout_for(
                             &events,
-                            symbol.as_str(),
+                            &calendar::instrument_currencies(
+                                symbol.as_str(),
+                                symbol_spec_for(&specs, symbol.as_str()),
+                            ),
                             unix_secs(state.now()),
                             policy.calendar_blackout_minutes(),
                         ) {
@@ -1517,7 +1533,7 @@ fn candidate_symbols(configured: &[Symbol], managed: &[ManagedPosition]) -> Vec<
         if let Ok(symbol) = Symbol::parse(&position.symbol)
             && !symbols
                 .iter()
-                .any(|known| known.as_str() == symbol.as_str())
+                .any(|known| known.as_str().eq_ignore_ascii_case(symbol.as_str()))
         {
             symbols.push(symbol);
         }
@@ -1552,7 +1568,7 @@ fn series_for_symbol<'a>(
 ) -> Option<&'a CandleSeries> {
     markets
         .iter()
-        .find(|(candidate, _)| candidate.as_str() == symbol)
+        .find(|(candidate, _)| candidate.as_str().eq_ignore_ascii_case(symbol))
         .map(|(_, series)| series)
 }
 
@@ -1591,6 +1607,8 @@ fn eligible_entry_markets(
     specs: &[(Symbol, SymbolSpecPayload)],
     policy: &RiskPolicy,
     now: SystemTime,
+    broker_offset: Option<i64>,
+    news_required: bool,
 ) -> Vec<(Symbol, CandleSeries)> {
     let session_open = configured_session_open(policy, now);
     markets
@@ -1601,6 +1619,16 @@ fn eligible_entry_markets(
             let contract_open = match symbol_spec_for(specs, symbol.as_str()) {
                 Some(spec) => {
                     spec.trade_allowed
+                        && crate::risk::window::entry_session(
+                            spec,
+                            symbol,
+                            policy.allows_weekend(symbol),
+                            unix_secs(now),
+                            broker_offset,
+                        ) != crate::risk::window::InstrumentSession::Closed
+                        && (!news_required
+                            || !crate::calendar::instrument_currencies(symbol.as_str(), Some(spec))
+                                .is_empty())
                         && spec.tick_size.is_finite()
                         && spec.tick_size > 0.0
                         && spec.tick_value.is_finite()
@@ -1670,7 +1698,7 @@ fn symbol_spec_for<'a>(
 ) -> Option<&'a SymbolSpecPayload> {
     specs
         .iter()
-        .find(|(candidate, _)| candidate.as_str() == symbol)
+        .find(|(candidate, _)| candidate.as_str().eq_ignore_ascii_case(symbol))
         .map(|(_, spec)| spec)
 }
 
@@ -1678,7 +1706,7 @@ fn symbol_spec_for<'a>(
 fn judgement_for_symbol<'a>(judgements: &'a [(Symbol, Value)], symbol: &str) -> Option<&'a Value> {
     judgements
         .iter()
-        .find(|(candidate, _)| candidate.as_str() == symbol)
+        .find(|(candidate, _)| candidate.as_str().eq_ignore_ascii_case(symbol))
         .map(|(_, summary)| summary)
 }
 
@@ -1703,7 +1731,7 @@ fn parse_symbol_list(raw: &str) -> Result<Vec<Symbol>, ConfigError> {
         })?;
         if !symbols
             .iter()
-            .any(|known: &Symbol| known.as_str() == symbol.as_str())
+            .any(|known: &Symbol| known.as_str().eq_ignore_ascii_case(symbol.as_str()))
         {
             symbols.push(symbol);
         }
@@ -3592,7 +3620,15 @@ fn proposal_input(
                     "trade_allowed": spec.trade_allowed
                 });
             }
-            let upcoming = calendar::upcoming(events, symbol.as_str(), now, CALENDAR_HORIZON_SECS);
+            let upcoming = calendar::upcoming_for(
+                events,
+                &calendar::instrument_currencies(
+                    symbol.as_str(),
+                    symbol_spec_for(specs, symbol.as_str()),
+                ),
+                now,
+                CALENDAR_HORIZON_SECS,
+            );
             if !upcoming.is_empty() {
                 asset["upcoming_events"] = json!(
                     upcoming
@@ -3612,7 +3648,7 @@ fn proposal_input(
             }
             if let Some(position) = managed
                 .iter()
-                .find(|position| position.symbol == symbol.as_str())
+                .find(|position| position.symbol.eq_ignore_ascii_case(symbol.as_str()))
             {
                 asset["open_position"] = json!({
                     "ticket": position.ticket,
@@ -3914,6 +3950,9 @@ mod tests {
     /// values IFC Markets publishes for EURUSD-class pairs.
     fn canned_spec(symbol: &str) -> SymbolSpecPayload {
         SymbolSpecPayload {
+            currency_base: None,
+            currency_profit: None,
+            sessions: Vec::new(),
             symbol: symbol.to_owned(),
             digits: 5,
             point: 0.00001,
@@ -4410,7 +4449,8 @@ mod tests {
         })
         .expect("weekend list applies");
 
-        let weekend = eligible_entry_markets(&markets, &specs, &policy, sunday_morning());
+        let weekend =
+            eligible_entry_markets(&markets, &specs, &policy, sunday_morning(), None, false);
         assert_eq!(
             weekend
                 .iter()
@@ -4419,7 +4459,7 @@ mod tests {
             ["BTCUSD"]
         );
 
-        let weekday = eligible_entry_markets(&markets, &specs, &policy, test_now());
+        let weekday = eligible_entry_markets(&markets, &specs, &policy, test_now(), None, false);
         assert_eq!(
             weekday
                 .iter()
@@ -6828,6 +6868,7 @@ mod tests {
         // GBPUSD has none, so only it should take the candle's price.
         let facts = AccountFacts {
             news: Default::default(),
+            session: Default::default(),
             trade_allowed: true,
             open_orders: 1,
             open_lots: 0.01,
@@ -6847,7 +6888,7 @@ mod tests {
             priced
                 .prices
                 .iter()
-                .find(|(known, _)| known.as_str() == symbol)
+                .find(|(known, _)| known.as_str().eq_ignore_ascii_case(symbol))
                 .map(|(_, value)| *value)
         };
         assert_eq!(

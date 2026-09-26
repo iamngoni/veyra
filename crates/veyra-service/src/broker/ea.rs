@@ -2043,7 +2043,7 @@ mod tests {
     #[test]
     fn order_requests_map_only_from_approved_intents() {
         let draft = TradeIntentDraft::new(
-            parse_instrument("eurusd").expect("symbol"),
+            parse_instrument("EURUSD").expect("symbol"),
             Side::Buy,
             OrderKind::Market,
             Volume::parse(0.01).expect("volume"),

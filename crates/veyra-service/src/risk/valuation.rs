@@ -118,7 +118,9 @@ fn quote_in_usd(base: &str, quote: &str, price: f64, prices: &[(Symbol, f64)]) -
         return Some(1.0 / price);
     }
     let direct = format!("USD{quote}");
-    if let Some((_, leg)) = prices.iter().find(|(symbol, _)| symbol.as_str() == direct)
+    if let Some((_, leg)) = prices
+        .iter()
+        .find(|(symbol, _)| symbol.as_str().eq_ignore_ascii_case(&direct))
         && leg.is_finite()
         && *leg > 0.0
     {
@@ -127,7 +129,7 @@ fn quote_in_usd(base: &str, quote: &str, price: f64, prices: &[(Symbol, f64)]) -
     let inverse = format!("{quote}USD");
     prices
         .iter()
-        .find(|(symbol, _)| symbol.as_str() == inverse)
+        .find(|(symbol, _)| symbol.as_str().eq_ignore_ascii_case(&inverse))
         .map(|(_, leg)| *leg)
         .filter(|rate| rate.is_finite() && *rate > 0.0)
 }
@@ -308,6 +310,9 @@ mod tests {
 
     fn venue_spec(name: &str, tick_size: f64, tick_value: f64) -> SymbolSpecPayload {
         SymbolSpecPayload {
+            currency_base: None,
+            currency_profit: None,
+            sessions: Vec::new(),
             symbol: name.to_owned(),
             digits: 2,
             point: tick_size,

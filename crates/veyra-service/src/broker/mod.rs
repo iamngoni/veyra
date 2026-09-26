@@ -17,7 +17,7 @@ pub use command::{
     CommandKind, CommandPayload, CommandRecord, CommandState, ListedCommand, ModifyOrderRequest,
     ORDER_MAGIC, OrderCheckPayload, OrderExecutionPayload, OrderHistoryPayload,
     OrderHistoryRequest, OrderRequest, PositionKind, PositionPayload, RatesPayload, RatesRequest,
-    SUPPORTED_TIMEFRAME_MINUTES, SymbolSpecPayload, SymbolSpecRequest,
+    SUPPORTED_TIMEFRAME_MINUTES, SymbolSpecPayload, SymbolSpecRequest, TradeSession,
 };
 /// EA-specific transport surface, used by the EA server and its contract tests.
 pub use ea::{EaErrorBody, EaLink, EaPoll, EaReply, build_server, create_ea_app};
@@ -133,9 +133,22 @@ impl AccountLogin {
     }
 }
 
-/// Validated instrument symbol (for example `EURUSD`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Validated instrument symbol (for example `EURUSD` or `SP500m`).
+///
+/// The broker's spelling is kept as given, because MT4 names can be
+/// mixed-case (`SP500m`, `Nd100m`). Equality ignores ASCII case, so a
+/// configured `SP500M`, a model's `sp500m`, and the venue's `SP500m` are the
+/// same instrument everywhere symbols are compared.
+#[derive(Debug, Clone)]
 pub struct Symbol(String);
+
+impl PartialEq for Symbol {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
+}
+
+impl Eq for Symbol {}
 
 impl Symbol {
     /// Parses a symbol: 1-24 characters of `[A-Za-z0-9._#+-]`.

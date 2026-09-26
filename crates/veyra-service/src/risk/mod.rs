@@ -58,6 +58,9 @@ const SYMBOLS_RULE: &str = "must list 1-64 comma-separated instrument symbols";
 const WEEKEND_SYMBOLS_RULE: &str =
     "must list at most 64 distinct symbols that also appear in the instrument allowlist";
 const VOLUME_RULE: &str = "must be a finite number greater than 0 and at most 100";
+const CORRELATED_GROUPS_RULE: &str = "must list groups of 2-16 allowlisted symbols joined by '+', separated by commas, with each symbol in at most one group";
+/// Most correlated groups a policy may declare.
+const MAX_CORRELATED_GROUPS: usize = 16;
 const OPEN_ORDERS_RULE: &str = "must be an integer from 0 through 1000";
 const DUPLICATE_WINDOW_RULE: &str = "must be an integer number of seconds from 0 through 86400";
 const PERCENT_RULE: &str = "must be a number from 0 through 100 (0 disables the check)";
@@ -94,6 +97,11 @@ pub struct RiskPolicyPatch {
     /// Allowed instruments whose venue trades through the standard FX weekend.
     /// Every entry must also appear in `symbols`.
     pub weekend_symbols: Option<Vec<String>>,
+    /// Groups of allowed instruments that move together (for example
+    /// `[["SP500m", "Nd100m"]]`); at most one position per group may be open.
+    /// An empty list clears every group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlated_groups: Option<Vec<Vec<String>>>,
     /// Largest lot volume a single intent may request.
     pub max_volume_per_order: Option<f64>,
     /// Largest total open volume.
@@ -167,6 +175,62 @@ fn parse_weekend_symbol_entries(entries: &[String]) -> Result<Vec<Symbol>, RiskE
         }
     }
     Ok(symbols)
+}
+
+/// Validates correlated groups: each has 2-16 distinct allowlisted symbols
+/// and no symbol appears in two groups.
+fn validate_correlated_groups(
+    groups: Vec<Vec<String>>,
+    symbols: &[Symbol],
+    name: &'static str,
+) -> Result<Vec<Vec<Symbol>>, RiskError> {
+    let invalid = || RiskError {
+        name,
+        reason: CORRELATED_GROUPS_RULE,
+    };
+    if groups.len() > MAX_CORRELATED_GROUPS {
+        return Err(invalid());
+    }
+    let mut seen: Vec<Symbol> = Vec::new();
+    let mut parsed = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut members: Vec<Symbol> = Vec::new();
+        for entry in group.iter().map(|entry| entry.trim()) {
+            let symbol = parse_instrument(entry).map_err(|_| invalid())?;
+            if members.contains(&symbol) {
+                continue;
+            }
+            // Keep the allowlist's spelling so summaries read like the venue.
+            let allowed = symbols
+                .iter()
+                .find(|allowed| **allowed == symbol)
+                .ok_or_else(invalid)?;
+            if seen.contains(allowed) {
+                return Err(invalid());
+            }
+            members.push(allowed.clone());
+        }
+        if !(2..=16).contains(&members.len()) {
+            return Err(invalid());
+        }
+        seen.extend(members.iter().cloned());
+        parsed.push(members);
+    }
+    Ok(parsed)
+}
+
+/// Splits `A+B, C+D` into groups.
+fn split_correlated_groups(raw: &str) -> Vec<Vec<String>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+        .map(|group| {
+            group
+                .split('+')
+                .map(|entry| entry.trim().to_owned())
+                .collect()
+        })
+        .collect()
 }
 
 /// Ensures the weekend exception cannot widen the main instrument allowlist.
@@ -296,6 +360,7 @@ pub struct RiskPolicy {
     kill_switch: bool,
     symbols: Vec<Symbol>,
     weekend_symbols: Vec<Symbol>,
+    correlated_groups: Vec<Vec<Symbol>>,
     max_volume_per_order: Volume,
     max_total_lots: Volume,
     max_open_orders: u32,
@@ -326,6 +391,7 @@ impl RiskPolicy {
             kill_switch,
             symbols,
             weekend_symbols: Vec::new(),
+            correlated_groups: Vec::new(),
             max_volume_per_order,
             max_total_lots,
             max_open_orders,
@@ -437,6 +503,14 @@ impl RiskPolicy {
             Some(raw) => parse_weekend_symbols(&raw)?,
         };
         validate_weekend_subset(&symbols, &weekend_symbols, "VEYRA_RISK_WEEKEND_SYMBOLS")?;
+        let correlated_groups = match trimmed(&mut source, "VEYRA_RISK_CORRELATED_GROUPS") {
+            None => Vec::new(),
+            Some(raw) => validate_correlated_groups(
+                split_correlated_groups(&raw),
+                &symbols,
+                "VEYRA_RISK_CORRELATED_GROUPS",
+            )?,
+        };
 
         let max_volume_per_order = match trimmed(&mut source, "VEYRA_RISK_MAX_VOLUME_PER_ORDER") {
             None => Volume::MINIMUM,
@@ -613,6 +687,7 @@ impl RiskPolicy {
         .with_trading_without_jev(allow_trading_without_jev)
         .with_weekend_positions(weekend_positions);
         policy.weekend_symbols = weekend_symbols;
+        policy.correlated_groups = correlated_groups;
         Ok(policy)
     }
 
@@ -635,6 +710,21 @@ impl RiskPolicy {
             Some(entries) => parse_weekend_symbol_entries(entries)?,
         };
         validate_weekend_subset(&symbols, &weekend_symbols, "weekendSymbols")?;
+        let correlated_groups = match &patch.correlated_groups {
+            // A group that no longer fits a narrowed allowlist is refused,
+            // not silently dropped.
+            None => validate_correlated_groups(
+                self.correlated_groups
+                    .iter()
+                    .map(|group| group.iter().map(|s| s.as_str().to_owned()).collect())
+                    .collect(),
+                &symbols,
+                "correlatedGroups",
+            )?,
+            Some(groups) => {
+                validate_correlated_groups(groups.clone(), &symbols, "correlatedGroups")?
+            }
+        };
 
         let max_volume_per_order = match patch.max_volume_per_order {
             None => self.max_volume_per_order,
@@ -756,6 +846,7 @@ impl RiskPolicy {
         .with_trading_without_jev(allow_trading_without_jev)
         .with_weekend_positions(weekend_positions);
         policy.weekend_symbols = weekend_symbols;
+        policy.correlated_groups = correlated_groups;
         Ok(policy)
     }
 
@@ -828,6 +919,14 @@ impl RiskPolicy {
                     .map(|symbol| symbol.as_str().to_owned())
                     .collect(),
             ),
+            // Only written when set, so a snapshot stays readable by a build
+            // that predates the field.
+            correlated_groups: (!self.correlated_groups.is_empty()).then(|| {
+                self.correlated_groups
+                    .iter()
+                    .map(|group| group.iter().map(|s| s.as_str().to_owned()).collect())
+                    .collect()
+            }),
             max_volume_per_order: Some(self.max_volume_per_order.value()),
             max_total_lots: Some(self.max_total_lots.value()),
             max_open_orders: Some(self.max_open_orders),
@@ -863,6 +962,21 @@ impl RiskPolicy {
         self.weekend_positions
     }
 
+    /// Replaces the correlated groups (members must be allowlisted; used by
+    /// callers that build a policy directly, and by tests).
+    pub fn with_correlated_groups(mut self, groups: Vec<Vec<Symbol>>) -> Self {
+        self.correlated_groups = groups;
+        self
+    }
+
+    /// The correlated group `symbol` belongs to, if any.
+    pub fn correlated_group(&self, symbol: &Symbol) -> Option<&[Symbol]> {
+        self.correlated_groups
+            .iter()
+            .find(|group| group.contains(symbol))
+            .map(Vec::as_slice)
+    }
+
     /// Instruments allowed to trade through the standard FX weekend guard.
     pub fn weekend_symbols(&self) -> &[Symbol] {
         &self.weekend_symbols
@@ -879,7 +993,7 @@ impl RiskPolicy {
     pub fn allows_weekend_name(&self, symbol: &str) -> bool {
         self.weekend_symbols
             .iter()
-            .any(|allowed| allowed.as_str() == symbol)
+            .any(|allowed| allowed.as_str().eq_ignore_ascii_case(symbol))
     }
 
     /// News blackout either side of a high-impact event, in minutes; zero
@@ -910,6 +1024,11 @@ impl RiskPolicy {
                 .weekend_symbols
                 .iter()
                 .map(|symbol| symbol.as_str())
+                .collect::<Vec<_>>(),
+            "correlatedGroups": self
+                .correlated_groups
+                .iter()
+                .map(|group| group.iter().map(Symbol::as_str).collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
             "maxVolumePerOrder": self.max_volume_per_order.value(),
             "maxTotalLots": self.max_total_lots.value(),
@@ -1095,6 +1214,71 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_owned())
         }
+    }
+
+    #[test]
+    fn correlated_groups_parse_validate_and_round_trip() {
+        let symbols = "EURUSD,SP500m,Nd100m,BTCUSD,ETHUSD";
+        let policy = RiskPolicy::from_source(source(&[
+            ("VEYRA_RISK_SYMBOLS", symbols),
+            (
+                "VEYRA_RISK_CORRELATED_GROUPS",
+                "sp500m + ND100M, BTCUSD+ETHUSD",
+            ),
+        ]))
+        .expect("groups parse");
+        let sp = parse_instrument("SP500M").expect("symbol");
+        let group = policy.correlated_group(&sp).expect("grouped");
+        assert_eq!(
+            group.iter().map(Symbol::as_str).collect::<Vec<_>>(),
+            vec!["SP500m", "Nd100m"],
+            "members take the allowlist's spelling"
+        );
+        assert!(
+            policy
+                .correlated_group(&parse_instrument("EURUSD").expect("symbol"))
+                .is_none()
+        );
+        assert_eq!(
+            policy.summary()["correlatedGroups"],
+            serde_json::json!([["SP500m", "Nd100m"], ["BTCUSD", "ETHUSD"]])
+        );
+        let restored = RiskPolicy::default()
+            .apply_patch(&policy.snapshot_patch())
+            .expect("snapshot applies");
+        assert_eq!(
+            restored.summary()["correlatedGroups"],
+            policy.summary()["correlatedGroups"]
+        );
+
+        for bad in ["SP500m", "SP500m+GBPUSD", "SP500m+Nd100m,Nd100m+EURUSD"] {
+            let error = RiskPolicy::from_source(source(&[
+                ("VEYRA_RISK_SYMBOLS", symbols),
+                ("VEYRA_RISK_CORRELATED_GROUPS", bad),
+            ]))
+            .expect_err("invalid group");
+            assert_eq!(error.name, "VEYRA_RISK_CORRELATED_GROUPS", "{bad}");
+        }
+
+        let cleared = policy
+            .apply_patch(&RiskPolicyPatch {
+                correlated_groups: Some(Vec::new()),
+                ..RiskPolicyPatch::default()
+            })
+            .expect("cleared");
+        assert!(cleared.correlated_group(&sp).is_none());
+        assert!(
+            cleared.snapshot_patch().correlated_groups.is_none(),
+            "an empty list is left out of the snapshot"
+        );
+        let narrowed = policy.apply_patch(&RiskPolicyPatch {
+            symbols: Some(vec!["EURUSD".to_owned(), "SP500m".to_owned()]),
+            ..RiskPolicyPatch::default()
+        });
+        assert_eq!(
+            narrowed.expect_err("group outside the allowlist").name,
+            "correlatedGroups"
+        );
     }
 
     #[test]

@@ -561,6 +561,18 @@ impl SymbolSpecRequest {
     }
 }
 
+/// One weekly trading session in broker server time, as the terminal reports
+/// it (`SymbolInfoSessionTrade`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeSession {
+    /// Day of the week, Sunday = 0.
+    pub day: u8,
+    /// Seconds after the day's midnight when trading opens.
+    pub from: u32,
+    /// Seconds after the day's midnight when trading closes, up to 86 400.
+    pub to: u32,
+}
+
 /// Venue contract details for one instrument as the terminal reports them.
 ///
 /// These values price risk locally: the spread and minimum stop distance
@@ -625,12 +637,53 @@ pub struct SymbolSpecPayload {
     /// Whether the broker currently allows trading this instrument.
     #[serde(rename = "tradeAllowed")]
     pub trade_allowed: bool,
+    /// Base currency (`EUR` for EURUSD, often `USD` for a US index CFD), when
+    /// the terminal reports one. An EA before 1.26 omits it.
+    #[serde(
+        default,
+        rename = "currencyBase",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub currency_base: Option<String>,
+    /// Currency profit is counted in (`USD` for EURUSD or a US index CFD),
+    /// when reported.
+    #[serde(
+        default,
+        rename = "currencyProfit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub currency_profit: Option<String>,
+    /// Weekly trading sessions in server time; empty when the terminal does
+    /// not report them (an EA before 1.26).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<TradeSession>,
 }
 
 impl SymbolSpecPayload {
     /// Largest accepted price-digit count; anything above is a parse error
     /// rather than a contract decision.
     const MAX_DIGITS: u32 = 10;
+
+    /// The instrument's reported currencies (base, then profit), upper-cased,
+    /// without duplicates. Anything that is not a three-letter code is left
+    /// out, so an index CFD whose base "currency" is its own name contributes
+    /// only its profit currency.
+    pub fn currencies(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for raw in [&self.currency_base, &self.currency_profit]
+            .into_iter()
+            .flatten()
+        {
+            let code = raw.trim().to_ascii_uppercase();
+            if code.len() == 3
+                && code.bytes().all(|byte| byte.is_ascii_uppercase())
+                && !out.contains(&code)
+            {
+                out.push(code);
+            }
+        }
+        out
+    }
 
     /// Margin the venue estimates it would require to open `lots`, in account
     /// currency. Zero means the venue did not report a pre-queue estimate.
@@ -694,6 +747,14 @@ impl SymbolSpecPayload {
         }
         if self.swap_type > 3 {
             return Err("swapType must be 0, 1, 2, or 3".to_owned());
+        }
+        for session in &self.sessions {
+            if session.day > 6 || session.from >= session.to || session.to > 86_400 {
+                return Err(
+                    "sessions must name a day 0-6 and an opening before a close within one day"
+                        .to_owned(),
+                );
+            }
         }
         Ok(())
     }

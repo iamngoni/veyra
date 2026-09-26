@@ -1846,6 +1846,9 @@ mod tests {
                 });
             }
             Ok(crate::broker::SymbolSpecPayload {
+                currency_base: None,
+                currency_profit: None,
+                sessions: Vec::new(),
                 symbol: symbol.as_str().to_owned(),
                 digits: 5,
                 point: 0.00001,
@@ -3031,30 +3034,36 @@ mod tests {
             .expect("event");
 
         assert_eq!(
-            crate::routes::news_window(&gated(30), &eurusd).await,
+            crate::routes::news_window(&gated(30), &eurusd, None).await,
             NewsWindow::Unchecked,
             "no calendar configured"
         );
         let disabled = gated(0).with_calendar(calendar(vec![nfp.clone()], false));
         assert_eq!(
-            crate::routes::news_window(&disabled, &eurusd).await,
+            crate::routes::news_window(&disabled, &eurusd, None).await,
             NewsWindow::Unchecked,
             "a zero window disables the check"
         );
         let state = gated(30).with_calendar(calendar(vec![nfp, later], false));
         assert_eq!(
-            crate::routes::news_window(&state, &eurusd).await,
+            crate::routes::news_window(&state, &eurusd, None).await,
             NewsWindow::Blackout,
             "NFP in ten minutes blocks a USD pair"
         );
         assert_eq!(
-            crate::routes::news_window(&state, &audnzd).await,
+            crate::routes::news_window(&state, &audnzd, None).await,
             NewsWindow::Clear,
             "no AUD or NZD release in the window"
         );
+        let index = Symbol::parse("SP500m").expect("symbol");
+        assert_eq!(
+            crate::routes::news_window(&state, &index, None).await,
+            NewsWindow::Unavailable,
+            "an instrument with no known currencies cannot be cleared"
+        );
         let failing = gated(30).with_calendar(calendar(Vec::new(), true));
         assert_eq!(
-            crate::routes::news_window(&failing, &eurusd).await,
+            crate::routes::news_window(&failing, &eurusd, None).await,
             NewsWindow::Unavailable
         );
     }

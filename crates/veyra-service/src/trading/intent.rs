@@ -184,10 +184,12 @@ impl OrderKind {
     }
 }
 
-/// Parses an instrument into canonical MT4 form: trimmed and upper-cased.
-/// Allowlists and intents both use this, so their comparison is exact.
+/// Parses an instrument, trimmed, keeping its spelling: broker names such as
+/// `SP500m` are mixed-case and must reach the terminal as written. Symbol
+/// equality ignores case, so allowlists and intents still match; an approved
+/// intent takes the allowlist's spelling (see [`crate::risk::RiskGate`]).
 pub fn parse_instrument(raw: &str) -> Result<Symbol, IntentError> {
-    Symbol::parse(&raw.trim().to_ascii_uppercase()).map_err(IntentError::from)
+    Symbol::parse(raw.trim()).map_err(IntentError::from)
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,6 +226,15 @@ pub struct TradeIntentDraft {
 }
 
 impl TradeIntentDraft {
+    /// The same draft under another spelling of its symbol (same instrument,
+    /// by case-insensitive equality). Used to send the allowlist's spelling.
+    pub(crate) fn with_symbol_spelling(&self, symbol: Symbol) -> Self {
+        Self {
+            symbol,
+            ..self.clone()
+        }
+    }
+
     /// Builds a draft from already validated components.
     pub fn new(
         symbol: Symbol,
@@ -501,7 +512,7 @@ mod tests {
 
     fn draft() -> TradeIntentDraft {
         TradeIntentDraft::new(
-            parse_instrument("eurusd").expect("symbol"),
+            parse_instrument("EURUSD").expect("symbol"),
             Side::Buy,
             OrderKind::Market,
             Volume::parse(0.01).expect("volume"),
@@ -523,7 +534,7 @@ mod tests {
         }))
         .expect("valid draft");
 
-        assert_eq!(parsed.symbol().as_str(), "EURUSD");
+        assert_eq!(parsed.symbol().as_str(), "eurusd", "spelling is kept");
         assert_eq!(parsed.side(), Side::Buy);
         assert_eq!(parsed.order(), OrderKind::Market);
         assert_eq!(parsed.volume().value(), 0.01);
@@ -535,7 +546,7 @@ mod tests {
         assert_eq!(
             wire,
             json!({
-                "symbol": "EURUSD",
+                "symbol": "eurusd",
                 "side": "buy",
                 "order_type": "market",
                 "price": null,
@@ -697,10 +708,16 @@ mod tests {
     }
 
     #[test]
-    fn instrument_parsing_normalises_case_and_whitespace() {
+    fn instrument_parsing_trims_and_keeps_the_broker_spelling() {
         assert_eq!(
-            parse_instrument("  eurusd ").expect("valid").as_str(),
-            "EURUSD"
+            parse_instrument("  SP500m ").expect("valid").as_str(),
+            "SP500m",
+            "mixed-case broker names reach the terminal as written"
+        );
+        assert_eq!(
+            parse_instrument("eurusd").expect("valid"),
+            parse_instrument("EURUSD").expect("valid"),
+            "but the same instrument in any case is equal"
         );
         assert_eq!(parse_instrument("").expect_err("empty").field, "symbol");
     }

@@ -163,21 +163,46 @@ impl CalendarEvent {
         self.time
     }
 
-    /// Whether the event applies to an instrument: `ALL` events apply
-    /// everywhere, otherwise the event currency must be one of the legs of a
-    /// six-letter pair (`XAUUSD` responds through its USD leg).
+    /// Whether the event applies to an instrument named like a six-letter
+    /// pair (`XAUUSD` responds through its USD leg). Instruments that are not
+    /// pairs, such as index CFDs, need [`CalendarEvent::applies_to_currencies`]
+    /// with the currencies their contract reports.
     pub fn applies_to(&self, symbol: &str) -> bool {
-        if self.currency == ALL_CURRENCIES {
-            return true;
-        }
-        let bytes = symbol.as_bytes();
-        if bytes.len() != 6 || !bytes.iter().all(u8::is_ascii_alphabetic) {
-            return false;
-        }
-        let base = &symbol[..3];
-        let quote = &symbol[3..];
-        self.currency.eq_ignore_ascii_case(base) || self.currency.eq_ignore_ascii_case(quote)
+        self.applies_to_currencies(&instrument_currencies(symbol, None))
     }
+
+    /// Whether the event applies to an instrument moved by `currencies`:
+    /// `ALL` events apply everywhere, otherwise the event's currency must be
+    /// one of them.
+    pub fn applies_to_currencies(&self, currencies: &[String]) -> bool {
+        self.currency == ALL_CURRENCIES
+            || currencies
+                .iter()
+                .any(|currency| self.currency.eq_ignore_ascii_case(currency))
+    }
+}
+
+/// Currencies whose news moves an instrument. The terminal's reported
+/// contract currencies win when present (so `SP500m` responds to USD news);
+/// otherwise a six-letter name is read as a pair's two legs. Anything else
+/// has no currencies and no news applies to it.
+pub fn instrument_currencies(
+    symbol: &str,
+    spec: Option<&crate::broker::SymbolSpecPayload>,
+) -> Vec<String> {
+    if let Some(currencies) = spec.map(crate::broker::SymbolSpecPayload::currencies)
+        && !currencies.is_empty()
+    {
+        return currencies;
+    }
+    let bytes = symbol.as_bytes();
+    if bytes.len() != 6 || !bytes.iter().all(u8::is_ascii_alphabetic) {
+        return Vec::new();
+    }
+    vec![
+        symbol[..3].to_ascii_uppercase(),
+        symbol[3..].to_ascii_uppercase(),
+    ]
 }
 
 /// Events for one instrument inside the configured blackout window.
@@ -191,13 +216,29 @@ pub fn blackout<'a>(
     now: i64,
     window_minutes: u64,
 ) -> Option<&'a CalendarEvent> {
+    blackout_for(
+        events,
+        &instrument_currencies(symbol, None),
+        now,
+        window_minutes,
+    )
+}
+
+/// [`blackout`] for an instrument moved by `currencies` (see
+/// [`instrument_currencies`]).
+pub fn blackout_for<'a>(
+    events: &'a [CalendarEvent],
+    currencies: &[String],
+    now: i64,
+    window_minutes: u64,
+) -> Option<&'a CalendarEvent> {
     if window_minutes == 0 {
         return None;
     }
     let window_secs = window_minutes.saturating_mul(60);
     events.iter().find(|event| {
         event.impact == Impact::High
-            && event.applies_to(symbol)
+            && event.applies_to_currencies(currencies)
             && event.time.abs_diff(now) <= window_secs
     })
 }
@@ -209,10 +250,27 @@ pub fn upcoming<'a>(
     now: i64,
     horizon_secs: i64,
 ) -> Vec<&'a CalendarEvent> {
+    upcoming_for(
+        events,
+        &instrument_currencies(symbol, None),
+        now,
+        horizon_secs,
+    )
+}
+
+/// [`upcoming`] for an instrument moved by `currencies`.
+pub fn upcoming_for<'a>(
+    events: &'a [CalendarEvent],
+    currencies: &[String],
+    now: i64,
+    horizon_secs: i64,
+) -> Vec<&'a CalendarEvent> {
     let until = now.saturating_add(horizon_secs);
     events
         .iter()
-        .filter(|event| event.applies_to(symbol) && event.time >= now && event.time < until)
+        .filter(|event| {
+            event.applies_to_currencies(currencies) && event.time >= now && event.time < until
+        })
         .collect()
 }
 
@@ -443,5 +501,70 @@ mod tests {
         let titles: Vec<&str> = listed.iter().map(|event| event.title()).collect();
         assert_eq!(titles, vec!["Soon", "Later"]);
         assert!(upcoming(&events, "AUDNZD", now, 7_200).is_empty());
+    }
+
+    fn spec_json(extra: serde_json::Value) -> crate::broker::SymbolSpecPayload {
+        let mut base = serde_json::json!({
+            "symbol": "SP500m", "digits": 1, "point": 0.1, "bid": 6500.0, "ask": 6500.5,
+            "spreadPoints": 5, "stopLevelPoints": 0, "freezeLevelPoints": 0,
+            "lotMin": 0.01, "lotMax": 50.0, "lotStep": 0.01, "tickValue": 0.01,
+            "tickSize": 0.1, "marginRequired": 32.5, "swapLong": -1.0, "swapShort": -0.5,
+            "swapType": 0, "tradeAllowed": true
+        });
+        if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
+            base.extend(extra.clone());
+        }
+        serde_json::from_value(base).expect("spec parses")
+    }
+
+    #[test]
+    fn index_news_comes_from_the_contract_currencies() {
+        let old_ea = spec_json(serde_json::json!({}));
+        assert!(
+            old_ea.currencies().is_empty(),
+            "an EA before 1.26 reports none"
+        );
+        assert!(old_ea.sessions.is_empty());
+        assert!(instrument_currencies("SP500m", Some(&old_ea)).is_empty());
+
+        let index = spec_json(serde_json::json!({
+            "currencyBase": "SP500m", "currencyProfit": "usd",
+            "sessions": [{"day": 1, "from": 3600, "to": 82800}]
+        }));
+        index.validate().expect("valid");
+        assert_eq!(
+            index.currencies(),
+            vec!["USD".to_owned()],
+            "a name is not a currency"
+        );
+        assert_eq!(
+            instrument_currencies("SP500m", Some(&index)),
+            vec!["USD".to_owned()]
+        );
+        assert_eq!(
+            instrument_currencies("EURUSD", None),
+            vec!["EUR".to_owned(), "USD".to_owned()]
+        );
+
+        let now = 1_758_000_000_i64;
+        let events = vec![event("NFP", "USD", Impact::High, now + 600)];
+        let usd = instrument_currencies("SP500m", Some(&index));
+        assert_eq!(
+            blackout_for(&events, &usd, now, 30)
+                .expect("blocked")
+                .title(),
+            "NFP"
+        );
+        assert_eq!(upcoming_for(&events, &usd, now, 3_600).len(), 1);
+        assert!(blackout_for(&events, &[], now, 30).is_none());
+
+        let broken = spec_json(serde_json::json!({
+            "sessions": [{"day": 7, "from": 0, "to": 100}]
+        }));
+        assert!(broken.validate().is_err());
+        let backwards = spec_json(serde_json::json!({
+            "sessions": [{"day": 1, "from": 500, "to": 100}]
+        }));
+        assert!(backwards.validate().is_err());
     }
 }

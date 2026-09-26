@@ -311,7 +311,7 @@ mod tests {
     fn policy() -> RiskPolicy {
         RiskPolicy::new(
             false,
-            vec![parse_instrument("eurusd").expect("symbol")],
+            vec![parse_instrument("EURUSD").expect("symbol")],
             Volume::parse(0.5).expect("volume"),
             Volume::parse(0.5).expect("volume"),
             2,
@@ -323,6 +323,7 @@ mod tests {
     fn facts() -> Option<AccountFacts> {
         Some(AccountFacts {
             news: Default::default(),
+            session: Default::default(),
             trade_allowed: true,
             open_orders: 0,
             open_lots: 0.0,

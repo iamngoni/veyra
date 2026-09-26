@@ -6,7 +6,7 @@
 // Requires the endpoint to be listed in
 // Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.25"
+#property version   "1.26"
 #property description "Veyra control channel: heartbeat, account/position snapshots, market rates, order validation, gated live execution, and Veyra-owned closes and stop changes."
 
 input string InUrl         = "__VEYRA_URL__";            // Veyra endpoint (loopback or tunnel)
@@ -128,6 +128,46 @@ string ExecutionResultJson(bool executed, int code, string comment, int ticket, 
           + ",\"price\":" + DoubleToString(price, digits) + "}");
   }
 
+// Rounds a price to the instrument's tick grid and quote precision. Index and
+// metal CFDs often tick in steps coarser than one point, and the broker
+// rejects a stop or target between ticks. Zero stays zero (no level).
+double ToTickGrid(string symbol, double value)
+  {
+   if(value <= 0.0) return(value);
+   int digits = (int)MarketInfo(symbol, MODE_DIGITS);
+   if(digits < 0) digits = 5;
+   double tick = MarketInfo(symbol, MODE_TICKSIZE);
+   if(tick > 0.0) value = MathRound(value / tick) * tick;
+   return(NormalizeDouble(value, digits));
+  }
+
+// Weekly trading sessions in server time as [{"day":0-6,"from":s,"to":s}],
+// Sunday = 0, seconds from midnight, "to" up to 86400. The service uses them
+// to refuse entries while an instrument's market is closed (index cash-session
+// breaks, weekends). An instrument with no reported sessions gives [].
+string TradeSessionsJson(string symbol)
+  {
+   string json = "[";
+   bool first = true;
+   for(int day = 0; day < 7; day++)
+     {
+      for(uint index = 0; index < 8; index++)
+        {
+         datetime from = 0;
+         datetime to = 0;
+         if(!SymbolInfoSessionTrade(symbol, (ENUM_DAY_OF_WEEK)day, index, from, to)) break;
+         int start = (int)from;
+         int end = (int)to;
+         if(end > 86400) end = 86400;
+         if(start < 0 || end <= start) continue;
+         if(!first) json += ",";
+         json += "{\"day\":" + (string)day + ",\"from\":" + (string)start + ",\"to\":" + (string)end + "}";
+         first = false;
+        }
+     }
+   return(json + "]");
+  }
+
 // Validates one order request against the terminal's market rules and margin
 // engine: volume range and step, price side, stop distance, and free margin.
 // Returns 0 when the request would be accepted, otherwise a classic MT4 trade
@@ -142,6 +182,9 @@ int ValidateOrderRequest(string response, string &comment, double &margin, doubl
    double volume    = JsonNumber(response, "volume");
    double sl        = JsonNumber(response, "stop_loss");
    double tp        = JsonNumber(response, "take_profit");
+   price = ToTickGrid(symbol, price);
+   sl    = ToTickGrid(symbol, sl);
+   tp    = ToTickGrid(symbol, tp);
 
    comment = "ok";
    margin = 0.0;
@@ -315,8 +358,8 @@ void HandleOpenOrder(string response, string id)
    string side      = JsonString(response, "side");
    string orderType = JsonString(response, "order_type");
    double volume    = JsonNumber(response, "volume");
-   double sl        = JsonNumber(response, "stop_loss");
-   double tp        = JsonNumber(response, "take_profit");
+   double sl        = ToTickGrid(symbol, JsonNumber(response, "stop_loss"));
+   double tp        = ToTickGrid(symbol, JsonNumber(response, "take_profit"));
    int magic        = (int)JsonNumber(response, "magic");
 
    // Classic MQL4 order-type values; this build declares only OP_BUY/OP_SELL.
@@ -353,7 +396,7 @@ void HandleOpenOrder(string response, string id)
    double fillPrice = entry;
    if(OrderSelect(ticket, SELECT_BY_TICKET)) fillPrice = OrderOpenPrice();
    int digits = (int)MarketInfo(symbol, MODE_DIGITS);
-   if(digits <= 0) digits = 5;
+   if(digits < 0) digits = 5;
    Print("VeyraProbe open_order sent ticket=", (string)ticket, " price=",
          DoubleToString(fillPrice, digits));
    SendAck(id, ExecutionResultJson(true, 0, "order sent", ticket, fillPrice, digits));
@@ -400,7 +443,7 @@ string PositionsJson(int maxEntries)
      {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
       int digits = (int)MarketInfo(OrderSymbol(), MODE_DIGITS);
-      if(digits <= 0) digits = 5;
+      if(digits < 0) digits = 5;
       if(included > 0) out = out + ",";
       out = out + "{\"ticket\":" + (string)OrderTicket()
             + ",\"symbol\":\"" + EscapeJson(OrderSymbol()) + "\""
@@ -477,7 +520,7 @@ void HandleCloseOrder(string response, string id)
      }
 
    int digits = (int)MarketInfo(symbol, MODE_DIGITS);
-   if(digits <= 0) digits = 5;
+   if(digits < 0) digits = 5;
    Print("VeyraProbe close_order closed ticket=", (string)ticket, " price=", DoubleToString(price, digits));
    SendAck(id, ExecutionResultJson(true, 0, "closed", ticket, price, digits));
   }
@@ -523,8 +566,8 @@ void HandleModifyOrder(string response, string id)
    double openPrice = OrderOpenPrice();
    double currentSl = OrderStopLoss();
    double currentTp = OrderTakeProfit();
-   double newSl = (sl > 0.0 ? sl : currentSl);
-   double newTp = (tp > 0.0 ? tp : currentTp);
+   double newSl = (sl > 0.0 ? ToTickGrid(symbol, sl) : currentSl);
+   double newTp = (tp > 0.0 ? ToTickGrid(symbol, tp) : currentTp);
 
    int code = 0;
    string comment = "ok";
@@ -576,7 +619,7 @@ void HandleModifyOrder(string response, string id)
      }
 
    int digits = (int)MarketInfo(symbol, MODE_DIGITS);
-   if(digits <= 0) digits = 5;
+   if(digits < 0) digits = 5;
    Print("VeyraProbe modify_order ok ticket=", (string)ticket, " sl=", DoubleToString(newSl, digits),
          " tp=", DoubleToString(newTp, digits));
    SendAck(id, ExecutionResultJson(true, 0, "stops changed", ticket, openPrice, digits));
@@ -620,7 +663,7 @@ void HandleRates(string response, string id)
      }
 
    int digits = (int)MarketInfo(symbol, MODE_DIGITS);
-   if(digits <= 0) digits = 5;
+   if(digits < 0) digits = 5;
 
    string json = "{\"symbol\":\"" + EscapeJson(symbol) + "\",\"timeframeMinutes\":" + (string)tf
                  + ",\"candles\":[";
@@ -680,7 +723,7 @@ void HandleSymbolSpec(string response, string id)
      }
 
    int specDigits = (int)MarketInfo(symbol, MODE_DIGITS);
-   if(specDigits <= 0) specDigits = 5;
+   if(specDigits < 0) specDigits = 5;
    string json = "{\"symbol\":\"" + EscapeJson(symbol) + "\""
                  + ",\"digits\":" + (string)specDigits
                  + ",\"point\":" + DoubleToString(point, 8)
@@ -702,6 +745,9 @@ void HandleSymbolSpec(string response, string id)
                  + ",\"swapShort\":" + DoubleToString(MarketInfo(symbol, MODE_SWAPSHORT), 4)
                  + ",\"swapType\":" + (string)(int)MarketInfo(symbol, MODE_SWAPTYPE)
                  + ",\"tradeAllowed\":" + (MarketInfo(symbol, MODE_TRADEALLOWED) == 1.0 ? "true" : "false")
+                 + ",\"currencyBase\":\"" + EscapeJson(SymbolInfoString(symbol, SYMBOL_CURRENCY_BASE)) + "\""
+                 + ",\"currencyProfit\":\"" + EscapeJson(SymbolInfoString(symbol, SYMBOL_CURRENCY_PROFIT)) + "\""
+                 + ",\"sessions\":" + TradeSessionsJson(symbol)
                  + "}";
    SendAck(id, json);
   }
@@ -731,7 +777,7 @@ void HandleOrderHistory(string response, string id)
 
       string symbol = OrderSymbol();
       int digits = (int)MarketInfo(symbol, MODE_DIGITS);
-      if(digits <= 0) digits = 5;
+      if(digits < 0) digits = 5;
       string kind = (OrderType() == OP_SELL) ? "sell" : "buy";
       string entry = "{\"ticket\":" + (string)(long)OrderTicket()
                      + ",\"symbol\":\"" + EscapeJson(symbol) + "\""

@@ -164,6 +164,9 @@ mod tests {
 
     fn valid_spec() -> SymbolSpecPayload {
         SymbolSpecPayload {
+            currency_base: None,
+            currency_profit: None,
+            sessions: Vec::new(),
             symbol: "EURUSD".to_owned(),
             digits: 5,
             point: 0.00001,
