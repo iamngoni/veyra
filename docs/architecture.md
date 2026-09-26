@@ -171,11 +171,11 @@ One append-only PostgreSQL table (`audit_events`: id, timestamp, kind, JSONB pay
 | Event kind | Written when |
 | --- | --- |
 | `service_started` | Process start; carries the effective risk policy so every later decision can be read against the rules in force |
-| `command_queued` | A command enters the queue (`kind`, `command_id`, plus `intent_id` for orders) |
-| `command_completed` | A validated ack completes (`kind`, bounded result summary) |
+| `command_queued` | A command enters the queue (`kind`, `command_id`, plus `intent_id` for orders). Stored only for commands that are not routine reads (below) |
+| `command_completed` | A validated ack completes (`kind`, bounded result summary). Stored only for commands that are not routine reads |
 | `command_failed` | A failed acknowledgement is processed, or an acknowledgement arrives for a command the queue already marked failed (for example a timeout) |
 | `broker_snapshot` | A validated `account_snapshot` ack is retained |
-| `balance_observed` | A validated, broker-reported account balance was observed (feeds the balance-history chart) |
+| `balance_observed` | A validated, broker-reported account balance was observed (feeds the balance-history chart): every change at once, an unchanged balance at most every 15 minutes |
 | `agent_tool_called` | The decision loop executed one read-only tool (tool, bounded arguments and result, step, rationale) |
 | `agent_turn` | One model turn of the decision loop: exactly what the model was shown and what it answered |
 | `failure` | A panic, or an error that would otherwise exist only in the in-memory log ring |
@@ -184,6 +184,8 @@ One append-only PostgreSQL table (`audit_events`: id, timestamp, kind, JSONB pay
 | `proposal_evaluated` | Every autopilot decision attempt (`outcome`: `no_trade`, `rejected`, `approved_dry_run`, `queued`, `unavailable`, `held`, `close_queued`, `close_rejected`, `stop_rejected`, `break_even`, `trailing_stop`, …). Entry and review decisions carry the model's `rationale` and, when a judge is configured, the chosen asset's `judgements`, so the why is queryable next to the what |
 | `reconciliation_drift` | A snapshot shows orders Veyra does not own, or a truncated position list |
 | `position_closed` | A managed ticket disappears from the book (last observed values, including P/L) |
+
+**Routine reads are live-only.** Queueing and completing a read-only broker command — `ping`, `account_snapshot`, `rates`, `symbol_spec`, `order_history` — reaches the live feed and the counters but is not stored (`audit::is_routine_read`). These were about 75,000 rows a day, over 99% of all writes, and nothing reads them back; storing them slowed every write and read of the table. Their failures are stored, as are all order commands (`order_check`, `open_order`, `close_order`, `modify_order`) and the `broker_snapshot` row each snapshot produces.
 
 Read routes on the loopback surface:
 

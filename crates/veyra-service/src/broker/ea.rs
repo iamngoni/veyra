@@ -270,6 +270,10 @@ struct BalanceSampleState {
     at_ms: u64,
 }
 
+/// How often an unchanged balance is still recorded. Changes are recorded at
+/// once; this only keeps a flat stretch visible on the balance chart.
+pub const BALANCE_HEARTBEAT_MS: u64 = 15 * 60_000;
+
 /// Shared state of the EA control channel.
 #[derive(Debug)]
 pub struct EaLink {
@@ -598,7 +602,9 @@ impl EaLink {
         guard.clone()
     }
 
-    /// Builds a durable observation from one validated, connected heartbeat.
+    /// Builds a durable observation from one validated, connected heartbeat:
+    /// every change of balance, account, or server immediately, and an
+    /// unchanged balance at most every [`BALANCE_HEARTBEAT_MS`].
     /// Missing or invalid optional balance data never changes the poll reply.
     fn balance_observation(
         &self,
@@ -627,7 +633,7 @@ impl EaLink {
             previous.login == login
                 && previous.server == server
                 && previous.balance == balance
-                && at_ms.saturating_sub(previous.at_ms) < 60_000
+                && at_ms.saturating_sub(previous.at_ms) < BALANCE_HEARTBEAT_MS
         }) {
             return None;
         }
@@ -2602,12 +2608,12 @@ mod tests {
         link.apply_ack(&ack);
         link.audit_ack(&ack).await;
 
+        // A snapshot is a routine read: its completion is live-only, while
+        // the book state it reported is stored.
         let events = trail.events();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].kind(), AuditKind::CommandCompleted);
-        assert_eq!(events[0].payload()["kind"], "account_snapshot");
-        assert_eq!(events[1].kind(), AuditKind::BrokerSnapshot);
-        assert_eq!(events[1].payload()["orders"], 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind(), AuditKind::BrokerSnapshot);
+        assert_eq!(events[0].payload()["orders"], 1);
 
         let failing = link.enqueue(CommandKind::Ping);
         let failure = EaAck {
@@ -2619,10 +2625,11 @@ mod tests {
         link.apply_ack(&failure);
         link.audit_ack(&failure).await;
 
+        // Failures are stored even for routine reads.
         let events = trail.events();
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[2].kind(), AuditKind::CommandFailed);
-        assert_eq!(events[2].payload()["error"], "nope");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind(), AuditKind::CommandFailed);
+        assert_eq!(events[1].payload()["error"], "nope");
 
         // A foreign position turns the next snapshot into audited drift.
         let drifting = link.enqueue(CommandKind::AccountSnapshot);
@@ -2653,16 +2660,15 @@ mod tests {
         link.audit_ack(&foreign_ack).await;
 
         let events = trail.events();
-        assert_eq!(events.len(), 7);
-        assert_eq!(events[3].kind(), AuditKind::CommandCompleted);
+        assert_eq!(events.len(), 5);
         // The managed ticket 123 vanished in this snapshot, so the journal
         // records the closure before the new book state.
-        assert_eq!(events[4].kind(), AuditKind::PositionClosed);
-        assert_eq!(events[4].payload()["ticket"], 123);
-        assert_eq!(events[5].kind(), AuditKind::BrokerSnapshot);
-        assert_eq!(events[6].kind(), AuditKind::ReconciliationDrift);
+        assert_eq!(events[2].kind(), AuditKind::PositionClosed);
+        assert_eq!(events[2].payload()["ticket"], 123);
+        assert_eq!(events[3].kind(), AuditKind::BrokerSnapshot);
+        assert_eq!(events[4].kind(), AuditKind::ReconciliationDrift);
         assert_eq!(
-            events[6].payload()["unknownTickets"],
+            events[4].payload()["unknownTickets"],
             serde_json::json!([456])
         );
     }

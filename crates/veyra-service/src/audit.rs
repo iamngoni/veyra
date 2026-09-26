@@ -8,6 +8,13 @@
 //! while a configured-but-unusable database fails startup, so a missing trail
 //! is never mistaken for an empty one.
 //!
+//! Routine reads are live-only: queueing and completing a read-only broker
+//! command (ping, account snapshot, candles, symbol contract, order history)
+//! reaches the in-memory feed and counters but is not stored. They are tens
+//! of thousands of rows a day that no decision depends on, and storing them
+//! slowed every write and read of the trail. Their failures, every order
+//! command, and the snapshot's own `broker_snapshot` row stay durable.
+//!
 //! Reads are bounded: [`AuditQuery`] is a validated filter (kinds, symbol,
 //! ticket, command ids, outcome, time window, row cap) whose semantics are
 //! defined once by [`AuditQuery::matches`]. Storage may answer it with native
@@ -25,6 +32,26 @@ use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
 use crate::balance::BalancePoint;
+
+/// Read-only broker commands whose queue and completion events are not
+/// stored (see the module notes). Failures of these commands are stored.
+pub const ROUTINE_READS: [&str; 5] = [
+    "ping",
+    "account_snapshot",
+    "rates",
+    "symbol_spec",
+    "order_history",
+];
+
+/// Whether an event is a routine read's queue or completion, which the live
+/// feed shows but the durable trail does not keep.
+pub fn is_routine_read(kind: AuditKind, payload: &Value) -> bool {
+    matches!(kind, AuditKind::CommandQueued | AuditKind::CommandCompleted)
+        && payload
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|command| ROUTINE_READS.contains(&command))
+}
 
 /// Event categories written to the trail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -751,9 +778,13 @@ impl AuditRuntime {
     /// Appends an event best-effort: failures are logged, never propagated, so
     /// an audit hiccup can not block or fail a command. The event also enters
     /// the in-memory feed for live readers, whether or not storage accepts it.
+    /// Routine reads ([`is_routine_read`]) go to the feed and counters only.
     pub async fn try_record(&self, event: AuditEvent) {
         self.feed.publish(event.kind(), event.payload());
         self.counters.tally(event.kind(), event.payload());
+        if is_routine_read(event.kind(), event.payload()) {
+            return;
+        }
         if let Err(error) = self.trail.record(event).await {
             tracing::warn!(%error, "audit write failed");
         }
@@ -1040,6 +1071,36 @@ mod tests {
         assert_eq!(counters["command.command_queued.open_order"], 1);
         assert_eq!(counters["command.command_completed.open_order"], 1);
         assert_eq!(counters["event.broker_snapshot"], 1);
+    }
+
+    #[test]
+    fn only_routine_read_queue_and_completion_events_are_live_only() {
+        use serde_json::json;
+        for command in ROUTINE_READS {
+            assert!(is_routine_read(
+                AuditKind::CommandQueued,
+                &json!({"kind": command})
+            ));
+            assert!(is_routine_read(
+                AuditKind::CommandCompleted,
+                &json!({"kind": command})
+            ));
+            assert!(
+                !is_routine_read(AuditKind::CommandFailed, &json!({"kind": command})),
+                "failures are stored"
+            );
+        }
+        for order in ["open_order", "close_order", "modify_order", "order_check"] {
+            assert!(!is_routine_read(
+                AuditKind::CommandCompleted,
+                &json!({"kind": order})
+            ));
+        }
+        assert!(!is_routine_read(
+            AuditKind::BrokerSnapshot,
+            &json!({"kind": "account_snapshot"})
+        ));
+        assert!(!is_routine_read(AuditKind::CommandCompleted, &json!({})));
     }
 
     #[test]

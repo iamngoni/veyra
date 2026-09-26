@@ -851,8 +851,11 @@ pub async fn balance_history(
                 .snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.connected())
-    }) && last_observed_at_ms
-        .is_some_and(|at_ms| now_ms.saturating_sub(at_ms) <= 90_000);
+    }) && last_observed_at_ms.is_some_and(|at_ms| {
+        // A flat balance is only re-recorded every heartbeat, so the newest
+        // point may be that old while still being current.
+        now_ms.saturating_sub(at_ms) <= crate::broker::ea::BALANCE_HEARTBEAT_MS + 90_000
+    });
     HttpResponse::Ok().json(BalanceHistory {
         status: "ok",
         source: "broker_balance",
@@ -2061,7 +2064,9 @@ mod tests {
                 serde_json::json!({"outcome": "no_trade"}),
             ))
             .await;
-        assert_eq!(trail.events().len(), 2);
+        // The routine snapshot is live-only: the feed shows both events,
+        // the durable trail keeps only the decision.
+        assert_eq!(trail.events().len(), 1);
 
         let app = test::init_service(create_app(state.clone())).await;
         let response =

@@ -300,9 +300,15 @@ mod tests {
         let audited = AppState::new(config(), Some(runtime), None, gate())
             .with_audit(Some(AuditRuntime::new(trail.clone())));
         assert!(refresh_once(&audited).await);
-        let events = trail.events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind(), AuditKind::CommandQueued);
-        assert_eq!(events[0].payload()["origin"], "periodic_refresh");
+        // The queued snapshot reaches the live feed but is not stored.
+        assert!(trail.events().is_empty());
+        let live = audited
+            .audit()
+            .expect("audit")
+            .feed_after(0, 10, std::time::Duration::ZERO)
+            .await;
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].kind, AuditKind::CommandQueued);
+        assert_eq!(live[0].payload["origin"], "periodic_refresh");
     }
 }

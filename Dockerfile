@@ -13,9 +13,14 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 
+# The build shares the Docker VM with the live database. A cached target keeps
+# rebuilds incremental, and a job cap leaves CPU for PostgreSQL: an uncapped
+# cold release build once stalled audit writes for up to 78 s.
+ARG BUILD_JOBS=6
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --locked --release --package veyra-service \
+    --mount=type=cache,target=/src/target \
+    cargo build --locked --release --jobs "${BUILD_JOBS}" --package veyra-service \
     && install -Dm755 target/release/veyra-service /out/veyra-service
 
 FROM debian:bookworm-slim AS runtime
