@@ -7,9 +7,17 @@
 //! entries instead of silently dropping a blackout. The parsed week is cached
 //! for the configured lifetime so a short autopilot cadence does not hammer a
 //! public endpoint.
+//!
+//! The publisher is often slow or briefly unreachable. Because the week only
+//! changes once a week, a failed refresh falls back to the last good copy for
+//! up to [`MAX_STALE`], as long as that copy still lists events ahead (last
+//! week's file on a Sunday lists none and is refused, so the fallback cannot
+//! hide a new week's releases). After a failure the publisher is retried at
+//! most every [`RETRY_AFTER_FAILURE`], so every autopilot tick does not wait
+//! on a timeout.
 
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -24,6 +32,10 @@ use crate::calendar::{
 const CALENDAR_URL: &str = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
 /// Largest response body accepted from the publisher.
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Oldest cached week used when a refresh fails.
+pub const MAX_STALE: Duration = Duration::from_secs(12 * 3_600);
+/// Least time between publisher requests after one failed.
+pub const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 struct Cached {
@@ -38,6 +50,20 @@ pub struct ForexfactoryCalendar {
     url: String,
     cache_ttl: Duration,
     cached: Mutex<Option<Cached>>,
+    last_failure: Mutex<Option<Instant>>,
+}
+
+/// Whether a cached week may stand in for a failed refresh: young enough and
+/// still listing something ahead of `now` (UTC seconds).
+fn usable_stale(events: &[CalendarEvent], age: Duration, now: i64) -> bool {
+    age < MAX_STALE && events.iter().any(|event| event.time() >= now)
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 impl ForexfactoryCalendar {
@@ -64,42 +90,80 @@ impl ForexfactoryCalendar {
             url,
             cache_ttl: settings.cache_ttl(),
             cached: Mutex::new(None),
+            last_failure: Mutex::new(None),
         })
     }
 
-    /// Returns the cached week, refetching when the cache lifetime expired.
+    /// Returns the cached week, refetching when the cache lifetime expired and
+    /// falling back to the last good week when the refresh fails (see the
+    /// module notes).
     async fn fetch(&self, from: i64, until: i64) -> Result<Vec<CalendarEvent>, CalendarError> {
-        let fresh = {
-            // Same poisoning stance as the rest of the service: writers
-            // replace the whole value, readers clone, so recovering is safe.
-            let guard = match self.cached.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard
-                .as_ref()
-                .filter(|cached| cached.fetched_at.elapsed() < self.cache_ttl)
-                .map(|cached| cached.events.clone())
-        };
-        let events = match fresh {
-            Some(events) => events,
-            None => {
-                let fetched = self.fetch_remote().await?;
-                let mut guard = match self.cached.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                *guard = Some(Cached {
-                    fetched_at: Instant::now(),
-                    events: fetched.clone(),
-                });
-                fetched
-            }
-        };
+        let events = self.week().await?;
         Ok(events
             .into_iter()
             .filter(|event| event.time() >= from && event.time() < until)
             .collect())
+    }
+
+    async fn week(&self) -> Result<Vec<CalendarEvent>, CalendarError> {
+        // Same poisoning stance as the rest of the service: writers replace
+        // the whole value, readers clone, so recovering is safe.
+        let (fresh, stale) = {
+            let guard = match self.cached.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match guard.as_ref() {
+                Some(cached) if cached.fetched_at.elapsed() < self.cache_ttl => {
+                    (Some(cached.events.clone()), None)
+                }
+                Some(cached)
+                    if usable_stale(&cached.events, cached.fetched_at.elapsed(), unix_now()) =>
+                {
+                    (None, Some(cached.events.clone()))
+                }
+                _ => (None, None),
+            }
+        };
+        if let Some(events) = fresh {
+            return Ok(events);
+        }
+        let backing_off = {
+            let guard = match self.last_failure.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.is_some_and(|failed| failed.elapsed() < RETRY_AFTER_FAILURE)
+        };
+        if backing_off && let Some(events) = stale.clone() {
+            return Ok(events);
+        }
+        match self.fetch_remote().await {
+            Ok(fetched) => {
+                if let Ok(mut guard) = self.cached.lock() {
+                    *guard = Some(Cached {
+                        fetched_at: Instant::now(),
+                        events: fetched.clone(),
+                    });
+                }
+                if let Ok(mut guard) = self.last_failure.lock() {
+                    *guard = None;
+                }
+                Ok(fetched)
+            }
+            Err(error) => {
+                if let Ok(mut guard) = self.last_failure.lock() {
+                    *guard = Some(Instant::now());
+                }
+                match stale {
+                    Some(events) => {
+                        tracing::warn!(%error, "calendar refresh failed; using the last good week");
+                        Ok(events)
+                    }
+                    None => Err(error),
+                }
+            }
+        }
     }
 
     async fn fetch_remote(&self) -> Result<Vec<CalendarEvent>, CalendarError> {
@@ -355,5 +419,75 @@ mod tests {
             matches!(error, CalendarError::Transport { .. }),
             "unexpected error: {error}"
         );
+    }
+
+    const FUTURE: &str = r#"[
+        {"title":"Non-Farm Employment Change","country":"USD","date":"2099-01-02T08:30:00-05:00","impact":"High","forecast":"","previous":""}
+    ]"#;
+
+    /// Answers the first request with `first` and every later one with 503.
+    fn spawn_flaky_server(requests: Arc<AtomicUsize>, first: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let served = requests.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let (status, body) = if served == 0 {
+                    ("HTTP/1.1 200 OK", first)
+                } else {
+                    ("HTTP/1.1 503 Service Unavailable", "")
+                };
+                let response = format!(
+                    "{status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{address}/calendar.json")
+    }
+
+    #[actix_web::test]
+    async fn a_failed_refresh_reuses_the_last_good_week_and_backs_off() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let url = spawn_flaky_server(requests.clone(), FUTURE);
+        let calendar = ForexfactoryCalendar::with_url(settings(Duration::ZERO), url).expect("feed");
+
+        let first = calendar.events(0, i64::MAX).await.expect("fetched");
+        assert_eq!(first.len(), 1);
+        // The cache expired at once, the refresh fails, the good week stands in.
+        let fallback = calendar.events(0, i64::MAX).await.expect("stale week");
+        assert_eq!(fallback, first);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        // Within the back-off the publisher is not asked again.
+        calendar.events(0, i64::MAX).await.expect("stale week");
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "backing off");
+    }
+
+    #[actix_web::test]
+    async fn last_weeks_file_does_not_stand_in() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let url = spawn_flaky_server(requests, SAMPLE);
+        let calendar = ForexfactoryCalendar::with_url(settings(Duration::ZERO), url).expect("feed");
+        calendar.events(0, i64::MAX).await.expect("fetched");
+        // SAMPLE lists only past events: failing closed is the only safe answer.
+        assert!(calendar.events(0, i64::MAX).await.is_err());
+    }
+
+    #[test]
+    fn stale_weeks_expire_and_need_upcoming_events() {
+        let events = parse_events(FUTURE.as_bytes()).expect("parses");
+        let now = 1_790_000_000;
+        assert!(usable_stale(&events, Duration::from_secs(3_600), now));
+        assert!(!usable_stale(&events, MAX_STALE, now), "too old");
+        assert!(
+            !usable_stale(&events, Duration::ZERO, i64::MAX),
+            "nothing ahead"
+        );
+        assert!(!usable_stale(&[], Duration::ZERO, now));
     }
 }
