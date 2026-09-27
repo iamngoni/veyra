@@ -5,6 +5,7 @@
 
 #![deny(missing_docs)]
 
+pub mod advisories;
 pub mod app;
 pub mod assistant_chat;
 pub mod audit;

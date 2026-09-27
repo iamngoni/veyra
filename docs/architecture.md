@@ -30,7 +30,7 @@ Status at a glance (see `README.md` and `docs/roadmap.md` for evidence):
 | Piece | Role | Where |
 | --- | --- | --- |
 | Service (`veyra-service`) | configuration, risk gate, command queue, autopilot, HTTP surface | Rust 2024 + Actix Web + Tokio, `crates/veyra-service` |
-| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/account/balance-history`, `/market/candles`, `/market/spec`, `/market/sessions`, `/calendar`, `/performance`, `/trades`, `/reconciliation`, `/risk/policy`, `/config`, `/assistant/chat`, `/model/credential`, `/model/subscriptions*`, `/model/cooldowns*`, `/notifications*` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
+| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/account/balance-history`, `/market/candles`, `/market/spec`, `/market/sessions`, `/calendar`, `/performance`, `/trades`, `/reconciliation`, `/risk/policy`, `/config`, `/assistant/chat`, `/model/credential`, `/model/subscriptions*`, `/model/cooldowns*`, `/notifications*`, `/advisories` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
 | EA channel listener | token-authenticated `POST /ea/poll` carrying heartbeats and the command queue | `127.0.0.1:7801` by default (`VEYRA_EA_BIND_*`); an explicit `VEYRA_EA_ALLOW_NON_LOOPBACK=true` opt-in permits an unpublished isolated container bind |
 | MT4 terminal + `VeyraProbe` EA | holds the broker session, polls the channel, executes acknowledged commands, reports dry runs while disarmed | `ea/VeyraProbe.mq4` inside MetaTrader 4 (Wine) |
 | Cloudflare tunnel | `veyra.antonlabs.cc` → `127.0.0.1:7801` — the EA channel only | launchd agent, `KeepAlive` |
@@ -298,6 +298,8 @@ The sidebar shows status pills (terminal live/stale, EA armed/disarmed, trading 
 | Diagnostics | Autopilot configuration and Jev/model-budget usage, the model route, top `/metrics` counters, and the `/logs` tail with a level filter |
 | Notifications | Channels (email, Telegram, Discord, Slack, ntfy, Pushover, webhook) with setup guides and test sends, per-event switches, the daily-summary hour, and recent deliveries, from `/notifications` |
 | Settings | The live settings overlay from `/config`, model credentials, and subscription connections |
+
+A status banner above every page shows `GET /advisories`: plain-language notices, most severe first, for whatever is stopping or pausing trades — kill switch, execution off, EA disarmed, MT4 not reporting, a loss limit (with what it takes to resume), repeated model failures or a recently skipped autopilot round (with the reason in plain words), and closed markets with when entries reopen (the FX week, the nightly rollover pause, the operator's session window, and each index's own hours). The route is read-only; it may ask the terminal for an index contract to read its hours, bounded by a 3-second timeout.
 
 A read-only assistant (`POST /assistant/chat`) sits beside every page. It streams each retrieval it runs over positions, account state, recorded decisions, and model health, and it has no order, close, or modify tool.
 

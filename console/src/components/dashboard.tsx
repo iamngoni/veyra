@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { StatusBanner } from './banner'
 import { ChartPanel, MARKET_BARS, type ChartMode, type MarketTimeframe, type PerformanceRange } from './chart'
 import { AssistantChat } from './chat'
 import { KpiRow, OpenPositions, PerformanceSummary } from './overview'
@@ -53,6 +54,9 @@ export function Dashboard() {
   const { data: history, error: historyError } = usePoll(() => api.performance(365), 60000)
   const { data: sessions } = usePoll(api.sessions, 30000)
   const { data: metrics, error: metricsError } = usePoll(api.metrics, 10000)
+  // Conditions change on the scale of minutes (a session closing, a breaker
+  // tripping); the banner reads them on every tab.
+  const { data: advisories, error: advisoriesError } = usePoll(api.advisories, 30000)
   const { events, notable, connected, settled } = useEventFeed(200)
   const [focus, setFocus] = useState(true)
   const [logLevel, setLogLevel] = useState<LogLevel>('info')
@@ -217,6 +221,9 @@ export function Dashboard() {
                 name, so it never covers the content below. */}
             <AssistantChat />
           </header>
+
+          {/* Between the view's name and its content, on every view. */}
+          <StatusBanner advisories={advisories} error={advisoriesError} />
 
           {tab === 'overview' ? (
             <div className="overview">

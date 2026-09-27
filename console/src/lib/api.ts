@@ -423,6 +423,29 @@ export type Reconciliation = {
   positions?: Array<Record<string, unknown>>
 }
 
+/** How much an advisory matters: `critical` stops trading, `warning` limits it, `info` explains a quiet spell. */
+export type AdvisorySeverity = 'info' | 'warning' | 'critical'
+
+/**
+ * One condition the operator should know about right now, in plain words,
+ * e.g. `market_closed` or `kill_switch`. The console renders every id the same
+ * way, so a new condition needs no console change.
+ */
+export type Advisory = {
+  /** Stable identity, unique within one response. */
+  id: string
+  severity: AdvisorySeverity
+  /** Short headline, e.g. `FX, gold and indices are closed`. */
+  title: string
+  /** One more sentence of context; null when the title says it all. */
+  detail?: string | null
+  /** When the condition is expected to end, UTC milliseconds; null when unknown. */
+  untilMs?: number | null
+}
+
+/** Current advisories from `/advisories`, most severe first; empty when nothing needs saying. */
+export type Advisories = { items: Advisory[]; generatedAtMs: number }
+
 /**
  * One live setting as the service reports it.
  *
@@ -776,6 +799,8 @@ export const api = {
   trades: (days = 30, page = 1, pageSize = 20) =>
     get<TradesPage>(`/trades?days=${days}&page=${page}&pageSize=${pageSize}`),
   sessions: () => get<MarketSessions>('/market/sessions'),
+  /** Conditions worth a banner (kill switch, market closed, stale terminal), most severe first. */
+  advisories: () => get<Advisories>('/advisories'),
   events: (after: number | undefined, waitMs = 15000, limit = 200) =>
     get<Feed>(after === undefined ? `/events?limit=${limit}` : `/events?after=${after}&wait_ms=${waitMs}&limit=${limit}`),
   logs: (after: number | undefined, level: LogLevel, limit = 300) =>

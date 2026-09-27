@@ -73,6 +73,7 @@ describe('api', () => {
     await api.audit(50)
     await api.trades(7)
     await api.notifications()
+    await api.advisories()
 
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       '/api/status',
@@ -87,6 +88,7 @@ describe('api', () => {
       '/api/audit?limit=50',
       '/api/trades?days=7&page=1&pageSize=20',
       '/api/notifications',
+      '/api/advisories',
     ])
     for (const call of fetchMock.mock.calls) {
       expect(call[1]?.headers).toEqual({ accept: 'application/json' })
