@@ -17,6 +17,7 @@ pub mod config;
 pub mod control;
 pub mod credential;
 pub mod jev;
+pub mod judge;
 pub mod logs;
 pub mod market;
 pub mod model;
@@ -76,6 +77,8 @@ pub struct AppState {
     credential_vault: Option<crate::credential::CredentialVault>,
     subscription_auth: crate::subscription_auth::SubscriptionAuthState,
     jev: Option<JevRuntime>,
+    /// Operator choice of judge (TypeSafe or OpenAI with Jev fallback).
+    judge_control: Option<crate::judge::JudgeControl>,
     audit: Option<AuditRuntime>,
     logs: Option<Arc<LogBuffer>>,
     risk: RiskGate,
@@ -119,6 +122,7 @@ impl AppState {
             credential_vault: None,
             subscription_auth: crate::subscription_auth::SubscriptionAuthState::new(),
             jev: None,
+            judge_control: None,
             audit: None,
             logs: None,
             risk,
@@ -228,6 +232,12 @@ impl AppState {
     /// Attaches the configured judgement integration, if any.
     pub fn with_jev(mut self, jev: Option<JevRuntime>) -> Self {
         self.jev = jev;
+        self
+    }
+
+    /// Attaches the operator's judge selection, restored at startup.
+    pub fn with_judge_control(mut self, control: Option<crate::judge::JudgeControl>) -> Self {
+        self.judge_control = control;
         self
     }
 
@@ -416,8 +426,16 @@ impl AppState {
     }
 
     /// Returns the active judgement integration, if one is configured.
+    ///
+    /// The runtime answers through the operator-selected judge (see
+    /// [`crate::judge`]); callers need not know which one it is.
     pub fn jev(&self) -> Option<&JevRuntime> {
         self.jev.as_ref()
+    }
+
+    /// Operator judge selection, when the service was started with one.
+    pub fn judge_control(&self) -> Option<&crate::judge::JudgeControl> {
+        self.judge_control.as_ref()
     }
 
     /// Returns the active audit trail, if one is configured.

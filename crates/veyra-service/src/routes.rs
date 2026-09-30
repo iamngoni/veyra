@@ -41,6 +41,8 @@ struct StatusResponse {
     broker_provider: Option<&'static str>,
     market_provider: Option<&'static str>,
     model_provider: Option<&'static str>,
+    /// Judge answering first: `openai` while the operator selected it (with
+    /// TypeSafe Jev as fallback), else `typesafe`; null without a judge.
     jev_provider: Option<&'static str>,
     persistence: Option<&'static str>,
     /// Active economic-calendar provider, when one is configured.
@@ -50,7 +52,8 @@ struct StatusResponse {
     ea_live_orders: bool,
     autopilot: Option<serde_json::Value>,
     model_budget: Option<serde_json::Value>,
-    /// Process-lifetime judge usage (calls, failures, reported tokens).
+    /// Cumulative judge usage (calls, failures, reported tokens, and calls
+    /// the TypeSafe fallback answered for a selected OpenAI primary).
     jev_usage: Option<serde_json::Value>,
     /// Effective risk gate policy; always present (the gate never sleeps).
     risk_policy: serde_json::Value,
@@ -222,7 +225,8 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
             "calls": usage.calls,
             "failures": usage.failures,
             "inputTokens": usage.input_tokens,
-            "outputTokens": usage.output_tokens
+            "outputTokens": usage.output_tokens,
+            "fallbacks": usage.fallbacks
         })
     });
     let persistence = state.audit().map(|runtime| runtime.provider().as_str());

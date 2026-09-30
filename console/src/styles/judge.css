@@ -1,0 +1,52 @@
+/* Judge selection (components/judge.tsx): a settings group whose controls
+   apply at once, unlike the live-settings form around it. */
+
+.judge-note, .judge-active { display: inline-flex; align-items: center; gap: 6px; }
+
+.judge-body { display: grid; grid-column: 2; min-width: 0; gap: 12px; }
+.judge-body .tab-group-fields { grid-column: auto; }
+p.judge-body { margin: 0; }
+
+/* Key input and its Save button share one line. */
+.judge-key { display: flex; min-width: 0; gap: 8px; }
+.judge-key .tab-input { flex: 1 1 auto; min-width: 0; }
+
+.judge-secret { display: flex; min-height: var(--control-lg); align-items: center; gap: 12px; }
+.judge-secret-state { color: var(--color-ink); font-size: var(--text-base); font-variant-numeric: tabular-nums; }
+
+.judge-rows { display: grid; gap: 4px; }
+.judge-row {
+  display: flex;
+  min-width: 0;
+  min-height: 40px;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid var(--color-line-soft);
+}
+.judge-row .tab-control-head { flex: 1 1 auto; }
+
+.judge-result {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-ink-muted);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+.judge-result.tone-ok { color: var(--color-ok); }
+.judge-result.tone-bad { color: var(--color-bad); }
+
+.judge-fallbacks { display: inline-flex; align-items: center; gap: 4px; color: var(--color-ink-muted); }
+.judge-toggle { display: inline-flex; flex: 0 0 auto; }
+
+.judge-message { margin: 0; color: var(--color-ink-muted); font-size: 12px; overflow-wrap: anywhere; }
+.judge-message:empty { display: none; }
+
+@media (max-width: 960px) {
+  .judge-body { grid-column: 1; }
+}
+@media (max-width: 660px) {
+  .judge-key { flex-wrap: wrap; }
+  .judge-key .tab-input { font-size: 16px; }
+}

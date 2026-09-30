@@ -50,8 +50,11 @@ export type Status = {
   autopilot: AutopilotStatus | null
   /** Model call usage against the configured caps; null without a model. */
   model_budget: { hourLimit: number; hourCalls: number; dayLimit: number; dayCalls: number } | null
-  /** Judge usage as this service observed it; null without a judge. */
-  jev_usage: { calls: number; failures: number; inputTokens: number; outputTokens: number } | null
+  /**
+   * Judge usage as this service observed it; null without a judge.
+   * `fallbacks` counts judgements Jev answered because OpenAI failed.
+   */
+  jev_usage: { calls: number; failures: number; inputTokens: number; outputTokens: number; fallbacks?: number } | null
   /** Effective risk gate policy; always present. */
   risk_policy: RiskPolicy
   /**
@@ -634,6 +637,55 @@ export function testNotification(token: string, provider: NotificationProviderId
   return notificationRequest<{ ok: boolean }>('/notifications/test', 'POST', token, { provider })
 }
 
+/** Which service answers the judgement questions. */
+export type JudgeProvider = 'typesafe' | 'openai'
+
+/** The latest OpenAI connection test, as the service saved it. */
+export type JudgeTest = { ok: boolean; atMs: number; latencyMs: number; detail: string; model: string }
+
+/**
+ * The judge selection. OpenAI can only be selected with a saved key, a
+ * passing latest test, and TypeSafe Jev configured as its fallback.
+ */
+export type JudgeSettings = {
+  provider: JudgeProvider
+  /** Whether TypeSafe Jev is configured, which OpenAI needs as its fallback. */
+  fallbackAvailable: boolean
+  /** False without encrypted credential storage; nothing can be saved. */
+  available: boolean
+  openai: {
+    key: { set: boolean; hint: string | null }
+    model: string
+    test: JudgeTest | null
+    /** Judgements Jev answered because OpenAI failed. */
+    fallbacks: number
+  }
+}
+
+/** An authenticated judge change; throws the service's reason on refusal. */
+async function judgeRequest<T>(path: string, method: 'PUT' | 'POST' | 'DELETE', token: string, body?: unknown): Promise<T> {
+  const response = await fetch(`${BASE}${path}`, {
+    method,
+    headers: { accept: 'application/json', 'content-type': 'application/json', 'x-veyra-admin-token': token },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  })
+  const payload = (await response.json().catch(() => null)) as (T & { error?: string; reason?: string }) | null
+  if (!response.ok) {
+    throw new Error(payload?.reason ?? payload?.error?.replaceAll('_', ' ') ?? `Request failed (${response.status})`)
+  }
+  if (!payload) throw new Error('The service did not confirm the change.')
+  return payload
+}
+
+/** Judge selection: OpenAI Decisions key, connection test, and the switch. */
+export const judge = {
+  select: (token: string, provider: JudgeProvider) => judgeRequest<JudgeSettings>('/judge', 'PUT', token, { provider }),
+  saveKey: (token: string, key: string) => judgeRequest<JudgeSettings>('/judge/openai/key', 'PUT', token, { key }),
+  removeKey: (token: string) => judgeRequest<JudgeSettings>('/judge/openai/key', 'DELETE', token),
+  test: (token: string) =>
+    judgeRequest<{ ok: boolean; latencyMs: number; detail: string }>('/judge/openai/test', 'POST', token),
+}
+
 const BASE = '/api'
 
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -811,6 +863,8 @@ export const api = {
   config: () => get<RuntimeConfig>('/config'),
   /** Notification settings, delivery counters and recent deliveries. */
   notifications: () => get<NotificationSettings>('/notifications'),
+  /** Which judge answers first, the OpenAI key hint and its latest test. */
+  judge: () => get<JudgeSettings>('/judge'),
   updateConfig: (patch: RuntimeConfigPatch) =>
     post<{ changed: string[]; settings: Record<string, LiveSetting> }>('/config', patch),
   /** Returns every benched model to the route at once. */

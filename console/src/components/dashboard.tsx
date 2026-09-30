@@ -11,6 +11,7 @@ import { ChartPanel, MARKET_BARS, type ChartMode, type MarketTimeframe, type Per
 import { AssistantChat } from './chat'
 import { KpiRow, OpenPositions, PerformanceSummary } from './overview'
 import { AutopilotCard, RecentActivity, RiskControls } from './rail'
+import { JudgeSection } from './judge'
 import { NotificationsPanel } from './notifications'
 import { LiveSettingsPanel } from './settings'
 import { Sidebar, Topbar, type NavTab } from './shell'
@@ -70,6 +71,7 @@ export function Dashboard() {
     error: notificationsError,
     refetch: refetchNotifications,
   } = usePoll(api.notifications, 60000)
+  const { data: judge, error: judgeError, refetch: refetchJudge } = usePoll(api.judge, 60000)
   const [traceKind, setTraceKind] = useState('all')
   const { theme, toggle } = useTheme()
   const [tab, setTab] = useState<TabId>('overview')
@@ -324,6 +326,7 @@ export function Dashboard() {
                 settings={liveConfig?.settings}
                 secretStatus={liveConfig?.secrets?.VEYRA_MODEL_API_KEY}
                 secretStore={liveConfig?.secret_store}
+                judge={<JudgeSection settings={judge} error={judgeError} onRefresh={() => void refetchJudge()} />}
                 onApply={applyConfig}
                 onRefresh={() => void refetchConfig()}
               />

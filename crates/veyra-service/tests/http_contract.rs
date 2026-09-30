@@ -15,7 +15,8 @@ use veyra_service::broker::{
     AccountLogin, AccountSnapshot, BrokerRuntime, BrokerSettings, ServerName, Symbol,
 };
 use veyra_service::config::{ConfigError, ServiceConfig};
-use veyra_service::jev::{JevRuntime, JevSettings};
+use veyra_service::jev::{JevRuntime, JevSettings, OpenAiSettings};
+use veyra_service::judge::JudgeControl;
 use veyra_service::risk::{RiskGate, RiskPolicy};
 
 fn test_config() -> ServiceConfig {
@@ -431,6 +432,43 @@ async fn status_reports_the_configured_jev_provider() {
     let response = test::call_service(&unconfigured, request).await;
     let body: serde_json::Value = test::read_body_json(response).await;
     assert!(body["jev_provider"].is_null());
+}
+
+#[actix_web::test]
+async fn judge_selection_defaults_to_typesafe_and_refuses_unauthenticated_writes() {
+    let control = JudgeControl::new(&OpenAiSettings::default()).expect("judge control builds");
+    let app = test::init_service(create_app(
+        test_state(None)
+            .with_jev(Some(test_jev()))
+            .with_judge_control(Some(control)),
+    ))
+    .await;
+    let response =
+        test::call_service(&app, test::TestRequest::get().uri("/judge").to_request()).await;
+    assert!(response.status().is_success());
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["provider"], "typesafe");
+    assert_eq!(body["fallbackAvailable"], true);
+    assert_eq!(body["available"], false);
+    assert_eq!(body["openai"]["model"], "gpt-6-luna");
+    assert_eq!(body["openai"]["key"]["set"], false);
+
+    // Without console credential storage nothing can be changed.
+    let response = test::call_service(
+        &app,
+        test::TestRequest::put()
+            .uri("/judge")
+            .set_json(serde_json::json!({"provider": "openai"}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 503);
+
+    let response =
+        test::call_service(&app, test::TestRequest::get().uri("/status").to_request()).await;
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["jev_provider"], "typesafe");
+    assert_eq!(body["jev_usage"]["fallbacks"], 0);
 }
 
 #[actix_web::test]

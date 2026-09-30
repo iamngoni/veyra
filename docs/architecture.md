@@ -19,6 +19,7 @@ Status at a glance (see `README.md` and `docs/roadmap.md` for evidence):
 | Venue contracts (`symbol_spec`) | Live-proven against IFC Markets: spread, stop level, lot band, margin per lot, and swap rates for every menu symbol; pre-queue lot/margin/stop checks and a console-editable ATR(14) noise floor |
 | Decision model | Live-proven structured answers over the OpenRouter preset |
 | Jev judgements | Live-proven (`jev-1.13.0`, ~1.3 s per request) |
+| OpenAI Decisions judge | Built and tested against a local mock only. The live endpoint answers `403 "Decision API is not enabled for this user."` (limited preview), so no real OpenAI judgement has been seen and its wire format is assumed, not verified. Off by default; Jev answers whenever it fails |
 | Economic calendar | Live-proven (ForexFactory weekly export; high-impact blackout and per-asset event context) |
 | Risk gate + `order_check` | Live-proven (retcode 0 and 129 for validation, without sending an order) |
 | Autonomous entry | Live-proven first autonomous order (EURUSD 0.01 sell, ticket 10650805, retcode 0) after explicit owner approval of both switches |
@@ -91,7 +92,7 @@ Every integration follows the same five-part shape: **a narrow trait + a provide
 | Broker | `VEYRA_BROKER_PROVIDER` | `ea` | `BrokerLink` (`broker/mod.rs`) with the neutral command/report types in `broker/command.rs` | `BrokerProvider` | `broker/settings.rs` (`BrokerSettings::from_source`) | `BrokerRuntime::from_settings` (`broker/mod.rs`) | `broker/ea.rs` (`EaLink`, implementing `BrokerLink`) |
 | Market data | `VEYRA_MARKET_PROVIDER` | `ea` | `MarketFeed` (`market/mod.rs`) | `MarketProvider` | `market/settings.rs` (`MarketSettings::from_source`) | `MarketRuntime::from_settings` (`market/mod.rs`) | `market/ea.rs` (`EaMarketFeed`) |
 | Decision model | `VEYRA_MODEL_PROVIDER` | `openrouter` | `DecisionEngine` (`model/mod.rs`) | `ModelProvider` | `model/settings.rs` (`ModelSettings::from_source`) | `ModelRuntime::from_settings` (`model/mod.rs`) | `model/agent_runtime_engine.rs` (`AgentRuntimeEngine`) for API providers and `model/subscription_engine.rs` (`SubscriptionEngine`) for ChatGPT/Claude subscriptions, routed by `PreferredEngine` (`model/preferred.rs`) and wrapped in `BudgetedEngine` (`model/budget.rs`) |
-| Judgements | `VEYRA_JEV_PROVIDER` | `typesafe` | `SemanticJudge` (`jev/mod.rs`) | `JevProvider` | `jev/settings.rs` (`JevSettings::from_source`) | `JevRuntime::from_settings` (`jev/mod.rs`) | `jev/http.rs` (`HttpJev`); contract types in `jev/contract.rs` |
+| Judgements | `VEYRA_JEV_PROVIDER` | `typesafe` | `SemanticJudge` (`jev/mod.rs`) | `JevProvider` | `jev/settings.rs` (`JevSettings::from_source`) | `JevRuntime::from_settings` (`jev/mod.rs`) | `jev/http.rs` (`HttpJev`); contract types in `jev/contract.rs`. OpenAI Decisions (`jev/openai.rs`) is selected in the console, never here — see **Judge providers and fallback** |
 | Economic calendar | `VEYRA_CALENDAR_PROVIDER` | `forexfactory` | `EventCalendar` (`calendar/mod.rs`) | `CalendarProvider` | `calendar/settings.rs` (`CalendarSettings::from_source`) | `CalendarRuntime::from_settings` (`calendar/mod.rs`) | `calendar/forexfactory.rs` (`ForexfactoryCalendar`, weekly JSON export, cached) |
 | Audit trail | `VEYRA_DATABASE_URL` enables it | `postgres` | `AuditTrail` (`audit.rs`) | `AuditProvider` | — (URL is the switch) | `main.rs`: `Store::connect` + embedded migrations | `store.rs` (`Store`) |
 
@@ -105,6 +106,16 @@ Rules that hold across all of them:
 ### Notification channels
 
 Notifications (`notify/`) are the one integration where several providers are active at once and are chosen in the console rather than by an environment variable, so they are a closed `ProviderKind` enum instead of a trait selected at startup. The boundary is the same: every wire format lives in `notify/providers.rs` behind one `send` function, and nothing else in the service knows a channel exists. Sources only call `Notifier::notify`, which filters and `try_send`s onto a bounded queue and never waits; one worker fans each notification out to every enabled channel concurrently, with retries for transient failures. Two read-only watchers produce the notifications: one follows the audit feed (fills, closes, failed orders, drift), the other samples health every 30 s and reports transitions (breakers, halts, broker link, model trouble) plus the daily summary. `veyra-service watchdog` is a separate process that reports the service itself being down. Operator guide: [notifications.md](notifications.md).
+
+### Judge providers and fallback
+
+The configured judge is always TypeSafe Jev (`VEYRA_JEV_*`). The operator can put OpenAI's Decisions API (`POST {base}/v1/decisions`, `jev/openai.rs`) in front of it from Settings → Judge; Jev then becomes its automatic fallback (`jev/fallback.rs`). The switch lives inside `JevRuntime`, so `AppState::jev()` and every caller are unchanged.
+
+- **Preconditions.** OpenAI can be switched on only with a TypeSafe Jev configured, an OpenAI key saved, and a passing connection test of that key against the configured model. `PUT /judge` refuses otherwise with `409` (`openai_needs_fallback`, `openai_key_missing`, `openai_test_required`). Saving or removing the key, a failing test, or a model change since the last test returns the selection to Jev.
+- **Fallback.** Any OpenAI error — transport, status (401/403 carry OpenAI's own message, e.g. the preview's "not enabled"), malformed body, or answers that fail the judgement contract — is logged and the same request goes to Jev, so a tick never loses its judgements to OpenAI. After a failure OpenAI is skipped for 60 s. Jev's own errors behave exactly as without OpenAI. `/status` reports `jev_provider: "openai"` while it is selected and counts Jev's answers in `jev_usage.fallbacks`.
+- **Unverified format.** OpenAI has not published the Decisions API; the request and response are *assumed* to match TypeSafe's System One shape (`model`, `state`, typed `questions` in; `answers` with probabilities and confidence, plus `usage`, out) and go through the same strict contract, so any difference fails closed onto Jev.
+- **Storage.** The key is sealed by the credential vault (`judge_openai_key`) and shown only as a four-character hint; the selection and last test (`judge_prefs`) are plain runtime state, saved before they apply and restored at startup. Unreadable state fails startup.
+- **Routes.** `GET /judge`; with the operator token: `PUT /judge`, `PUT`/`DELETE /judge/openai/key`, and `POST /judge/openai/test` (one fixed choice/noul/score probe through OpenAI only, never the fallback). `VEYRA_JUDGE_OPENAI_MODEL` (default `gpt-6-luna`) and `VEYRA_JUDGE_OPENAI_BASE_URL` (default `https://api.openai.com`) are optional.
 
 ### Adding a provider
 
@@ -224,7 +235,7 @@ The surrounding guards:
 - **Bounded execution deviation** — the EA caps `OrderSend` slippage at twice the live spread, floored at 10 points and capped at 30, so a spread blowout cannot become a blank cheque.
 - **Bounded model budget** — `BudgetedEngine` wraps whatever engine a provider builds; `VEYRA_MODEL_MAX_CALLS_PER_HOUR` / `_PER_DAY` (0 = unlimited, the default) refuse calls past a fixed window, and `/status` reports usage against the caps.
 - **Model failover** — each tier resolves to an ordered chain (`VEYRA_MODEL_FALLBACKS`, or a per-tier list that replaces it), capped at 4 fallbacks because every extra candidate costs a live round trip during an outage. A candidate is abandoned for the next one when the provider refuses it — out of credits (HTTP 402), rate limited, overloaded, an unexpected status, or an answer that does not satisfy the schema. A *transport* failure is the exception: the provider was never reached, so the next candidate would fail identically and the retry policy already covers it. Fallback candidates must support the active structured-response path and be permitted by the account's provider-routing policy. The chain is reported on `/status` as `autopilot.model_fallbacks`, and `decisions.lastModel` / `lastSuccessfulModel` report the actual candidates used, so a stalled loop can be told apart from one that ran out of configured options; a serving fallback is logged with the model that answered.
-- **Judge usage counters** — the Jev runtime counts calls, failures, and the provider-reported input/output tokens; `/status` carries the totals and the console shows them in the Autopilot panel. The counters are snapshotted to durable runtime state every minute, so the service's authoritative usage view — the one that matters because the provider's dashboard can lag, aggregate differently, or belong to another project — survives restarts and reboots.
+- **Judge usage counters** — the Jev runtime counts calls, failures, the provider-reported input/output tokens, and the calls Jev answered for a failing OpenAI primary (`fallbacks`); `/status` carries the totals and the console shows them in the Autopilot panel. The counters are snapshotted to durable runtime state every minute, so the service's authoritative usage view — the one that matters because the provider's dashboard can lag, aggregate differently, or belong to another project — survives restarts and reboots.
 - **Duplicate window** — `VEYRA_RISK_DUPLICATE_WINDOW_SECS` (default 60) suppresses an identical approved draft.
 - **Missing or stale state rejects.** No fresh link report or no connected terminal means `account_state_unavailable`, not an assumption.
 - `POST /intents/check` performs a broker-side `order_check` without the trading switch because it never sends an order; `POST /intents/execute`, `/intents/close`, and `/intents/modify` all refuse with `403 trading_disabled` unless the service switch is on.
@@ -257,7 +268,7 @@ Counters and baselines that must survive restarts live in one Postgres table, `r
 
 | Key | Holds | Loaded into |
 | --- | --- | --- |
-| `jev_usage` | cumulative judge calls, failures, provider-reported tokens | `/status` and the console's Autopilot panel |
+| `jev_usage` | cumulative judge calls, failures, provider-reported tokens, and Jev fallbacks | `/status` and the console's Autopilot panel |
 | `model_budget` | hourly/daily call-window anchors and counts (wall-clock anchored, so restarts cannot reset the budget) | `BudgetedEngine` admission |
 | `equity_baselines` | UTC day anchor, day-open equity, peak equity | drawdown breakers |
 | `stop_basis` | per-ticket entry-risk memory | break-even/trailing planner |
@@ -268,6 +279,8 @@ Counters and baselines that must survive restarts live in one Postgres table, `r
 | `subscription_codex`, `subscription_claude_code` | encrypted ChatGPT (Codex) and Claude Code subscription credentials | the subscription engine |
 | `notify_prefs` | notification switches, enabled channels, and their non-secret settings | the notifier and the watchdog |
 | `notify_secrets` | notification channel credentials, encrypted | the notifier and the watchdog |
+| `judge_prefs` | the judge selection (`typesafe`/`openai`) and the last OpenAI test result | `JudgeControl` and the `JevRuntime` primary slot; unreadable fails startup |
+| `judge_openai_key` | the OpenAI Decisions API key, encrypted | `JudgeControl` |
 
 What deliberately stays volatile: the **pending command queue** (replaying undelivered commands after downtime would risk stale orders — the venue, not the queue, is the source of truth), the **event and log rings** (`/events`, `/logs` — the audit trail is the durable record), and **`/metrics` counters** (process-lifetime views derived from the stream; the audit table can answer the same questions durably with SQL). Writes are best-effort: storage trouble logs a warning and the trading path continues, because a lost counter must never stop the bot. Unusable stored values (a hand-edited or stale row) log and fall back to the in-memory default; an unreadable `risk_policy` row fails startup loudly rather than silently reverting operator intent.
 
@@ -297,7 +310,7 @@ The sidebar shows status pills (terminal live/stale, EA armed/disarmed, trading 
 | Trace | The durable audit trail from `/audit` |
 | Diagnostics | Autopilot configuration and Jev/model-budget usage, the model route, top `/metrics` counters, and the `/logs` tail with a level filter |
 | Notifications | Channels (email, Telegram, Discord, Slack, ntfy, Pushover, webhook) with setup guides and test sends, per-event switches, the daily-summary hour, and recent deliveries, from `/notifications` |
-| Settings | The live settings overlay from `/config`, model credentials, and subscription connections |
+| Settings | The live settings overlay from `/config`, model credentials, subscription connections, and the Judge section (OpenAI key, connection test, and the switch from Jev to OpenAI Decisions) |
 
 A status banner above every page shows `GET /advisories`: plain-language notices, most severe first, for whatever is stopping or pausing trades — kill switch, execution off, EA disarmed, MT4 not reporting, a loss limit (with what it takes to resume), repeated model failures or a recently skipped autopilot round (with the reason in plain words), and closed markets with when entries reopen (the FX week, the nightly rollover pause, the operator's session window, and each index's own hours). The route is read-only; it may ask the terminal for an index contract to read its hours, bounded by a 3-second timeout.
 
@@ -328,7 +341,7 @@ A read-only assistant (`POST /assistant/chat`) sits beside every page. It stream
 | New broker/venue | Implement `BrokerLink` (report + enqueue/await command surface) in a new `broker/<provider>.rs`, add the variant to `BrokerProvider` + `broker/settings.rs` + `BrokerRuntime::from_settings`, and mirror `tests/ea_contract.rs`; `control.rs`, `reconciliation.rs`, `market/`, and `autopilot.rs` need no changes |
 | New market-data provider | `market/mod.rs` (trait + enum + factory arm), `market/settings.rs`, new `market/<provider>.rs` (use `market/ea.rs` as the template) |
 | New model provider | `model/mod.rs` (enum + parse + factory arm), `model/settings.rs` arms, new engine module (or extend `agent_runtime_engine.rs`); `BudgetedEngine` wraps it automatically |
-| New judgement provider | `jev/mod.rs` (enum + factory arm), `jev/settings.rs` arms, new transport module alongside `jev/http.rs`; contract types live in `jev/contract.rs` |
+| New judgement provider | `jev/mod.rs` (enum + factory arm), `jev/settings.rs` arms, new transport module alongside `jev/http.rs` (reuse its `wire_body` / `post_json` / `accept_response` for System One-shaped APIs, as `jev/openai.rs` does); contract types live in `jev/contract.rs`. A console-selected primary over the configured judge goes through `judge/` and `JevRuntime::use_primary` |
 | Different audit storage | Implement `AuditTrail` (see `audit.rs` and `store.rs`) and swap the construction in `main.rs` |
 | New symbols | `VEYRA_RISK_SYMBOLS` + `VEYRA_AUTOPILOT_SYMBOLS` (up to 16, comma-separated; `VEYRA_AUTOPILOT_SYMBOL` remains the single-symbol form), spelled as the broker spells them. CFDs/crypto/indices additionally require usable live tick economics; add genuinely weekend-traded instruments to `VEYRA_RISK_WEEKEND_SYMBOLS` and instruments that move together to `VEYRA_RISK_CORRELATED_GROUPS`. See **Stock indices** for what an index needs. |
 | New timeframe | `VEYRA_AUTOPILOT_TIMEFRAME`; the console's timeframe picker (`MarketTimeframe` in `console/src/components/chart.tsx`) lists the chart choices |

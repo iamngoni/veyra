@@ -4,7 +4,9 @@
 //! request timeout performs `POST /v1/systemone`. The transport owns status
 //! mapping and nothing else: request and response meaning live in
 //! [`crate::jev::contract`], and every response is validated against the
-//! request that produced it before a caller sees it.
+//! request that produced it before a caller sees it. The encoding, send, and
+//! acceptance helpers are shared with other System One-shaped providers (see
+//! [`crate::jev::openai`]); only status mapping is provider-specific.
 
 use std::collections::BTreeMap;
 
@@ -54,6 +56,86 @@ struct WireRequest<'a> {
     questions: BTreeMap<&'a str, Value>,
 }
 
+/// Encodes a validated request in the shared System One wire shape:
+/// `{"model", "state", "questions": {id: {"type", "instructions", "criteria"}}}`.
+///
+/// # Errors
+/// Returns [`JevError::Transport`] when the body cannot be encoded.
+pub(crate) fn wire_body(request: &JevRequest, model: &str) -> Result<Value, JevError> {
+    let questions = request
+        .questions()
+        .iter()
+        .map(|(id, question)| (id.as_str(), question.wire()))
+        .collect();
+    serde_json::to_value(WireRequest {
+        state: request.state().value(),
+        model,
+        questions,
+    })
+    .map_err(|error| JevError::Transport {
+        reason: format!("request encoding failed: {error}"),
+    })
+}
+
+/// Sends one encoded request with bearer authentication and returns the HTTP
+/// status and the raw body. Status meaning belongs to the caller.
+///
+/// # Errors
+/// Returns [`JevError::Transport`] for network, timeout, or body-read
+/// failures.
+pub(crate) async fn post_json(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bearer: &str,
+    body: &Value,
+) -> Result<(u16, Vec<u8>), JevError> {
+    let response = client
+        .post(endpoint)
+        .bearer_auth(bearer)
+        .json(body)
+        .send()
+        .await
+        .map_err(|error| JevError::Transport {
+            reason: transport_reason(&error),
+        })?;
+    let status = response.status().as_u16();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| JevError::Transport {
+            reason: transport_reason(&error),
+        })?;
+    Ok((status, bytes.to_vec()))
+}
+
+/// Parses a success body and checks that it answers exactly `request`.
+///
+/// A rejected response is logged with a bounded preview: provider drift in
+/// probability formatting must be diagnosable without reconstructing the
+/// request, and the response carries only judgements.
+///
+/// # Errors
+/// Returns [`JevError::MalformedResponse`] or [`JevError::Contract`] when the
+/// body violates the contract.
+pub(crate) fn accept_response(
+    provider: JevProvider,
+    request: &JevRequest,
+    bytes: &[u8],
+) -> Result<JevResponse, JevError> {
+    let parsed = match parse_response_body(bytes) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            logging::warn_rejected(provider, &error, bytes);
+            return Err(error);
+        }
+    };
+    if let Err(error) = request.validate_answers(&parsed) {
+        logging::warn_rejected(provider, &error, bytes);
+        return Err(error);
+    }
+    Ok(parsed)
+}
+
 #[async_trait]
 impl SemanticJudge for HttpJev {
     fn provider(&self) -> JevProvider {
@@ -61,38 +143,9 @@ impl SemanticJudge for HttpJev {
     }
 
     async fn judge(&self, request: JevRequest) -> Result<JevResponse, JevError> {
-        let questions = request
-            .questions()
-            .iter()
-            .map(|(id, question)| (id.as_str(), question.wire()))
-            .collect();
-        let body = serde_json::to_value(WireRequest {
-            state: request.state().value(),
-            model: &self.model,
-            questions,
-        })
-        .map_err(|error| JevError::Transport {
-            reason: format!("request encoding failed: {error}"),
-        })?;
-
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .bearer_auth(self.api_key.expose())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| JevError::Transport {
-                reason: transport_reason(&error),
-            })?;
-
-        let status = response.status().as_u16();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| JevError::Transport {
-                reason: transport_reason(&error),
-            })?;
+        let body = wire_body(&request, &self.model)?;
+        let (status, bytes) =
+            post_json(&self.client, &self.endpoint, self.api_key.expose(), &body).await?;
 
         match status {
             200..=299 => {}
@@ -109,38 +162,28 @@ impl SemanticJudge for HttpJev {
                 });
             }
         }
-
-        // A rejected response is logged with a bounded preview: provider drift
-        // in probability formatting must be diagnosable without reconstructing
-        // the request, and the response carries only judgements.
-        let parsed = match parse_response_body(&bytes) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                logging::warn_rejected(&error, &bytes);
-                return Err(error);
-            }
-        };
-        if let Err(error) = request.validate_answers(&parsed) {
-            logging::warn_rejected(&error, &bytes);
-            return Err(error);
-        }
-        Ok(parsed)
+        accept_response(JevProvider::TypeSafe, &request, &bytes)
     }
 }
 
 mod logging {
-    use crate::jev::JevError;
+    use crate::jev::{JevError, JevProvider};
 
     /// Bounded response preview attached to contract rejections.
     const PREVIEW_CHARS: usize = 700;
 
-    pub(super) fn warn_rejected(error: &JevError, bytes: &[u8]) {
+    pub(super) fn warn_rejected(provider: JevProvider, error: &JevError, bytes: &[u8]) {
         let preview: String = String::from_utf8_lossy(bytes)
             .chars()
             .filter(|character| !character.is_control() || *character == ' ')
             .take(PREVIEW_CHARS)
             .collect();
-        tracing::warn!(%error, preview, "jev response rejected");
+        tracing::warn!(
+            provider = provider.as_str(),
+            %error,
+            preview,
+            "judge response rejected"
+        );
     }
 }
 
@@ -159,7 +202,7 @@ fn transport_reason(error: &reqwest::Error) -> String {
 }
 
 /// Keeps the first 256 printable characters of an error body.
-fn error_detail(bytes: &[u8]) -> String {
+pub(crate) fn error_detail(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let cleaned: String = text.chars().filter(|c| !c.is_control()).take(256).collect();
     let trimmed = cleaned.trim();

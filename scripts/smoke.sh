@@ -27,7 +27,7 @@ for _ in $(seq 1 100); do
 done
 if [ "$ready" -ne 1 ]; then echo "server did not become ready" >&2; exit 1; fi
 
-for route in health ready status; do
+for route in health ready status judge; do
   echo "== /${route}"
   curl --fail --silent --show-error "${BASE}/${route}"
   echo

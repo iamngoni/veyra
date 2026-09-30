@@ -11,7 +11,8 @@ use veyra_service::audit::{AuditEvent, AuditKind, AuditRuntime, AuditTrail};
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
 use veyra_service::calendar::{CalendarRuntime, CalendarSettings};
 use veyra_service::credential::CredentialVault;
-use veyra_service::jev::{JevRuntime, JevSettings};
+use veyra_service::jev::{JevRuntime, JevSettings, OpenAiSettings};
+use veyra_service::judge::JudgeControl;
 use veyra_service::logs::{self, LogBuffer};
 use veyra_service::market::{MarketRuntime, MarketSettings};
 use veyra_service::model::{ModelRuntime, settings::ModelSettings};
@@ -94,6 +95,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // The operator's judge choice: OpenAI Decisions layered over the
+    // configured Jev, resumed only while its key, a passing test, and the Jev
+    // fallback all still exist. Unreadable saved state fails startup.
+    let judge_control = JudgeControl::new(&OpenAiSettings::from_env()?)?;
+    if let Some(vault) = &vault {
+        judge_control
+            .restore(&runtime_state, vault, jev.as_ref())
+            .await?;
+    }
+
     // Market data follows the broker: the EA provider reads candles through
     // the same command channel, so it refuses to build without it.
     let market = match MarketSettings::from_env()? {
@@ -138,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_calendar(calendar)
         .with_autopilot(autopilot)
         .with_jev(jev)
+        .with_judge_control(Some(judge_control))
         .with_logs(logs)
         .with_runtime_state(runtime_state.clone())
         .with_notifier(notifier)

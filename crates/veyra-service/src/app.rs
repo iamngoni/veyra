@@ -62,4 +62,9 @@ pub fn create_app(
         .service(crate::notify::routes::notifications)
         .service(crate::notify::routes::update_notifications)
         .service(crate::notify::routes::test_notification)
+        .service(crate::judge::routes::judge)
+        .service(crate::judge::routes::select_judge)
+        .service(crate::judge::routes::set_openai_key)
+        .service(crate::judge::routes::delete_openai_key)
+        .service(crate::judge::routes::test_openai)
 }
