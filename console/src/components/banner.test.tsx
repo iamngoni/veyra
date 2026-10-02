@@ -139,6 +139,8 @@ describe('StatusBanner', () => {
     const { rerender } = render(<StatusBanner advisories={served(news)} />)
     const until = () => document.querySelector('.banner-until') as HTMLElement
     expect(until().firstChild?.textContent).toBe('14:00–15:00')
+    // A long headline gives way on a narrow strip; its full text stays on hover.
+    expect(screen.getByText(news.title).getAttribute('title')).toBe(news.title)
     expect(within(until()).getByRole('button', { name: 'About when this starts and ends' })).toBeTruthy()
     expect(within(until()).getByRole('tooltip', { hidden: true }).textContent).toBe(
       'Expected from Wed 15 Jul, 14:00 until 15:00 your time — starts in 3h 55m.',

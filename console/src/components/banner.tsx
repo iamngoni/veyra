@@ -104,7 +104,9 @@ function AdvisoryRow({ item, now }: { item: Advisory; now: number }) {
   return (
     <li className={`banner-row is-${level}`}>
       <Dot tone={tone} label={label} />
-      <strong className="banner-title">{item.title}</strong>
+      <strong className="banner-title" title={item.title}>
+        {item.title}
+      </strong>
       {/* One line on a desktop window; the full sentence stays on hover. */}
       {item.detail ? (
         <span className="banner-detail" title={item.detail}>
