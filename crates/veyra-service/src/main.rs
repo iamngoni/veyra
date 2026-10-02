@@ -38,18 +38,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // counters, baselines, and the operator's live risk policy are restored
     // from it, and a configured database that is unreachable fails startup
     // rather than silently running without an audit trail.
-    let (runtime_state, audit) = match config.database_url() {
+    let (runtime_state, audit, ledger) = match config.database_url() {
         Some(url) => {
             let store = Arc::new(Store::connect(url).await?);
             store.migrate().await?;
             let trail: Arc<dyn AuditTrail> = store.clone();
             let state_store: Arc<dyn veyra_service::state::StateStore> = store.clone();
+            let ledger: veyra_service::ledger::SharedLedger = store.clone();
             (
                 RuntimeState::new(Some(state_store)),
                 Some(Arc::new(AuditRuntime::new(trail))),
+                Some(ledger),
             )
         }
-        None => (RuntimeState::disabled(), None),
+        None => (RuntimeState::disabled(), None, None),
     };
 
     let vault = CredentialVault::from_env()?;
@@ -152,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_judge_control(Some(judge_control))
         .with_logs(logs)
         .with_runtime_state(runtime_state.clone())
+        .with_ledger(ledger)
         .with_notifier(notifier)
         .with_audit(audit.as_ref().map(|runtime| (**runtime).clone()));
 
@@ -214,6 +217,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
             .await;
     }
+
+    // Veyra's own closed-trade record: a one-year backfill from the
+    // terminal, then a week every 15 minutes (read-only history commands).
+    actix_web::rt::spawn(veyra_service::ledger::sync_forever(state.clone()));
 
     // Notification sources: read-only watchers of the audit feed and of
     // health transitions. They only queue messages; delivery never blocks.

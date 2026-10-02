@@ -18,6 +18,7 @@ pub mod control;
 pub mod credential;
 pub mod jev;
 pub mod judge;
+pub mod ledger;
 pub mod logs;
 pub mod market;
 pub mod model;
@@ -80,6 +81,8 @@ pub struct AppState {
     /// Operator choice of judge (TypeSafe or OpenAI with Jev fallback).
     judge_control: Option<crate::judge::JudgeControl>,
     audit: Option<AuditRuntime>,
+    /// Veyra's own record of closed trades (see [`crate::ledger`]).
+    ledger: Option<crate::ledger::SharedLedger>,
     logs: Option<Arc<LogBuffer>>,
     risk: RiskGate,
     runtime_state: RuntimeState,
@@ -124,6 +127,7 @@ impl AppState {
             jev: None,
             judge_control: None,
             audit: None,
+            ledger: None,
             logs: None,
             risk,
             runtime_state: RuntimeState::disabled(),
@@ -223,7 +227,18 @@ impl AppState {
         &self.subscription_auth
     }
 
-    /// Attaches the configured audit trail, if any.
+    /// Attaches Veyra's closed-trade ledger, if any.
+    pub fn with_ledger(mut self, ledger: Option<crate::ledger::SharedLedger>) -> Self {
+        self.ledger = ledger;
+        self
+    }
+
+    /// Veyra's own record of closed trades, when a database is configured.
+    pub fn ledger(&self) -> Option<&crate::ledger::SharedLedger> {
+        self.ledger.as_ref()
+    }
+
+    /// Attaches the audit trail, if any.
     pub fn with_audit(mut self, audit: Option<AuditRuntime>) -> Self {
         self.audit = audit;
         self

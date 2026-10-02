@@ -1,10 +1,10 @@
 //! Realized-trade observations for the assistant: closed trades and
 //! performance, both from the terminal's account history.
 //!
-//! Read-only boundary: the only broker interaction is the existing
-//! `order_history` command for the Veyra magic number — the same path the
-//! `/performance` route uses, with its 1–365 day window and 256-order
-//! terminal cap. It never reaches an order path. Broker-clock times are
+//! Read-only boundary: closed trades come through [`crate::ledger`], the same
+//! path the `/performance` route uses: the terminal's `order_history` answer
+//! for the Veyra magic number is recorded in Veyra's own ledger and read back
+//! from it, with a 1–365 day window. It never reaches an order path. Broker-clock times are
 //! converted to UTC with [`BrokerClock`] before any time filter applies.
 
 use serde_json::{Map, Value, json};
@@ -16,13 +16,7 @@ use super::clock::{
     utc_text,
 };
 use crate::AppState;
-use crate::broker::{
-    ClosedTradePayload, CommandPayload, CommandState, ORDER_MAGIC, OrderHistoryPayload,
-    OrderHistoryRequest, PositionKind,
-};
-
-/// How long one history request may wait for the terminal.
-const HISTORY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+use crate::broker::{ClosedTradePayload, OrderHistoryPayload, OrderHistoryRequest, PositionKind};
 
 /// Scope statement attached to every history result.
 const HISTORY_SCOPE: &str =
@@ -37,27 +31,20 @@ pub(super) async fn fetch_history(
     state: &AppState,
     days: u32,
 ) -> Result<OrderHistoryPayload, String> {
-    let broker = state
-        .broker()
-        .ok_or_else(|| "broker_unavailable".to_owned())?;
-    let request = OrderHistoryRequest::new(days, ORDER_MAGIC)
-        .map_err(|_| "invalid_history_window: days must be from 1 through 365".to_owned())?;
-    let link = broker.link();
-    let id = link.enqueue_order_history(request);
-    match link.await_command(id, HISTORY_WAIT).await {
-        CommandState::Completed {
-            payload: CommandPayload::OrderHistory(history),
-        } => Ok(history),
-        CommandState::Completed { .. } => {
-            Err("order_history_failed: the terminal answered with a different payload".to_owned())
+    use crate::ledger::HistoryError;
+    match crate::ledger::closed_trades(state, days).await {
+        Ok(history) => Ok(history.payload()),
+        Err(HistoryError::InvalidWindow) => {
+            Err("invalid_history_window: days must be from 1 through 365".to_owned())
         }
-        CommandState::Failed { reason } => Err(format!(
+        Err(HistoryError::Unavailable) => Err("broker_unavailable".to_owned()),
+        Err(HistoryError::Failed(reason)) if reason.contains("pending") => {
+            Err("order_history_timeout: the terminal did not answer within 20 s".to_owned())
+        }
+        Err(HistoryError::Failed(reason)) => Err(format!(
             "order_history_failed: {}",
             super::bounded::clip(&reason, 200)
         )),
-        CommandState::Pending => {
-            Err("order_history_timeout: the terminal did not answer within 20 s".to_owned())
-        }
     }
 }
 
@@ -284,6 +271,7 @@ pub(super) async fn performance(state: &AppState, arguments: &Value) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broker::ORDER_MAGIC;
 
     fn trade(
         ticket: i64,

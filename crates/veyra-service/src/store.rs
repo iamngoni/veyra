@@ -327,6 +327,103 @@ fn filtered_query(query: &AuditQuery) -> QueryBuilder<'static, Postgres> {
     builder
 }
 
+#[async_trait]
+impl crate::ledger::TradeLedger for Store {
+    async fn record_trades(
+        &self,
+        trades: &[crate::broker::ClosedTradePayload],
+    ) -> Result<usize, crate::ledger::LedgerError> {
+        if trades.is_empty() {
+            return Ok(0);
+        }
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "insert into closed_trades (ticket, symbol, kind, lots, open_price, close_price, \
+             open_time, close_time, profit, swap, commission, magic) ",
+        );
+        let mut rows = Vec::with_capacity(trades.len());
+        for trade in trades {
+            let kind = serde_json::to_value(trade.kind)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or_else(|| crate::ledger::LedgerError {
+                    reason: "trade kind has no text form".to_owned(),
+                })?;
+            rows.push((trade, kind));
+        }
+        builder.push_values(rows, |mut row, (trade, kind)| {
+            row.push_bind(trade.ticket)
+                .push_bind(trade.symbol.clone())
+                .push_bind(kind)
+                .push_bind(trade.lots)
+                .push_bind(trade.open_price)
+                .push_bind(trade.close_price)
+                .push_bind(trade.open_time)
+                .push_bind(trade.close_time)
+                .push_bind(trade.profit)
+                .push_bind(trade.swap)
+                .push_bind(trade.commission)
+                .push_bind(i64::from(trade.magic));
+        });
+        builder.push(
+            " on conflict (ticket) do update set symbol = excluded.symbol, kind = excluded.kind, \
+             lots = excluded.lots, open_price = excluded.open_price, \
+             close_price = excluded.close_price, open_time = excluded.open_time, \
+             close_time = excluded.close_time, profit = excluded.profit, swap = excluded.swap, \
+             commission = excluded.commission, magic = excluded.magic, updated_at = now()",
+        );
+        let result = builder.build().execute(&self.pool).await.map_err(|error| {
+            crate::ledger::LedgerError {
+                reason: format!("record closed trades failed: {error}"),
+            }
+        })?;
+        Ok(usize::try_from(result.rows_affected()).unwrap_or(usize::MAX))
+    }
+
+    async fn closed_since(
+        &self,
+        since: i64,
+        magic: u32,
+    ) -> Result<Vec<crate::broker::ClosedTradePayload>, crate::ledger::LedgerError> {
+        let rows = sqlx::query(
+            "select ticket, symbol, kind, lots, open_price, close_price, open_time, close_time, \
+                    profit, swap, commission, magic \
+             from closed_trades where magic = $1 and close_time >= $2 \
+             order by close_time desc, ticket desc",
+        )
+        .bind(i64::from(magic))
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| crate::ledger::LedgerError {
+            reason: format!("read closed trades failed: {error}"),
+        })?;
+        rows.into_iter()
+            .map(|row| {
+                let kind: String = row.get("kind");
+                let kind = serde_json::from_value(Value::String(kind.clone())).map_err(|_| {
+                    crate::ledger::LedgerError {
+                        reason: format!("stored trade kind `{kind}` is unknown"),
+                    }
+                })?;
+                Ok(crate::broker::ClosedTradePayload {
+                    ticket: row.get("ticket"),
+                    symbol: row.get("symbol"),
+                    kind,
+                    lots: row.get("lots"),
+                    open_price: row.get("open_price"),
+                    close_price: row.get("close_price"),
+                    open_time: row.get("open_time"),
+                    close_time: row.get("close_time"),
+                    profit: row.get("profit"),
+                    swap: row.get("swap"),
+                    commission: row.get("commission"),
+                    magic: u32::try_from(row.get::<i64, _>("magic")).unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+}
+
 fn storage_error(action: &str, error: &impl std::fmt::Display) -> AuditError {
     AuditError::Storage {
         reason: format!("{action} failed: {error}"),

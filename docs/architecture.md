@@ -295,6 +295,12 @@ Index CFDs (`SP500m`, `Nd100m` at IFC Markets) trade through the same path as FX
 
 The EA also rounds entry, stop, and target prices to the instrument's tick size (index CFDs often tick coarser than one point) and keeps a 0-digit quote at 0 digits. Not modelled yet: exchange holidays (the broker refuses orders when closed).
 
+## Closed-trade ledger
+
+Veyra keeps its own record of closed trades in `closed_trades` (migration `0007_closed_trades.sql`): one row per venue ticket with symbol, side, lots, open/close prices and broker-clock times, profit, swap, commission, and magic. It is never pruned with the audit trail.
+
+The terminal only reveals the account history its Account History tab is set to show (a restart can reset it to "Today"), so it is not a reliable source on its own. Every surface that needs closed trades — `/performance`, `/trades`, and the assistant's `closed_trades`/`performance` tools — goes through `ledger::closed_trades`: it asks the terminal for the window, upserts whatever comes back, and answers from the ledger. Responses say where the answer came from (`source`: `ledger`, `ledger_only` when the terminal did not answer, or `terminal` without a database) and carry `terminalError` when the terminal failed. A background sync backfills a year of history at startup (retrying every 15 minutes until the terminal answers), then refreshes the last 7 days every 15 minutes, so the ledger stays current even when nobody opens the console.
+
 ## Console
 
 `console/` is a TanStack Start application served by a supervised Vite preview on `http://127.0.0.1:3000`. It reads only the loopback control surface, proxying `/api` so the browser never needs cross-origin access. There is no authentication: keep it on loopback.
