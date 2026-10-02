@@ -559,6 +559,7 @@ mod tests {
             orders,
             total,
             truncated: false,
+            adjustments: Vec::new(),
         }
     }
 

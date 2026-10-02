@@ -4453,10 +4453,10 @@ mod tests {
 
         for (name, value) in [
             ("VEYRA_AUTOPILOT_ENABLED", "sure"),
-            ("VEYRA_AUTOPILOT_SYMBOL", "bad symbol"),
+            ("VEYRA_AUTOPILOT_SYMBOL", "bad/symbol"),
             ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,,GBPUSD"),
             ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,"),
-            ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,bad symbol"),
+            ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,bad/symbol"),
             (
                 "VEYRA_AUTOPILOT_SYMBOLS",
                 "A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q",
@@ -5963,6 +5963,8 @@ mod tests {
             server_time,
             leverage: 100,
             margin_level: 357.5,
+            currency: None,
+            trade_server_time: None,
         }
     }
 
@@ -5980,6 +5982,8 @@ mod tests {
             server_time: 1_758_003_600,
             leverage: 100,
             margin_level: 0.0,
+            currency: None,
+            trade_server_time: None,
         }
     }
 
@@ -7144,6 +7148,7 @@ mod tests {
             free_margin: None,
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
+            account_currency: None,
         };
 
         let priced = with_reference_prices(facts, &markets);
@@ -7467,10 +7472,10 @@ mod tests {
 
         for broken in [
             json!({"positions": {"0": {"symbol": "EURUSD", "highNetProfit": 1.0, "armed": true}}, "cooldowns": {}, "pendingFreshBaselines": []}),
-            json!({"positions": {"1": {"symbol": "bad symbol", "highNetProfit": 1.0, "armed": true}}, "cooldowns": {}, "pendingFreshBaselines": []}),
+            json!({"positions": {"1": {"symbol": "bad/symbol", "highNetProfit": 1.0, "armed": true}}, "cooldowns": {}, "pendingFreshBaselines": []}),
             json!({"positions": {"1": {"symbol": "EURUSD", "highNetProfit": -1.0, "armed": true}}, "cooldowns": {}, "pendingFreshBaselines": []}),
             json!({"positions": {}, "cooldowns": {"EURUSD": -1}, "pendingFreshBaselines": []}),
-            json!({"positions": {}, "cooldowns": {}, "pendingFreshBaselines": [], "freshMarketRequired": ["bad symbol"]}),
+            json!({"positions": {}, "cooldowns": {}, "pendingFreshBaselines": [], "freshMarketRequired": ["bad/symbol"]}),
         ] {
             assert!(
                 after_close_restart.restore_state(&broken).is_err(),

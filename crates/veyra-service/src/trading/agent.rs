@@ -914,6 +914,7 @@ mod tests {
             symbol_specs: Vec::new(),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
+            account_currency: None,
         }
     }
 
@@ -1248,7 +1249,7 @@ mod tests {
     async fn market_tool_validates_every_argument() {
         let harness = harness(vec![
             tool("get_market", json!({})),
-            tool("get_market", json!({ "symbol": "bad symbol" })),
+            tool("get_market", json!({ "symbol": "bad/symbol" })),
             tool("get_market", json!({ "symbol": "EURUSD", "bars": 0 })),
             tool("get_market", json!({ "symbol": "EURUSD", "bars": 241 })),
             tool("get_market", json!({ "symbol": "EURUSD", "bars": "ten" })),
@@ -1467,6 +1468,8 @@ mod tests {
                 server_time: 1_700_000_000,
                 leverage: 100,
                 margin_level: 0.0,
+                currency: None,
+                trade_server_time: None,
             });
         harness.state = AppState::new(config(), Some(broker), None, gate())
             .with_audit(Some(AuditRuntime::new(harness.trail.clone())));

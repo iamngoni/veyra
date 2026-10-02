@@ -185,9 +185,19 @@ pub struct AccountSnapshotPayload {
     /// Whether the terminal omitted orders beyond its own cap.
     #[serde(rename = "positionsTruncated")]
     pub positions_truncated: bool,
-    /// Terminal server time.
+    /// The terminal host's clock (`TimeLocal()`), which matches the broker
+    /// only when the host runs on broker time.
     #[serde(rename = "serverTime")]
     pub server_time: i64,
+    /// The broker's own clock at its latest quote (`TimeCurrent()`); absent
+    /// from EAs before 1.27. Preferred over `serverTime` while quotes are
+    /// fresh (see [`crate::broker_clock`]).
+    #[serde(rename = "tradeServerTime", default)]
+    pub trade_server_time: Option<i64>,
+    /// Account deposit currency (for example `USD`); absent from EAs before
+    /// 1.27.
+    #[serde(default)]
+    pub currency: Option<String>,
     /// Account leverage (for example 100 for 1:100), or zero when the
     /// terminal does not report it.
     #[serde(default)]
@@ -199,6 +209,11 @@ pub struct AccountSnapshotPayload {
 }
 
 impl AccountSnapshotPayload {
+    /// Account deposit currency in upper case, when the terminal reports it.
+    pub fn account_currency(&self) -> Option<String> {
+        self.currency.as_deref().map(str::to_ascii_uppercase)
+    }
+
     /// Rejects non-finite money values and unusable exposure data before they
     /// reach callers.
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -217,6 +232,16 @@ impl AccountSnapshotPayload {
         }
         if self.margin_level < 0.0 {
             return Err("marginLevel must be non-negative".to_owned());
+        }
+        if self.trade_server_time.is_some_and(|time| time < 0) {
+            return Err("tradeServerTime must be non-negative".to_owned());
+        }
+        if let Some(currency) = &self.currency
+            && (currency.is_empty()
+                || currency.len() > 8
+                || !currency.chars().all(|c| c.is_ascii_alphanumeric()))
+        {
+            return Err("currency must be 1-8 letters or digits".to_owned());
         }
         if self.positions.len() > MAX_POSITIONS {
             return Err(format!(
@@ -887,9 +912,121 @@ pub struct OrderHistoryPayload {
     pub total: u32,
     /// Whether the terminal omitted orders beyond its cap.
     pub truncated: bool,
+    /// Balance operations and credit in the same window (dividends,
+    /// corrections, deposits, withdrawals), newest first; absent from EAs
+    /// before 1.27.
+    #[serde(default)]
+    pub adjustments: Vec<BalanceOperationPayload>,
+}
+
+/// Kind of a non-trade account entry, as the terminal records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BalanceOperationKind {
+    /// A balance operation: dividend, correction, deposit or withdrawal.
+    Balance,
+    /// Broker credit (bonus funds), not the trader's money.
+    Credit,
+}
+
+impl BalanceOperationKind {
+    /// Stable wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Balance => "balance",
+            Self::Credit => "credit",
+        }
+    }
+
+    /// Parses a stored wire name.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "balance" => Some(Self::Balance),
+            "credit" => Some(Self::Credit),
+            _ => None,
+        }
+    }
+}
+
+/// What a balance operation most likely is, read from its kind and comment.
+/// Brokers word comments differently, so anything unrecognised stays an
+/// adjustment rather than being guessed into a category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdjustmentCategory {
+    /// An index or share CFD dividend adjustment.
+    Dividend,
+    /// Money moved in or out by the account holder.
+    Transfer,
+    /// Broker credit.
+    Credit,
+    /// Any other correction.
+    Adjustment,
+}
+
+/// One balance operation or credit entry from the account history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BalanceOperationPayload {
+    /// Venue ticket of the entry.
+    pub ticket: i64,
+    /// Balance operation or credit.
+    pub kind: BalanceOperationKind,
+    /// Signed amount in account currency.
+    pub amount: f64,
+    /// When it was booked (broker server seconds).
+    pub time: i64,
+    /// The broker's comment, as given.
+    #[serde(default)]
+    pub comment: String,
+}
+
+impl BalanceOperationPayload {
+    /// Longest comment the payload accepts.
+    pub const MAX_COMMENT: usize = 256;
+
+    /// The likely category, from the kind and the broker's comment.
+    pub fn category(&self) -> AdjustmentCategory {
+        if self.kind == BalanceOperationKind::Credit {
+            return AdjustmentCategory::Credit;
+        }
+        let comment = self.comment.to_ascii_lowercase();
+        if comment.contains("div") {
+            AdjustmentCategory::Dividend
+        } else if ["deposit", "withdraw", "transfer", "payment", "wire"]
+            .iter()
+            .any(|word| comment.contains(word))
+        {
+            AdjustmentCategory::Transfer
+        } else {
+            AdjustmentCategory::Adjustment
+        }
+    }
+
+    /// Rejects entries that cannot be recorded.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.ticket <= 0 {
+            return Err("adjustment ticket must be positive".to_owned());
+        }
+        if !self.amount.is_finite() {
+            return Err("adjustment amount must be a finite number".to_owned());
+        }
+        if self.time < 0 {
+            return Err("adjustment time must be non-negative".to_owned());
+        }
+        if self.comment.chars().count() > Self::MAX_COMMENT {
+            return Err(format!(
+                "adjustment comment must be at most {} characters",
+                Self::MAX_COMMENT
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl OrderHistoryPayload {
+    /// Largest adjustment list the payload accepts.
+    pub const MAX_ADJUSTMENTS: usize = 128;
+
     /// Largest order list the payload accepts.
     pub const MAX_ORDERS: usize = 256;
 
@@ -906,6 +1043,15 @@ impl OrderHistoryPayload {
         }
         for order in &self.orders {
             order.validate()?;
+        }
+        if self.adjustments.len() > Self::MAX_ADJUSTMENTS {
+            return Err(format!(
+                "adjustments must contain at most {} entries",
+                Self::MAX_ADJUSTMENTS
+            ));
+        }
+        for adjustment in &self.adjustments {
+            adjustment.validate()?;
         }
         Ok(())
     }

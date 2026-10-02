@@ -48,6 +48,8 @@ pub enum StateKey {
     JudgePrefs,
     /// Encrypted OpenAI Decisions API key.
     JudgeOpenAiKey,
+    /// Last broker-clock offset and terminal build (see [`crate::terminal`]).
+    Terminal,
 }
 
 impl StateKey {
@@ -68,6 +70,7 @@ impl StateKey {
             Self::NotifySecrets => "notify_secrets",
             Self::JudgePrefs => "judge_prefs",
             Self::JudgeOpenAiKey => "judge_openai_key",
+            Self::Terminal => "terminal",
         }
     }
 }

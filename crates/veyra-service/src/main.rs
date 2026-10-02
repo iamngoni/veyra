@@ -221,6 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Veyra's own closed-trade record: a one-year backfill from the
     // terminal, then a week every 15 minutes (read-only history commands).
     actix_web::rt::spawn(veyra_service::ledger::sync_forever(state.clone()));
+    actix_web::rt::spawn(veyra_service::terminal::watch(state.clone()));
 
     // Notification sources: read-only watchers of the audit feed and of
     // health transitions. They only queue messages; delivery never blocks.
@@ -437,6 +438,11 @@ async fn restore_runtime_state(state: &AppState, runtime: &RuntimeState) {
     {
         tracing::warn!(%error, "stored equity baselines are unusable; re-baselining");
     }
+    if let Some(value) = runtime.load(StateKey::Terminal).await
+        && let Err(error) = state.terminal_memory().restore_state(&value)
+    {
+        tracing::warn!(%error, "stored terminal memory is unusable; re-learning");
+    }
     if let Some(value) = runtime.load(StateKey::StopBasis).await
         && let Err(error) = state.stop_basis().restore_state(&value)
     {
@@ -472,6 +478,12 @@ async fn persist_runtime_state(state: &AppState, runtime: &RuntimeState) {
         .await;
     runtime
         .save(StateKey::StopBasis, &state.stop_basis().state_snapshot())
+        .await;
+    runtime
+        .save(
+            StateKey::Terminal,
+            &state.terminal_memory().state_snapshot(),
+        )
         .await;
     runtime
         .save(

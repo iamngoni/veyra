@@ -129,7 +129,19 @@ export type RiskPolicy = {
   allowTradingWithoutJev: boolean
   /** What happens to open positions in the final hours before Friday's close. */
   weekendPositions: WeekendPositions
+  /** When the daily-loss day starts; absent from older services (UTC). */
+  dailyLossReset?: DailyLossReset
+  /** What the daily loss is measured from; absent from older services (equity). */
+  dailyLossBasis?: DailyLossBasis
+  /** Fixed balance the peak brake measures from; 0 or absent uses the highest equity. */
+  drawdownReference?: number
 }
+
+/** When the daily-loss day starts: UTC midnight or the broker server's midnight. */
+export type DailyLossReset = 'utc' | 'broker'
+
+/** What the daily loss is measured from at the start of the day. */
+export type DailyLossBasis = 'equity' | 'balance' | 'higher'
 
 export type Metrics = {
   service: string
@@ -184,6 +196,16 @@ export type Account = {
   positions?: Position[]
   positionsTruncated?: boolean
   serverTime?: number
+  /** Account deposit currency, e.g. `USD`; absent from EAs before 1.27. */
+  currency?: string | null
+  /** Terminal build the EA reports; absent from EAs before 1.27. */
+  terminalBuild?: number | null
+  /** EA version the terminal runs; absent from EAs before 1.27. */
+  eaVersion?: string | null
+  /** The service's own broker clock offset from UTC, when it knows it. */
+  brokerOffsetSecs?: number
+  /** What that offset was measured from. */
+  clockBasis?: 'quote' | 'remembered' | 'host_clock'
 }
 
 export type FeedEvent = {
@@ -273,6 +295,21 @@ export type Performance = {
   trades: ClosedTrade[]
   total: number
   truncated: boolean
+  /** Balance operations in the window, by category; absent from older services. */
+  adjustments?: AdjustmentSummary
+}
+
+/** Non-trade account entries in a window, summed by what they most likely are. */
+export type AdjustmentSummary = {
+  count: number
+  /** Dividend adjustments on index and share CFDs. */
+  dividends: number
+  /** Other broker corrections. */
+  other: number
+  /** Deposits and withdrawals. */
+  transfers: number
+  /** Broker credit. */
+  credit: number
 }
 
 /** Why a closed Veyra trade left the book, as `/trades` reports it. */
@@ -387,6 +424,9 @@ export type RiskPolicyPatch = {
   minStopAtrFraction?: number
   allowTradingWithoutJev?: boolean
   weekendPositions?: WeekendPositions
+  dailyLossReset?: DailyLossReset
+  dailyLossBasis?: DailyLossBasis
+  drawdownReference?: number
 }
 
 export type CommandRecord = {

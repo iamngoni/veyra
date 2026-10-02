@@ -13,11 +13,12 @@ pub mod settings;
 
 /// Provider-neutral command and report types every venue integration speaks.
 pub use command::{
-    AccountSnapshotPayload, CandlePayload, CloseOrderRequest, ClosedTradePayload, CommandId,
-    CommandKind, CommandPayload, CommandRecord, CommandState, ListedCommand, ModifyOrderRequest,
-    ORDER_MAGIC, OrderCheckPayload, OrderExecutionPayload, OrderHistoryPayload,
-    OrderHistoryRequest, OrderRequest, PositionKind, PositionPayload, RatesPayload, RatesRequest,
-    SUPPORTED_TIMEFRAME_MINUTES, SymbolSpecPayload, SymbolSpecRequest, TradeSession,
+    AccountSnapshotPayload, AdjustmentCategory, BalanceOperationKind, BalanceOperationPayload,
+    CandlePayload, CloseOrderRequest, ClosedTradePayload, CommandId, CommandKind, CommandPayload,
+    CommandRecord, CommandState, ListedCommand, ModifyOrderRequest, ORDER_MAGIC, OrderCheckPayload,
+    OrderExecutionPayload, OrderHistoryPayload, OrderHistoryRequest, OrderRequest, PositionKind,
+    PositionPayload, RatesPayload, RatesRequest, SUPPORTED_TIMEFRAME_MINUTES, SymbolSpecPayload,
+    SymbolSpecRequest, TradeSession,
 };
 /// EA-specific transport surface, used by the EA server and its contract tests.
 pub use ea::{EaErrorBody, EaLink, EaPoll, EaReply, build_server, create_ea_app};
@@ -133,6 +134,27 @@ impl AccountLogin {
     }
 }
 
+/// See [`Symbol::six_letter_code`]; also used for raw names that have not
+/// been parsed into a [`Symbol`].
+///
+/// Only the suffixes brokers use for account types count: one after a
+/// separator (`.raw`, `-ECN`, `_i`, `+`) or a short lower-case tag (`m`,
+/// `pro`). Anything else after the six letters (`EURUSDX`, `EURUSDZ6`) may be
+/// a different contract, so it yields `None` and the instrument needs its
+/// live specification.
+pub fn six_letter_code(name: &str) -> Option<String> {
+    let trimmed = name.trim_start_matches(['#', '.']);
+    if !trimmed.is_ascii() || trimmed.len() < 6 {
+        return None;
+    }
+    let (code, rest) = trimmed.split_at(6);
+    let plain_suffix = rest.is_empty()
+        || rest.starts_with(['.', '-', '_', '+', '#'])
+        || (rest.len() <= 4 && rest.chars().all(|c| c.is_ascii_lowercase()));
+    (plain_suffix && code.chars().all(|c| c.is_ascii_alphabetic()))
+        .then(|| code.to_ascii_uppercase())
+}
+
 /// Validated instrument symbol (for example `EURUSD` or `SP500m`).
 ///
 /// The broker's spelling is kept as given, because MT4 names can be
@@ -151,22 +173,38 @@ impl PartialEq for Symbol {
 impl Eq for Symbol {}
 
 impl Symbol {
-    /// Parses a symbol: 1-24 characters of `[A-Za-z0-9._#+-]`.
+    /// Longest symbol accepted. MT5 venues name synthetic indices in words
+    /// (`Volatility 100 (1s) Index`).
+    pub const MAX_LEN: usize = 32;
+
+    /// Parses a symbol: 1-32 characters of letters, digits, `. _ # + -`,
+    /// parentheses, and single spaces between words.
     pub fn parse(value: &str) -> Result<Self, BrokerError> {
         let trimmed = value.trim();
         let valid = !trimmed.is_empty()
-            && trimmed.len() <= 24
-            && trimmed
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '#' | '+' | '-'));
+            && trimmed.len() <= Self::MAX_LEN
+            && !trimmed.contains("  ")
+            && trimmed.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '.' | '_' | '#' | '+' | '-' | '(' | ')' | ' ')
+            });
         if valid {
             Ok(Self(trimmed.to_owned()))
         } else {
             Err(BrokerError::InvalidPayload {
                 field: "symbol",
-                reason: "must be 1-24 characters of letters, digits, '.', '_', '#', '+' or '-'",
+                reason: "must be 1-32 characters of letters, digits, '.', '_', '#', '+', '-', parentheses or single spaces",
             })
         }
+    }
+
+    /// The six-letter instrument code inside a broker's name, in upper case:
+    /// `EURUSD` for `EURUSD`, `EURUSDm`, `EURUSD.raw`, `EURUSD-ECN` or
+    /// `#EURUSD`. `None` when the name does not start with six letters
+    /// (`SP500m`, `Volatility 75 Index`). Whether the code is a currency
+    /// pair is the caller's question.
+    pub fn six_letter_code(&self) -> Option<String> {
+        six_letter_code(&self.0)
     }
 
     /// Returns the validated symbol.
@@ -186,6 +224,8 @@ pub struct AccountSnapshot {
     live_orders: bool,
     open_orders: u32,
     open_lots: f64,
+    terminal_build: Option<u32>,
+    ea_version: Option<String>,
 }
 
 impl AccountSnapshot {
@@ -210,7 +250,27 @@ impl AccountSnapshot {
             live_orders: false,
             open_orders,
             open_lots,
+            terminal_build: None,
+            ea_version: None,
         }
+    }
+
+    /// Records the terminal build and EA version the heartbeat reported
+    /// (both absent from EAs before 1.27).
+    pub fn with_terminal(mut self, build: Option<u32>, ea_version: Option<String>) -> Self {
+        self.terminal_build = build.filter(|build| *build > 0);
+        self.ea_version = ea_version;
+        self
+    }
+
+    /// Terminal build, when the EA reports it.
+    pub fn terminal_build(&self) -> Option<u32> {
+        self.terminal_build
+    }
+
+    /// EA version, when the EA reports it.
+    pub fn ea_version(&self) -> Option<&str> {
+        self.ea_version.as_deref()
     }
 
     /// Records whether the terminal's EA is armed for live orders.
@@ -568,9 +628,41 @@ mod tests {
             Symbol::parse("US100.cash").expect("valid").as_str(),
             "US100.cash"
         );
-        for bad in ["", "  ", "has space", "bad$char", &"A".repeat(25)] {
+        // Worded MT5 names are symbols too.
+        assert_eq!(
+            Symbol::parse("Volatility 100 (1s) Index")
+                .expect("valid")
+                .as_str(),
+            "Volatility 100 (1s) Index"
+        );
+        for bad in ["", "  ", "two  spaces", "bad$char", "a/b", &"A".repeat(33)] {
             assert!(Symbol::parse(bad).is_err(), "must reject: {bad:?}");
         }
+        for (name, code) in [
+            ("EURUSD", Some("EURUSD")),
+            ("eurusd", Some("EURUSD")),
+            ("EURUSDm", Some("EURUSD")),
+            ("EURUSDpro", Some("EURUSD")),
+            ("EURUSD.raw", Some("EURUSD")),
+            ("EURUSD-ECN", Some("EURUSD")),
+            ("EURUSD+", Some("EURUSD")),
+            ("#EURUSD", Some("EURUSD")),
+            ("EURUSDX", None),
+            ("EURUSDZ6", None),
+            ("EURUSDmicro", None),
+            ("SP500m", None),
+            ("Volatility 75 Index", None),
+            ("EUR", None),
+        ] {
+            assert_eq!(six_letter_code(name).as_deref(), code, "{name}");
+        }
+        assert_eq!(
+            Symbol::parse("GBPUSDm")
+                .expect("valid")
+                .six_letter_code()
+                .as_deref(),
+            Some("GBPUSD")
+        );
     }
 
     #[test]

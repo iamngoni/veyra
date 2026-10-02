@@ -289,3 +289,52 @@ async fn postgres_ledger_upserts_and_reads_closed_trades() {
             .is_empty()
     );
 }
+
+#[actix_web::test]
+#[ignore = "requires VEYRA_DATABASE_URL and a running PostgreSQL server"]
+async fn postgres_ledger_upserts_and_reads_balance_operations() {
+    use veyra_service::broker::{BalanceOperationKind, BalanceOperationPayload};
+    use veyra_service::ledger::TradeLedger;
+
+    let url =
+        std::env::var("VEYRA_DATABASE_URL").expect("VEYRA_DATABASE_URL must be set (source .env)");
+    let store = Store::connect(&url)
+        .await
+        .expect("postgres must accept the connection");
+    store.migrate().await.expect("migrations must run");
+    let ticket = i64::from(uuid::Uuid::new_v4().as_u128() as u32) + 1_000_000_000;
+    let entry = |ticket: i64, time: i64, amount: f64, kind| BalanceOperationPayload {
+        ticket,
+        kind,
+        amount,
+        time,
+        comment: "Dividend \"SP500m\"".to_owned(),
+    };
+    assert_eq!(store.record_adjustments(&[]).await.expect("empty"), 0);
+    store
+        .record_adjustments(&[
+            entry(ticket, 4_000_000_000, -0.12, BalanceOperationKind::Balance),
+            entry(ticket + 1, 4_000_000_100, 5.0, BalanceOperationKind::Credit),
+        ])
+        .await
+        .expect("insert");
+    store
+        .record_adjustments(&[entry(
+            ticket,
+            4_000_000_000,
+            -0.15,
+            BalanceOperationKind::Balance,
+        )])
+        .await
+        .expect("upsert");
+    let found = store.adjustments_since(4_000_000_000).await.expect("read");
+    let mine: Vec<_> = found
+        .iter()
+        .filter(|row| row.ticket == ticket || row.ticket == ticket + 1)
+        .collect();
+    assert_eq!(mine.len(), 2);
+    assert_eq!(mine[0].ticket, ticket + 1, "newest first");
+    assert_eq!(mine[0].kind, BalanceOperationKind::Credit);
+    assert_eq!(mine[1].amount, -0.15, "upsert replaced the row");
+    assert_eq!(mine[1].comment, "Dividend \"SP500m\"");
+}

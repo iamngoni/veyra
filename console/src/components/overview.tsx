@@ -440,7 +440,10 @@ export function OpenPositions({
 
 /* ---------- 30-day performance ---------- */
 
-type Stat = { label: string; value: ReactNode; tone?: string; sub?: string; subTone?: string }
+type Stat = { label: string; value: ReactNode; tone?: string; sub?: string; subTone?: string; subTitle?: string }
+
+const ADJUSTMENTS_HELP =
+  'Dividend adjustments and corrections the broker booked in the window, outside trade P/L. Deposits, withdrawals and credit are left out.'
 
 function stats(performance: Performance, balance: number | undefined): Stat[] {
   const report = performance.report
@@ -452,9 +455,14 @@ function stats(performance: Performance, balance: number | undefined): Stat[] {
     ]
   }
   const net = report.net_profit
+  // Booked adjustments (dividends, corrections) sit beside trade P/L; money
+  // moved in or out is neither, but it did change the balance.
+  const adjustments = performance.adjustments
+  const booked = adjustments ? adjustments.dividends + adjustments.other : 0
+  const moved = adjustments?.transfers ?? 0
   // Return on the balance the window started from; meaningless when the
   // window's result is the whole balance or more.
-  const start = balance === undefined ? 0 : balance - net
+  const start = balance === undefined ? 0 : balance - net - booked - moved
   const record = [
     plural(report.wins, 'win', 'wins'),
     plural(report.losses, 'loss', 'losses'),
@@ -466,8 +474,15 @@ function stats(performance: Performance, balance: number | undefined): Stat[] {
       label: 'Net P/L',
       value: signedAmount(net),
       tone: signTone(net),
-      sub: start > 0 ? signedPercent((net / start) * 100, 1) : undefined,
+      sub:
+        [
+          start > 0 ? signedPercent((net / start) * 100, 1) : undefined,
+          booked !== 0 ? `adjustments ${signedAmount(booked)}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(' · ') || undefined,
       subTone: toneOrMuted(net),
+      subTitle: booked !== 0 ? ADJUSTMENTS_HELP : undefined,
     },
     {
       label: 'Closed trades',
@@ -506,7 +521,9 @@ export function PerformanceSummary({
             <div key={item.label} className="perf-stat">
               <dt className="perf-label">{item.label}</dt>
               <dd className={`perf-value ${item.tone ?? ''}`}>{item.value}</dd>
-              <dd className={`perf-sub ${item.subTone ?? ''}`}>{item.sub}</dd>
+              <dd className={`perf-sub ${item.subTone ?? ''}`} title={item.subTitle}>
+                {item.sub}
+              </dd>
             </div>
           ))}
         </dl>

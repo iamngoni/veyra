@@ -132,6 +132,8 @@ fn fixture_with(server_time: Option<i64>, positions: Vec<PositionPayload>) -> Fi
             server_time,
             leverage: 100,
             margin_level: 0.0,
+            currency: None,
+            trade_server_time: None,
         });
     }
     let trail = Arc::new(MemoryTrail::default());
@@ -434,7 +436,7 @@ async fn closed_trades_validates_before_queueing_anything() {
         (json!({"days": 0}), "days must be an integer"),
         (json!({"days": 400}), "days must be an integer"),
         (json!({"utc_offset_minutes": 900}), "utc_offset_minutes"),
-        (json!({"symbol": "not a symbol"}), "symbol must be"),
+        (json!({"symbol": "not/a/symbol"}), "symbol must be"),
     ] {
         let error = Tool::ClosedTrades
             .read(&fixture.state, &arguments)
@@ -718,7 +720,7 @@ async fn decision_history_filters_the_durable_trail() {
             "since must be before until",
         ),
         (json!({"ticket": 0}), "ticket must be an integer"),
-        (json!({"symbol": "no spaces"}), "symbol must be"),
+        (json!({"symbol": "no/slashes"}), "symbol must be"),
         (
             json!({"extra": true}),
             "unsupported decision_history argument",
@@ -1071,6 +1073,8 @@ async fn completed_command_details_stay_bounded_and_balance_free() {
         server_time: now(),
         leverage: 100,
         margin_level: 0.0,
+        currency: None,
+        trade_server_time: None,
     };
     let detail = super::journal::command_detail(&CommandPayload::AccountSnapshot(snapshot));
     assert_eq!(detail["tickets"], json!([1]));
@@ -1132,6 +1136,7 @@ async fn completed_command_details_stay_bounded_and_balance_free() {
             }],
             total: 1,
             truncated: false,
+            adjustments: Vec::new(),
         }));
     assert_eq!(history["tickets"], json!([9]));
 }

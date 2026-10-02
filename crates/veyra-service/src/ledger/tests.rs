@@ -125,3 +125,80 @@ async fn sync_does_nothing_without_a_ledger_or_broker() {
     sync_forever(state(None, 1_000)).await;
     sync_forever(state(Some(Arc::new(MemoryLedger::default())), 1_000)).await;
 }
+
+fn adjustment(ticket: i64, time: i64, amount: f64, comment: &str) -> BalanceOperationPayload {
+    BalanceOperationPayload {
+        ticket,
+        kind: crate::broker::BalanceOperationKind::Balance,
+        amount,
+        time,
+        comment: comment.to_owned(),
+    }
+}
+
+#[actix_web::test]
+async fn the_memory_ledger_keeps_balance_operations_by_ticket() {
+    let ledger = MemoryLedger::default();
+    assert_eq!(
+        ledger
+            .record_adjustments(&[
+                adjustment(1, 1_000, -0.12, "Dividend US500"),
+                adjustment(2, 3_000, 50.0, "Deposit"),
+            ])
+            .await
+            .expect("recorded"),
+        2
+    );
+    // A later answer for the same ticket replaces it.
+    ledger
+        .record_adjustments(&[adjustment(2, 3_000, 60.0, "Deposit")])
+        .await
+        .expect("upsert");
+    let recent = ledger.adjustments_since(2_000).await.expect("read");
+    assert_eq!(recent.len(), 1);
+    assert!((recent[0].amount - 60.0).abs() < 1e-9);
+    let all = ledger.adjustments_since(0).await.expect("read");
+    assert_eq!(
+        all.iter().map(|entry| entry.ticket).collect::<Vec<_>>(),
+        vec![2, 1],
+        "newest first"
+    );
+}
+
+#[test]
+fn adjustments_are_summed_by_category() {
+    let mut credit = adjustment(4, 4, 10.0, "bonus");
+    credit.kind = crate::broker::BalanceOperationKind::Credit;
+    let summary = AdjustmentSummary::of(&[
+        adjustment(1, 1, -0.12, "Dividend US500"),
+        adjustment(2, 2, -0.08, "div adj NDX"),
+        adjustment(3, 3, 0.05, "correction"),
+        adjustment(5, 5, 100.0, "Deposit via card"),
+        adjustment(6, 6, -20.0, "Withdrawal"),
+        credit,
+    ]);
+    assert_eq!(summary.count, 6);
+    assert!((summary.dividends + 0.20).abs() < 1e-9);
+    assert!((summary.other - 0.05).abs() < 1e-9);
+    assert!((summary.transfers - 80.0).abs() < 1e-9);
+    assert!((summary.credit - 10.0).abs() < 1e-9);
+    assert_eq!(AdjustmentSummary::of(&[]), AdjustmentSummary::default());
+}
+
+#[actix_web::test]
+async fn the_ledger_answers_with_its_balance_operations() {
+    let now = 10 * 86_400;
+    let ledger: SharedLedger = Arc::new(MemoryLedger::default());
+    ledger
+        .record_adjustments(&[
+            adjustment(1, now - 86_400, -0.12, "Dividend"),
+            adjustment(2, now - 40 * 86_400, 5.0, "old"),
+        ])
+        .await
+        .expect("seeded");
+    let history = closed_trades(&state(Some(ledger), now), 30)
+        .await
+        .expect("answered");
+    assert_eq!(history.adjustments.len(), 1, "only the 30-day window");
+    assert_eq!(history.payload().adjustments.len(), 1);
+}

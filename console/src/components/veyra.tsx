@@ -22,6 +22,8 @@ import type {
   MarketSessions,
   Metrics,
   ModelCooldown,
+  DailyLossBasis,
+  DailyLossReset,
   RiskPolicy,
   RiskPolicyPatch,
   Status,
@@ -192,6 +194,21 @@ function isoTime(ms: number): string | undefined {
 
 /* ---------- account ---------- */
 
+/** Where the service's broker-clock offset came from. */
+const CLOCK_BASIS: Record<NonNullable<Account['clockBasis']>, string> = {
+  quote: 'live quotes',
+  remembered: 'last live quote',
+  host_clock: 'terminal host clock',
+}
+
+/** `UTC+02:00` for an offset in seconds. */
+function utcOffset(secs: number): string {
+  const minutes = Math.abs(secs) / 60
+  const hh = String(Math.floor(minutes / 60)).padStart(2, '0')
+  const mm = String(minutes % 60).padStart(2, '0')
+  return `UTC${secs < 0 ? '−' : '+'}${hh}:${mm}`
+}
+
 export function AccountPanel({ account, error }: { account?: Account; error?: string }) {
   // Nothing on screen is invented: before the first poll every value is a
   // skeleton, and after a failed one it is a dash.
@@ -229,6 +246,27 @@ export function AccountPanel({ account, error }: { account?: Account; error?: st
         />
         <Field label="Server" value={show(Boolean(account?.server), () => String(account?.server))} />
         <Field label="Login" value={show(account?.login != null, () => String(account?.login))} />
+        <Field label="Currency" value={show(Boolean(account?.currency), () => String(account?.currency))} />
+        <Field
+          label="Terminal"
+          value={show(account?.terminalBuild != null, () =>
+            [`Build ${account?.terminalBuild}`, account?.eaVersion ? `EA ${account.eaVersion}` : null]
+              .filter(Boolean)
+              .join(' · '),
+          )}
+        />
+        <Field
+          label="Broker clock"
+          value={show(typeof account?.brokerOffsetSecs === 'number', () =>
+            [
+              utcOffset(account?.brokerOffsetSecs ?? 0),
+              account?.clockBasis ? CLOCK_BASIS[account.clockBasis] : null,
+            ]
+              .filter(Boolean)
+              .join(' · '),
+          )}
+          tone={account?.clockBasis === 'host_clock' ? 'tone-warn' : undefined}
+        />
       </Fields>
     </Panel>
   )
@@ -288,6 +326,17 @@ const WEEKEND_LABELS: Record<WeekendPositions, string> = {
   agent: 'Analyst decides',
   hold: 'Held through',
   flatten: 'Flattened before close',
+}
+
+const RESET_LABELS: Record<DailyLossReset, string> = {
+  utc: 'UTC midnight',
+  broker: 'Broker midnight',
+}
+
+const BASIS_LABELS: Record<DailyLossBasis, string> = {
+  equity: 'Day-start equity',
+  balance: 'Day-start balance',
+  higher: 'Higher of the two',
 }
 
 /**
@@ -630,6 +679,8 @@ type PolicyDraft = {
   killSwitch: boolean
   allowTradingWithoutJev: boolean
   weekendPositions: WeekendPositions
+  dailyLossReset: DailyLossReset
+  dailyLossBasis: DailyLossBasis
   symbols: string
   weekendSymbols: string
   maxVolumePerOrder: string
@@ -643,6 +694,7 @@ type PolicyDraft = {
   maxNetFactorLots: string
   calendarBlackoutMinutes: string
   minStopAtrFraction: string
+  drawdownReference: string
 }
 
 type NumericDraftKey =
@@ -656,6 +708,7 @@ type NumericDraftKey =
   | 'maxNetFactorLots'
   | 'calendarBlackoutMinutes'
   | 'minStopAtrFraction'
+  | 'drawdownReference'
 
 const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer: boolean; help: string }> = [
   {
@@ -692,13 +745,19 @@ const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer
     key: 'maxDailyLossPercent',
     label: 'Daily brake (%)',
     integer: false,
-    help: "Refuses new orders once equity is this many percent below the day's opening equity; 0 is off.",
+    help: "Refuses new orders once equity is this many percent below the day's starting point; 0 is off.",
   },
   {
     key: 'maxPeakDrawdownPercent',
     label: 'Peak brake (%)',
     integer: false,
-    help: 'Refuses new orders once equity is this many percent below its highest point; 0 is off.',
+    help: 'Refuses new orders once equity is this many percent below its highest point, or below the peak reference when one is set; 0 is off.',
+  },
+  {
+    key: 'drawdownReference',
+    label: 'Peak reference',
+    integer: false,
+    help: "A fixed balance the peak brake measures from, such as a prop account's starting balance; 0 uses the highest equity reached.",
   },
   {
     key: 'maxNetFactorLots',
@@ -728,6 +787,9 @@ const POLICY_HELP = {
   weekendSymbols: 'Instruments from Symbols whose market trades through the weekend, such as BTCUSD.',
   sessionUtc: 'UTC hours in which new orders are allowed, such as 7-21 or 22-6 across midnight; empty is always.',
   weekendPositions: "What happens to open positions before Friday's close.",
+  dailyLossReset: "When the daily brake's day starts. Most prop firms reset at the broker's midnight.",
+  dailyLossBasis:
+    'What the daily brake measures from at the start of the day: equity includes floating profit, balance does not.',
 }
 
 function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
@@ -735,6 +797,8 @@ function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
     killSwitch: policy.killSwitch,
     allowTradingWithoutJev: policy.allowTradingWithoutJev,
     weekendPositions: policy.weekendPositions,
+    dailyLossReset: policy.dailyLossReset ?? 'utc',
+    dailyLossBasis: policy.dailyLossBasis ?? 'equity',
     symbols: policy.symbols.join(', '),
     weekendSymbols: (policy.weekendSymbols ?? []).join(', '),
     maxVolumePerOrder: String(policy.maxVolumePerOrder),
@@ -748,6 +812,7 @@ function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
     maxNetFactorLots: String(policy.maxNetFactorLots),
     calendarBlackoutMinutes: String(policy.calendarBlackoutMinutes),
     minStopAtrFraction: String(policy.minStopAtrFraction),
+    drawdownReference: String(policy.drawdownReference ?? 0),
   }
 }
 
@@ -757,6 +822,8 @@ function patchFromDraft(draft: PolicyDraft): { patch: RiskPolicyPatch } | { erro
     killSwitch: draft.killSwitch,
     allowTradingWithoutJev: draft.allowTradingWithoutJev,
     weekendPositions: draft.weekendPositions,
+    dailyLossReset: draft.dailyLossReset,
+    dailyLossBasis: draft.dailyLossBasis,
     symbols: draft.symbols
       .split(',')
       .map((symbol) => symbol.trim())
@@ -781,27 +848,30 @@ function patchFromDraft(draft: PolicyDraft): { patch: RiskPolicyPatch } | { erro
   return { patch }
 }
 
-/** The weekend preference is a choice, not free text. */
-function WeekendControl({
+/** A closed set of policy choices is a menu, not free text. */
+function ChoiceControl<T extends string>({
+  label,
+  help,
   value,
+  options,
   onChange,
 }: {
-  value: WeekendPositions
-  onChange: (value: WeekendPositions) => void
+  label: string
+  help: string
+  value: T
+  options: Array<[T, string]>
+  onChange: (value: T) => void
 }) {
   const id = useId()
   return (
-    <Control id={id} label="Weekend positions" help={POLICY_HELP.weekendPositions}>
+    <Control id={id} label={label} help={help}>
       <span className="tab-select">
-        <select
-          id={id}
-          className="tab-input"
-          value={value}
-          onChange={(event) => onChange(event.target.value as WeekendPositions)}
-        >
-          <option value="agent">Agent decides per position</option>
-          <option value="hold">Hold through the weekend</option>
-          <option value="flatten">Flatten before the close</option>
+        <select id={id} className="tab-input" value={value} onChange={(event) => onChange(event.target.value as T)}>
+          {options.map(([option, text]) => (
+            <option key={option} value={option}>
+              {text}
+            </option>
+          ))}
         </select>
         <Icon name="chevron-down" size={16} />
       </span>
@@ -865,8 +935,8 @@ export function RiskPanel({
   }
   const flip = (key: 'killSwitch' | 'allowTradingWithoutJev') =>
     setDraft((current) => current && { ...current, [key]: !current[key] })
-  const setWeekend = (value: WeekendPositions) =>
-    setDraft((current) => current && { ...current, weekendPositions: value })
+  const choose = <K extends 'weekendPositions' | 'dailyLossReset' | 'dailyLossBasis'>(key: K) => (value: PolicyDraft[K]) =>
+    setDraft((current) => current && { ...current, [key]: value })
   const save = async (apply: (patch: RiskPolicyPatch) => Promise<string | undefined>, current: PolicyDraft) => {
     const parsed = patchFromDraft(current)
     if ('error' in parsed) {
@@ -942,7 +1012,38 @@ export function RiskPanel({
             help={POLICY_HELP.sessionUtc}
             placeholder="Always open"
           />
-          <WeekendControl value={draft.weekendPositions} onChange={setWeekend} />
+          <ChoiceControl
+            label="Weekend positions"
+            help={POLICY_HELP.weekendPositions}
+            value={draft.weekendPositions}
+            options={[
+              ['agent', 'Agent decides per position'],
+              ['hold', 'Hold through the weekend'],
+              ['flatten', 'Flatten before the close'],
+            ]}
+            onChange={choose('weekendPositions')}
+          />
+          <ChoiceControl
+            label="Day starts"
+            help={POLICY_HELP.dailyLossReset}
+            value={draft.dailyLossReset}
+            options={[
+              ['utc', RESET_LABELS.utc],
+              ['broker', RESET_LABELS.broker],
+            ]}
+            onChange={choose('dailyLossReset')}
+          />
+          <ChoiceControl
+            label="Daily loss from"
+            help={POLICY_HELP.dailyLossBasis}
+            value={draft.dailyLossBasis}
+            options={[
+              ['equity', BASIS_LABELS.equity],
+              ['balance', BASIS_LABELS.balance],
+              ['higher', BASIS_LABELS.higher],
+            ]}
+            onChange={choose('dailyLossBasis')}
+          />
           {POLICY_NUMBER_FIELDS.map((field) => (
             <TextControl
               key={field.key}
@@ -1002,6 +1103,16 @@ export function RiskPanel({
                 .filter(Boolean)
                 .join(' · ') || 'off',
             ),
+          )}
+        />
+        <Field
+          label="Loss measured"
+          value={view((current) =>
+            [
+              RESET_LABELS[current.dailyLossReset ?? 'utc'],
+              BASIS_LABELS[current.dailyLossBasis ?? 'equity'].toLowerCase(),
+              (current.drawdownReference ?? 0) > 0 ? `peak from ${current.drawdownReference}` : 'peak from high',
+            ].join(' · '),
           )}
         />
         <Field

@@ -740,6 +740,8 @@ pub async fn account_state(state: Data<AppState>) -> HttpResponse {
         body["login"] = json!(snapshot.login().value());
         body["server"] = json!(snapshot.server().as_str());
         body["symbol"] = json!(snapshot.symbol().as_str());
+        body["terminalBuild"] = json!(snapshot.terminal_build());
+        body["eaVersion"] = json!(snapshot.ea_version());
     }
     body["ageSecs"] = json!(
         link.last_account_age(SystemTime::now())
@@ -757,6 +759,13 @@ pub async fn account_state(state: Data<AppState>) -> HttpResponse {
         body["positions"] = json!(account.positions);
         body["positionsTruncated"] = json!(account.positions_truncated);
         body["serverTime"] = json!(account.server_time);
+        body["currency"] = json!(account.account_currency());
+    }
+    // The service's own reading of the broker clock (see `broker_clock`), so
+    // the console converts broker times the same way the service does.
+    if let Ok(clock) = crate::broker_clock::BrokerClock::from_state(&state) {
+        body["brokerOffsetSecs"] = json!(clock.offset_secs());
+        body["clockBasis"] = json!(clock.basis().as_str());
     }
     HttpResponse::Ok().json(body)
 }
@@ -1025,6 +1034,7 @@ pub async fn performance(
             HttpResponse::Ok().json(json!({
                 "days": days,
                 "report": report,
+                "adjustments": crate::ledger::AdjustmentSummary::of(&history.adjustments),
                 "trades": history.orders,
                 "total": history.total,
                 "truncated": history.truncated,
@@ -1949,7 +1959,7 @@ mod tests {
         let response = test::call_service(
             &app,
             test::TestRequest::get()
-                .uri("/market/candles?symbol=bad%20symbol")
+                .uri("/market/candles?symbol=bad%2Fsymbol")
                 .to_request(),
         )
         .await;
@@ -2150,8 +2160,14 @@ mod tests {
             "connected": true,
             "tradeAllowed": true,
             "orders": 0,
-            "lots": 0.0
+            "lots": 0.0,
+            "build": 1440,
+            "ea": "1.27"
         });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
         let mut command = None;
         for _ in 0..40 {
             let response = test::call_service(
@@ -2192,6 +2208,8 @@ mod tests {
                 }],
                 "positionsTruncated": false,
                 "serverTime": 1_758_000_000,
+                "tradeServerTime": now + 7_200 - 4,
+                "currency": "usd",
                 "leverage": 100,
                 "marginLevel": 12.5
             }
@@ -2220,6 +2238,23 @@ mod tests {
         assert_eq!(body["positions"][0]["magic"], 77041);
         assert_eq!(body["login"], 94168);
         assert_eq!(body["server"], "IFCMarkets-Real");
+        assert_eq!(body["currency"], "USD");
+        assert_eq!(body["terminalBuild"], 1440);
+        assert_eq!(body["eaVersion"], "1.27");
+        assert_eq!(body["serverTime"], 1_758_000_000);
+        // One quote reading of a new offset is not trusted yet, and the host
+        // clock (a year off here) is implausible: no offset is claimed.
+        assert!(body["brokerOffsetSecs"].is_null());
+        // With the offset already known, the fresh quote confirms it.
+        state
+            .terminal_memory()
+            .restore_state(&serde_json::json!({ "offsetSecs": 7_200 }))
+            .expect("seed");
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/account").to_request()).await;
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["brokerOffsetSecs"], 7_200);
+        assert_eq!(body["clockBasis"], "quote");
     }
 
     #[actix_web::test]
@@ -2261,7 +2296,7 @@ mod tests {
         let response = test::call_service(
             &app,
             test::TestRequest::get()
-                .uri("/market/spec?symbol=bad%20symbol")
+                .uri("/market/spec?symbol=bad%2Fsymbol")
                 .to_request(),
         )
         .await;
@@ -2568,7 +2603,16 @@ mod tests {
                     "openPrice": 1.1, "closePrice": 1.099, "openTime": now - 7_200,
                     "closeTime": now - 3_600, "profit": 0.33, "swap": 0.0, "commission": 0.0,
                     "magic": 77041
-                }], "total": 1, "truncated": false}
+                }], "total": 1, "truncated": false, "adjustments": [
+                    {"ticket": 900_001, "kind": "balance", "amount": -0.12,
+                     "time": now - 86_400, "comment": "Dividend SP500m"},
+                    {"ticket": 900_002, "kind": "balance", "amount": 50.0,
+                     "time": now - 2 * 86_400, "comment": "Deposit"},
+                    {"ticket": 900_003, "kind": "balance", "amount": 0.05,
+                     "time": now - 3 * 86_400, "comment": "correction"},
+                    {"ticket": 900_004, "kind": "credit", "amount": 10.0,
+                     "time": now - 4 * 86_400, "comment": "bonus"}
+                ]}
             })
         });
         let response = task.await.expect("task joins");
@@ -2581,6 +2625,19 @@ mod tests {
         );
         assert_eq!(body["trades"][0]["ticket"], 10_674_729, "newest first");
         assert_eq!(body["report"]["trades"], 2);
+        // Balance operations are recorded and summed beside, not into, trades.
+        let adjustments = &body["adjustments"];
+        assert_eq!(adjustments["count"], 4);
+        assert_eq!(adjustments["dividends"], -0.12);
+        assert_eq!(adjustments["other"], 0.05);
+        assert_eq!(adjustments["transfers"], 50.0);
+        assert_eq!(adjustments["credit"], 10.0);
+        let kept = ledger.adjustments_since(0).await.expect("ledger");
+        assert_eq!(
+            kept.iter().map(|entry| entry.ticket).collect::<Vec<_>>(),
+            vec![900_001, 900_002, 900_003, 900_004],
+            "newest first"
+        );
 
         // The terminal fails: the ledger still answers, and says so.
         let route_state = state.clone();

@@ -223,32 +223,60 @@ fn breaker_advisories(state: &AppState, now: SystemTime) -> Vec<Advisory> {
         return Vec::new();
     };
     let policy = state.risk().policy();
-    let drawdowns = state.equity_guard().observe(account.equity, now);
-    let peak = state.equity_guard().state_snapshot()["peakEquity"].as_f64();
+    let rules = policy.loss_rules();
+    let drawdowns = crate::risk::guard::observe_account(state, &account, now);
+    let fixed_reference = rules.drawdown_reference > 0.0;
+    let peak = if fixed_reference {
+        Some(rules.drawdown_reference)
+    } else {
+        state.equity_guard().state_snapshot()["peakEquity"].as_f64()
+    };
+    let day_offset_secs = match rules.reset {
+        crate::risk::DailyReset::Broker => crate::broker_clock::BrokerClock::from_state(state)
+            .map(crate::broker_clock::BrokerClock::offset_secs)
+            .unwrap_or(0),
+        crate::risk::DailyReset::Utc => 0,
+    };
     breaker_items(
         (
             policy.max_daily_loss_percent(),
             policy.max_peak_drawdown_percent(),
         ),
         (drawdowns.day_percent, drawdowns.peak_percent),
-        peak,
+        Baselines {
+            peak,
+            fixed_reference,
+            day_offset_secs,
+        },
         unix_secs(now),
     )
 }
 
+/// Where the breakers measure from, for their wording and resume times.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Baselines {
+    /// The highest equity reached, or the fixed reference when one is set.
+    peak: Option<f64>,
+    /// Whether `peak` is the operator's fixed reference balance.
+    fixed_reference: bool,
+    /// Offset of the clock whose midnight starts a new day (0 = UTC).
+    day_offset_secs: i64,
+}
+
 /// The breaker notices for `drawdowns` (day, peak percent) against `limits`,
-/// given the recorded peak equity and the time (UTC seconds).
+/// given the baselines and the time (UTC seconds).
 fn breaker_items(
     limits: (f64, f64),
     drawdowns: (f64, f64),
-    peak: Option<f64>,
+    baselines: Baselines,
     now: i64,
 ) -> Vec<Advisory> {
     let (daily, peak_limit) = limits;
     let (day_percent, peak_percent) = drawdowns;
     let mut out = Vec::new();
     if daily > 0.0 && day_percent >= daily {
-        let next_day = (now.div_euclid(86_400) + 1) * 86_400;
+        let offset = baselines.day_offset_secs;
+        let next_day = ((now + offset).div_euclid(86_400) + 1) * 86_400 - offset;
         out.push(advisory(
             "breaker_daily",
             Severity::Critical,
@@ -260,16 +288,23 @@ fn breaker_items(
         ));
     }
     if peak_limit > 0.0 && peak_percent >= peak_limit {
-        let resume = peak.map(|peak| peak * (1.0 - peak_limit / 100.0));
+        let resume = baselines.peak.map(|peak| peak * (1.0 - peak_limit / 100.0));
         out.push(advisory(
             "breaker_peak",
             Severity::Critical,
-            format!("New trades paused: {peak_percent:.1}% below the account's peak"),
-            Some(match resume {
-                Some(level) => format!(
+            if baselines.fixed_reference {
+                format!("New trades paused: {peak_percent:.1}% below the reference balance")
+            } else {
+                format!("New trades paused: {peak_percent:.1}% below the account's peak")
+            },
+            Some(match (resume, baselines.fixed_reference) {
+                (Some(level), false) => format!(
                     "Limit is {peak_limit:.0}%. Resumes when equity is back above {level:.2}, or when the peak is reset."
                 ),
-                None => format!("Limit is {peak_limit:.0}%."),
+                (Some(level), true) => format!(
+                    "Limit is {peak_limit:.0}%. Resumes when equity is back above {level:.2}."
+                ),
+                (None, _) => format!("Limit is {peak_limit:.0}%."),
             }),
             None,
         ));
@@ -795,10 +830,47 @@ mod tests {
         assert!(skipped_round(&state, later).await.is_none());
     }
 
+    fn highest(peak: Option<f64>) -> Baselines {
+        Baselines {
+            peak,
+            fixed_reference: false,
+            day_offset_secs: 0,
+        }
+    }
+
+    #[test]
+    fn breakers_follow_the_broker_day_and_a_fixed_reference() {
+        let now = SATURDAY_NOON;
+        // Two hours ahead of UTC, the broker's midnight is 22:00 UTC.
+        let broker = Baselines {
+            day_offset_secs: 7_200,
+            ..highest(None)
+        };
+        let daily = breaker_items((5.0, 0.0), (6.0, 0.0), broker, now);
+        assert_eq!(
+            daily[0].until_ms,
+            Some((SATURDAY_NOON + 10 * 3_600) * 1_000)
+        );
+        let fixed = Baselines {
+            peak: Some(1_000.0),
+            fixed_reference: true,
+            day_offset_secs: 0,
+        };
+        let items = breaker_items((0.0, 10.0), (0.0, 11.0), fixed, now);
+        assert_eq!(
+            items[0].title,
+            "New trades paused: 11.0% below the reference balance"
+        );
+        assert_eq!(
+            items[0].detail.as_deref(),
+            Some("Limit is 10%. Resumes when equity is back above 900.00.")
+        );
+    }
+
     #[test]
     fn breakers_say_what_it_takes_to_resume() {
         let now = SATURDAY_NOON;
-        let items = breaker_items((20.0, 25.0), (0.0, 27.8), Some(49.92), now);
+        let items = breaker_items((20.0, 25.0), (0.0, 27.8), highest(Some(49.92)), now);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "breaker_peak");
         assert_eq!(
@@ -811,18 +883,18 @@ mod tests {
                 "Limit is 25%. Resumes when equity is back above 37.44, or when the peak is reset."
             )
         );
-        let daily = breaker_items((20.0, 25.0), (21.0, 5.0), None, now);
+        let daily = breaker_items((20.0, 25.0), (21.0, 5.0), highest(None), now);
         assert_eq!(daily[0].id, "breaker_daily");
         // Resumes at the next UTC midnight.
         assert_eq!(
             daily[0].until_ms,
             Some((SATURDAY_NOON + 12 * 3_600) * 1_000)
         );
-        let unknown_peak = breaker_items((0.0, 25.0), (0.0, 30.0), None, now);
+        let unknown_peak = breaker_items((0.0, 25.0), (0.0, 30.0), highest(None), now);
         assert_eq!(unknown_peak[0].detail.as_deref(), Some("Limit is 25%."));
-        assert!(breaker_items((20.0, 25.0), (1.0, 2.0), Some(40.0), now).is_empty());
+        assert!(breaker_items((20.0, 25.0), (1.0, 2.0), highest(Some(40.0)), now).is_empty());
         assert!(
-            breaker_items((0.0, 0.0), (99.0, 99.0), Some(40.0), now).is_empty(),
+            breaker_items((0.0, 0.0), (99.0, 99.0), highest(Some(40.0)), now).is_empty(),
             "a zero limit is off"
         );
     }

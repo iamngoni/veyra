@@ -46,14 +46,11 @@ pub struct PositionFact {
     pub lots: f64,
 }
 
-/// Splits a symbol into its base and quote currencies when it is a plain
-/// six-letter pair, ignoring a broker suffix such as `EURUSD.raw`.
+/// Splits a symbol into its base and quote currencies when its six-letter
+/// code is a pair of known currencies, ignoring a broker's prefix or suffix
+/// (`EURUSDm`, `EURUSD.raw`, `#EURUSD`).
 pub fn currency_pair(symbol: &Symbol) -> Option<(String, String)> {
-    let uppercase = symbol.as_str().to_ascii_uppercase();
-    let core = uppercase.split('.').next().unwrap_or("");
-    if core.len() != 6 || !core.is_ascii() {
-        return None;
-    }
+    let core = symbol.six_letter_code()?;
     let (base, quote) = core.split_at(3);
     if CURRENCIES.contains(&base) && CURRENCIES.contains(&quote) {
         Some((base.to_owned(), quote.to_owned()))
@@ -65,11 +62,7 @@ pub fn currency_pair(symbol: &Symbol) -> Option<(String, String)> {
 /// Splits `XAUUSD`-style metals into their contract spec when the quote is a
 /// known currency. Other synthetic symbols return `None`.
 fn metal_spec(symbol: &Symbol) -> Option<MetalSpec> {
-    let uppercase = symbol.as_str().to_ascii_uppercase();
-    let core = uppercase.split('.').next().unwrap_or("");
-    if core.len() != 6 || !core.is_ascii() {
-        return None;
-    }
+    let core = symbol.six_letter_code()?;
     let (base, quote) = core.split_at(3);
     if !CURRENCIES.contains(&quote) {
         return None;
@@ -346,6 +339,12 @@ mod tests {
         );
         assert_eq!(currency_pair(&symbol("XAUUSD")), None);
         assert_eq!(currency_pair(&symbol("EURUSDX")), None);
+        // Account-type suffixes keep the pair.
+        assert_eq!(
+            currency_pair(&symbol("EURUSDm")),
+            Some(("EUR".to_owned(), "USD".to_owned()))
+        );
+        assert_eq!(pip_size(&symbol("USDJPYm")), Some(0.01));
 
         // EURUSD: one pip on one lot is ten dollars, whatever the price.
         let eurusd = pip_value_per_lot(&symbol("EURUSD"), 1.10, &[]).expect("value");

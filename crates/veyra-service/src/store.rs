@@ -422,6 +422,68 @@ impl crate::ledger::TradeLedger for Store {
             })
             .collect()
     }
+
+    async fn record_adjustments(
+        &self,
+        adjustments: &[crate::broker::BalanceOperationPayload],
+    ) -> Result<usize, crate::ledger::LedgerError> {
+        if adjustments.is_empty() {
+            return Ok(0);
+        }
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "insert into balance_operations (ticket, kind, amount, op_time, comment) ",
+        );
+        builder.push_values(adjustments, |mut row, adjustment| {
+            row.push_bind(adjustment.ticket)
+                .push_bind(adjustment.kind.as_str())
+                .push_bind(adjustment.amount)
+                .push_bind(adjustment.time)
+                .push_bind(adjustment.comment.clone());
+        });
+        builder.push(
+            " on conflict (ticket) do update set kind = excluded.kind, \
+             amount = excluded.amount, op_time = excluded.op_time, \
+             comment = excluded.comment, updated_at = now()",
+        );
+        let result = builder.build().execute(&self.pool).await.map_err(|error| {
+            crate::ledger::LedgerError {
+                reason: format!("record balance operations failed: {error}"),
+            }
+        })?;
+        Ok(usize::try_from(result.rows_affected()).unwrap_or(usize::MAX))
+    }
+
+    async fn adjustments_since(
+        &self,
+        since: i64,
+    ) -> Result<Vec<crate::broker::BalanceOperationPayload>, crate::ledger::LedgerError> {
+        let rows = sqlx::query(
+            "select ticket, kind, amount, op_time, comment from balance_operations \
+             where op_time >= $1 order by op_time desc, ticket desc",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| crate::ledger::LedgerError {
+            reason: format!("read balance operations failed: {error}"),
+        })?;
+        rows.into_iter()
+            .map(|row| {
+                let kind: String = row.get("kind");
+                Ok(crate::broker::BalanceOperationPayload {
+                    ticket: row.get("ticket"),
+                    kind: crate::broker::BalanceOperationKind::parse(&kind).ok_or_else(|| {
+                        crate::ledger::LedgerError {
+                            reason: format!("stored balance operation kind `{kind}` is unknown"),
+                        }
+                    })?,
+                    amount: row.get("amount"),
+                    time: row.get("op_time"),
+                    comment: row.get("comment"),
+                })
+            })
+            .collect()
+    }
 }
 
 fn storage_error(action: &str, error: &impl std::fmt::Display) -> AuditError {

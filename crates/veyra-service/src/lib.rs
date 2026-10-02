@@ -33,6 +33,7 @@ pub mod server;
 pub mod state;
 pub mod store;
 pub mod subscription_auth;
+pub mod terminal;
 pub mod text;
 pub mod trade_journal;
 pub mod trades;
@@ -97,6 +98,7 @@ pub struct AppState {
     decision_health: Arc<crate::trading::autopilot::DecisionHealth>,
     rotation: Arc<AtomicUsize>,
     equity_guard: Arc<EquityGuard>,
+    terminal_memory: Arc<crate::terminal::TerminalMemory>,
     order_admission: Arc<tokio::sync::Mutex<()>>,
     /// Operator notification queue; a disabled notifier drops everything.
     notifier: crate::notify::Notifier,
@@ -141,6 +143,7 @@ impl AppState {
             decision_health: Arc::new(crate::trading::autopilot::DecisionHealth::default()),
             rotation: Arc::new(AtomicUsize::new(0)),
             equity_guard: Arc::new(EquityGuard::new()),
+            terminal_memory: Arc::new(crate::terminal::TerminalMemory::new()),
             order_admission: Arc::new(tokio::sync::Mutex::new(())),
             notifier: crate::notify::Notifier::disabled(),
         }
@@ -477,6 +480,12 @@ impl AppState {
     /// Equity baseline tracker feeding the daily and peak drawdown breakers.
     pub fn equity_guard(&self) -> &Arc<EquityGuard> {
         &self.equity_guard
+    }
+
+    /// Broker-clock offset and terminal build remembered across snapshots
+    /// and restarts (see [`crate::terminal`]).
+    pub fn terminal_memory(&self) -> &Arc<crate::terminal::TerminalMemory> {
+        &self.terminal_memory
     }
 
     /// Serializes the final account revalidation and open-order enqueue so two

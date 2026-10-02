@@ -157,6 +157,8 @@ mod tests {
             server_time: 1_758_000_000,
             leverage: 100,
             margin_level: 0.0,
+            currency: None,
+            trade_server_time: None,
         }
     }
 

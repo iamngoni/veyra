@@ -2,15 +2,16 @@
  * MetaTrader's clocks, reconciled with UTC.
  *
  * The EA stamps closed orders, open positions and candles with the broker's
- * server clock, and reports the terminal host's clock as the account's
- * `serverTime` (MQL `TimeLocal`). Neither is UTC. In this deployment the
- * broker and the host keep the same offset — checked against the audit
- * trail's own UTC stamps for the same tickets — so the host offset, measured
- * against the snapshot's age and rounded to the quarter hour every real zone
- * uses, turns broker stamps back into true instants.
+ * server clock, which is not UTC. The service measures the broker's offset
+ * from its latest quotes and reports it as the account's `brokerOffsetSecs`;
+ * that is the offset used here, so the console and the service convert times
+ * the same way. A service that does not report one falls back to the
+ * terminal host's clock (`serverTime`, MQL `TimeLocal`), measured against
+ * the snapshot's age and rounded to the quarter hour every real zone uses —
+ * right only while the host runs on broker time.
  *
- * Without an account snapshot the offset is unknown, and callers hold broker
- * times back rather than place them hours away from where they belong.
+ * Without either, the offset is unknown, and callers hold broker times back
+ * rather than place them hours away from where they belong.
  */
 
 import type { Account, CandleSeries, ClosedTrade } from './api'
@@ -22,6 +23,7 @@ const MOST_OFFSET = 14 * 3600
 
 /** Seconds the broker clock runs ahead of UTC, or undefined before a snapshot. */
 export function brokerOffsetSecs(account: Account | undefined, nowMs: number): number | undefined {
+  if (typeof account?.brokerOffsetSecs === 'number') return account.brokerOffsetSecs
   if (!account?.serverTime) return undefined
   const observedAt = nowMs / 1000 - account.ageSecs
   const offset = Math.round((account.serverTime - observedAt) / QUARTER_HOUR) * QUARTER_HOUR

@@ -24,8 +24,8 @@ use async_trait::async_trait;
 
 use crate::AppState;
 use crate::broker::{
-    ClosedTradePayload, CommandPayload, CommandState, ORDER_MAGIC, OrderHistoryPayload,
-    OrderHistoryRequest,
+    AdjustmentCategory, BalanceOperationPayload, ClosedTradePayload, CommandPayload, CommandState,
+    ORDER_MAGIC, OrderHistoryPayload, OrderHistoryRequest,
 };
 
 /// How long one history request may wait for the terminal.
@@ -67,12 +67,33 @@ pub trait TradeLedger: Send + Sync + fmt::Debug + 'static {
         since: i64,
         magic: u32,
     ) -> Result<Vec<ClosedTradePayload>, LedgerError>;
+
+    /// Inserts or refreshes balance operations and credit entries; returns
+    /// how many rows were written.
+    ///
+    /// # Errors
+    /// Returns [`LedgerError`] when the store is unavailable.
+    async fn record_adjustments(
+        &self,
+        adjustments: &[BalanceOperationPayload],
+    ) -> Result<usize, LedgerError>;
+
+    /// Balance operations booked at or after `since` (broker server
+    /// seconds), newest first.
+    ///
+    /// # Errors
+    /// Returns [`LedgerError`] when the store is unavailable.
+    async fn adjustments_since(
+        &self,
+        since: i64,
+    ) -> Result<Vec<BalanceOperationPayload>, LedgerError>;
 }
 
 /// In-memory ledger for tests and database-less runs.
 #[derive(Debug, Default)]
 pub struct MemoryLedger {
     trades: Mutex<std::collections::BTreeMap<i64, ClosedTradePayload>>,
+    adjustments: Mutex<std::collections::BTreeMap<i64, BalanceOperationPayload>>,
 }
 
 #[async_trait]
@@ -102,6 +123,81 @@ impl TradeLedger for MemoryLedger {
             .collect();
         newest_first(&mut trades);
         Ok(trades)
+    }
+
+    async fn record_adjustments(
+        &self,
+        adjustments: &[BalanceOperationPayload],
+    ) -> Result<usize, LedgerError> {
+        let mut stored = self.adjustments.lock().map_err(|_| LedgerError {
+            reason: "memory ledger lock poisoned".to_owned(),
+        })?;
+        for adjustment in adjustments {
+            stored.insert(adjustment.ticket, adjustment.clone());
+        }
+        Ok(adjustments.len())
+    }
+
+    async fn adjustments_since(
+        &self,
+        since: i64,
+    ) -> Result<Vec<BalanceOperationPayload>, LedgerError> {
+        let stored = self.adjustments.lock().map_err(|_| LedgerError {
+            reason: "memory ledger lock poisoned".to_owned(),
+        })?;
+        let mut adjustments: Vec<BalanceOperationPayload> = stored
+            .values()
+            .filter(|adjustment| adjustment.time >= since)
+            .cloned()
+            .collect();
+        newest_adjustments_first(&mut adjustments);
+        Ok(adjustments)
+    }
+}
+
+/// Sorts balance operations newest first, ties by ticket.
+pub fn newest_adjustments_first(adjustments: &mut [BalanceOperationPayload]) {
+    adjustments.sort_by(|left, right| {
+        right
+            .time
+            .cmp(&left.time)
+            .then(right.ticket.cmp(&left.ticket))
+    });
+}
+
+/// Totals of balance operations by category, for reporting beside trade P/L.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustmentSummary {
+    /// Entries in the window.
+    pub count: usize,
+    /// Dividend adjustments (index and share CFDs).
+    pub dividends: f64,
+    /// Other corrections the broker booked.
+    pub other: f64,
+    /// Deposits and withdrawals: the holder's money, not performance.
+    pub transfers: f64,
+    /// Broker credit: not the holder's money.
+    pub credit: f64,
+}
+
+impl AdjustmentSummary {
+    /// Sums `adjustments` by [`AdjustmentCategory`].
+    pub fn of(adjustments: &[BalanceOperationPayload]) -> Self {
+        let mut summary = Self {
+            count: adjustments.len(),
+            ..Self::default()
+        };
+        for adjustment in adjustments {
+            let bucket = match adjustment.category() {
+                AdjustmentCategory::Dividend => &mut summary.dividends,
+                AdjustmentCategory::Adjustment => &mut summary.other,
+                AdjustmentCategory::Transfer => &mut summary.transfers,
+                AdjustmentCategory::Credit => &mut summary.credit,
+            };
+            *bucket += adjustment.amount;
+        }
+        summary
     }
 }
 
@@ -141,6 +237,8 @@ pub struct History {
     pub source: Source,
     /// Why the terminal did not answer, when it did not.
     pub terminal_error: Option<String>,
+    /// Balance operations and credit in the window, newest first.
+    pub adjustments: Vec<BalanceOperationPayload>,
 }
 
 impl History {
@@ -150,6 +248,7 @@ impl History {
             orders: self.orders.clone(),
             total: self.total,
             truncated: self.truncated,
+            adjustments: self.adjustments.clone(),
         }
     }
 }
@@ -224,6 +323,7 @@ pub async fn closed_trades(state: &AppState, days: u32) -> Result<History, Histo
                 orders: history.orders,
                 source: Source::Terminal,
                 terminal_error: None,
+                adjustments: history.adjustments,
             }),
             Some(Err(reason)) => Err(HistoryError::Failed(reason)),
         };
@@ -233,12 +333,29 @@ pub async fn closed_trades(state: &AppState, days: u32) -> Result<History, Histo
             if let Err(error) = ledger.record_trades(&history.orders).await {
                 tracing::warn!(%error, "closed trades could not be recorded");
             }
+            if let Err(error) = ledger.record_adjustments(&history.adjustments).await {
+                tracing::warn!(%error, "balance operations could not be recorded");
+            }
             (history.truncated, None)
         }
         Some(Err(reason)) => (false, Some(reason.clone())),
         None => (false, Some("broker unavailable".to_owned())),
     };
     let since = broker_now(state).saturating_sub(i64::from(days) * 86_400);
+    // Balance operations are reporting only: an unreadable table falls back to
+    // what the terminal said this time rather than failing the trades.
+    let adjustments = match ledger.adjustments_since(since).await {
+        Ok(adjustments) => adjustments,
+        Err(error) => {
+            tracing::warn!(%error, "balance operations unreadable; using the terminal's");
+            let mut adjustments = match &terminal {
+                Some(Ok(history)) => history.adjustments.clone(),
+                _ => Vec::new(),
+            };
+            newest_adjustments_first(&mut adjustments);
+            adjustments
+        }
+    };
     match ledger.closed_since(since, ORDER_MAGIC).await {
         Ok(orders) => Ok(History {
             total: u32::try_from(orders.len()).unwrap_or(u32::MAX),
@@ -250,6 +367,7 @@ pub async fn closed_trades(state: &AppState, days: u32) -> Result<History, Histo
                 Source::LedgerOnly
             },
             terminal_error,
+            adjustments,
         }),
         Err(error) => {
             tracing::warn!(%error, "trade ledger unreadable; answering from the terminal");
@@ -262,6 +380,7 @@ pub async fn closed_trades(state: &AppState, days: u32) -> Result<History, Histo
                         orders: history.orders,
                         source: Source::Terminal,
                         terminal_error: None,
+                        adjustments,
                     })
                 }
                 Some(Err(reason)) => Err(HistoryError::Failed(reason)),

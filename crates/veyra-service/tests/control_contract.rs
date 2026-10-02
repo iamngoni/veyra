@@ -347,6 +347,7 @@ async fn execution_revalidates_the_latest_book_after_an_earlier_approval() {
         free_margin: Some(20.57),
         day_drawdown_percent: Some(0.0),
         peak_drawdown_percent: Some(0.0),
+        account_currency: None,
     };
     let RiskDecision::Approved(intent) = state.risk().evaluate(&draft, Some(initial), test_now())
     else {

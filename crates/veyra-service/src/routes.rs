@@ -587,15 +587,18 @@ pub(crate) async fn account_facts(state: &AppState) -> Option<AccountFacts> {
             None if open_orders == 0 => (Vec::new(), Vec::new(), Vec::new(), None, None),
             None => return None,
         };
-    let (day_drawdown_percent, peak_drawdown_percent) = match equity {
-        Some(equity) => {
-            let drawdowns = state
-                .equity_guard()
-                .observe(equity, std::time::SystemTime::now());
+    let account = runtime.link().last_account().filter(|_| equity.is_some());
+    let (day_drawdown_percent, peak_drawdown_percent) = match &account {
+        Some(account) => {
+            let drawdowns =
+                crate::risk::guard::observe_account(state, account, std::time::SystemTime::now());
             (Some(drawdowns.day_percent), Some(drawdowns.peak_percent))
         }
         None => (None, None),
     };
+    let account_currency = account
+        .as_ref()
+        .and_then(|account| account.account_currency());
     Some(AccountFacts {
         news: Default::default(),
         session: Default::default(),
@@ -610,6 +613,7 @@ pub(crate) async fn account_facts(state: &AppState) -> Option<AccountFacts> {
         free_margin,
         day_drawdown_percent,
         peak_drawdown_percent,
+        account_currency,
     })
 }
 
