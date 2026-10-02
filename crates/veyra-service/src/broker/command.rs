@@ -990,11 +990,19 @@ impl BalanceOperationPayload {
             return AdjustmentCategory::Credit;
         }
         let comment = self.comment.to_ascii_lowercase();
+        // Back-office references such as `D828081/BB/BTC` (deposit) or
+        // `W123456` (withdrawal): a D or W followed by digits.
+        let reference = {
+            let mut chars = comment.trim().chars();
+            matches!(chars.next(), Some('d' | 'w'))
+                && chars.take_while(char::is_ascii_digit).count() >= 4
+        };
         if comment.contains("div") {
             AdjustmentCategory::Dividend
-        } else if ["deposit", "withdraw", "transfer", "payment", "wire"]
-            .iter()
-            .any(|word| comment.contains(word))
+        } else if reference
+            || ["deposit", "withdraw", "transfer", "payment", "wire"]
+                .iter()
+                .any(|word| comment.contains(word))
         {
             AdjustmentCategory::Transfer
         } else {

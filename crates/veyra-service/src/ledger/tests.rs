@@ -175,12 +175,16 @@ fn adjustments_are_summed_by_category() {
         adjustment(3, 3, 0.05, "correction"),
         adjustment(5, 5, 100.0, "Deposit via card"),
         adjustment(6, 6, -20.0, "Withdrawal"),
+        adjustment(7, 7, 20.0, "D828081/BB/BTC"),
+        adjustment(8, 8, -5.0, "W123456"),
+        adjustment(9, 9, 1.0, "D12 fee"),
         credit,
     ]);
-    assert_eq!(summary.count, 6);
+    assert_eq!(summary.count, 9);
     assert!((summary.dividends + 0.20).abs() < 1e-9);
-    assert!((summary.other - 0.05).abs() < 1e-9);
-    assert!((summary.transfers - 80.0).abs() < 1e-9);
+    // A short `D12` is not a back-office reference.
+    assert!((summary.other - 1.05).abs() < 1e-9);
+    assert!((summary.transfers - 95.0).abs() < 1e-9);
     assert!((summary.credit - 10.0).abs() < 1e-9);
     assert_eq!(AdjustmentSummary::of(&[]), AdjustmentSummary::default());
 }

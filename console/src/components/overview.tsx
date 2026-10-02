@@ -442,8 +442,8 @@ export function OpenPositions({
 
 type Stat = { label: string; value: ReactNode; tone?: string; sub?: string; subTone?: string; subTitle?: string }
 
-const ADJUSTMENTS_HELP =
-  'Dividend adjustments and corrections the broker booked in the window, outside trade P/L. Deposits, withdrawals and credit are left out.'
+const DIVIDENDS_HELP =
+  'Dividend adjustments the broker booked on index positions in the window, outside trade P/L.'
 
 function stats(performance: Performance, balance: number | undefined): Stat[] {
   const report = performance.report
@@ -455,14 +455,12 @@ function stats(performance: Performance, balance: number | undefined): Stat[] {
     ]
   }
   const net = report.net_profit
-  // Booked adjustments (dividends, corrections) sit beside trade P/L; money
-  // moved in or out is neither, but it did change the balance.
-  const adjustments = performance.adjustments
-  const booked = adjustments ? adjustments.dividends + adjustments.other : 0
-  const moved = adjustments?.transfers ?? 0
-  // Return on the balance the window started from; meaningless when the
-  // window's result is the whole balance or more.
-  const start = balance === undefined ? 0 : balance - net - booked - moved
+  // Dividends sit beside trade P/L. Deposits, and anything the broker's
+  // comment does not identify, count as capital rather than performance.
+  const dividends = performance.adjustments?.dividends ?? 0
+  // Return on the capital: the balance less what the window earned. It is
+  // meaningless when the window's result is the whole balance or more.
+  const start = balance === undefined ? 0 : balance - net - dividends
   const record = [
     plural(report.wins, 'win', 'wins'),
     plural(report.losses, 'loss', 'losses'),
@@ -477,12 +475,12 @@ function stats(performance: Performance, balance: number | undefined): Stat[] {
       sub:
         [
           start > 0 ? signedPercent((net / start) * 100, 1) : undefined,
-          booked !== 0 ? `adjustments ${signedAmount(booked)}` : undefined,
+          dividends !== 0 ? `dividends ${signedAmount(dividends)}` : undefined,
         ]
           .filter(Boolean)
           .join(' · ') || undefined,
       subTone: toneOrMuted(net),
-      subTitle: booked !== 0 ? ADJUSTMENTS_HELP : undefined,
+      subTitle: dividends !== 0 ? DIVIDENDS_HELP : undefined,
     },
     {
       label: 'Closed trades',
