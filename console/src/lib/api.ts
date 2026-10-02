@@ -455,6 +455,8 @@ export type Advisory = {
   detail?: string | null
   /** When the condition is expected to end, UTC milliseconds; null when unknown. */
   untilMs?: number | null
+  /** When a condition announced ahead starts, UTC milliseconds; null once in effect. */
+  startsMs?: number | null
 }
 
 /** Current advisories from `/advisories`, most severe first; empty when nothing needs saying. */

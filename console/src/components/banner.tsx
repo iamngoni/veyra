@@ -44,10 +44,24 @@ const clock = (at: Date) => `${pad(at.getHours())}:${pad(at.getMinutes())}`
  * where a weekday alone would be ambiguous.
  */
 export function untilLabel(untilMs: number, nowMs: number): string {
-  const until = new Date(untilMs)
-  if (until.toDateString() === new Date(nowMs).toDateString()) return `until ${clock(until)}`
-  if (untilMs - nowMs < 6 * DAY_MS) return `until ${WEEKDAYS[until.getDay()]} ${clock(until)}`
-  return `until ${until.getDate()} ${MONTHS[until.getMonth()]} ${clock(until)}`
+  return `until ${moment(untilMs, nowMs)}`
+}
+
+/** `02:00` later today, `Mon 01:00` within the week, `10 Oct 09:30` beyond it. */
+function moment(ms: number, nowMs: number): string {
+  const at = new Date(ms)
+  if (at.toDateString() === new Date(nowMs).toDateString()) return clock(at)
+  if (ms - nowMs < 6 * DAY_MS) return `${WEEKDAYS[at.getDay()]} ${clock(at)}`
+  return `${at.getDate()} ${MONTHS[at.getMonth()]} ${clock(at)}`
+}
+
+/**
+ * A condition announced ahead, on the browser's clock: `14:00–15:00`, the end
+ * by its clock alone when it falls on the start's day.
+ */
+export function windowLabel(startsMs: number, untilMs: number, nowMs: number): string {
+  const sameDay = new Date(startsMs).toDateString() === new Date(untilMs).toDateString()
+  return `${moment(startsMs, nowMs)}–${sameDay ? clock(new Date(untilMs)) : moment(untilMs, nowMs)}`
 }
 
 /**
@@ -72,12 +86,21 @@ export function untilDetail(untilMs: number, nowMs: number): string {
   return `Expected to end ${date}, ${clock(until)} your time — ${countdown(untilMs, nowMs)}.`
 }
 
+/** The tooltip behind an announced window: when it starts and ends, and the time to its start. */
+export function windowDetail(startsMs: number, untilMs: number, nowMs: number): string {
+  const starts = new Date(startsMs)
+  const date = `${WEEKDAYS[starts.getDay()]} ${starts.getDate()} ${MONTHS[starts.getMonth()]}`
+  return `Expected from ${date}, ${clock(starts)} until ${clock(new Date(untilMs))} your time — starts ${countdown(startsMs, nowMs)}.`
+}
+
 function AdvisoryRow({ item, now }: { item: Advisory; now: number }) {
   // A severity this console does not know yet reads as information rather
   // than breaking the row.
   const level: AdvisorySeverity = Object.hasOwn(SEVERITY, item.severity) ? item.severity : 'info'
   const { tone, label } = SEVERITY[level]
   const until = item.untilMs ?? undefined
+  // Still ahead, the strip shows the whole window; once in effect, its end.
+  const starts = until !== undefined && item.startsMs != null && item.startsMs > now ? item.startsMs : undefined
   return (
     <li className={`banner-row is-${level}`}>
       <Dot tone={tone} label={label} />
@@ -88,7 +111,12 @@ function AdvisoryRow({ item, now }: { item: Advisory; now: number }) {
           {item.detail}
         </span>
       ) : null}
-      {until !== undefined ? (
+      {until !== undefined && starts !== undefined ? (
+        <span className="banner-until">
+          {windowLabel(starts, until, now)}
+          <Hint text={windowDetail(starts, until, now)} label="when this starts and ends" />
+        </span>
+      ) : until !== undefined ? (
         <span className="banner-until">
           {untilLabel(until, now)}
           <Hint text={untilDetail(until, now)} label="when this ends" />

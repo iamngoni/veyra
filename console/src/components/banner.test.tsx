@@ -11,7 +11,7 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Advisories, Advisory } from '../lib/api'
-import { StatusBanner, countdown, untilDetail, untilLabel } from './banner'
+import { StatusBanner, countdown, untilDetail, untilLabel, windowDetail, windowLabel } from './banner'
 
 /** Wednesday 15 July 2026 on the local clock; hours and minutes as given. */
 const at = (day: number, hours: number, minutes = 0) => new Date(2026, 6, day, hours, minutes).getTime()
@@ -27,6 +27,14 @@ const closed: Advisory = {
   title: 'FX, gold and indices are closed',
   detail: 'BTC and ETH still trade.',
   untilMs: at(15, 12, 0),
+}
+const news: Advisory = {
+  id: 'news',
+  severity: 'info',
+  title: 'USD news ahead: Non-Farm Employment Change',
+  detail: 'New USD trades pause 30 minutes either side of the release.',
+  startsMs: at(15, 14, 0),
+  untilMs: at(15, 15, 0),
 }
 const rollover: Advisory = { id: 'rollover_pause', severity: 'info', title: 'Daily rollover pause', untilMs: at(15, 10, 50) }
 
@@ -127,6 +135,21 @@ describe('StatusBanner', () => {
     expect(tip.textContent).toBe('Expected to end Wed 15 Jul, 12:00 your time — in 1h 54m.')
   })
 
+  it('shows the whole window of a condition announced ahead, and only its end once it starts', () => {
+    const { rerender } = render(<StatusBanner advisories={served(news)} />)
+    const until = () => document.querySelector('.banner-until') as HTMLElement
+    expect(until().firstChild?.textContent).toBe('14:00–15:00')
+    expect(within(until()).getByRole('button', { name: 'About when this starts and ends' })).toBeTruthy()
+    expect(within(until()).getByRole('tooltip', { hidden: true }).textContent).toBe(
+      'Expected from Wed 15 Jul, 14:00 until 15:00 your time — starts in 3h 55m.',
+    )
+
+    // Past its start, even before the next poll drops the start.
+    vi.setSystemTime(at(15, 14, 10))
+    rerender(<StatusBanner advisories={served({ ...news })} />)
+    expect(until().firstChild?.textContent).toBe('until 15:00')
+  })
+
   it('folds past two strips behind a disclosure that sits outside the live region', () => {
     render(<StatusBanner advisories={served(killSwitch, stale, closed, rollover)} />)
     expect(rows().map((row) => row.textContent)).toEqual(['Kill switch is on', 'Terminal not reporting'])
@@ -175,6 +198,15 @@ describe('end-time wording', () => {
     expect(countdown(NOW + 30_000, NOW)).toBe('in 1m')
     expect(countdown(NOW, NOW)).toBe('any moment now')
     expect(countdown(NOW - MINUTE, NOW)).toBe('any moment now')
+  })
+
+  it('names both ends of a window, the end by its clock alone on the same day', () => {
+    expect(windowLabel(at(15, 14, 0), at(15, 15, 0), NOW)).toBe('14:00–15:00')
+    expect(windowLabel(at(16, 14, 0), at(16, 15, 0), NOW)).toBe('Thu 14:00–15:00')
+    expect(windowLabel(at(15, 23, 45), at(16, 0, 15), NOW)).toBe('23:45–Thu 00:15')
+    expect(windowDetail(at(16, 14, 0), at(16, 15, 0), NOW)).toBe(
+      'Expected from Thu 16 Jul, 14:00 until 15:00 your time — starts in 1d 3h.',
+    )
   })
 
   it('spells out the full local date in the tooltip', () => {
