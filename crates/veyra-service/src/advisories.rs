@@ -342,6 +342,78 @@ fn closed_instruments_item(closed: &[(String, Option<i64>)]) -> Option<Advisory>
     ))
 }
 
+/// How far ahead an upcoming high-impact release is announced.
+const NEWS_LOOKAHEAD_SECS: i64 = 3 * 3_600;
+
+/// The news notice: a high-impact release for a currency the autopilot
+/// trades is inside the blackout now, or due within [`NEWS_LOOKAHEAD_SECS`].
+/// `until_ms` is when that currency's pause ends.
+fn news_item(
+    events: &[crate::calendar::CalendarEvent],
+    currencies: &[String],
+    now: i64,
+    window_secs: i64,
+) -> Option<Advisory> {
+    let event = events
+        .iter()
+        .filter(|event| {
+            event.impact() == crate::calendar::Impact::High
+                && event.applies_to_currencies(currencies)
+                && event.time() + window_secs >= now
+                && event.time() - now <= NEWS_LOOKAHEAD_SECS
+        })
+        .min_by_key(|event| event.time())?;
+    let currency = event.currency();
+    let pausing = now >= event.time() - window_secs;
+    let minutes = window_secs / 60;
+    Some(advisory(
+        "news",
+        Severity::Info,
+        if pausing {
+            format!("{currency} trades paused for news: {}", event.title())
+        } else {
+            format!("{currency} news ahead: {}", event.title())
+        },
+        Some(if pausing {
+            format!("No new {currency} trades {minutes} minutes either side of the release.")
+        } else {
+            format!(
+                "New {currency} trades pause {minutes} minutes before the release, until {minutes} minutes after."
+            )
+        }),
+        Some((event.time() + window_secs) * 1_000),
+    ))
+}
+
+/// Reads the calendar for [`news_item`], over the currencies of the
+/// instruments the autopilot trades. Quiet without a calendar or blackout.
+async fn news_advisory(state: &AppState, now: SystemTime) -> Option<Advisory> {
+    let calendar = state.calendar()?;
+    let minutes = state.risk().policy().calendar_blackout_minutes();
+    if minutes == 0 {
+        return None;
+    }
+    let window = i64::try_from(minutes.saturating_mul(60)).unwrap_or(i64::MAX);
+    let mut currencies: Vec<String> = Vec::new();
+    for symbol in state.autopilot()?.symbols() {
+        for currency in crate::calendar::instrument_currencies(symbol.as_str(), None) {
+            if !currencies.contains(&currency) {
+                currencies.push(currency);
+            }
+        }
+    }
+    let utc = unix_secs(now);
+    let events = calendar
+        .feed()
+        .events(
+            utc.saturating_sub(window),
+            utc.saturating_add(NEWS_LOOKAHEAD_SECS + 1),
+        )
+        .await
+        .ok()?;
+    news_item(&events, &currencies, utc, window)
+}
+
 /// Every advisory in force now, most severe first.
 pub async fn collect(state: &AppState) -> Vec<Advisory> {
     let now = state.now();
@@ -408,6 +480,9 @@ pub async fn collect(state: &AppState) -> Vec<Advisory> {
         .all(|item| item.id == "rollover_pause" || item.id == "session_closed");
     items.extend(window_items);
     if fx_week_open && let Some(item) = instrument_advisory(state, now).await {
+        items.push(item);
+    }
+    if fx_week_open && let Some(item) = news_advisory(state, now).await {
         items.push(item);
     }
 
@@ -692,5 +767,40 @@ mod tests {
         let early = window_advisories(at(1_790_197_200 - 18 * 3_600), Some(session), &[]);
         assert_eq!(early[0].id, "session_closed");
         assert!(early[0].until_ms.is_some());
+    }
+
+    #[test]
+    fn high_impact_news_is_announced_ahead_and_while_it_pauses_trading() {
+        use crate::calendar::{CalendarEvent, Impact};
+        let nfp_at = 1_000_000;
+        let events = vec![
+            CalendarEvent::new("Non-Farm Employment Change", "USD", Impact::High, nfp_at)
+                .expect("event"),
+            CalendarEvent::new("Retail Sales", "GBP", Impact::Medium, nfp_at - 600).expect("event"),
+            CalendarEvent::new("ECB Speech", "EUR", Impact::High, nfp_at + 7 * 3_600)
+                .expect("event"),
+        ];
+        let usd = vec!["USD".to_owned(), "EUR".to_owned()];
+        let window = 30 * 60;
+        // Two hours ahead: announced, with the end of the pause.
+        let ahead = news_item(&events, &usd, nfp_at - 2 * 3_600, window).expect("ahead");
+        assert_eq!(ahead.title, "USD news ahead: Non-Farm Employment Change");
+        assert_eq!(ahead.until_ms, Some((nfp_at + window) * 1_000));
+        // Inside the blackout: paused.
+        let pausing = news_item(&events, &usd, nfp_at - 10 * 60, window).expect("pausing");
+        assert_eq!(
+            pausing.title,
+            "USD trades paused for news: Non-Farm Employment Change"
+        );
+        assert!(
+            pausing
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("30 minutes"))
+        );
+        // Too far ahead, already over, or not a traded currency: quiet.
+        assert!(news_item(&events, &usd, nfp_at - 4 * 3_600, window).is_none());
+        assert!(news_item(&events, &usd, nfp_at + window + 60, window).is_none());
+        assert!(news_item(&events, &["JPY".to_owned()], nfp_at - 600, window).is_none());
     }
 }

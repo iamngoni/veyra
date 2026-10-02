@@ -70,6 +70,17 @@ export type Status = {
     lastModel?: string | null
     /** Most recent model candidate that returned a structured answer. */
     lastSuccessfulModel?: string | null
+    /** The latest entry decision from the durable journal; survives restarts. */
+    lastEntry?: {
+      atMs: number | null
+      outcome: string | null
+      symbol: string | null
+      side: string | null
+      reason: string | null
+      rationale: string | null
+    } | null
+    /** When the autopilot next looks for entries (UTC ms); null while off. */
+    nextCheckMs?: number | null
   } | null
   /** Ordered model candidates currently in force, e.g. `chatgpt:gpt-6-luna` first. */
   model_route?: string[]
