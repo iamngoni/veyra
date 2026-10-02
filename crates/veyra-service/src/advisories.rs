@@ -59,6 +59,19 @@ pub struct Advisory {
     /// When a condition announced ahead is expected to start, UTC
     /// milliseconds; `None` once it is in effect.
     pub starts_ms: Option<i64>,
+    /// Timed entries the notice covers, soonest first, such as each release;
+    /// the console shows their times on the viewer's clock. Empty for most.
+    pub schedule: Vec<ScheduleEntry>,
+}
+
+/// One timed entry of an [`Advisory`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleEntry {
+    /// When it happens, UTC milliseconds.
+    pub at_ms: i64,
+    /// What happens, e.g. `USD Non-Farm Employment Change`.
+    pub label: String,
 }
 
 impl Advisory {
@@ -83,6 +96,7 @@ fn advisory(
         detail,
         until_ms,
         starts_ms: None,
+        schedule: Vec::new(),
     }
 }
 
@@ -357,75 +371,123 @@ fn closed_instruments_item(closed: &[(String, Option<i64>)]) -> Option<Advisory>
 /// How far ahead an upcoming high-impact release is announced.
 const NEWS_LOOKAHEAD_SECS: i64 = 3 * 3_600;
 
+/// Once announced, how far ahead the notice lists releases.
+const NEWS_SCHEDULE_SECS: i64 = 12 * 3_600;
+
+/// Most release times one notice lists.
+const NEWS_SCHEDULE_MAX: usize = 6;
+
+/// Currencies in order of first appearance.
+fn currencies_of<'a>(
+    events: impl IntoIterator<Item = &'a crate::calendar::CalendarEvent>,
+) -> Vec<&'a str> {
+    let mut currencies: Vec<&str> = Vec::new();
+    for event in events {
+        if !currencies.contains(&event.currency()) {
+            currencies.push(event.currency());
+        }
+    }
+    currencies
+}
+
+/// Releases due at one minute, by currency:
+/// `USD Average Hourly Earnings m/m, Non-Farm Employment Change; CAD Employment Change`.
+fn releases_label(releases: &[&crate::calendar::CalendarEvent]) -> String {
+    currencies_of(releases.iter().copied())
+        .into_iter()
+        .map(|currency| {
+            let mut titles: Vec<&str> = Vec::new();
+            for event in releases.iter().filter(|event| event.currency() == currency) {
+                if !titles.contains(&event.title()) {
+                    titles.push(event.title());
+                }
+            }
+            format!("{currency} {}", titles.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// The news notice: the next high-impact release for a currency the
 /// autopilot trades is inside the blackout now, or due within
-/// [`NEWS_LOOKAHEAD_SECS`]. Releases due at the same minute (a jobs report is
-/// several) share the notice. `until_ms` is when the pause ends; ahead of it,
-/// `starts_ms` is when it begins.
+/// [`NEWS_LOOKAHEAD_SECS`]. Its schedule lists that release and the ones
+/// after it within [`NEWS_SCHEDULE_SECS`], one entry per minute (a jobs
+/// report is several releases). `until_ms` is when the next pause ends;
+/// ahead of it, `starts_ms` is when it begins.
 fn news_item(
     events: &[crate::calendar::CalendarEvent],
     currencies: &[String],
     now: i64,
     window_secs: i64,
 ) -> Option<Advisory> {
-    let due: Vec<&crate::calendar::CalendarEvent> = events
+    let mut due: Vec<&crate::calendar::CalendarEvent> = events
         .iter()
         .filter(|event| {
             event.impact() == crate::calendar::Impact::High
                 && event.applies_to_currencies(currencies)
                 && event.time() + window_secs >= now
-                && event.time() - now <= NEWS_LOOKAHEAD_SECS
+                && event.time() - now <= NEWS_SCHEDULE_SECS
         })
         .collect();
-    let release = due.iter().map(|event| event.time()).min()?;
-    let releases: Vec<&crate::calendar::CalendarEvent> = due
-        .into_iter()
-        .filter(|event| event.time() == release)
-        .collect();
-    let mut affected: Vec<&str> = Vec::new();
-    for event in &releases {
-        if !affected.contains(&event.currency()) {
-            affected.push(event.currency());
-        }
+    due.sort_by_key(|event| event.time());
+    let release = due.first()?.time();
+    if release - now > NEWS_LOOKAHEAD_SECS {
+        return None;
     }
-    let mut names: Vec<String> = Vec::new();
-    for event in &releases {
-        let name = if affected.len() > 1 {
-            format!("{} {}", event.currency(), event.title())
+    let mut groups: Vec<Vec<&crate::calendar::CalendarEvent>> = Vec::new();
+    for event in due {
+        let same_minute = groups
+            .last()
+            .and_then(|group| group.first())
+            .is_some_and(|first| first.time() == event.time());
+        if same_minute {
+            if let Some(group) = groups.last_mut() {
+                group.push(event);
+            }
+        } else if groups.len() == NEWS_SCHEDULE_MAX {
+            break;
         } else {
-            event.title().to_owned()
-        };
-        if !names.contains(&name) {
-            names.push(name);
+            groups.push(vec![event]);
         }
     }
-    let currency = affected.join(" and ");
-    let names = names.join(", ");
+    let schedule = groups
+        .iter()
+        .filter_map(|group| {
+            Some(ScheduleEntry {
+                at_ms: group.first()?.time() * 1_000,
+                label: releases_label(group),
+            })
+        })
+        .collect();
     let starts = release - window_secs;
     let minutes = window_secs / 60;
     let until_ms = Some((release + window_secs) * 1_000);
-    Some(if now >= starts {
+    let mut item = if now >= starts {
+        let currency = currencies_of(groups.first().into_iter().flatten().copied()).join(" and ");
         advisory(
             "news",
             Severity::Info,
-            format!("{currency} trades paused for news: {names}"),
+            format!("{currency} trades paused for news"),
             Some(format!(
                 "No new {currency} trades {minutes} minutes either side of the release."
             )),
             until_ms,
         )
     } else {
+        let currency = currencies_of(groups.iter().flatten().copied()).join(" and ");
         advisory(
             "news",
             Severity::Info,
-            format!("{currency} news ahead: {names}"),
+            format!("{currency} news ahead"),
             Some(format!(
-                "New {currency} trades pause {minutes} minutes either side of the release."
+                "New trades in a currency pause {minutes} minutes either side of its releases."
             )),
             until_ms,
         )
         .starting(starts * 1_000)
-    })
+    };
+    item.schedule = schedule;
+    Some(item)
 }
 
 /// Reads the calendar for [`news_item`], over the currencies of the
@@ -450,7 +512,7 @@ async fn news_advisory(state: &AppState, now: SystemTime) -> Option<Advisory> {
         .feed()
         .events(
             utc.saturating_sub(window),
-            utc.saturating_add(NEWS_LOOKAHEAD_SECS + 1),
+            utc.saturating_add(NEWS_SCHEDULE_SECS + 1),
         )
         .await
         .ok()?;
@@ -822,67 +884,77 @@ mod tests {
             CalendarEvent::new("Retail Sales", "GBP", Impact::Medium, nfp_at - 600).expect("event"),
             CalendarEvent::new("ECB Speech", "EUR", Impact::High, nfp_at + 7 * 3_600)
                 .expect("event"),
+            CalendarEvent::new("BOJ Speech", "JPY", Impact::High, nfp_at + 3_600).expect("event"),
         ];
-        let usd = vec!["USD".to_owned(), "EUR".to_owned()];
+        let traded = vec!["USD".to_owned(), "EUR".to_owned()];
         let window = 30 * 60;
-        // Two hours ahead: announced, with the end of the pause.
-        let ahead = news_item(&events, &usd, nfp_at - 2 * 3_600, window).expect("ahead");
-        assert_eq!(ahead.title, "USD news ahead: Non-Farm Employment Change");
-        assert_eq!(ahead.until_ms, Some((nfp_at + window) * 1_000));
+        // Two hours ahead: announced with the window of the next pause, and
+        // every traded release in the next twelve hours on the schedule.
+        let ahead = news_item(&events, &traded, nfp_at - 2 * 3_600, window).expect("ahead");
+        assert_eq!(ahead.title, "USD and EUR news ahead");
         assert_eq!(ahead.starts_ms, Some((nfp_at - window) * 1_000));
-        // Inside the blackout: paused.
-        let pausing = news_item(&events, &usd, nfp_at - 10 * 60, window).expect("pausing");
+        assert_eq!(ahead.until_ms, Some((nfp_at + window) * 1_000));
         assert_eq!(
-            pausing.title,
-            "USD trades paused for news: Non-Farm Employment Change"
+            ahead.schedule,
+            vec![
+                ScheduleEntry {
+                    at_ms: nfp_at * 1_000,
+                    label: "USD Non-Farm Employment Change".to_owned(),
+                },
+                ScheduleEntry {
+                    at_ms: (nfp_at + 7 * 3_600) * 1_000,
+                    label: "EUR ECB Speech".to_owned(),
+                },
+            ]
         );
-        assert!(
-            pausing
-                .detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("30 minutes"))
+        // Inside the blackout: paused, for that release's currency.
+        let pausing = news_item(&events, &traded, nfp_at - 10 * 60, window).expect("pausing");
+        assert_eq!(pausing.title, "USD trades paused for news");
+        assert_eq!(
+            pausing.detail.as_deref(),
+            Some("No new USD trades 30 minutes either side of the release.")
         );
         // In effect, there is no start left to announce.
         assert_eq!(pausing.starts_ms, None);
-        // Too far ahead, already over, or not a traded currency: quiet.
-        assert!(news_item(&events, &usd, nfp_at - 4 * 3_600, window).is_none());
-        assert!(news_item(&events, &usd, nfp_at + window + 60, window).is_none());
-        assert!(news_item(&events, &["JPY".to_owned()], nfp_at - 600, window).is_none());
+        // Too far ahead, already over, or not a traded currency: quiet, even
+        // with a later release inside the schedule's reach.
+        assert!(news_item(&events, &traded, nfp_at - 4 * 3_600, window).is_none());
+        assert!(news_item(&events, &traded, nfp_at + window + 60, window).is_none());
+        assert!(news_item(&events, &["CHF".to_owned()], nfp_at - 600, window).is_none());
     }
 
     #[test]
-    fn releases_due_together_share_one_notice() {
+    fn releases_due_together_share_one_schedule_entry() {
         use crate::calendar::{CalendarEvent, Impact};
         let at = 1_000_000;
         let event = |title: &str, currency: &str, time: i64| {
             CalendarEvent::new(title, currency, Impact::High, time).expect("event")
         };
-        let jobs = vec![
+        let mut jobs = vec![
             event("Average Hourly Earnings m/m", "USD", at),
             event("Non-Farm Employment Change", "USD", at),
             event("Unemployment Rate", "USD", at),
-            event("FOMC Member Speaks", "USD", at + 3_600),
+            event("Employment Change", "CAD", at),
+            event("Non-Farm Employment Change", "USD", at),
         ];
-        let usd = vec!["USD".to_owned()];
-        let notice = news_item(&jobs, &usd, at - 3_600, 30 * 60).expect("ahead");
-        assert_eq!(
-            notice.title,
-            "USD news ahead: Average Hourly Earnings m/m, Non-Farm Employment Change, Unemployment Rate"
-        );
-        // Another currency at the same minute is named with its own.
-        let mut both = jobs;
-        both.push(event("Employment Change", "CAD", at));
+        // More release times than one notice lists.
+        for hour in 1..=8 {
+            jobs.push(event("FOMC Member Speaks", "USD", at + hour * 3_600));
+        }
         let currencies = vec!["USD".to_owned(), "CAD".to_owned()];
-        let notice = news_item(&both, &currencies, at - 3_600, 30 * 60).expect("ahead");
-        assert!(
-            notice
-                .title
-                .starts_with("USD and CAD news ahead: USD Average Hourly")
+        let notice = news_item(&jobs, &currencies, at - 3_600, 30 * 60).expect("ahead");
+        assert_eq!(notice.title, "USD and CAD news ahead");
+        assert_eq!(
+            notice.schedule.first().map(|entry| entry.label.as_str()),
+            Some(
+                "USD Average Hourly Earnings m/m, Non-Farm Employment Change, Unemployment Rate; \
+                 CAD Employment Change"
+            )
         );
-        assert!(notice.title.ends_with("CAD Employment Change"));
+        assert_eq!(notice.schedule.len(), NEWS_SCHEDULE_MAX);
         assert_eq!(
             notice.detail.as_deref(),
-            Some("New USD and CAD trades pause 30 minutes either side of the release.")
+            Some("New trades in a currency pause 30 minutes either side of its releases.")
         );
     }
 }

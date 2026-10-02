@@ -457,6 +457,16 @@ export type Advisory = {
   untilMs?: number | null
   /** When a condition announced ahead starts, UTC milliseconds; null once in effect. */
   startsMs?: number | null
+  /** Timed entries the notice covers, soonest first, e.g. each release; empty for most. */
+  schedule?: ScheduleEntry[] | null
+}
+
+/** One timed entry of an advisory, shown on the viewer's clock. */
+export type ScheduleEntry = {
+  /** When it happens, UTC milliseconds. */
+  atMs: number
+  /** What happens, e.g. `USD Non-Farm Employment Change`. */
+  label: string
 }
 
 /** Current advisories from `/advisories`, most severe first; empty when nothing needs saying. */

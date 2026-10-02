@@ -50,21 +50,57 @@
   background-image: linear-gradient(var(--color-bad-dim), var(--color-bad-dim));
 }
 
-/* The detail gives way first, then the title; the end time never does. */
-.banner-title {
+/* The words between the dot and the end time. While wider than the strip
+   they crawl like a news ticker: two passes side by side, shifted by one
+   pass and its gap so the loop has no seam, paused under the pointer or
+   keyboard focus. The end time never gives way. */
+.ticker {
+  display: block;
   min-width: 0;
-  flex: 0 1 auto;
+  flex: 1 1 auto;
   overflow: hidden;
-  font-weight: var(--weight-semibold);
-  text-overflow: ellipsis;
+  border-radius: 2px;
 }
-.banner-detail {
-  min-width: 0;
-  flex: 0 100 auto;
-  overflow: hidden;
-  color: var(--color-ink-muted);
-  text-overflow: ellipsis;
+.ticker.is-moving {
+  mask-image: linear-gradient(90deg, transparent, #000 10px, #000 calc(100% - 24px), transparent);
 }
+.ticker:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+.ticker-track {
+  display: inline-flex;
+  width: max-content;
+  vertical-align: top;
+}
+.ticker.is-moving .ticker-track {
+  animation: ticker var(--ticker-duration) linear 1.5s infinite;
+}
+.banner-row:hover .ticker-track,
+.ticker:focus-visible .ticker-track { animation-play-state: paused; }
+.ticker-copy { display: inline-flex; flex: none; }
+.ticker.is-moving .ticker-copy { padding-right: var(--ticker-gap); }
+.ticker-content {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+@keyframes ticker {
+  to { transform: translateX(calc(-1 * var(--ticker-distance))); }
+}
+
+/* Still for anyone who asks for less motion: one pass, faded at the edge,
+   the full words on hover. */
+@media (prefers-reduced-motion: reduce) {
+  .ticker.is-moving .ticker-track { animation: none; }
+  .ticker-copy[aria-hidden='true'] { display: none; }
+}
+
+.banner-title { font-weight: var(--weight-semibold); }
+.banner-entry time {
+  margin-right: 2px;
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--weight-medium);
+}
+.banner-detail { color: var(--color-ink-muted); }
 .banner-until {
   display: inline-flex;
   flex: 0 0 auto;
@@ -95,9 +131,9 @@
 }
 .banner-more:hover { background: var(--color-hover); color: var(--color-ink); }
 
-/* A phone has height to spare and no room across: the title and end time
-   share the first line, the detail wraps under the title, and the
-   disclosure moves below the strips. */
+/* A phone has height to spare and no room across: the words wrap beside the
+   dot instead of crawling, the end time keeps the first line's right edge,
+   and the disclosure moves below the strips. */
 @media (max-width: 660px) {
   .banner { flex-direction: column; align-items: stretch; }
   .banner-more { align-self: flex-end; }
@@ -111,8 +147,12 @@
     white-space: normal;
   }
   .banner-row .dot { margin-top: 6px; }
-  .banner-title { overflow: visible; }
-  .banner-detail { grid-row: 2; grid-column: 2 / -1; overflow: visible; }
+  .ticker { overflow: visible; }
+  .ticker.is-moving { mask-image: none; }
+  .ticker.is-moving .ticker-track { animation: none; }
+  .ticker-track, .ticker-copy, .ticker-content { display: flex; width: auto; }
+  .ticker-content { flex-wrap: wrap; gap: 2px var(--space-2); }
+  .ticker-copy[aria-hidden='true'] { display: none; }
   .banner-until { grid-row: 1; grid-column: 3; padding-left: 0; }
 }
 

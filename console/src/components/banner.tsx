@@ -12,11 +12,15 @@
  * appears later is announced. Rows are keyed by the service's stable id and
  * the moving countdown lives only in the hidden tooltip, so a poll that
  * changes nothing announces nothing.
+ *
+ * A strip's words crawl like a news ticker when they are wider than the
+ * strip (see `Ticker`), so a long notice or a schedule of releases reads in
+ * full on one line.
  */
 
-import { useId, useState } from 'react'
+import { type CSSProperties, type ReactNode, useId, useLayoutEffect, useRef, useState } from 'react'
 
-import type { Advisories, Advisory, AdvisorySeverity } from '../lib/api'
+import type { Advisories, Advisory, AdvisorySeverity, ScheduleEntry } from '../lib/api'
 import { Dot, Hint, type Tone } from './ui'
 
 import '../styles/banner.css'
@@ -93,6 +97,71 @@ export function windowDetail(startsMs: number, untilMs: number, nowMs: number): 
   return `Expected from ${date}, ${clock(starts)} until ${clock(new Date(untilMs))} your time — starts ${countdown(startsMs, nowMs)}.`
 }
 
+/** Ticker speed, pixels per second: slow enough to read in passing. */
+const TICKER_SPEED = 48
+
+/** Space between the end of a strip's words and their next pass, pixels. */
+const TICKER_GAP = 64
+
+/**
+ * Words that crawl right to left, like a news ticker, while they are wider
+ * than their strip, and stand still while they fit. Hover or keyboard focus
+ * pauses them; with reduced motion they stand still, faded at the edge, and
+ * `text` stays on hover either way. The second pass that makes the loop
+ * seamless is hidden from assistive technology, so the words are read once.
+ */
+function Ticker({ text, children }: { text: string; children: ReactNode }) {
+  const viewport = useRef<HTMLSpanElement>(null)
+  const content = useRef<HTMLSpanElement>(null)
+  // The words' own width while it exceeds the strip; 0 while they fit.
+  const [width, setWidth] = useState(0)
+
+  useLayoutEffect(() => {
+    const measure = () => {
+      const natural = content.current?.offsetWidth ?? 0
+      const room = viewport.current?.clientWidth ?? 0
+      setWidth(natural > room ? natural : 0)
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return undefined
+    const observer = new ResizeObserver(measure)
+    for (const element of [viewport.current, content.current]) if (element) observer.observe(element)
+    return () => observer.disconnect()
+  }, [text])
+
+  const moving = width > 0
+  const distance = width + TICKER_GAP
+  const style = moving
+    ? ({
+        '--ticker-gap': `${TICKER_GAP}px`,
+        '--ticker-distance': `${distance}px`,
+        '--ticker-duration': `${(distance / TICKER_SPEED).toFixed(2)}s`,
+      } as CSSProperties)
+    : undefined
+  return (
+    <span
+      ref={viewport}
+      className={`ticker${moving ? ' is-moving' : ''}`}
+      style={style}
+      title={moving ? text : undefined}
+      tabIndex={moving ? 0 : undefined}
+    >
+      <span className="ticker-track">
+        <span className="ticker-copy">
+          <span ref={content} className="ticker-content">
+            {children}
+          </span>
+        </span>
+        {moving ? (
+          <span className="ticker-copy" aria-hidden="true">
+            <span className="ticker-content">{children}</span>
+          </span>
+        ) : null}
+      </span>
+    </span>
+  )
+}
+
 function AdvisoryRow({ item, now }: { item: Advisory; now: number }) {
   // A severity this console does not know yet reads as information rather
   // than breaking the row.
@@ -101,18 +170,26 @@ function AdvisoryRow({ item, now }: { item: Advisory; now: number }) {
   const until = item.untilMs ?? undefined
   // Still ahead, the strip shows the whole window; once in effect, its end.
   const starts = until !== undefined && item.startsMs != null && item.startsMs > now ? item.startsMs : undefined
+  const schedule: ScheduleEntry[] = Array.isArray(item.schedule) ? item.schedule : []
+  const text = [
+    item.title,
+    ...schedule.map((entry) => `${moment(entry.atMs, now)} ${entry.label}`),
+    item.detail,
+  ]
+    .filter(Boolean)
+    .join(' · ')
   return (
     <li className={`banner-row is-${level}`}>
       <Dot tone={tone} label={label} />
-      <strong className="banner-title" title={item.title}>
-        {item.title}
-      </strong>
-      {/* One line on a desktop window; the full sentence stays on hover. */}
-      {item.detail ? (
-        <span className="banner-detail" title={item.detail}>
-          {item.detail}
-        </span>
-      ) : null}
+      <Ticker text={text}>
+        <strong className="banner-title">{item.title}</strong>
+        {schedule.map((entry) => (
+          <span className="banner-entry" key={`${entry.atMs}:${entry.label}`}>
+            <time dateTime={new Date(entry.atMs).toISOString()}>{moment(entry.atMs, now)}</time> {entry.label}
+          </span>
+        ))}
+        {item.detail ? <span className="banner-detail">{item.detail}</span> : null}
+      </Ticker>
       {until !== undefined && starts !== undefined ? (
         <span className="banner-until">
           {windowLabel(starts, until, now)}
