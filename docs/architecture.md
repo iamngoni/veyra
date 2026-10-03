@@ -346,7 +346,7 @@ A read-only assistant (`POST /assistant/chat`) sits beside every page. It stream
 - **H4 by default.** The supervised configuration runs H4 (`VEYRA_AUTOPILOT_TIMEFRAME`; the console chart defaults to H4 and lets the operator pick M15/H1/H4/D1/W1). Other timeframes exist in the contract (`M1`…`MN1`) but are not what is exercised today.
 - **EA-specific wire transport.** Command channels are provider-neutral (`BrokerLink` + `broker/command.rs`), but the only implemented transport today is the EA poll loop in `broker/ea.rs`; the `ea_link()` accessor remains for its transport and tests, and no other venue implementation exists yet.
 - **No console authentication.** The console and `/account` expose owner-facing money state. Keep them on loopback or a private network such as Tailscale; anything wider requires authentication first.
-- **Always-on deployment pending.** Supervision runs on one local Mac; a durable 24/7 host/VPS, managed secrets, remote monitoring, and a versioned deployment pipeline are open roadmap items.
+- **One host by design.** The Mac mini is the hosting environment (no VPS): it runs the Docker stack and the native MT4 terminal under launchd supervision. Managed secrets, off-host monitoring, and a versioned deployment pipeline are open roadmap items.
 - **One implementation for most integrations.** Broker, market data, judge, calendar, and audit each have one (`ea`, `ea`, `typesafe`, `forexfactory`, `postgres`); the abstraction is the extension point. The model layer is the exception: it supports many API providers plus ChatGPT and Claude subscriptions.
 
 ## Where to change things
