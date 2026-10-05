@@ -6,8 +6,8 @@
 // Requires the endpoint to be listed in
 // Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.27"
-#property description "Veyra control channel: heartbeat, account/position snapshots, market rates, order validation, gated live execution, and Veyra-owned closes and stop changes."
+#property version   "1.28"
+#property description "Veyra control channel: heartbeat, account/position snapshots, market rates, the broker's instrument list, order validation, gated live execution, and Veyra-owned closes and stop changes."
 
 input string InUrl         = "__VEYRA_URL__";            // Veyra endpoint (loopback or tunnel)
 input string InToken       = "__VEYRA_TOKEN__";          // shared token
@@ -18,7 +18,7 @@ input bool   InAllowLiveOrders = __VEYRA_ALLOW_LIVE__;   // arm live order place
 uint g_last       = 0;
 bool g_said_hello = false;
 
-#define VEYRA_EA_VERSION "1.27"
+#define VEYRA_EA_VERSION "1.28"
 #define MAX_ADJUSTMENTS  64
 
 int OnInit()

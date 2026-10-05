@@ -45,9 +45,9 @@ the same Apply, and choosing back what is already deployed discards the draft.
 | `GET /symbols` | The catalogue: `ready`, `server`, `fetchedAt`, `categories` with counts, and every instrument with its category and whether the risk gate accepts it. Always answers; `ready: false` carries a `reason`. |
 | `POST /symbols/refresh` | Pulls the list from the terminal now. 503 with a reason when no terminal is connected. |
 
-## Needs EA 1.27 or newer
+## Needs EA 1.28 or newer
 
-An older EA answers `list_symbols` with "unsupported command" and the picker
-shows its reason. Recompile (`scripts/compile_ea.sh`) and reload the EA on
-every machine that runs MetaTrader 4, and check that **InAllowLiveOrders**
+An older EA answers `list_symbols` with "unsupported command"; the picker
+shows that reason and the service retries with a backoff of up to 10 minutes. Recompile (`scripts/compile_ea.sh`) and reload the EA on
+the terminal, and check that **InAllowLiveOrders**
 still shows what you intend after the reload.

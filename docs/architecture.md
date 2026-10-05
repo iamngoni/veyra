@@ -31,7 +31,7 @@ Status at a glance (see `README.md` and `docs/roadmap.md` for evidence):
 | Piece | Role | Where |
 | --- | --- | --- |
 | Service (`veyra-service`) | configuration, risk gate, command queue, autopilot, HTTP surface | Rust 2024 + Actix Web + Tokio, `crates/veyra-service` |
-| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/account/balance-history`, `/market/candles`, `/market/spec`, `/market/sessions`, `/calendar`, `/performance`, `/trades`, `/reconciliation`, `/risk/policy`, `/config`, `/assistant/chat`, `/model/credential`, `/model/subscriptions*`, `/model/cooldowns*`, `/notifications*`, `/advisories` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
+| Diagnostics/control listener | `/health`, `/ready`, `/status`, `/metrics`, `/intents/*`, `/commands*`, `/events`, `/logs`, `/audit`, `/account`, `/account/balance-history`, `/market/candles`, `/market/spec`, `/market/sessions`, `/calendar`, `/performance`, `/trades`, `/reconciliation`, `/risk/policy`, `/config`, `/assistant/chat`, `/model/credential`, `/model/subscriptions*`, `/model/cooldowns*`, `/notifications*`, `/advisories`, `/symbols`, `/symbols/refresh` | `127.0.0.1:8080` (`VEYRA_BIND_HOST`/`VEYRA_BIND_PORT`) |
 | EA channel listener | token-authenticated `POST /ea/poll` carrying heartbeats and the command queue | `127.0.0.1:7801` by default (`VEYRA_EA_BIND_*`); an explicit `VEYRA_EA_ALLOW_NON_LOOPBACK=true` opt-in permits an unpublished isolated container bind |
 | MT4 terminal + `VeyraProbe` EA | holds the broker session, polls the channel, executes acknowledged commands, reports dry runs while disarmed | `ea/VeyraProbe.mq4` inside MetaTrader 4 (Wine) |
 | Cloudflare tunnel | `veyra.antonlabs.cc` → `127.0.0.1:7801` — the EA channel only | launchd agent, `KeepAlive` |
@@ -100,7 +100,7 @@ Rules that hold across all of them:
 
 - An absent provider with no related variables disables the integration; a **partially configured section fails startup**. Malformed values name the setting and never echo its raw value; secrets are redacted from `Debug`.
 - The `ea` market provider refuses to build without an active broker command channel, because it reads candles through it.
-- The broker contract covers reporting *and* the command channel: `BrokerLink` exposes `enqueue_order_check` / `enqueue_open_order` / `enqueue_close_order` / `enqueue_modify_order` / `enqueue_rates` / `enqueue_symbol_spec`, `command` / `await_command` / `recent_commands`, and the retained account snapshot. `control.rs`, `reconciliation.rs`, `market/`, and `trading/autopilot.rs` depend on the trait alone, so a new venue is one implementation module plus selector arms — no caller edits. A test-only second implementation in `broker/mod.rs` holds that seam in place.
+- The broker contract covers reporting *and* the command channel: `BrokerLink` exposes `enqueue_order_check` / `enqueue_open_order` / `enqueue_close_order` / `enqueue_modify_order` / `enqueue_rates` / `enqueue_symbol_spec` / `enqueue_order_history` / `enqueue_list_symbols`, `command` / `await_command` / `recent_commands`, and the retained account snapshot. `control.rs`, `reconciliation.rs`, `market/`, and `trading/autopilot.rs` depend on the trait alone, so a new venue is one implementation module plus selector arms — no caller edits. A test-only second implementation in `broker/mod.rs` holds that seam in place.
 - `/status` reports the active provider identifiers (including the calendar), the broker link state, both switches, the autopilot settings, the model budget, and the effective risk policy. `GET /calendar?hours=1-168` lists the upcoming events the entry path sees.
 
 ### Notification channels
@@ -196,7 +196,7 @@ One append-only PostgreSQL table (`audit_events`: id, timestamp, kind, JSONB pay
 | `reconciliation_drift` | A snapshot shows orders Veyra does not own, or a truncated position list |
 | `position_closed` | A managed ticket disappears from the book (last observed values, including P/L) |
 
-**Routine reads are live-only.** Queueing and completing a read-only broker command — `ping`, `account_snapshot`, `rates`, `symbol_spec`, `order_history` — reaches the live feed and the counters but is not stored (`audit::is_routine_read`). These were about 75,000 rows a day, over 99% of all writes, and nothing reads them back; storing them slowed every write and read of the table. Their failures are stored, as are all order commands (`order_check`, `open_order`, `close_order`, `modify_order`) and the `broker_snapshot` row each snapshot produces.
+**Routine reads are live-only.** Queueing and completing a read-only broker command — `ping`, `account_snapshot`, `rates`, `symbol_spec`, `order_history`, `list_symbols` — reaches the live feed and the counters but is not stored (`audit::is_routine_read`). These were about 75,000 rows a day, over 99% of all writes, and nothing reads them back; storing them slowed every write and read of the table. Their failures are stored, as are all order commands (`order_check`, `open_order`, `close_order`, `modify_order`) and the `broker_snapshot` row each snapshot produces.
 
 Read routes on the loopback surface:
 
@@ -325,7 +325,7 @@ The sidebar shows status pills (terminal live/stale, EA armed/disarmed, trading 
 | Trace | The durable audit trail from `/audit` |
 | Diagnostics | Autopilot configuration and Jev/model-budget usage, the model route, top `/metrics` counters, and the `/logs` tail with a level filter |
 | Notifications | Channels (email, Telegram, Discord, Slack, ntfy, Pushover, webhook) with setup guides and test sends, per-event switches, the daily-summary hour, and recent deliveries, from `/notifications` |
-| Settings | The live settings overlay from `/config`, model credentials, subscription connections, and the Judge section (OpenAI key, connection test, and the switch from Jev to OpenAI Decisions) |
+| Settings | The live settings overlay from `/config` (with an instrument picker over the broker's own list, see [instruments.md](instruments.md)), model credentials, subscription connections, and the Judge section (OpenAI key, connection test, and the switch from Jev to OpenAI Decisions) |
 
 A status banner above every page shows `GET /advisories`: plain-language notices, most severe first, for whatever is stopping or pausing trades — kill switch, execution off, EA disarmed, MT4 not reporting, a loss limit (with what it takes to resume), repeated model failures or a recently skipped autopilot round (with the reason in plain words), and closed markets with when entries reopen (the FX week, the nightly rollover pause, the operator's session window, and each index's own hours). The route is read-only; it may ask the terminal for an index contract to read its hours, bounded by a 3-second timeout.
 

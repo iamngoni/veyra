@@ -148,6 +148,10 @@
       aggregates wins/losses/win rate, net P/L, profit factor, and per-symbol
       totals, and the console shows it as the Performance panel — proven live
       (the USDJPY take-profit: open 156.198, close 156.410, net +1.36, 1W/0L).
+- [ ] Instrument picker: a read-only `list_symbols` command (EA 1.28) pages
+      the broker's full instrument list into `GET /symbols`, and Settings ->
+      Autopilot -> Instruments chooses from it by market. Built and tested
+      locally; not yet seen against a live terminal.
 - [x] Economic calendar: a provider-neutral `EventCalendar` trait with the
       keyless ForexFactory weekly export as the first implementation (cached),
       `GET /calendar` for operators, per-asset `upcoming_events` in the entry
