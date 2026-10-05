@@ -30,6 +30,7 @@ pub mod server;
 pub mod state;
 pub mod store;
 pub mod subscription_auth;
+pub mod symbols;
 pub mod text;
 pub mod trade_journal;
 pub mod trades;
@@ -93,6 +94,8 @@ pub struct AppState {
     order_admission: Arc<tokio::sync::Mutex<()>>,
     /// Operator notification queue; a disabled notifier drops everything.
     notifier: crate::notify::Notifier,
+    /// The broker's instrument list, pulled once per connection.
+    symbols: Arc<crate::symbols::SymbolCatalog>,
 }
 
 impl AppState {
@@ -134,6 +137,7 @@ impl AppState {
             equity_guard: Arc::new(EquityGuard::new()),
             order_admission: Arc::new(tokio::sync::Mutex::new(())),
             notifier: crate::notify::Notifier::disabled(),
+            symbols: Arc::new(crate::symbols::SymbolCatalog::new()),
         }
     }
 
@@ -412,6 +416,11 @@ impl AppState {
             .model
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = model;
+    }
+
+    /// The broker's instrument catalogue, shared by every clone of the state.
+    pub fn symbols(&self) -> &crate::symbols::SymbolCatalog {
+        &self.symbols
     }
 
     /// Returns the active judgement integration, if one is configured.
