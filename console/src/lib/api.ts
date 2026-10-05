@@ -406,6 +406,46 @@ export type AuditPage = {
   error?: string
 }
 
+/** Kind of market a broker instrument belongs to; ids match the service's. */
+export type SymbolCategoryId =
+  | 'forex'
+  | 'indices'
+  | 'metals'
+  | 'energies'
+  | 'commodities'
+  | 'crypto'
+  | 'stocks'
+  | 'bonds'
+  | 'other'
+
+/** One instrument the connected broker offers. */
+export type CatalogSymbol = {
+  name: string
+  description: string
+  path: string
+  category: SymbolCategoryId
+  /** Whether the risk gate's allowlist accepts it today. */
+  riskAllowed: boolean
+}
+
+/**
+ * The broker's instrument list, pulled once per terminal connection. Until the
+ * terminal has answered, `ready` is false and `reason` says what it waits for.
+ */
+export type SymbolCatalog =
+  | { ready: false; reason: string; categories: []; symbols: [] }
+  | {
+      ready: true
+      server: string
+      /** Unix seconds when the list was pulled. */
+      fetchedAt: number
+      total: number
+      /** Instruments left out because Veyra cannot trade a name like that. */
+      skipped: number
+      categories: Array<{ id: SymbolCategoryId; label: string; count: number }>
+      symbols: CatalogSymbol[]
+    }
+
 /** Partial update to the live risk policy; omitted fields keep their value. */
 export type RiskPolicyPatch = {
   killSwitch?: boolean
@@ -923,6 +963,12 @@ export const api = {
   /** Durable trail, newest first. Survives restarts, unlike the log ring. */
   audit: (limit = 200) => get<AuditPage>(`/audit?limit=${limit}`),
   updatePolicy: (patch: RiskPolicyPatch) => post<RiskPolicy>('/risk/policy', patch),
+  /** The live risk policy, including the instrument allowlist. */
+  riskPolicy: () => get<RiskPolicy>('/risk/policy'),
+  /** Every instrument the broker offers, grouped by market; served from memory. */
+  symbols: () => get<SymbolCatalog>('/symbols'),
+  /** Asks the terminal for its instrument list again. */
+  refreshSymbols: () => post<{ status: string; count: number }>('/symbols/refresh', {}),
   config: () => get<RuntimeConfig>('/config'),
   /** Notification settings, delivery counters and recent deliveries. */
   notifications: () => get<NotificationSettings>('/notifications'),

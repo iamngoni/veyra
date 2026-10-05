@@ -307,6 +307,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Instrument catalogue: pull the broker's symbol list when a terminal
+    // connects (and again if the account moves server), then serve it from
+    // memory. The step is cheap and does nothing while the list is current.
+    if state.broker().is_some() {
+        let catalogue_state = state.clone();
+        actix_web::rt::spawn(async move {
+            loop {
+                veyra_service::symbols::maintain(&catalogue_state).await;
+                actix_web::rt::time::sleep(Duration::from_secs(15)).await;
+            }
+        });
+    }
+
     // Retention: prune audit history once an hour, best-effort. Zero days
     // keeps everything.
     let retention_days = state.config().audit_retention_days();
