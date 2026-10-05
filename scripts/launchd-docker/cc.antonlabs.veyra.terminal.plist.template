@@ -12,6 +12,10 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- MT4 may be started as the watcher's child (with a startup file);
+         it must outlive a restart of the watcher. -->
+    <key>AbandonProcessGroup</key>
+    <true/>
     <key>ThrottleInterval</key>
     <integer>30</integer>
     <key>StandardOutPath</key>
