@@ -121,11 +121,20 @@ pub async fn update_risk_policy(
 ) -> HttpResponse {
     let current = state.risk().policy();
     match current.apply_patch(&patch.into_inner()) {
-        Err(error) => HttpResponse::BadRequest().json(json!({
-            "error": "invalid_policy",
-            "field": error.name,
-            "reason": error.reason
-        })),
+        Err(error) => {
+            // A refusal changes nothing, but it must still be visible after the
+            // fact: the console's message is gone once the page is.
+            tracing::warn!(
+                field = error.name,
+                reason = error.reason,
+                "risk policy change refused"
+            );
+            HttpResponse::BadRequest().json(json!({
+                "error": "invalid_policy",
+                "field": error.name,
+                "reason": error.reason
+            }))
+        }
         Ok(updated) => {
             state.risk().update_policy(updated.clone());
             // Persist the effective policy so a restart resumes the operator's
@@ -579,6 +588,9 @@ pub async fn update_runtime_config(
     let accepted = match state.runtime_config().screen(&patch) {
         Ok(accepted) => accepted,
         Err(rejected) => {
+            for edit in &rejected {
+                tracing::warn!(field = %edit.name, reason = %edit.reason, "settings change refused");
+            }
             return HttpResponse::BadRequest().json(json!({
                 "error": "invalid_settings",
                 "rejected": rejected
@@ -594,6 +606,7 @@ pub async fn update_runtime_config(
     let staged = match crate::runtime_config::validate(state.runtime_config(), &accepted) {
         Ok(staged) => staged,
         Err(edit) => {
+            tracing::warn!(field = %edit.name, reason = %edit.reason, "settings change refused");
             return HttpResponse::BadRequest().json(json!({
                 "error": "invalid_settings",
                 "rejected": [{"field": edit.name, "reason": edit.reason}]
