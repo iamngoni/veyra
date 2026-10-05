@@ -21,8 +21,8 @@ import { Icon } from './ui'
 
 /** The service rotates through at most this many instruments. */
 export const MAX_AUTOPILOT_SYMBOLS = 16
-/** Rows drawn at once; a broker can list thousands, so the rest wait for a search. */
-const VISIBLE_ROWS = 120
+/** Rows per page; a broker can list thousands, so the list is paged rather than cut off. */
+export const PAGE_ROWS = 50
 /** The shape the service accepts for an instrument name. */
 const SYMBOL_NAME = /^(?!.* {2})[A-Za-z0-9._#+() -]{1,32}$/
 
@@ -85,6 +85,7 @@ export function SymbolPicker({
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState<CategoryFilter>('all')
+  const [page, setPage] = useState(0)
   const [note, setNote] = useState<string>()
   const [allowing, setAllowing] = useState(false)
   const root = useRef<HTMLDivElement>(null)
@@ -120,6 +121,11 @@ export function SymbolPicker({
     if (!catalog?.ready) return []
     return catalog.symbols.filter((symbol) => (category === 'all' || symbol.category === category) && (needle === '' || matches(symbol, needle)))
   }, [catalog, category, needle])
+
+  const pageCount = Math.max(1, Math.ceil(rows.length / PAGE_ROWS))
+  const current = Math.min(page, pageCount - 1)
+  const first = current * PAGE_ROWS
+  const shown = rows.slice(first, first + PAGE_ROWS)
 
   const full = selected.length >= MAX_AUTOPILOT_SYMBOLS
   const refused = selected.filter((name) => known.get(name.toLowerCase())?.riskAllowed === false)
@@ -223,7 +229,10 @@ export function SymbolPicker({
             aria-label="Search instruments"
             placeholder="Search by name, description or folder"
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => {
+              setQuery(event.target.value)
+              setPage(0)
+            }}
             autoFocus
           />
           {catalog?.ready ? (
@@ -232,7 +241,10 @@ export function SymbolPicker({
                 type="button"
                 className={`sym-cat${category === 'all' ? ' is-on' : ''}`}
                 aria-pressed={category === 'all'}
-                onClick={() => setCategory('all')}
+                onClick={() => {
+                  setCategory('all')
+                  setPage(0)
+                }}
               >
                 All <span>{catalog.total.toLocaleString()}</span>
               </button>
@@ -242,7 +254,10 @@ export function SymbolPicker({
                   type="button"
                   className={`sym-cat${category === entry.id ? ' is-on' : ''}`}
                   aria-pressed={category === entry.id}
-                  onClick={() => setCategory(entry.id)}
+                  onClick={() => {
+                    setCategory(entry.id)
+                    setPage(0)
+                  }}
                 >
                   {entry.label} <span>{entry.count.toLocaleString()}</span>
                 </button>
@@ -260,7 +275,7 @@ export function SymbolPicker({
           {catalog?.ready ? (
             rows.length > 0 ? (
               <ul className="sym-list" aria-label="Instruments">
-                {rows.slice(0, VISIBLE_ROWS).map((symbol) => {
+                {shown.map((symbol) => {
                   const checked = chosen.has(symbol.name.toLowerCase())
                   return (
                     <li key={symbol.name}>
@@ -286,10 +301,18 @@ export function SymbolPicker({
               <p className="sym-status">Nothing matches that search.</p>
             )
           ) : null}
-          {catalog?.ready && rows.length > VISIBLE_ROWS ? (
-            <p className="sym-status">
-              Showing the first {VISIBLE_ROWS} of {rows.length.toLocaleString()}. Search or pick a market to narrow it.
-            </p>
+          {catalog?.ready && rows.length > PAGE_ROWS ? (
+            <nav className="sym-pager" aria-label="Instrument pages">
+              <Button onClick={() => setPage(current - 1)} disabled={current === 0}>
+                Previous
+              </Button>
+              <span className="sym-status" aria-live="polite">
+                {first + 1}–{first + shown.length} of {rows.length.toLocaleString()}
+              </span>
+              <Button onClick={() => setPage(current + 1)} disabled={current >= pageCount - 1}>
+                Next
+              </Button>
+            </nav>
           ) : null}
 
           {canAddTyped ? (

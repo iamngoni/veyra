@@ -163,13 +163,25 @@ describe('SymbolPicker', () => {
     expect(boxes.filter((box) => box.checked).every((box) => !box.disabled)).toBe(true)
   })
 
-  it('shows only the first rows of a very long list and says so', async () => {
-    const huge = Array.from({ length: 200 }, (_, index) => entry(`SYM${String(index).padStart(3, '0')}`, 'stocks'))
+  it('pages a very long list so every instrument can be reached', async () => {
+    const huge = Array.from({ length: 120 }, (_, index) => entry(`SYM${String(index).padStart(3, '0')}`, 'stocks'))
     vi.spyOn(api, 'symbols').mockResolvedValue(readyCatalog(huge))
     render(<Harness />)
     const dialog = await openPicker()
-    expect(await within(dialog).findByText(/Showing the first 120 of 200/)).toBeTruthy()
-    expect(within(dialog).getAllByRole('checkbox')).toHaveLength(120)
+    expect(await within(dialog).findByText('1–50 of 120')).toBeTruthy()
+    expect(within(dialog).getAllByRole('checkbox')).toHaveLength(50)
+    expect((within(dialog).getByRole('button', { name: 'Previous' }) as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Next' }))
+    expect(within(dialog).getByText('51–100 of 120')).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Next' }))
+    expect(within(dialog).getByText('101–120 of 120')).toBeTruthy()
+    expect(within(dialog).getAllByRole('checkbox')).toHaveLength(20)
+    expect((within(dialog).getByRole('button', { name: 'Next' }) as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.change(within(dialog).getByLabelText('Search instruments'), { target: { value: 'SYM11' } })
+    expect(within(dialog).queryByRole('navigation', { name: 'Instrument pages' })).toBeNull()
+    expect(within(dialog).getAllByRole('checkbox')).toHaveLength(10)
   })
 
   it('marks instruments the risk gate would refuse and allows them only on request', async () => {
