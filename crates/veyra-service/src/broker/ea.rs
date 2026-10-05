@@ -31,7 +31,8 @@ use crate::broker::command::{
     AccountSnapshotPayload, CloseOrderRequest, CommandId, CommandKind, CommandPayload,
     CommandRecord, CommandState, ListedCommand, ModifyOrderRequest, OrderCheckPayload,
     OrderExecutionPayload, OrderHistoryPayload, OrderHistoryRequest, OrderRequest, PositionPayload,
-    RatesPayload, RatesRequest, SymbolSpecPayload, SymbolSpecRequest,
+    RatesPayload, RatesRequest, SymbolListPayload, SymbolListRequest, SymbolSpecPayload,
+    SymbolSpecRequest,
 };
 use crate::broker::settings::EaToken;
 use crate::broker::{
@@ -228,6 +229,9 @@ pub enum EaReply {
         /// Present for account-history commands.
         #[serde(skip_serializing_if = "Option::is_none")]
         history: Option<Box<OrderHistoryRequest>>,
+        /// Present for instrument-list commands.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        symbols: Option<Box<SymbolListRequest>>,
     },
 }
 
@@ -260,6 +264,18 @@ struct EaCommand {
     request: Option<CommandRequest>,
 }
 
+/// The request body of a delivered command, at most one field set.
+#[derive(Default)]
+struct Attached {
+    order: Option<Box<OrderRequest>>,
+    close: Option<Box<CloseOrderRequest>>,
+    modify: Option<Box<ModifyOrderRequest>>,
+    rates: Option<Box<RatesRequest>>,
+    spec: Option<Box<SymbolSpecRequest>>,
+    history: Option<Box<OrderHistoryRequest>>,
+    symbols: Option<Box<SymbolListRequest>>,
+}
+
 /// Payload a queued command carries, when it needs one.
 #[derive(Debug, Clone, PartialEq)]
 enum CommandRequest {
@@ -275,6 +291,8 @@ enum CommandRequest {
     SymbolSpec(SymbolSpecRequest),
     /// Account-history request for one magic number and window.
     OrderHistory(OrderHistoryRequest),
+    /// One page of the broker's instrument list.
+    SymbolList(SymbolListRequest),
 }
 
 /// Retained account snapshot plus the instant it was validated.
@@ -385,6 +403,14 @@ impl EaLink {
         self.enqueue_with(
             CommandKind::SymbolSpec,
             Some(CommandRequest::SymbolSpec(request)),
+        )
+    }
+
+    /// Queues a read-only request for one page of the broker's instruments.
+    pub fn enqueue_list_symbols(&self, request: SymbolListRequest) -> CommandId {
+        self.enqueue_with(
+            CommandKind::ListSymbols,
+            Some(CommandRequest::SymbolList(request)),
         )
     }
 
@@ -544,7 +570,8 @@ impl EaLink {
                         | CommandPayload::ModifyOrder(_)
                         | CommandPayload::Rates(_)
                         | CommandPayload::SymbolSpec(_)
-                        | CommandPayload::OrderHistory(_) => None,
+                        | CommandPayload::OrderHistory(_)
+                        | CommandPayload::SymbolList(_) => None,
                     };
                     command.state = CommandState::Completed { payload };
                     command.completed_at = Some(Instant::now());
@@ -586,6 +613,37 @@ impl EaLink {
     /// Constant-time comparison of a presented token with the configured one.
     pub fn token_matches(&self, presented: &str) -> bool {
         bool::from(self.token.expose().as_bytes().ct_eq(presented.as_bytes()))
+    }
+
+    /// Test hook: answers the next queued `list_symbols` command as the
+    /// terminal would, with `answer(offset, limit)` as the acknowledgement
+    /// data or an error. Returns whether such a command was waiting.
+    #[cfg(test)]
+    pub(crate) fn answer_next_symbol_page(
+        &self,
+        answer: impl FnOnce(u32, u32) -> Result<serde_json::Value, String>,
+    ) -> bool {
+        let Some((id, CommandKind::ListSymbols, Some(CommandRequest::SymbolList(request)))) =
+            self.deliverable()
+        else {
+            return false;
+        };
+        let ack = match answer(request.offset(), request.limit()) {
+            Ok(data) => EaAck {
+                id,
+                ok: true,
+                data: Some(data),
+                error: None,
+            },
+            Err(error) => EaAck {
+                id,
+                ok: false,
+                data: None,
+                error: Some(error),
+            },
+        };
+        self.apply_ack(&ack);
+        true
     }
 
     /// Records a validated snapshot as the latest venue state.
@@ -919,6 +977,10 @@ impl BrokerLink for EaLink {
         EaLink::enqueue_order_history(self, request)
     }
 
+    fn enqueue_list_symbols(&self, request: SymbolListRequest) -> CommandId {
+        EaLink::enqueue_list_symbols(self, request)
+    }
+
     fn has_pending(&self, kind: CommandKind) -> bool {
         EaLink::has_pending(self, kind)
     }
@@ -1011,36 +1073,41 @@ pub async fn poll(payload: web::Bytes, link: web::Data<EaLink>) -> HttpResponse 
                 }
                 let reply = match link.deliverable() {
                     Some((id, kind, request)) => {
-                        let (order, close, modify, rates, spec, history) = match request {
+                        let mut attached = Attached::default();
+                        match request {
                             Some(CommandRequest::Order(order)) => {
-                                (Some(Box::new(order)), None, None, None, None, None)
+                                attached.order = Some(Box::new(order));
                             }
                             Some(CommandRequest::Close(close)) => {
-                                (None, Some(Box::new(close)), None, None, None, None)
+                                attached.close = Some(Box::new(close));
                             }
                             Some(CommandRequest::Modify(modify)) => {
-                                (None, None, Some(Box::new(modify)), None, None, None)
+                                attached.modify = Some(Box::new(modify));
                             }
                             Some(CommandRequest::Rates(rates)) => {
-                                (None, None, None, Some(Box::new(rates)), None, None)
+                                attached.rates = Some(Box::new(rates));
                             }
                             Some(CommandRequest::SymbolSpec(spec)) => {
-                                (None, None, None, None, Some(Box::new(spec)), None)
+                                attached.spec = Some(Box::new(spec));
                             }
                             Some(CommandRequest::OrderHistory(history)) => {
-                                (None, None, None, None, None, Some(Box::new(history)))
+                                attached.history = Some(Box::new(history));
                             }
-                            None => (None, None, None, None, None, None),
-                        };
+                            Some(CommandRequest::SymbolList(symbols)) => {
+                                attached.symbols = Some(Box::new(symbols));
+                            }
+                            None => {}
+                        }
                         EaReply::Command {
                             id,
                             kind,
-                            order,
-                            close,
-                            modify,
-                            rates,
-                            spec,
-                            history,
+                            order: attached.order,
+                            close: attached.close,
+                            modify: attached.modify,
+                            rates: attached.rates,
+                            spec: attached.spec,
+                            history: attached.history,
+                            symbols: attached.symbols,
                         }
                     }
                     // Ask for a pong on hello and until one has been seen for
@@ -1121,6 +1188,13 @@ fn payload_for(kind: CommandKind, data: Option<Value>) -> Result<CommandPayload,
             payload.validate()?;
             Ok(CommandPayload::OrderHistory(payload))
         }
+        CommandKind::ListSymbols => {
+            let value = data.ok_or_else(|| "list_symbols ack is missing data".to_owned())?;
+            let payload: SymbolListPayload = serde_json::from_value(value)
+                .map_err(|error| format!("invalid list_symbols payload: {error}"))?;
+            payload.validate()?;
+            Ok(CommandPayload::SymbolList(payload))
+        }
     }
 }
 
@@ -1186,6 +1260,11 @@ fn completed_summary(payload: &CommandPayload) -> Value {
             "total": history.total,
             "truncated": history.truncated
         }),
+        CommandPayload::SymbolList(list) => serde_json::json!({
+            "symbols": list.symbols.len(),
+            "offset": list.offset,
+            "total": list.total
+        }),
     }
 }
 
@@ -1243,7 +1322,8 @@ mod tests {
     use crate::broker::Symbol as BrokerSymbol;
     use crate::broker::{
         AccountSnapshotPayload, CandlePayload, CommandId, CommandKind, CommandPayload,
-        CommandState, OrderHistoryRequest, PositionKind, PositionPayload, SymbolSpecRequest,
+        CommandState, OrderHistoryRequest, PositionKind, PositionPayload, SymbolListRequest,
+        SymbolSpecRequest,
     };
     use crate::trading::intent::{
         OrderKind, Price, Side, TradeIntent, TradeIntentDraft, Volume, parse_instrument,
@@ -1273,6 +1353,7 @@ mod tests {
         assert_eq!(CommandKind::ModifyOrder.as_str(), "modify_order");
         assert_eq!(CommandKind::Rates.as_str(), "rates");
         assert_eq!(CommandKind::SymbolSpec.as_str(), "symbol_spec");
+        assert_eq!(CommandKind::ListSymbols.as_str(), "list_symbols");
     }
 
     #[test]
@@ -1493,6 +1574,7 @@ mod tests {
             rates: Some(Box::new(request)),
             spec: None,
             history: None,
+            symbols: None,
         };
         let wire = serde_json::to_value(&reply).expect("serializes");
         assert_eq!(wire["t"], "cmd");
@@ -2510,6 +2592,7 @@ mod tests {
             rates: None,
             spec: Some(Box::new(request)),
             history: None,
+            symbols: None,
         };
         let wire = serde_json::to_value(&reply).expect("serializes");
         assert_eq!(wire["kind"], "symbol_spec");
@@ -2571,6 +2654,111 @@ mod tests {
     }
 
     #[test]
+    fn symbol_lists_deliver_validate_and_summarize() {
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        assert!(SymbolListRequest::new(0, 0).is_err(), "an empty page");
+        assert!(SymbolListRequest::new(0, 201).is_err(), "an oversized page");
+        assert!(SymbolListRequest::new(20_001, 10).is_err(), "a far offset");
+        let request = SymbolListRequest::new(200, 100).expect("request");
+        assert_eq!((request.offset(), request.limit()), (200, 100));
+        let id = link.enqueue_list_symbols(request.clone());
+
+        let (delivered, kind, payload) = link.deliverable().expect("pending command");
+        assert_eq!(delivered, id);
+        assert_eq!(kind, CommandKind::ListSymbols);
+        assert_eq!(payload, Some(CommandRequest::SymbolList(request.clone())));
+
+        let reply = EaReply::Command {
+            id,
+            kind,
+            order: None,
+            close: None,
+            modify: None,
+            rates: None,
+            spec: None,
+            history: None,
+            symbols: Some(Box::new(request)),
+        };
+        let wire = serde_json::to_value(&reply).expect("serializes");
+        assert_eq!(wire["kind"], "list_symbols");
+        assert_eq!(wire["symbols"]["offset"], 200);
+        assert_eq!(wire["symbols"]["limit"], 100);
+        assert!(wire.get("spec").is_none(), "absent requests are omitted");
+
+        link.apply_ack(&EaAck {
+            id,
+            ok: true,
+            data: Some(serde_json::json!({
+                "total": 350,
+                "offset": 200,
+                "symbols": [
+                    {"name": "EURUSD", "description": "Euro vs US Dollar", "path": "Forex\\Majors\\EURUSD"},
+                    {"name": "US30"}
+                ]
+            })),
+            error: None,
+        });
+        let CommandState::Completed {
+            payload: CommandPayload::SymbolList(list),
+        } = link.command(id).expect("record").state
+        else {
+            panic!("expected a completed symbol list");
+        };
+        assert_eq!(list.symbols.len(), 2);
+        assert_eq!(list.symbols[1].path, "", "missing text defaults to empty");
+        let listed = link.recent_commands(1);
+        let summary = listed[0].summary.as_ref().expect("summary");
+        assert_eq!(summary["symbols"], 2);
+        assert_eq!(summary["offset"], 200);
+        assert_eq!(summary["total"], 350);
+
+        // Every malformed acknowledgement fails the command instead of storing junk.
+        let rejected = [
+            serde_json::json!({"total": 1, "offset": 0}),
+            serde_json::json!({"total": 1, "offset": 0, "symbols": [{"name": "A"}, {"name": "B"}]}),
+            serde_json::json!({"total": 5, "offset": 0, "symbols": [{"name": "  "}]}),
+            serde_json::json!({"total": 5, "offset": 0, "symbols": [{"name": "A\nB"}]}),
+            serde_json::json!({"total": 5, "offset": 0, "symbols": [{"name": "A", "path": "x".repeat(300)}]}),
+            serde_json::json!({
+                "total": 1000,
+                "offset": 0,
+                "symbols": (0..201).map(|i| serde_json::json!({"name": format!("S{i}")})).collect::<Vec<_>>()
+            }),
+        ];
+        for data in rejected {
+            let bad = link.enqueue_list_symbols(SymbolListRequest::new(0, 200).expect("page"));
+            link.apply_ack(&EaAck {
+                id: bad,
+                ok: true,
+                data: Some(data.clone()),
+                error: None,
+            });
+            assert!(
+                matches!(
+                    link.command(bad).expect("record").state,
+                    CommandState::Failed { .. }
+                ),
+                "must reject {data}"
+            );
+        }
+        let missing = link.enqueue_list_symbols(SymbolListRequest::new(0, 200).expect("page"));
+        link.apply_ack(&EaAck {
+            id: missing,
+            ok: true,
+            data: None,
+            error: None,
+        });
+        assert!(matches!(
+            link.command(missing).expect("record").state,
+            CommandState::Failed { .. }
+        ));
+    }
+
+    #[test]
     fn order_history_commands_deliver_validate_and_summarize() {
         let link = EaLink::new(
             EaToken::parse("test-token-1234567890").expect("token"),
@@ -2598,6 +2786,7 @@ mod tests {
             rates: None,
             spec: None,
             history: Some(Box::new(request)),
+            symbols: None,
         };
         let wire = serde_json::to_value(&reply).expect("serializes");
         assert_eq!(wire["kind"], "order_history");

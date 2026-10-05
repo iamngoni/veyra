@@ -17,8 +17,8 @@ pub use command::{
     CandlePayload, CloseOrderRequest, ClosedTradePayload, CommandId, CommandKind, CommandPayload,
     CommandRecord, CommandState, ListedCommand, ModifyOrderRequest, ORDER_MAGIC, OrderCheckPayload,
     OrderExecutionPayload, OrderHistoryPayload, OrderHistoryRequest, OrderRequest, PositionKind,
-    PositionPayload, RatesPayload, RatesRequest, SUPPORTED_TIMEFRAME_MINUTES, SymbolSpecPayload,
-    SymbolSpecRequest, TradeSession,
+    PositionPayload, RatesPayload, RatesRequest, SUPPORTED_TIMEFRAME_MINUTES, SymbolListEntry,
+    SymbolListPayload, SymbolListRequest, SymbolSpecPayload, SymbolSpecRequest, TradeSession,
 };
 /// EA-specific transport surface, used by the EA server and its contract tests.
 pub use ea::{EaErrorBody, EaLink, EaPoll, EaReply, build_server, create_ea_app};
@@ -373,6 +373,9 @@ pub trait BrokerLink: Send + Sync + fmt::Debug + 'static {
     /// Queues a read-only account-history request.
     fn enqueue_order_history(&self, request: OrderHistoryRequest) -> CommandId;
 
+    /// Queues a read-only request for one page of the broker's instrument list.
+    fn enqueue_list_symbols(&self, request: SymbolListRequest) -> CommandId;
+
     /// Whether a command of `kind` is still awaiting acknowledgement.
     fn has_pending(&self, kind: CommandKind) -> bool;
 
@@ -515,6 +518,10 @@ mod tests {
             CommandId::new()
         }
 
+        fn enqueue_list_symbols(&self, _request: SymbolListRequest) -> CommandId {
+            CommandId::new()
+        }
+
         fn has_pending(&self, _kind: CommandKind) -> bool {
             false
         }
@@ -592,6 +599,7 @@ mod tests {
             link.enqueue_rates(RatesRequest::new(&symbol, 240, 1).expect("rates")),
             link.enqueue_symbol_spec(SymbolSpecRequest::new(&symbol)),
             link.enqueue_order_history(OrderHistoryRequest::new(30, ORDER_MAGIC).expect("history")),
+            link.enqueue_list_symbols(SymbolListRequest::new(0, 200).expect("symbol page")),
         ];
         for (index, id) in ids.iter().enumerate() {
             assert!(

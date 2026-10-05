@@ -12,18 +12,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { LogLevel } from './api'
 import {
   clockTime,
+  forgetSymbolCatalog,
   money,
   relativeTime,
   useEventFeed,
   useLogFeed,
   usePaged,
   usePoll,
+  useSymbolCatalog,
   useTheme,
 } from './hooks'
 
-const mocks = vi.hoisted(() => ({ events: vi.fn(), logs: vi.fn() }))
+const mocks = vi.hoisted(() => ({
+  events: vi.fn(),
+  logs: vi.fn(),
+  symbols: vi.fn(),
+  refreshSymbols: vi.fn(),
+}))
 
-vi.mock('./api', () => ({ api: { events: mocks.events, logs: mocks.logs } }))
+vi.mock('./api', () => ({
+  api: { events: mocks.events, logs: mocks.logs, symbols: mocks.symbols, refreshSymbols: mocks.refreshSymbols },
+}))
 
 beforeEach(() => {
   vi.useFakeTimers()
@@ -406,5 +415,149 @@ describe('useLogFeed', () => {
     unmount()
     await vi.advanceTimersByTimeAsync(6_000)
     expect(mocks.logs.mock.calls.length).toBe(calls)
+  })
+})
+
+describe('useSymbolCatalog', () => {
+  const held = {
+    ready: true as const,
+    server: 'Demo-Server',
+    fetchedAt: 1_000,
+    total: 1,
+    skipped: 0,
+    categories: [{ id: 'forex' as const, label: 'Forex', count: 1 }],
+    symbols: [{ name: 'EURUSD', description: '', path: 'Forex\\EURUSD', category: 'forex' as const, riskAllowed: true }],
+  }
+  const waiting = { ready: false as const, reason: 'waiting for the terminal', categories: [] as [], symbols: [] as [] }
+
+  beforeEach(() => {
+    forgetSymbolCatalog()
+    mocks.symbols.mockReset()
+    mocks.refreshSymbols.mockReset()
+  })
+
+  it('asks once when the list is ready and then leaves the service alone', async () => {
+    mocks.symbols.mockResolvedValue(held)
+    const { result } = renderHook(() => useSymbolCatalog())
+    await act(async () => {})
+    expect(result.current.catalog).toEqual(held)
+    expect(result.current.error).toBeUndefined()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(120_000)
+    })
+    expect(mocks.symbols).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps asking every ten seconds until the terminal has listed its instruments', async () => {
+    mocks.symbols.mockResolvedValueOnce(waiting).mockResolvedValueOnce(waiting).mockResolvedValue(held)
+    const { result } = renderHook(() => useSymbolCatalog())
+    await act(async () => {})
+    expect(result.current.catalog).toEqual(waiting)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    expect(result.current.catalog).toEqual(waiting)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    expect(result.current.catalog).toEqual(held)
+    expect(mocks.symbols).toHaveBeenCalledTimes(3)
+  })
+
+  it('never lets a later not-ready answer replace a list it already holds', async () => {
+    mocks.symbols.mockResolvedValueOnce(held).mockResolvedValue(waiting)
+    const { result } = renderHook(() => useSymbolCatalog())
+    await act(async () => {})
+    await act(async () => {
+      await result.current.reload()
+    })
+    expect(mocks.symbols).toHaveBeenCalledTimes(2)
+    expect(result.current.catalog).toEqual(held)
+  })
+
+  it('keeps the list across a remount and a page reload', async () => {
+    mocks.symbols.mockResolvedValue(held)
+    const first = renderHook(() => useSymbolCatalog())
+    await act(async () => {})
+    first.unmount()
+
+    // Remount in the same page: the list is there before any request answers.
+    mocks.symbols.mockReturnValue(new Promise(() => undefined))
+    const remounted = renderHook(() => useSymbolCatalog())
+    expect(remounted.result.current.catalog).toEqual(held)
+    remounted.unmount()
+
+    // A reload keeps only session storage.
+    expect(sessionStorage.getItem('veyra.symbolCatalog.v1')).toContain('EURUSD')
+    const reloaded = renderHook(() => useSymbolCatalog())
+    expect(reloaded.result.current.catalog).toEqual(held)
+  })
+
+  it('ignores stored data it cannot use', async () => {
+    mocks.symbols.mockReturnValue(new Promise(() => undefined))
+    for (const bad of ['not json', JSON.stringify({ ready: false }), JSON.stringify({ ready: true, symbols: 'x' })]) {
+      forgetSymbolCatalog()
+      sessionStorage.setItem('veyra.symbolCatalog.v1', bad)
+      const { result, unmount } = renderHook(() => useSymbolCatalog())
+      expect(result.current.catalog).toBeUndefined()
+      unmount()
+    }
+  })
+
+  it('works when session storage is unavailable', async () => {
+    const getItem = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new Error('blocked')
+    })
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('blocked')
+    })
+    const removeItem = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
+      throw new Error('blocked')
+    })
+    mocks.symbols.mockResolvedValue(held)
+    const { result } = renderHook(() => useSymbolCatalog())
+    await act(async () => {})
+    expect(result.current.catalog).toEqual(held)
+    expect(() => forgetSymbolCatalog()).not.toThrow()
+    getItem.mockRestore()
+    setItem.mockRestore()
+    removeItem.mockRestore()
+  })
+
+  it('reports an unreachable service and recovers on the next answer', async () => {
+    mocks.symbols.mockRejectedValueOnce(new Error('/symbols → 503')).mockResolvedValue(held)
+    const { result } = renderHook(() => useSymbolCatalog())
+    await act(async () => {})
+    expect(result.current.error).toBe('/symbols → 503')
+    expect(result.current.catalog).toBeUndefined()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    expect(result.current.error).toBeUndefined()
+    expect(result.current.catalog).toEqual(held)
+  })
+
+  it('asks the terminal again on refresh and reports a refusal', async () => {
+    mocks.symbols.mockResolvedValue(held)
+    mocks.refreshSymbols.mockResolvedValueOnce({ status: 'refreshed', count: 1 })
+    const { result } = renderHook(() => useSymbolCatalog())
+    await act(async () => {})
+    await act(async () => {
+      await result.current.refresh()
+    })
+    expect(mocks.refreshSymbols).toHaveBeenCalledTimes(1)
+    expect(mocks.symbols).toHaveBeenCalledTimes(2)
+    expect(result.current.refreshing).toBe(false)
+
+    mocks.refreshSymbols.mockRejectedValueOnce(new Error('the terminal is not connected'))
+    await act(async () => {
+      await result.current.refresh()
+    })
+    expect(result.current.error).toBe('the terminal is not connected')
+    expect(result.current.refreshing).toBe(false)
+    expect(result.current.catalog).toEqual(held)
   })
 })
