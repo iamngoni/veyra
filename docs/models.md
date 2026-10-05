@@ -45,15 +45,41 @@ Evaluate a model on dry runs before arming live orders.
 
 ## Jev
 
-`typesafe/jev-router` is the only Jev model on OpenRouter. It routes each
-request to an underlying model, so OpenRouter lists its price as variable.
-**Use it like any other model id; no TypeSafe key is required.**
+Jev runs on OpenRouter in two different ways. They are not interchangeable:
 
-`VEYRA_JEV_API_KEY` configures something different: an optional *judge* service
-that adds calibrated judgements to the autopilot's inputs. When it is not
-configured the autopilot decides from the candles alone and nothing is blocked.
-`VEYRA_RISK_ALLOW_TRADING_WITHOUT_JEV` only matters when a judge **is**
-configured and then fails.
+1. **As a chat model** (`typesafe/jev-router`): an ordinary OpenRouter model id
+   for the decision tiers. OpenRouter routes each request to an underlying LLM,
+   so its price varies.
+2. **As the judge** (`typesafe/jev-1.13`, alias `~typesafe/jev-latest`): a
+   *decision model*. OpenRouter rejects it on `/chat/completions` ("is a
+   decisions model") and serves it from `POST https://openrouter.ai/api/v1/systemone`
+   with the same request and response schema as TypeSafe's own System One API.
+   This is what Veyra's judge client speaks, so **no TypeSafe account is
+   needed**: the judge uses your OpenRouter key.
+
+### Judge through OpenRouter
+
+```dotenv
+VEYRA_JEV_API_KEY=sk-or-v1-...                 # the OpenRouter key
+VEYRA_JEV_BASE_URL=https://openrouter.ai/api   # Veyra appends /v1/systemone
+VEYRA_JEV_MODEL=jev-1.13                       # pinned; jev-latest also works
+```
+
+Verified on 2026-10-05 with the autopilot's three questions (direction, trend,
+momentum): HTTP 200, answers in the contract's shape, about $0.00002 per
+judgement. `jev-1.13`, `jev-latest` and `~typesafe/jev-latest` all resolve to
+`typesafe/jev-1.13-20260917`. The config validator accepts bare names only, so
+set `jev-1.13`, not `typesafe/jev-1.13`.
+
+With a judge configured, a judge failure pauses the autopilot tick
+(`VEYRA_RISK_ALLOW_TRADING_WITHOUT_JEV` empty = fail closed). Set it to `true`
+only if you would rather trade on the model alone during a judge outage.
+
+### Without a judge
+
+Leave the three `VEYRA_JEV_*` variables empty. The autopilot then decides from
+the candles alone; its prompt does not mention judgements, so the model is not
+tempted to ask for a tool that cannot answer.
 
 ## Cost control
 
