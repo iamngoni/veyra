@@ -11,6 +11,11 @@ import { api, subscriptions, type CatalogSymbol, type LiveSetting, type SymbolCa
 import { forgetSymbolCatalog } from '../lib/hooks'
 import { LiveSettingsPanel, symbolLimit } from './settings'
 
+/** Real responses can be read twice through `clone()`; the console's request wrapper relies on it. */
+function withClone(response: Response): Response {
+  return Object.assign(response, { clone: () => response })
+}
+
 beforeEach(() => {
   vi.spyOn(subscriptions, 'status').mockResolvedValue({ subscriptions: { codex: { connected: false }, claude_code: { connected: false } } })
 })
@@ -310,7 +315,7 @@ describe('LiveSettingsPanel', () => {
 
   describe('API credential panel', () => {
     function jsonResponse(body: unknown, status = 200): Response {
-      return { ok: status >= 200 && status < 300, status, json: async () => body } as unknown as Response
+      return withClone({ ok: status >= 200 && status < 300, status, json: async () => body } as unknown as Response)
     }
 
     /** Scoped to the credential card: its "Operator token" field is not the only one on screen. */
@@ -408,7 +413,7 @@ describe('LiveSettingsPanel', () => {
     it('surfaces a rejected credential update by message, and a bodyless failure by status', async () => {
       const fetchMock = vi.fn()
         .mockResolvedValueOnce(jsonResponse({ reason: 'token rejected' }, 401))
-        .mockResolvedValueOnce({ ok: false, status: 500, json: async () => { throw new Error('not json') } } as unknown as Response)
+        .mockResolvedValueOnce(withClone({ ok: false, status: 500, json: async () => { throw new Error('not json') } } as unknown as Response))
       vi.stubGlobal('fetch', fetchMock)
       render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore />)
       const panel = within(credentialPanel())

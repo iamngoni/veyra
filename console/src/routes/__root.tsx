@@ -2,6 +2,7 @@ import { HeadContent, Scripts, createRootRoute } from '@tanstack/react-router'
 import { TanStackRouterDevtoolsPanel } from '@tanstack/react-router-devtools'
 import { TanStackDevtools } from '@tanstack/react-devtools'
 
+import { Toaster } from '../components/toast'
 import appCss from '../styles.css?url'
 // The Latin cut of the self-hosted Inter (see styles.css), preloaded so the
 // first paint is already set in it rather than swapping from a fallback.
@@ -58,6 +59,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
       </head>
       <body>
         {children}
+        <Toaster />
         <TanStackDevtools
           config={{
             position: 'bottom-right',

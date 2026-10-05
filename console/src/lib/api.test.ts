@@ -4,7 +4,7 @@
  * query parameters, and failure behaviour the console relies on.
  */
 
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   api,
@@ -17,13 +17,19 @@ import {
   updateNotifications,
   type AssistantEvent,
 } from './api'
+import { clearToasts, currentToasts } from './toast'
+
+/** Real responses can be read twice through `clone()`; the console's request wrapper relies on it. */
+function withClone(response: Response): Response {
+  return Object.assign(response, { clone: () => response })
+}
 
 function jsonResponse(body: unknown, status = 200): Response {
-  return {
+  return withClone({
     ok: status >= 200 && status < 300,
     status,
     json: async () => body,
-  } as unknown as Response
+  } as unknown as Response)
 }
 
 afterEach(() => {
@@ -307,7 +313,7 @@ describe('api', () => {
     })
 
     it('refuses a response with no body to stream', async () => {
-      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, body: null } as unknown as Response))
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(withClone({ ok: true, body: null } as unknown as Response)))
       await expect(streamAssistant('q', [], () => {}, signal)).rejects.toThrow('The assistant stream did not open.')
     })
 
@@ -416,7 +422,7 @@ describe('api', () => {
     })
 
     it('refuses an ok response with no confirming body', async () => {
-      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => null } as unknown as Response))
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(withClone({ ok: true, status: 200, json: async () => null } as unknown as Response)))
       await expect(subscriptions.remove('codex', 't')).rejects.toThrow('The service did not confirm the connection change.')
     })
   })
@@ -456,7 +462,7 @@ describe('api', () => {
         .mockResolvedValueOnce(jsonResponse({ error: 'invalid_notifications', rejected }, 400))
         .mockResolvedValueOnce(jsonResponse({ error: 'notification_failed', reason: 'HTTP 401: Unauthorized' }, 502))
         .mockResolvedValueOnce(jsonResponse({ error: 'invalid_operator_token' }, 401))
-        .mockResolvedValueOnce({ ok: false, status: 500, json: async () => { throw new SyntaxError('html') } } as unknown as Response)
+        .mockResolvedValueOnce(withClone({ ok: false, status: 500, json: async () => { throw new SyntaxError('html') } } as unknown as Response))
       vi.stubGlobal('fetch', fetchMock)
 
       const first = await updateNotifications('t', {}).catch((error: unknown) => error)
@@ -471,7 +477,7 @@ describe('api', () => {
     })
 
     it('refuses an ok response with no body', async () => {
-      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => null } as unknown as Response))
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(withClone({ ok: true, status: 200, json: async () => null } as unknown as Response)))
       await expect(updateNotifications('t', {})).rejects.toThrow('The service did not confirm the change.')
     })
   })
@@ -500,13 +506,65 @@ describe('api', () => {
       const fetchMock = vi.fn()
         .mockResolvedValueOnce(jsonResponse({ error: 'openai_test_required', reason: 'Run a passing test first.' }, 409))
         .mockResolvedValueOnce(jsonResponse({ error: 'invalid_operator_token' }, 401))
-        .mockResolvedValueOnce({ ok: false, status: 502, json: async () => { throw new SyntaxError('html') } } as unknown as Response)
-        .mockResolvedValueOnce({ ok: true, status: 200, json: async () => null } as unknown as Response)
+        .mockResolvedValueOnce(withClone({ ok: false, status: 502, json: async () => { throw new SyntaxError('html') } } as unknown as Response))
+        .mockResolvedValueOnce(withClone({ ok: true, status: 200, json: async () => null } as unknown as Response))
       vi.stubGlobal('fetch', fetchMock)
       await expect(judge.select('t', 'openai')).rejects.toThrow('Run a passing test first.')
       await expect(judge.test('t')).rejects.toThrow('invalid operator token')
       await expect(judge.removeKey('t')).rejects.toThrow('Request failed (502)')
       await expect(judge.saveKey('t', 'sk-x')).rejects.toThrow('The service did not confirm the change.')
     })
+  })
+})
+
+describe('failure toasts', () => {
+  beforeEach(() => clearToasts())
+  afterEach(() => clearToasts())
+
+  it("toasts a refused change with the service's own reason", async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(jsonResponse({ error: 'invalid_policy', field: 'symbols', reason: 'must list 1-64 comma-separated instrument symbols' }, 400)),
+    )
+    await expect(api.updatePolicy({ symbols: ['EURUSD'] })).rejects.toThrow('symbols: must list 1-64')
+    expect(currentToasts()).toMatchObject([
+      { tone: 'bad', title: 'Refused: POST /risk/policy', detail: 'symbols: must list 1-64 comma-separated instrument symbols' },
+    ])
+  })
+
+  it('toasts a failing read once per endpoint and clears it when the read recovers', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ error: 'not_ready' }, 409))
+      .mockResolvedValueOnce(jsonResponse({ error: 'not_ready' }, 409))
+      .mockResolvedValueOnce(jsonResponse({ ready: false, reason: 'x', categories: [], symbols: [] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(api.symbols()).rejects.toThrow()
+    await expect(api.symbols()).rejects.toThrow()
+    expect(currentToasts()).toMatchObject([{ key: 'load /symbols', title: 'Could not load /symbols', detail: 'not ready', count: 2 }])
+    await api.symbols()
+    expect(currentToasts()).toEqual([])
+  })
+
+  it('reports an unreachable service once, however many requests fail, and stays quiet on abort', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn()
+        .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+        .mockResolvedValueOnce(withClone({ ok: false, status: 502, json: async () => { throw new SyntaxError('html') } } as unknown as Response))
+        .mockRejectedValueOnce(new DOMException('aborted', 'AbortError')),
+    )
+    await expect(api.symbols()).rejects.toThrow('Failed to fetch')
+    await expect(api.riskPolicy()).rejects.toThrow()
+    expect(currentToasts()).toMatchObject([{ key: 'service', title: 'The Veyra service is not answering', detail: '/risk/policy: HTTP 502', count: 2 }])
+    clearToasts()
+    await expect(api.symbols()).rejects.toThrow('aborted')
+    expect(currentToasts()).toEqual([])
+  })
+
+  it('keeps a Veyra reason on a 503 as that endpoint failing, not the service being down', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ error: 'refresh_failed', reason: 'the terminal is not connected' }, 503)))
+    await expect(api.refreshSymbols()).rejects.toThrow()
+    expect(currentToasts()).toMatchObject([{ title: 'Failed: POST /symbols/refresh', detail: 'the terminal is not connected' }])
   })
 })
