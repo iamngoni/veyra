@@ -227,6 +227,18 @@ describe('SymbolPicker', () => {
     expect(update).not.toHaveBeenCalled()
   })
 
+  it('says when the risk gate is too full instead of sending a list it would refuse', async () => {
+    vi.spyOn(api, 'symbols').mockResolvedValue(readyCatalog(MARKETS))
+    const full = Array.from({ length: 63 }, (_, index) => `HELD${index}`)
+    vi.spyOn(api, 'riskPolicy').mockResolvedValue({ symbols: full } as Awaited<ReturnType<typeof api.riskPolicy>>)
+    const update = vi.spyOn(api, 'updatePolicy')
+    render(<Harness initial="GBPUSD,US30" />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Allow GBPUSD, US30 in the risk gate' }))
+    expect(await screen.findByText(/already allows 63 of its 64 instruments, so 2 more will not fit/)).toBeTruthy()
+    expect(update).not.toHaveBeenCalled()
+  })
+
   it('lets an instrument be typed in while the terminal has not listed any', async () => {
     vi.spyOn(api, 'symbols').mockResolvedValue({ ready: false, reason: 'waiting for the terminal', categories: [], symbols: [] })
     const values: string[] = []
@@ -251,7 +263,7 @@ describe('SymbolPicker', () => {
     const dialog = await openPicker()
     expect(
       await within(dialog).findByText(
-        'The MetaTrader EA is too old to list instruments. Recompile VeyraProbe (version 1.27 or newer) and reload it on the chart.',
+        'The MetaTrader EA is too old to list instruments. Recompile VeyraProbe (version 1.28 or newer) and reload it on the chart.',
       ),
     ).toBeTruthy()
     // Typing an instrument in still works meanwhile.
