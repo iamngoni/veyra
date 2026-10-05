@@ -1064,8 +1064,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             &events,
             unix_secs(state.now()),
         );
-        let instructions =
-            proposal_instructions(state, &entry_markets, &account, state.jev().is_some());
+        let instructions = proposal_instructions(state, &entry_markets, &account);
         let engine = model.engine();
         let session = AgentSession {
             state,
@@ -2847,7 +2846,7 @@ async fn review_positions(
     origin: &'static str,
 ) -> TickOutcome {
     let judgements = judgement_for_symbol(session.judgements, series.symbol().as_str());
-    let instructions = review_instructions(series, positions, weekend, state.jev().is_some());
+    let instructions = review_instructions(series, positions, weekend);
     let input = review_input(state, series, positions, judgements, weekend);
     let outcome = match agent::run(session, &instructions, &input).await {
         Ok(outcome) => {
@@ -3229,7 +3228,6 @@ fn review_instructions(
     series: &CandleSeries,
     positions: &[ManagedPosition],
     weekend: Option<WeekendPrep>,
-    judge: bool,
 ) -> String {
     let tickets: Vec<String> = positions
         .iter()
@@ -3247,12 +3245,11 @@ fn review_instructions(
         "You are the analyst for Veyra, a single-instrument trading bot. Your open {symbol}          {timeframe} position(s) (ticket(s) {tickets}) were entered by this bot with a stop loss          and take profit attached.
          Decide for the reported position: `hold` keeps the entry bracket and lets the plan play          out; `close` flattens the ticket now because the thesis that justified the entry is no          longer supported by the latest candles and judgements.
          Closing costs the spread and abandons the bracket, so hold unless the evidence has          genuinely shifted; do not close merely because the position shows a small loss — the          attached stop defines the risk.{weekend_rules}
-         Answer with the provided schema only, including the ticket when you close, and a short `rationale` (a sentence or two, at most 280 characters) explaining the decision. Before answering you may call read-only tools: get_market(symbol, timeframe?, bars?),{judgement_tool} get_account(), get_positions(), and get_market_window(). Call a tool only when its result would change your decision.",
+         Answer with the provided schema only, including the ticket when you close, and a short `rationale` (a sentence or two, at most 280 characters) explaining the decision. Before answering you may call read-only tools: get_market(symbol, timeframe?, bars?), get_judgements(symbol), get_account(), get_positions(), and get_market_window(). Call a tool only when its result would change your decision.",
         symbol = series.symbol().as_str(),
         timeframe = series.timeframe().as_str(),
         tickets = tickets.join(", "),
-        weekend_rules = weekend_rules,
-        judgement_tool = if judge { " get_judgements(symbol)," } else { "" }
+        weekend_rules = weekend_rules
     )
 }
 
@@ -3826,7 +3823,6 @@ fn proposal_instructions(
     state: &AppState,
     markets: &[(Symbol, CandleSeries)],
     account: &AccountFacts,
-    judge: bool,
 ) -> String {
     let policy = state.risk().policy();
     let menu = markets
@@ -3835,7 +3831,7 @@ fn proposal_instructions(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles{judged_inputs}; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors. Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. High-impact events blackout entries for their currencies around the release; the `upcoming_events` list shows what is scheduled, so avoid fighting a print. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: {judgement_tool}get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
+        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles and optional calibrated judgements; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors. Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. High-impact events blackout entries for their currencies around the release; the `upcoming_events` list shows what is scheduled, so avoid fighting a print. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: get_judgements(symbol) for calibrated probabilities, get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
         menu = menu,
         timeframe = markets
             .first()
@@ -3844,17 +3840,7 @@ fn proposal_instructions(
         max_orders = policy.max_open_orders(),
         max_total = policy.max_total_lots().value(),
         open_lots = account.open_lots,
-        max_volume = policy.max_volume_per_order().value(),
-        judged_inputs = if judge {
-            " and optional calibrated judgements"
-        } else {
-            ""
-        },
-        judgement_tool = if judge {
-            "get_judgements(symbol) for calibrated probabilities, "
-        } else {
-            ""
-        }
+        max_volume = policy.max_volume_per_order().value()
     )
 }
 
@@ -4759,15 +4745,6 @@ mod tests {
             !requests[0].input.contains("judgements"),
             "no judgement engine is configured"
         );
-        // The prompt must not advertise a tool the run cannot answer: a model
-        // told it may ask for judgements keeps asking, and each ask is a
-        // wasted, failing call.
-        assert!(
-            !requests[0].instructions.contains("judgements")
-                && !requests[0].instructions.contains("get_judgements"),
-            "without a judge the instructions never mention judgements: {}",
-            requests[0].instructions
-        );
         assert!(requests[0].input.contains("\"symbol\":\"EURUSD\""));
         assert!(requests[0].instructions.contains("stop_loss"));
     }
@@ -5281,13 +5258,6 @@ mod tests {
             0.7
         );
         assert_eq!(input["assets"][0]["judgements"]["momentum"]["score"], 1.5);
-        assert!(
-            requests[0].instructions.contains("get_judgements(symbol)")
-                && requests[0]
-                    .instructions
-                    .contains("optional calibrated judgements"),
-            "with a judge the instructions offer judgements"
-        );
         assert_eq!(input["assets"][0]["market"]["bars"], 20);
         assert_eq!(
             input["assets"][0]["market"]["atr14"], 0.02,

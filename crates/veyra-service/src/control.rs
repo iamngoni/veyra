@@ -1755,11 +1755,6 @@ fn command_result(payload: CommandPayload) -> serde_json::Value {
             "total": history.total,
             "truncated": history.truncated
         }),
-        CommandPayload::SymbolList(list) => json!({
-            "symbols": list.symbols.len(),
-            "offset": list.offset,
-            "total": list.total
-        }),
         CommandPayload::OpenOrder(execution)
         | CommandPayload::CloseOrder(execution)
         | CommandPayload::ModifyOrder(execution) => json!({

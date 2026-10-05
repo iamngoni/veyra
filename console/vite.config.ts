@@ -1,7 +1,6 @@
 import { defineConfig } from 'vite'
 import { devtools } from '@tanstack/devtools-vite'
 
-import { cloudflare } from '@cloudflare/vite-plugin'
 import { tanstackStart } from '@tanstack/react-start/plugin/vite'
 
 import viteReact from '@vitejs/plugin-react'
@@ -23,13 +22,7 @@ const ALLOWED_HOSTS = (process.env.VEYRA_CONSOLE_ALLOWED_HOSTS ?? '')
 
 const config = defineConfig({
   resolve: { tsconfigPaths: true },
-  plugins: [
-    devtools(),
-    ...(process.env.VEYRA_TARGET === 'cloudflare' ? [cloudflare({ viteEnvironment: { name: 'ssr' } })] : []),
-    tailwindcss(),
-    tanstackStart(),
-    viteReact(),
-  ],
+  plugins: [devtools(), tailwindcss(), tanstackStart(), viteReact()],
   server: {
     allowedHosts: ALLOWED_HOSTS,
     proxy: {

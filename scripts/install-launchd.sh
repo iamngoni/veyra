@@ -2,12 +2,7 @@
 # Installs (or removes) the Veyra LaunchAgents that keep the stack running.
 #
 #   scripts/install-launchd.sh              # build-free install from current release binary
-#   scripts/install-launchd.sh --minimal    # only the service and the tunnel
 #   scripts/install-launchd.sh --uninstall  # remove agents and stop the supervised stack
-#
-# --minimal is for a setup where the console runs on Cloudflare and Postgres in
-# Docker: it skips the local console server, the MT4 terminal watcher, the
-# outage watchdog, backups, and log rotation, and needs none of their files.
 #
 # The installer renders scripts/launchd/*.plist.template with this checkout's
 # absolute paths, so the committed templates stay portable. It stops stray
@@ -30,19 +25,8 @@ LABELS=(
   cc.antonlabs.veyra.alerts
 )
 
-ALL_LABELS=("${LABELS[@]}")
-if [ "${1:-}" = "--minimal" ]; then
-  LABELS=(
-    cc.antonlabs.veyra.tunnel
-    cc.antonlabs.veyra.service
-  )
-elif [ -n "${1:-}" ] && [ "${1:-}" != "--uninstall" ]; then
-  echo "usage: $0 [--minimal|--uninstall]" >&2
-  exit 2
-fi
-
 uninstall() {
-  for label in "${ALL_LABELS[@]}"; do
+  for label in "${LABELS[@]}"; do
     launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
     rm -f "$AGENTS/$label.plist"
   done
@@ -59,21 +43,14 @@ if [ ! -x "$ROOT/target/release/veyra-service" ]; then
   exit 1
 fi
 
-if printf '%s\n' "${LABELS[@]}" | grep -q 'veyra.tunnel$' && [ ! -e "$HOME/.cloudflared/veyra-config.yml" ]; then
-  echo "missing $HOME/.cloudflared/veyra-config.yml (the tunnel agent reads it)." >&2
-  echo "if your config is config.yml: ln -s config.yml $HOME/.cloudflared/veyra-config.yml" >&2
-  exit 1
-fi
-
 mkdir -p "$AGENTS" "$LOGS"
 
-for label in "${LABELS[@]}"; do
-  template="$TEMPLATES/$label.plist.template"
-  name="$label.plist"
+for template in "$TEMPLATES"/*.plist.template; do
+  name="$(basename "$template" .template)"
   sed -e "s|__HOME__|$HOME|g" -e "s|__ROOT__|$ROOT|g" "$template" > "$AGENTS/$name"
   chmod 644 "$AGENTS/$name"
 done
-echo "rendered ${#LABELS[@]} LaunchAgents into $AGENTS"
+echo "rendered $(ls "$TEMPLATES" | wc -l | tr -d ' ') LaunchAgents into $AGENTS"
 
 # One supervised owner per port: stop session-bound instances first.
 pkill -f 'target/(debug|release)/veyra-service' 2>/dev/null && echo "stopped stray veyra-service" || true

@@ -48,7 +48,7 @@ const MAX_COMMAND_ROWS: i64 = 25;
 const ACTIVITY_ROWS: u32 = 35;
 
 /// Every command kind, for validating the `kind` filter.
-const COMMAND_KINDS: [CommandKind; 10] = [
+const COMMAND_KINDS: [CommandKind; 9] = [
     CommandKind::Ping,
     CommandKind::AccountSnapshot,
     CommandKind::OrderCheck,
@@ -58,16 +58,14 @@ const COMMAND_KINDS: [CommandKind; 10] = [
     CommandKind::Rates,
     CommandKind::SymbolSpec,
     CommandKind::OrderHistory,
-    CommandKind::ListSymbols,
 ];
 
 /// Refreshes and market reads that would drown the decisions out.
-const ROUTINE_COMMANDS: [CommandKind; 5] = [
+const ROUTINE_COMMANDS: [CommandKind; 4] = [
     CommandKind::Ping,
     CommandKind::AccountSnapshot,
     CommandKind::Rates,
     CommandKind::SymbolSpec,
-    CommandKind::ListSymbols,
 ];
 
 fn audit_error(_: crate::audit::AuditError) -> String {
@@ -650,11 +648,6 @@ pub(super) fn command_detail(payload: &CommandPayload) -> Value {
             "total": history.total,
             "truncated": history.truncated,
             "tickets": history.orders.iter().take(10).map(|trade| trade.ticket).collect::<Vec<_>>()
-        }),
-        CommandPayload::SymbolList(list) => json!({
-            "symbols": list.symbols.len(),
-            "offset": list.offset,
-            "total": list.total
         }),
     }
 }

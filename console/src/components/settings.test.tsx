@@ -4,11 +4,10 @@
  * reading of a value, apply, revert and discard.
  */
 
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { api, subscriptions, type CatalogSymbol, type LiveSetting, type SymbolCatalog } from '../lib/api'
-import { forgetSymbolCatalog } from '../lib/hooks'
+import { subscriptions, type LiveSetting } from '../lib/api'
 import { LiveSettingsPanel } from './settings'
 
 beforeEach(() => {
@@ -131,8 +130,7 @@ describe('LiveSettingsPanel', () => {
     })
     const { container } = render(<LiveSettingsPanel settings={everything} onApply={vi.fn()} />)
     const controls = [...container.querySelectorAll('.tab-control')]
-    // Symbol and Symbols are one instrument picker, so the two make one control.
-    expect(controls.length).toBe(grouped.size - 1)
+    expect(controls.length).toBe(grouped.size)
     expect(controls.length).toBeGreaterThan(40)
 
     const name = (control: Element) => control.querySelector('.tab-control-name')?.textContent
@@ -434,126 +432,5 @@ describe('LiveSettingsPanel', () => {
       expect((panel.getByRole('button', { name: 'Save key' }) as HTMLButtonElement).disabled).toBe(true)
       expect(fetchMock).not.toHaveBeenCalled()
     })
-  })
-})
-
-describe('LiveSettingsPanel instruments', () => {
-  const symbol = (name: string, category: CatalogSymbol['category'], description: string): CatalogSymbol => ({
-    name,
-    description,
-    path: `${category}\\${name}`,
-    category,
-    riskAllowed: true,
-  })
-  const catalog: SymbolCatalog = {
-    ready: true,
-    server: 'Demo-Server',
-    fetchedAt: Math.floor(Date.now() / 1000),
-    total: 3,
-    skipped: 0,
-    categories: [
-      { id: 'forex', label: 'Forex', count: 2 },
-      { id: 'indices', label: 'Indices', count: 1 },
-    ],
-    symbols: [symbol('EURUSD', 'forex', 'Euro vs US Dollar'), symbol('GBPUSD', 'forex', 'Pound vs US Dollar'), symbol('US30', 'indices', 'Wall Street 30')],
-  }
-  const single: Record<string, LiveSetting> = {
-    VEYRA_AUTOPILOT_SYMBOL: { value: 'EURUSD', overridden: false },
-    VEYRA_AUTOPILOT_SYMBOLS: { value: '', overridden: false },
-  }
-
-  beforeEach(() => {
-    forgetSymbolCatalog()
-    vi.spyOn(api, 'symbols').mockResolvedValue(catalog)
-  })
-
-  async function choose(name: RegExp) {
-    fireEvent.click(screen.getByRole('button', { name: 'Add or remove' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Choose instruments' })
-    await within(dialog).findByText(/3 instruments/)
-    fireEvent.click(within(dialog).getByRole('checkbox', { name }))
-    return dialog
-  }
-
-  it('replaces the Symbols box with a picker that shows the instrument already in use', () => {
-    render(<LiveSettingsPanel settings={single} onApply={vi.fn()} />)
-    expect(screen.getByText('Instruments')).toBeTruthy()
-    expect(screen.getByText('EURUSD')).toBeTruthy()
-    // Neither of the two plain text boxes is offered any more.
-    expect(document.querySelector('[data-field="VEYRA_AUTOPILOT_SYMBOL"]')).toBeNull()
-    expect(document.querySelector('[data-field="VEYRA_AUTOPILOT_SYMBOLS"]')).toBeNull()
-  })
-
-  it('shows a list that is already configured', () => {
-    render(
-      <LiveSettingsPanel
-        settings={{ VEYRA_AUTOPILOT_SYMBOL: { value: '', overridden: false }, VEYRA_AUTOPILOT_SYMBOLS: { value: 'US30, GBPUSD', overridden: false } }}
-        onApply={vi.fn()}
-      />,
-    )
-    expect(screen.getByText('US30')).toBeTruthy()
-    expect(screen.getByText('GBPUSD')).toBeTruthy()
-  })
-
-  it('applies the list and clears the single Symbol together, since the service takes only one of them', async () => {
-    const onApply = vi.fn().mockResolvedValue(undefined)
-    render(<LiveSettingsPanel settings={single} onApply={onApply} />)
-    await choose(/GBPUSD/)
-
-    expect(screen.getByText('2 unsaved')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
-    await waitFor(() => expect(onApply).toHaveBeenCalledTimes(1))
-    expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_SYMBOLS: 'EURUSD,GBPUSD', VEYRA_AUTOPILOT_SYMBOL: '' })
-  })
-
-  it('drops the draft when the choice comes back to what is deployed', async () => {
-    const onApply = vi.fn().mockResolvedValue(undefined)
-    render(<LiveSettingsPanel settings={single} onApply={onApply} />)
-    const dialog = await choose(/GBPUSD/)
-    expect(screen.getByText('2 unsaved')).toBeTruthy()
-
-    fireEvent.click(within(dialog).getByRole('checkbox', { name: /GBPUSD/ }))
-    expect(screen.queryByText(/unsaved/)).toBeNull()
-    expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(true)
-    expect(onApply).not.toHaveBeenCalled()
-  })
-
-  it('does not clear a Symbol that the service does not have', async () => {
-    const onApply = vi.fn().mockResolvedValue(undefined)
-    render(<LiveSettingsPanel settings={{ VEYRA_AUTOPILOT_SYMBOLS: { value: 'EURUSD', overridden: false } }} onApply={onApply} />)
-    await choose(/US30/)
-    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
-    await waitFor(() => expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_SYMBOLS: 'EURUSD,US30' }))
-  })
-
-  it('reverts both fields together to the deployed value', async () => {
-    const onApply = vi.fn().mockResolvedValue(undefined)
-    render(
-      <LiveSettingsPanel
-        settings={{
-          VEYRA_AUTOPILOT_SYMBOL: { value: '', overridden: true },
-          VEYRA_AUTOPILOT_SYMBOLS: { value: 'EURUSD,GBPUSD', overridden: true },
-        }}
-        onApply={onApply}
-      />,
-    )
-    expect(screen.getByText('Overridden')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Revert' }))
-    await waitFor(() => expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_SYMBOLS: null, VEYRA_AUTOPILOT_SYMBOL: null }))
-  })
-
-  it('keeps the draft on screen when the service refuses the revert', async () => {
-    const onApply = vi.fn().mockResolvedValue('VEYRA_AUTOPILOT_SYMBOLS: set either Symbol or Symbols')
-    render(
-      <LiveSettingsPanel
-        settings={{
-          VEYRA_AUTOPILOT_SYMBOL: { value: 'EURUSD', overridden: false },
-          VEYRA_AUTOPILOT_SYMBOLS: { value: 'EURUSD,GBPUSD', overridden: true },
-        }}
-        onApply={onApply}
-      />,
-    )
-    fireEvent.click(screen.getByRole('button', { name: 'Revert' }))
-    expect(await screen.findByRole('alert')).toHaveProperty('textContent', 'VEYRA_AUTOPILOT_SYMBOLS: set either Symbol or Symbols')
   })
 })

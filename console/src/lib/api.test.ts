@@ -205,26 +205,6 @@ describe('api', () => {
     ])
   })
 
-  it("reads the broker's instruments and the risk policy, and asks for a reload", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(jsonResponse({ ready: false, reason: 'waiting for the terminal', categories: [], symbols: [] }))
-      .mockResolvedValueOnce(jsonResponse({ symbols: ['EURUSD'] }))
-      .mockResolvedValueOnce(jsonResponse({ status: 'refreshed', count: 12 }))
-    vi.stubGlobal('fetch', fetchMock)
-
-    expect(await api.symbols()).toMatchObject({ ready: false })
-    expect(await api.riskPolicy()).toMatchObject({ symbols: ['EURUSD'] })
-    expect(await api.refreshSymbols()).toEqual({ status: 'refreshed', count: 12 })
-
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      '/api/symbols',
-      '/api/risk/policy',
-      '/api/symbols/refresh',
-    ])
-    expect(fetchMock.mock.calls[2][1]).toMatchObject({ method: 'POST', body: '{}' })
-  })
-
   it('posts policy patches as JSON to the control surface', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ killSwitch: true }))
     vi.stubGlobal('fetch', fetchMock)

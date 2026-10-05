@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
-import { api, type FeedEvent, type LogLevel, type LogRecord, type SymbolCatalog } from './api'
+import { api, type FeedEvent, type LogLevel, type LogRecord } from './api'
 import { isNotable } from './format'
 
 /** Polls an async source on an interval, keeping the last good value on error. */
@@ -233,94 +233,4 @@ export function clockTime(ms: number): string {
 
 export function money(value: number | undefined): string {
   return value === undefined ? '—' : value.toFixed(2)
-}
-
-const CATALOG_STORAGE_KEY = 'veyra.symbolCatalog.v1'
-/** Re-ask this often while the terminal has not yet listed its instruments. */
-const CATALOG_RETRY_MS = 10_000
-/** Survives a remount within the page: the list never blinks away. */
-let heldCatalog: SymbolCatalog | undefined
-
-function readStoredCatalog(): SymbolCatalog | undefined {
-  try {
-    const raw = sessionStorage.getItem(CATALOG_STORAGE_KEY)
-    const parsed = raw ? (JSON.parse(raw) as SymbolCatalog) : undefined
-    return parsed?.ready === true && Array.isArray(parsed.symbols) ? parsed : undefined
-  } catch {
-    return undefined
-  }
-}
-
-function storeCatalog(catalog: SymbolCatalog) {
-  try {
-    sessionStorage.setItem(CATALOG_STORAGE_KEY, JSON.stringify(catalog))
-  } catch {
-    // Private windows and full storage still work; the list just reloads.
-  }
-}
-
-/**
- * The broker's instrument list for pickers.
- *
- * The service pulls it from the terminal once per connection and serves it
- * from memory, so this reads it once and keeps it: in memory for the page and
- * in session storage across reloads. A later "not ready" answer (the service
- * restarted and the terminal has not yet answered) never replaces a list
- * already held. While nothing is held it asks again every few seconds.
- */
-export function useSymbolCatalog() {
-  const [catalog, setCatalog] = useState<SymbolCatalog | undefined>(() => heldCatalog ?? readStoredCatalog())
-  const [error, setError] = useState<string>()
-  const [refreshing, setRefreshing] = useState(false)
-
-  const load = useCallback(async () => {
-    try {
-      const next = await api.symbols()
-      if (next.ready) {
-        heldCatalog = next
-        storeCatalog(next)
-        setCatalog(next)
-      } else {
-        setCatalog((current) => (current?.ready ? current : next))
-      }
-      setError(undefined)
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
-    }
-  }, [])
-
-  const ready = catalog?.ready === true
-  useEffect(() => {
-    void load()
-  }, [load])
-  useEffect(() => {
-    if (ready) return
-    const timer = setInterval(() => void load(), CATALOG_RETRY_MS)
-    return () => clearInterval(timer)
-  }, [ready, load])
-
-  /** Asks the terminal for its list again, then shows the result. */
-  const refresh = useCallback(async () => {
-    setRefreshing(true)
-    try {
-      await api.refreshSymbols()
-      await load()
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
-    } finally {
-      setRefreshing(false)
-    }
-  }, [load])
-
-  return { catalog, error, refreshing, reload: load, refresh }
-}
-
-/** Clears the held list; for tests and sign-out. */
-export function forgetSymbolCatalog() {
-  heldCatalog = undefined
-  try {
-    sessionStorage.removeItem(CATALOG_STORAGE_KEY)
-  } catch {
-    // Nothing stored.
-  }
 }

@@ -58,8 +58,6 @@ pub fn create_app(
         .service(crate::control::event_feed)
         .service(crate::control::account_state)
         .service(crate::control::balance_history)
-        .service(crate::symbols::symbol_catalog)
-        .service(crate::symbols::refresh_symbols)
         .service(crate::advisories::advisories)
         .service(crate::notify::routes::notifications)
         .service(crate::notify::routes::update_notifications)
