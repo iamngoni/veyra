@@ -96,28 +96,22 @@ The EA does not need the Mac or the Pi. On any machine with MT4:
 3. Run only **one** terminal on the same account at a time, or two bots will
    act on it.
 
-## Updating the backend
+## Updating the backend and dashboard
 
-From the Mac, in `~/Desktop/veyra`, copy the source across and rebuild on the Pi
-(the build takes about 10 minutes and is capped at 2 CPU jobs so the media apps
-keep running):
+The Pi runs `main` and only `main`. Merge to `main` first, then from the Mac:
 
 ```bash
-rsync -a --delete -e "ssh -i $HOME/.ssh/id_ed25519_pi" \
-  --exclude='.git' --exclude='target' --exclude='.env' --exclude='.env.*' \
-  --exclude='**/node_modules' --exclude='**/dist' --exclude='work' \
-  ./ ras@100.118.226.126:veyra/
-ssh -i ~/.ssh/id_ed25519_pi ras@100.118.226.126 \
-  'cd veyra && docker compose build --build-arg BUILD_JOBS=2 veyra && docker compose up --detach --no-build veyra watchdog'
+scripts/deploy-pi.sh             # backend only
+scripts/deploy-pi.sh --console   # backend, then the Cloudflare dashboard
 ```
 
-The excludes matter: without them the sync would overwrite the Pi's own `.env`.
-
-## Updating the dashboard (Cloudflare)
+The script exports `origin/main` from git, so your checked-out branch and
+uncommitted edits never reach the Pi. It leaves the Pi's own `.env` alone,
+rebuilds on the Pi (about 10 minutes, capped at 2 CPU jobs so the media apps keep
+running), restarts, and records the deployed commit. Check what is live with:
 
 ```bash
-cd ~/Desktop/veyra/console
-VEYRA_TARGET=cloudflare npm run build && npx wrangler deploy
+ssh -i ~/.ssh/id_ed25519_pi ras@100.118.226.126 'cat veyra/.deployed-commit'
 ```
 
 ## If something is wrong
