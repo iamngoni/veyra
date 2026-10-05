@@ -705,7 +705,7 @@ mod tests {
             raw("US30", "Indices\\US30"),
             raw("eurusd", "Forex\\EURUSD"),
             raw("EURUSD", "Forex\\EURUSD"),
-            raw("bad name", ""),
+            raw("bad  name", ""),
             raw("BAD$CHAR", ""),
             raw("AUDUSD", "Forex\\AUDUSD"),
         ]);

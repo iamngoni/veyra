@@ -335,6 +335,7 @@ mod tests {
             symbol_specs: Vec::new(),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
+            account_currency: None,
         })
     }
 

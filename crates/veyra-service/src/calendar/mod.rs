@@ -195,14 +195,10 @@ pub fn instrument_currencies(
     {
         return currencies;
     }
-    let bytes = symbol.as_bytes();
-    if bytes.len() != 6 || !bytes.iter().all(u8::is_ascii_alphabetic) {
+    let Some(code) = crate::broker::six_letter_code(symbol) else {
         return Vec::new();
-    }
-    vec![
-        symbol[..3].to_ascii_uppercase(),
-        symbol[3..].to_ascii_uppercase(),
-    ]
+    };
+    vec![code[..3].to_owned(), code[3..].to_owned()]
 }
 
 /// Events for one instrument inside the configured blackout window.
@@ -436,8 +432,12 @@ mod tests {
         assert!(!eur.applies_to("GBPUSD"));
         assert!(!eur.applies_to("XAUUSD"));
         assert!(
-            !eur.applies_to("EURUSD.pro"),
-            "non-pair symbols never match"
+            eur.applies_to("EURUSD.pro") && eur.applies_to("EURUSDm"),
+            "a broker suffix keeps the pair's news"
+        );
+        assert!(
+            !eur.applies_to("EURUSDX"),
+            "an unknown continuation is not the pair"
         );
 
         let gold = event("Gold fix", "XAU", Impact::Medium, 1_000);

@@ -9,8 +9,10 @@ use std::time::Duration;
 use crate::calendar::CalendarProvider;
 use crate::config::ConfigError;
 
-/// Default window to wait for one calendar HTTP request.
-const DEFAULT_TIMEOUT_SECS: u64 = 5;
+/// Default window to wait for one calendar HTTP request. The publisher is
+/// often slow rather than down, so this is generous; a failed refresh falls
+/// back to the last good week anyway.
+const DEFAULT_TIMEOUT_SECS: u64 = 15;
 /// Smallest accepted request timeout.
 const MIN_TIMEOUT_SECS: u64 = 1;
 /// Largest accepted request timeout.

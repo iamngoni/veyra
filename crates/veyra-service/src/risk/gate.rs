@@ -67,6 +67,11 @@ pub struct AccountFacts {
     pub symbol_specs: Vec<SymbolSpecPayload>,
     /// Account equity reported by the latest validated snapshot, when known.
     pub equity: Option<f64>,
+    /// Account deposit currency (upper case) from the latest validated
+    /// snapshot, when the terminal reports it. Without a live contract an
+    /// instrument can only be valued in USD, so a non-USD account then fails
+    /// closed.
+    pub account_currency: Option<String>,
     /// Free margin reported by the latest validated snapshot, when known.
     /// The pre-queue margin check skips when it is unknown; the terminal
     /// still re-validates margin when the order is sent.
@@ -463,6 +468,16 @@ impl RiskGate {
             let Some(reference) = reference else {
                 return Err(RiskCode::RiskUnverifiable);
             };
+            // The name-based valuation prices in USD; for any other deposit
+            // currency only the venue's own tick value is trustworthy.
+            if spec.is_none()
+                && account
+                    .account_currency
+                    .as_deref()
+                    .is_some_and(|currency| currency != "USD")
+            {
+                return Err(RiskCode::RiskUnverifiable);
+            }
             if let Some(equity) = account.equity {
                 match valuation::risk_percent_with_spec(
                     draft,
@@ -600,6 +615,7 @@ mod tests {
             symbol_specs: Vec::new(),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
+            account_currency: None,
         })
     }
 
@@ -897,6 +913,7 @@ mod tests {
             free_margin: Some(1_000.0),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
+            account_currency: None,
         }
     }
 
@@ -1133,6 +1150,7 @@ mod tests {
             symbol_specs: Vec::new(),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
+            account_currency: None,
         });
         assert_eq!(
             expect_rejection(gate.evaluate(&draft(0.1), closed_account, now)).code(),
@@ -1234,7 +1252,36 @@ mod tests {
         // 0.01 lots, 20-pip stop: $2 on $1,000 = 0.2% passes.
         let small = draft_with_stop("EURUSD", 0.01, 1.118);
         assert!(matches!(
-            gate.evaluate(&small, Some(priced), now),
+            gate.evaluate(&small, Some(priced.clone()), now),
+            RiskDecision::Approved(_)
+        ));
+
+        // The name-based valuation is in USD: a USD account passes, any other
+        // currency without the venue's contract fails closed, and with the
+        // contract (tick value in the deposit currency) it is valued.
+        let mut usd = priced.clone();
+        usd.account_currency = Some("USD".to_owned());
+        // A fresh gate each time: an equal draft is a duplicate otherwise.
+        let fresh = || rule_policy(5.0, 0.0, 0.0, 0.0);
+        assert!(matches!(
+            fresh().evaluate(&small, Some(usd), now),
+            RiskDecision::Approved(_)
+        ));
+        let mut rand = priced.clone();
+        rand.account_currency = Some("ZAR".to_owned());
+        assert_eq!(
+            expect_rejection(fresh().evaluate(&small, Some(rand.clone()), now)).code(),
+            RiskCode::RiskUnverifiable
+        );
+        let mut contract = venue_spec("EURUSD", true);
+        contract.point = 0.00001;
+        contract.tick_size = 0.00001;
+        contract.tick_value = 1.8;
+        contract.bid = 1.12;
+        contract.ask = 1.12002;
+        rand.symbol_specs = vec![contract];
+        assert!(matches!(
+            fresh().evaluate(&small, Some(rand), now),
             RiskDecision::Approved(_)
         ));
 

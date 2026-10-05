@@ -477,6 +477,30 @@ describe('PerformanceSummary', () => {
     expect(stat('Net P/L').sub.textContent).toBe('')
   })
 
+  it('states dividends beside trade P/L and counts deposits as capital', () => {
+    const withAdjustments: Performance = {
+      ...performance({ net_profit: 100, expectancy: 2 }),
+      adjustments: { count: 3, dividends: -1.5, other: 0.5, transfers: 400, credit: 25 },
+    }
+    // Balance 1,498.5: 1,000 + 400 deposited is the capital, +100 traded,
+    // −1.5 in dividends.
+    render(<PerformanceSummary performance={withAdjustments} balance={1_498.5} />)
+    expect(stat('Net P/L').value.textContent).toBe('+100.00')
+    expect(stat('Net P/L').sub.textContent).toBe('+7.1% · dividends −1.50')
+    expect(stat('Net P/L').sub.getAttribute('title')).toContain('Dividend adjustments')
+  })
+
+  it('says nothing when there are no dividends', () => {
+    render(
+      <PerformanceSummary
+        performance={{ ...performance(), adjustments: { count: 2, dividends: 0, other: 20, transfers: 50, credit: 0 } }}
+        balance={23_517.3}
+      />,
+    )
+    expect(stat('Net P/L').sub.textContent).toBe('+8.5%')
+    expect(stat('Net P/L').sub.getAttribute('title')).toBeNull()
+  })
+
   it('omits the average when the service has none', () => {
     render(<PerformanceSummary performance={performance({ expectancy: null })} balance={30_000} />)
     expect(stat('Closed trades').sub.textContent).toBe('')

@@ -740,6 +740,8 @@ pub async fn account_state(state: Data<AppState>) -> HttpResponse {
         body["login"] = json!(snapshot.login().value());
         body["server"] = json!(snapshot.server().as_str());
         body["symbol"] = json!(snapshot.symbol().as_str());
+        body["terminalBuild"] = json!(snapshot.terminal_build());
+        body["eaVersion"] = json!(snapshot.ea_version());
     }
     body["ageSecs"] = json!(
         link.last_account_age(SystemTime::now())
@@ -757,6 +759,13 @@ pub async fn account_state(state: Data<AppState>) -> HttpResponse {
         body["positions"] = json!(account.positions);
         body["positionsTruncated"] = json!(account.positions_truncated);
         body["serverTime"] = json!(account.server_time);
+        body["currency"] = json!(account.account_currency());
+    }
+    // The service's own reading of the broker clock (see `broker_clock`), so
+    // the console converts broker times the same way the service does.
+    if let Ok(clock) = crate::broker_clock::BrokerClock::from_state(&state) {
+        body["brokerOffsetSecs"] = json!(clock.offset_secs());
+        body["clockBasis"] = json!(clock.basis().as_str());
     }
     HttpResponse::Ok().json(body)
 }
@@ -1007,51 +1016,48 @@ pub struct PerformanceQuery {
 #[get("/performance")]
 /// Returns realized performance from the venue's closed orders.
 ///
-/// Read-only: one `order_history` command is queued for the Veyra magic
-/// number and awaited, so the numbers come from actual fills (profit + swap +
-/// commission) rather than floating snapshots. Invalid windows are rejected
-/// before anything is queued, and a terminal that does not answer within the
-/// configured window is reported as a gateway failure.
+/// Read through [`crate::ledger::closed_trades`]: the terminal's account
+/// history for the Veyra magic number is recorded in Veyra's own ledger and
+/// the numbers come from the ledger, so they do not depend on how much history
+/// the terminal shows. They are actual fills (profit + swap + commission),
+/// not floating snapshots. Invalid windows are rejected before anything is
+/// queued; without a ledger, a terminal that does not answer is a gateway
+/// failure, with one the ledger still answers (`source: "ledger_only"`).
 pub async fn performance(
     state: Data<AppState>,
     query: web::Query<PerformanceQuery>,
 ) -> HttpResponse {
-    let Some(link) = command_link(&state) else {
-        return HttpResponse::ServiceUnavailable().json(json!({ "error": "broker_unavailable" }));
-    };
     let days = query.days.unwrap_or(OrderHistoryRequest::DEFAULT_DAYS);
-    let request = match OrderHistoryRequest::new(days, ORDER_MAGIC) {
-        Ok(request) => request,
-        Err(error) => {
-            return HttpResponse::BadRequest()
-                .json(json!({ "error": "invalid_window", "reason": error.to_string() }));
-        }
-    };
-    let id = link.enqueue_order_history(request);
-    match link.await_command(id, Duration::from_secs(20)).await {
-        CommandState::Completed {
-            payload: CommandPayload::OrderHistory(history),
-        } => {
+    match crate::ledger::closed_trades(&state, days).await {
+        Ok(history) => {
             let report = crate::performance::summarize(&history.orders);
             HttpResponse::Ok().json(json!({
                 "days": days,
                 "report": report,
+                "adjustments": crate::ledger::AdjustmentSummary::of(&history.adjustments),
                 "trades": history.orders,
                 "total": history.total,
-                "truncated": history.truncated
+                "truncated": history.truncated,
+                "source": history.source,
+                "terminalError": history.terminal_error
             }))
         }
-        CommandState::Completed { .. } => HttpResponse::BadGateway().json(json!({
-            "error": "history_failed",
-            "reason": "history command completed with a different payload"
-        })),
-        CommandState::Failed { reason } => {
+        Err(error) => history_error(error),
+    }
+}
+
+/// Maps a closed-trade read failure to its HTTP answer.
+fn history_error(error: crate::ledger::HistoryError) -> HttpResponse {
+    use crate::ledger::HistoryError;
+    match error {
+        HistoryError::InvalidWindow => HttpResponse::BadRequest()
+            .json(json!({ "error": "invalid_window", "reason": error.to_string() })),
+        HistoryError::Unavailable => {
+            HttpResponse::ServiceUnavailable().json(json!({ "error": "broker_unavailable" }))
+        }
+        HistoryError::Failed(reason) => {
             HttpResponse::BadGateway().json(json!({ "error": "history_failed", "reason": reason }))
         }
-        CommandState::Pending => HttpResponse::BadGateway().json(json!({
-            "error": "history_failed",
-            "reason": "history command still pending after the await window"
-        })),
     }
 }
 
@@ -1078,9 +1084,6 @@ pub struct TradesQuery {
 /// any recorded stop moves, and any recorded close) to classify why it
 /// closed; nothing here enqueues a second command or reaches an order path.
 pub async fn trades(state: Data<AppState>, query: web::Query<TradesQuery>) -> HttpResponse {
-    let Some(link) = command_link(&state) else {
-        return HttpResponse::ServiceUnavailable().json(json!({ "error": "broker_unavailable" }));
-    };
     let page = match crate::trades::TradePage::new(query.page, query.page_size) {
         Ok(page) => page,
         Err(error) => {
@@ -1089,23 +1092,15 @@ pub async fn trades(state: Data<AppState>, query: web::Query<TradesQuery>) -> Ht
         }
     };
     let days = query.days.unwrap_or(OrderHistoryRequest::DEFAULT_DAYS);
-    let request = match OrderHistoryRequest::new(days, ORDER_MAGIC) {
-        Ok(request) => request,
-        Err(error) => {
-            return HttpResponse::BadRequest()
-                .json(json!({ "error": "invalid_window", "reason": error.to_string() }));
-        }
-    };
-    let id = link.enqueue_order_history(request);
-    match link.await_command(id, Duration::from_secs(20)).await {
-        CommandState::Completed {
-            payload: CommandPayload::OrderHistory(history),
-        } => {
-            let report = crate::trades::build(&state, &history, page).await;
+    match crate::ledger::closed_trades(&state, days).await {
+        Ok(history) => {
+            let report = crate::trades::build(&state, &history.payload(), page).await;
             HttpResponse::Ok().json(json!({
                 "days": days,
                 "truncated": history.truncated,
                 "total": history.total,
+                "source": history.source,
+                "terminalError": history.terminal_error,
                 "page": page.number(),
                 "pageSize": page.size(),
                 "pageCount": report.page_count,
@@ -1114,17 +1109,7 @@ pub async fn trades(state: Data<AppState>, query: web::Query<TradesQuery>) -> Ht
                 "trades": report.trades
             }))
         }
-        CommandState::Completed { .. } => HttpResponse::BadGateway().json(json!({
-            "error": "history_failed",
-            "reason": "history command completed with a different payload"
-        })),
-        CommandState::Failed { reason } => {
-            HttpResponse::BadGateway().json(json!({ "error": "history_failed", "reason": reason }))
-        }
-        CommandState::Pending => HttpResponse::BadGateway().json(json!({
-            "error": "history_failed",
-            "reason": "history command still pending after the await window"
-        })),
+        Err(error) => history_error(error),
     }
 }
 
@@ -1979,7 +1964,7 @@ mod tests {
         let response = test::call_service(
             &app,
             test::TestRequest::get()
-                .uri("/market/candles?symbol=bad%20symbol")
+                .uri("/market/candles?symbol=bad%2Fsymbol")
                 .to_request(),
         )
         .await;
@@ -2180,8 +2165,14 @@ mod tests {
             "connected": true,
             "tradeAllowed": true,
             "orders": 0,
-            "lots": 0.0
+            "lots": 0.0,
+            "build": 1440,
+            "ea": "1.27"
         });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
         let mut command = None;
         for _ in 0..40 {
             let response = test::call_service(
@@ -2222,6 +2213,8 @@ mod tests {
                 }],
                 "positionsTruncated": false,
                 "serverTime": 1_758_000_000,
+                "tradeServerTime": now + 7_200 - 4,
+                "currency": "usd",
                 "leverage": 100,
                 "marginLevel": 12.5
             }
@@ -2250,6 +2243,23 @@ mod tests {
         assert_eq!(body["positions"][0]["magic"], 77041);
         assert_eq!(body["login"], 94168);
         assert_eq!(body["server"], "IFCMarkets-Real");
+        assert_eq!(body["currency"], "USD");
+        assert_eq!(body["terminalBuild"], 1440);
+        assert_eq!(body["eaVersion"], "1.27");
+        assert_eq!(body["serverTime"], 1_758_000_000);
+        // One quote reading of a new offset is not trusted yet, and the host
+        // clock (a year off here) is implausible: no offset is claimed.
+        assert!(body["brokerOffsetSecs"].is_null());
+        // With the offset already known, the fresh quote confirms it.
+        state
+            .terminal_memory()
+            .restore_state(&serde_json::json!({ "offsetSecs": 7_200 }))
+            .expect("seed");
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/account").to_request()).await;
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["brokerOffsetSecs"], 7_200);
+        assert_eq!(body["clockBasis"], "quote");
     }
 
     #[actix_web::test]
@@ -2291,7 +2301,7 @@ mod tests {
         let response = test::call_service(
             &app,
             test::TestRequest::get()
-                .uri("/market/spec?symbol=bad%20symbol")
+                .uri("/market/spec?symbol=bad%2Fsymbol")
                 .to_request(),
         )
         .await;
@@ -2503,6 +2513,159 @@ mod tests {
         let body: Value = test::read_body_json(response).await;
         assert_eq!(body["error"], "history_failed");
         assert_eq!(body["reason"], "history unavailable");
+    }
+
+    /// Delivers the next queued history command to a fake EA and answers it
+    /// with `$ack(&command)`.
+    macro_rules! answer_next_history {
+        ($ea_app:expr, $ack:expr) => {{
+            let hello = serde_json::json!({
+                "t": "hb", "token": "test-token-1234567890", "acct": 94168,
+                "server": "IFCMarkets-Real", "symbol": "EURUSD", "connected": true,
+                "tradeAllowed": true, "orders": 0, "lots": 0.0
+            });
+            let mut command = None;
+            for _ in 0..40 {
+                let response = test::call_service(
+                    $ea_app,
+                    test::TestRequest::post()
+                        .uri("/ea/poll")
+                        .set_payload(hello.to_string())
+                        .to_request(),
+                )
+                .await;
+                let body: Value = test::read_body_json(response).await;
+                if body["t"] == "cmd" {
+                    command = Some(body);
+                    break;
+                }
+                actix_web::rt::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            let command = command.expect("history command delivered");
+            assert_eq!(command["kind"], "order_history");
+            let ack: Value = ($ack)(&command);
+            let response = test::call_service(
+                $ea_app,
+                test::TestRequest::post()
+                    .uri("/ea/poll")
+                    .set_payload(ack.to_string())
+                    .to_request(),
+            )
+            .await;
+            assert!(response.status().is_success());
+        }};
+    }
+
+    #[actix_web::test]
+    async fn performance_reads_veyras_ledger_and_survives_a_silent_terminal() {
+        let (state, _) = audited_state(None);
+        let ledger: crate::ledger::SharedLedger =
+            std::sync::Arc::new(crate::ledger::MemoryLedger::default());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        // A trade the terminal no longer shows (its history tab is on Today).
+        let mut older = crate::broker::ClosedTradePayload {
+            ticket: 10_657_386,
+            symbol: "USDCAD".to_owned(),
+            kind: crate::broker::PositionKind::Buy,
+            lots: 0.01,
+            open_price: 1.415,
+            close_price: 1.41756,
+            open_time: now - 3 * 86_400,
+            close_time: now - 3 * 86_400 + 7_200,
+            profit: 0.42,
+            swap: 0.0,
+            commission: 0.0,
+            magic: crate::broker::ORDER_MAGIC,
+        };
+        ledger
+            .record_trades(std::slice::from_ref(&older))
+            .await
+            .expect("seeded");
+        older.ticket = 1;
+        let state = state.with_ledger(Some(ledger.clone()));
+        let link = state.broker().expect("broker").ea_link().expect("ea link");
+        let ea_app = test::init_service(crate::broker::ea::create_ea_app(link.clone())).await;
+
+        let route_state = state.clone();
+        let task = actix_web::rt::spawn(async move {
+            let app = test::init_service(create_app(route_state)).await;
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/performance?days=30")
+                    .to_request(),
+            )
+            .await
+        });
+        answer_next_history!(&ea_app, |command: &Value| {
+            serde_json::json!({
+                "t": "ack", "token": "test-token-1234567890", "id": command["id"], "ok": true,
+                "data": {"orders": [{
+                    "ticket": 10_674_729, "symbol": "EURUSD", "kind": "sell", "lots": 0.01,
+                    "openPrice": 1.1, "closePrice": 1.099, "openTime": now - 7_200,
+                    "closeTime": now - 3_600, "profit": 0.33, "swap": 0.0, "commission": 0.0,
+                    "magic": 77041
+                }], "total": 1, "truncated": false, "adjustments": [
+                    {"ticket": 900_001, "kind": "balance", "amount": -0.12,
+                     "time": now - 86_400, "comment": "Dividend SP500m"},
+                    {"ticket": 900_002, "kind": "balance", "amount": 50.0,
+                     "time": now - 2 * 86_400, "comment": "Deposit"},
+                    {"ticket": 900_003, "kind": "balance", "amount": 0.05,
+                     "time": now - 3 * 86_400, "comment": "correction"},
+                    {"ticket": 900_004, "kind": "credit", "amount": 10.0,
+                     "time": now - 4 * 86_400, "comment": "bonus"}
+                ]}
+            })
+        });
+        let response = task.await.expect("task joins");
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["source"], "ledger");
+        assert_eq!(
+            body["total"], 2,
+            "today's fill plus the one only Veyra kept"
+        );
+        assert_eq!(body["trades"][0]["ticket"], 10_674_729, "newest first");
+        assert_eq!(body["report"]["trades"], 2);
+        // Balance operations are recorded and summed beside, not into, trades.
+        let adjustments = &body["adjustments"];
+        assert_eq!(adjustments["count"], 4);
+        assert_eq!(adjustments["dividends"], -0.12);
+        assert_eq!(adjustments["other"], 0.05);
+        assert_eq!(adjustments["transfers"], 50.0);
+        assert_eq!(adjustments["credit"], 10.0);
+        let kept = ledger.adjustments_since(0).await.expect("ledger");
+        assert_eq!(
+            kept.iter().map(|entry| entry.ticket).collect::<Vec<_>>(),
+            vec![900_001, 900_002, 900_003, 900_004],
+            "newest first"
+        );
+
+        // The terminal fails: the ledger still answers, and says so.
+        let route_state = state.clone();
+        let task = actix_web::rt::spawn(async move {
+            let app = test::init_service(create_app(route_state)).await;
+            test::call_service(
+                &app,
+                test::TestRequest::get().uri("/trades?days=30").to_request(),
+            )
+            .await
+        });
+        answer_next_history!(&ea_app, |command: &Value| {
+            serde_json::json!({
+                "t": "ack", "token": "test-token-1234567890", "id": command["id"],
+                "ok": false, "error": "history unavailable"
+            })
+        });
+        let response = task.await.expect("task joins");
+        assert_eq!(response.status(), 200);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["source"], "ledger_only");
+        assert_eq!(body["terminalError"], "history unavailable");
+        assert_eq!(body["summary"]["count"], 2);
     }
 
     #[actix_web::test]

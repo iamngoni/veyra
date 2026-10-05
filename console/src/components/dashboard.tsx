@@ -6,10 +6,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { StatusBanner } from './banner'
 import { ChartPanel, MARKET_BARS, type ChartMode, type MarketTimeframe, type PerformanceRange } from './chart'
 import { AssistantChat } from './chat'
 import { KpiRow, OpenPositions, PerformanceSummary } from './overview'
 import { AutopilotCard, RecentActivity, RiskControls } from './rail'
+import { JudgeSection } from './judge'
 import { NotificationsPanel } from './notifications'
 import { LiveSettingsPanel } from './settings'
 import { Sidebar, Topbar, type NavTab } from './shell'
@@ -53,6 +55,9 @@ export function Dashboard() {
   const { data: history, error: historyError } = usePoll(() => api.performance(365), 60000)
   const { data: sessions } = usePoll(api.sessions, 30000)
   const { data: metrics, error: metricsError } = usePoll(api.metrics, 10000)
+  // Conditions change on the scale of minutes (a session closing, a breaker
+  // tripping); the banner reads them on every tab.
+  const { data: advisories, error: advisoriesError } = usePoll(api.advisories, 30000)
   const { events, notable, connected, settled } = useEventFeed(200)
   const [focus, setFocus] = useState(true)
   const [logLevel, setLogLevel] = useState<LogLevel>('info')
@@ -66,6 +71,7 @@ export function Dashboard() {
     error: notificationsError,
     refetch: refetchNotifications,
   } = usePoll(api.notifications, 60000)
+  const { data: judge, error: judgeError, refetch: refetchJudge } = usePoll(api.judge, 60000)
   const [traceKind, setTraceKind] = useState('all')
   const { theme, toggle } = useTheme()
   const [tab, setTab] = useState<TabId>('overview')
@@ -218,6 +224,9 @@ export function Dashboard() {
             <AssistantChat />
           </header>
 
+          {/* Between the view's name and its content, on every view. */}
+          <StatusBanner advisories={advisories} error={advisoriesError} />
+
           {tab === 'overview' ? (
             <div className="overview">
               <div className="overview-main">
@@ -317,6 +326,7 @@ export function Dashboard() {
                 settings={liveConfig?.settings}
                 secretStatus={liveConfig?.secrets?.VEYRA_MODEL_API_KEY}
                 secretStore={liveConfig?.secret_store}
+                judge={<JudgeSection settings={judge} error={judgeError} onRefresh={() => void refetchJudge()} />}
                 onApply={applyConfig}
                 onRefresh={() => void refetchConfig()}
               />

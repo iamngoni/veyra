@@ -18,6 +18,9 @@ input bool   InAllowLiveOrders = __VEYRA_ALLOW_LIVE__;   // arm live order place
 uint g_last       = 0;
 bool g_said_hello = false;
 
+#define VEYRA_EA_VERSION "1.27"
+#define MAX_ADJUSTMENTS  64
+
 int OnInit()
   {
    EventSetMillisecondTimer(250);
@@ -829,10 +832,32 @@ void HandleOrderHistory(string response, string id)
       included++;
      }
 
+   // Balance operations (type 6) and credit (type 7) in the same window:
+   // dividends, corrections, deposits and withdrawals. They carry no magic
+   // number, so they are reported separately from Veyra's trades.
+   string adjustments = "";
+   int adjusted = 0;
+   for(int j = total - 1; j >= 0 && adjusted < MAX_ADJUSTMENTS; j--)
+     {
+      if(!OrderSelect(j, SELECT_BY_POS, MODE_HISTORY)) continue;
+      int type = OrderType();
+      if(type != 6 && type != 7) continue;
+      if(OrderOpenTime() < cutoff) continue;
+      string adjustment = "{\"ticket\":" + (string)(long)OrderTicket()
+                          + ",\"kind\":\"" + (type == 6 ? "balance" : "credit") + "\""
+                          + ",\"amount\":" + DoubleToString(OrderProfit(), 2)
+                          + ",\"time\":" + (string)(long)OrderOpenTime()
+                          + ",\"comment\":\"" + EscapeJson(OrderComment()) + "\"}";
+      if(StringLen(adjustments) > 0) adjustments = adjustments + ",";
+      adjustments = adjustments + adjustment;
+      adjusted++;
+     }
+
    string json = "{\"orders\":[" + orders + "],\"total\":" + (string)matched
-                 + ",\"truncated\":" + (matched > included ? "true" : "false") + "}";
+                 + ",\"truncated\":" + (matched > included ? "true" : "false")
+                 + ",\"adjustments\":[" + adjustments + "]}";
    Print("VeyraProbe order_history days=", (string)days, " matched=", (string)matched,
-         " included=", (string)included);
+         " included=", (string)included, " adjustments=", (string)adjusted);
    SendAck(id, json);
   }
 
@@ -907,7 +932,9 @@ void HandleCommand(string response)
              + ",\"positionsTruncated\":" + (OrdersTotal() > 32 ? "true" : "false")
              + ",\"leverage\":" + (string)(int)AccountLeverage()
              + ",\"marginLevel\":" + DoubleToString(AccountMargin() > 0.0 ? AccountEquity() / AccountMargin() * 100.0 : 0.0, 2)
-             + ",\"serverTime\":" + (string)(long)TimeLocal() + "}";
+             + ",\"serverTime\":" + (string)(long)TimeLocal()
+             + ",\"tradeServerTime\":" + (string)(long)TimeCurrent()
+             + ",\"currency\":\"" + EscapeJson(AccountCurrency()) + "\"}";
      }
    else
      {
@@ -950,6 +977,8 @@ void OnTimer()
                  + ",\"lots\":" + DoubleToString(OpenLots(), 2)
                  + ",\"balance\":" + DoubleToString(AccountBalance(), 2)
                  + ",\"liveOrders\":" + (InAllowLiveOrders ? "true" : "false")
+                 + ",\"build\":" + (string)TerminalInfoInteger(TERMINAL_BUILD)
+                 + ",\"ea\":\"" + VEYRA_EA_VERSION + "\""
                  + ",\"ts\":" + (string)(long)TimeLocal() + "}";
 
    string response;

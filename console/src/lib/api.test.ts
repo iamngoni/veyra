@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   api,
   changeModelCredential,
+  judge,
   NotificationError,
   streamAssistant,
   subscriptions,
@@ -73,6 +74,7 @@ describe('api', () => {
     await api.audit(50)
     await api.trades(7)
     await api.notifications()
+    await api.advisories()
 
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       '/api/status',
@@ -87,6 +89,7 @@ describe('api', () => {
       '/api/audit?limit=50',
       '/api/trades?days=7&page=1&pageSize=20',
       '/api/notifications',
+      '/api/advisories',
     ])
     for (const call of fetchMock.mock.calls) {
       expect(call[1]?.headers).toEqual({ accept: 'application/json' })
@@ -470,6 +473,40 @@ describe('api', () => {
     it('refuses an ok response with no body', async () => {
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => null } as unknown as Response))
       await expect(updateNotifications('t', {})).rejects.toThrow('The service did not confirm the change.')
+    })
+  })
+
+  describe('judge', () => {
+    it('sends every change with the operator token, and the key only in the body', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ provider: 'typesafe' }))
+      vi.stubGlobal('fetch', fetchMock)
+      await api.judge()
+      await judge.select('operator-token', 'openai')
+      await judge.saveKey('operator-token', 'sk-proj-abc')
+      await judge.removeKey('operator-token')
+      await judge.test('operator-token')
+
+      const headers = { accept: 'application/json', 'content-type': 'application/json', 'x-veyra-admin-token': 'operator-token' }
+      expect(fetchMock.mock.calls).toEqual([
+        ['/api/judge', { signal: undefined, headers: { accept: 'application/json' } }],
+        ['/api/judge', { method: 'PUT', headers, body: JSON.stringify({ provider: 'openai' }) }],
+        ['/api/judge/openai/key', { method: 'PUT', headers, body: JSON.stringify({ key: 'sk-proj-abc' }) }],
+        ['/api/judge/openai/key', { method: 'DELETE', headers }],
+        ['/api/judge/openai/test', { method: 'POST', headers }],
+      ])
+    })
+
+    it('reports the reason, then the error code, then the status', async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(jsonResponse({ error: 'openai_test_required', reason: 'Run a passing test first.' }, 409))
+        .mockResolvedValueOnce(jsonResponse({ error: 'invalid_operator_token' }, 401))
+        .mockResolvedValueOnce({ ok: false, status: 502, json: async () => { throw new SyntaxError('html') } } as unknown as Response)
+        .mockResolvedValueOnce({ ok: true, status: 200, json: async () => null } as unknown as Response)
+      vi.stubGlobal('fetch', fetchMock)
+      await expect(judge.select('t', 'openai')).rejects.toThrow('Run a passing test first.')
+      await expect(judge.test('t')).rejects.toThrow('invalid operator token')
+      await expect(judge.removeKey('t')).rejects.toThrow('Request failed (502)')
+      await expect(judge.saveKey('t', 'sk-x')).rejects.toThrow('The service did not confirm the change.')
     })
   })
 })

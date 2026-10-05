@@ -44,6 +44,12 @@ describe('brokerOffsetSecs', () => {
     expect(brokerOffsetSecs(account({ serverTime: nowSecs - 2 + 5.5 * 3600 }), NOW_MS)).toBe(19800)
   })
 
+  it("prefers the service's own reading over the host clock", () => {
+    // The host clock says UTC; the service measured the broker at +2 from quotes.
+    expect(brokerOffsetSecs(account({ serverTime: nowSecs - 2, brokerOffsetSecs: 7200 }), NOW_MS)).toBe(7200)
+    expect(brokerOffsetSecs(account({ brokerOffsetSecs: 0 }), NOW_MS)).toBe(0)
+  })
+
   it('is unknown without a snapshot clock or with an impossible one', () => {
     expect(brokerOffsetSecs(undefined, NOW_MS)).toBeUndefined()
     expect(brokerOffsetSecs(account(), NOW_MS)).toBeUndefined()

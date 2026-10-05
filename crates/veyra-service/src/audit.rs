@@ -85,11 +85,13 @@ pub enum AuditKind {
     RiskPolicyUpdated,
     /// One or more live settings were changed from the control surface.
     RuntimeConfigUpdated,
+    /// The trading terminal reported a different build (it updated itself).
+    TerminalChanged,
 }
 
 impl AuditKind {
     /// Every category, in declaration order.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::CommandQueued,
         Self::CommandCompleted,
         Self::CommandFailed,
@@ -104,6 +106,7 @@ impl AuditKind {
         Self::Failure,
         Self::RiskPolicyUpdated,
         Self::RuntimeConfigUpdated,
+        Self::TerminalChanged,
     ];
 
     /// Parses a stable wire name; unknown names are rejected.
@@ -128,6 +131,7 @@ impl AuditKind {
             Self::Failure => "failure",
             Self::RiskPolicyUpdated => "risk_policy_updated",
             Self::RuntimeConfigUpdated => "runtime_config_updated",
+            Self::TerminalChanged => "terminal_changed",
         }
     }
 }
@@ -1245,7 +1249,7 @@ mod tests {
         .expect("valid");
         assert_eq!(base.kinds(), &kinds, "duplicate kinds collapse");
         assert_eq!(base.limit(), 200);
-        assert!(base.clone().with_symbol("bad symbol").is_err());
+        assert!(base.clone().with_symbol("bad/symbol").is_err());
         assert!(base.clone().with_ticket(0).is_err());
         assert!(base.clone().with_command_ids(&[]).is_err());
         assert!(base.clone().with_command_ids(&["nope".to_owned()]).is_err());

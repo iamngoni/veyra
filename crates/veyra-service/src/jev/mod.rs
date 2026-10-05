@@ -10,23 +10,32 @@
 //! (`VEYRA_JEV_PROVIDER`). Adding another System One provider means adding an
 //! implementation plus a variant; callers do not change.
 //!
+//! The configured judge is always TypeSafe. The operator may layer OpenAI
+//! Decisions ([`openai`]) over it at runtime as a primary with the configured
+//! judge as automatic fallback ([`fallback`]); [`JevRuntime`] holds that
+//! swappable slot so callers keep one stable handle (see [`crate::judge`]).
+//!
 //! The trade pipeline still owns every decision: Jev judgements are inputs
 //! code may consult, never execution authority.
 
 pub mod contract;
+pub mod fallback;
 pub mod http;
+pub mod openai;
 pub mod settings;
 
 pub use contract::{
     Answer, ChoiceAnswer, ChoiceOptions, Confidence, Instructions, JevRequest, JevResponse,
     NoulAnswer, NoulCriteria, Probability, Question, ScoreAnswer, ScoreLevels, State, Usage,
 };
+pub use fallback::FallbackJudge;
 pub use http::HttpJev;
+pub use openai::{OpenAiApiKey, OpenAiDecisions, OpenAiJudge, OpenAiKeyError, OpenAiSettings};
 pub use settings::{JevApiKey, JevSettings};
 
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use async_trait::async_trait;
 
@@ -35,6 +44,9 @@ use async_trait::async_trait;
 pub enum JevProvider {
     /// TypeSafe System One, currently the Jev model family.
     TypeSafe,
+    /// OpenAI Decisions (limited preview). Only ever an operator-selected
+    /// primary over a configured TypeSafe judge, never configured alone.
+    OpenAi,
 }
 
 impl JevProvider {
@@ -42,13 +54,15 @@ impl JevProvider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::TypeSafe => "typesafe",
+            Self::OpenAi => "openai",
         }
     }
 
-    /// Parses a configuration value; unknown providers are rejected.
+    /// Parses a provider name; unknown providers are rejected.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "typesafe" => Some(Self::TypeSafe),
+            "openai" => Some(Self::OpenAi),
             _ => None,
         }
     }
@@ -72,6 +86,15 @@ pub enum JevError {
     /// The service rejected the credential.
     #[error("jev rejected the credential")]
     Unauthorized,
+    /// The service refused access (401/403) and said why, for example a
+    /// preview API that is not enabled for the account.
+    #[error("judge denied access (status {status}): {detail}")]
+    Denied {
+        /// HTTP status reported by the service.
+        status: u16,
+        /// Non-sensitive explanation from the service, keys scrubbed.
+        detail: String,
+    },
     /// The service rejected the request payload.
     #[error("jev rejected the request: {detail}")]
     Rejected {
@@ -123,6 +146,8 @@ pub struct JevUsage {
     failures: AtomicU64,
     input_tokens: AtomicU64,
     output_tokens: AtomicU64,
+    /// Requests an operator-selected primary handed to the configured judge.
+    fallbacks: AtomicU64,
 }
 
 /// Snapshot of [`JevUsage`].
@@ -136,13 +161,22 @@ pub struct JevUsageSnapshot {
     pub input_tokens: u64,
     /// Completion tokens reported by the provider.
     pub output_tokens: u64,
+    /// Calls the configured judge answered because the selected primary
+    /// failed or was in its post-failure bypass window.
+    pub fallbacks: u64,
 }
 
-/// Active judgement integration selected by configuration.
+/// Active judgement integration selected by configuration, plus an optional
+/// operator-selected primary layered over it.
+///
+/// Clones share one primary slot, so a switch made through any clone (the
+/// console's) is seen by every holder (the autopilot's) on its next call.
 #[derive(Debug, Clone)]
 pub struct JevRuntime {
     provider: JevProvider,
     judge: Arc<dyn SemanticJudge>,
+    /// A [`FallbackJudge`] over `judge` while a primary is selected.
+    primary: Arc<RwLock<Option<Arc<dyn SemanticJudge>>>>,
     usage: Arc<JevUsage>,
 }
 
@@ -155,23 +189,68 @@ impl JevRuntime {
         match settings.provider() {
             JevProvider::TypeSafe => {
                 let judge = HttpJev::from_settings(&settings)?;
-                Ok(Self {
-                    provider: settings.provider(),
-                    judge: Arc::new(judge),
-                    usage: Arc::new(JevUsage::default()),
-                })
+                Ok(Self::assemble(settings.provider(), Arc::new(judge)))
             }
+            // Settings never select OpenAI (see `JevSettings::from_source`);
+            // it is only layered over a configured judge at runtime.
+            JevProvider::OpenAi => Err(JevError::Contract {
+                reason: "OpenAI is selected in the console, not configured as the base judge"
+                    .to_owned(),
+            }),
         }
     }
 
-    /// Provider identifier of the active implementation.
+    fn assemble(provider: JevProvider, judge: Arc<dyn SemanticJudge>) -> Self {
+        Self {
+            provider,
+            judge,
+            primary: Arc::new(RwLock::new(None)),
+            usage: Arc::new(JevUsage::default()),
+        }
+    }
+
+    fn primary_slot(&self) -> Option<Arc<dyn SemanticJudge>> {
+        self.primary
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Provider answering first: the selected primary, else the configured
+    /// judge.
     pub fn provider(&self) -> JevProvider {
+        self.primary_slot()
+            .map_or(self.provider, |primary| primary.provider())
+    }
+
+    /// Provider of the configured judge, which is also the fallback.
+    pub fn configured_provider(&self) -> JevProvider {
         self.provider
     }
 
-    /// Domain-level judgement contract used by application code.
-    pub fn judge(&self) -> &Arc<dyn SemanticJudge> {
-        &self.judge
+    /// Domain-level judgement contract used by application code: the
+    /// primary-with-fallback judge while a primary is selected, else the
+    /// configured judge.
+    pub fn judge(&self) -> Arc<dyn SemanticJudge> {
+        self.primary_slot()
+            .unwrap_or_else(|| Arc::clone(&self.judge))
+    }
+
+    /// Makes `primary` answer first, with the configured judge as automatic
+    /// fallback for any primary error (see [`FallbackJudge`]).
+    pub fn use_primary(&self, primary: Arc<dyn SemanticJudge>) {
+        let layered: Arc<dyn SemanticJudge> = Arc::new(FallbackJudge::new(
+            primary,
+            Arc::clone(&self.judge),
+            Arc::clone(&self.usage),
+            FallbackJudge::RETRY_AFTER,
+        ));
+        *self.primary.write().unwrap_or_else(PoisonError::into_inner) = Some(layered);
+    }
+
+    /// Returns to the configured judge alone.
+    pub fn clear_primary(&self) {
+        *self.primary.write().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// Runs one judgement request, counting the call and the token usage the
@@ -181,7 +260,7 @@ impl JevRuntime {
     /// Returns [`JevError`] from the active judge unchanged.
     pub async fn evaluate(&self, request: JevRequest) -> Result<JevResponse, JevError> {
         self.usage.calls.fetch_add(1, Ordering::Relaxed);
-        match self.judge.judge(request).await {
+        match self.judge().judge(request).await {
             Ok(response) => {
                 let usage = response.usage();
                 self.usage
@@ -207,11 +286,16 @@ impl JevRuntime {
             "calls": usage.calls,
             "failures": usage.failures,
             "inputTokens": usage.input_tokens,
-            "outputTokens": usage.output_tokens
+            "outputTokens": usage.output_tokens,
+            "fallbacks": usage.fallbacks
         })
     }
 
     /// Restores the cumulative counters from a stored snapshot.
+    ///
+    /// `fallbacks` postdates the other counters, so a snapshot written before
+    /// it existed restores it as zero; a present but non-numeric value is
+    /// still rejected.
     ///
     /// # Errors
     /// Returns a description when the value is not a usage snapshot.
@@ -221,6 +305,10 @@ impl JevRuntime {
                 .get(name)
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| format!("usage snapshot is missing `{name}`"))
+        };
+        let fallbacks = match value.get("fallbacks") {
+            None => 0,
+            Some(_) => field("fallbacks")?,
         };
         self.usage.calls.store(field("calls")?, Ordering::Relaxed);
         self.usage
@@ -232,6 +320,7 @@ impl JevRuntime {
         self.usage
             .output_tokens
             .store(field("outputTokens")?, Ordering::Relaxed);
+        self.usage.fallbacks.store(fallbacks, Ordering::Relaxed);
         Ok(())
     }
 
@@ -242,17 +331,14 @@ impl JevRuntime {
             failures: self.usage.failures.load(Ordering::Relaxed),
             input_tokens: self.usage.input_tokens.load(Ordering::Relaxed),
             output_tokens: self.usage.output_tokens.load(Ordering::Relaxed),
+            fallbacks: self.usage.fallbacks.load(Ordering::Relaxed),
         }
     }
 
     /// Builds a runtime around an injected judge; used by tests.
     #[cfg(test)]
     pub(crate) fn with_judge(provider: JevProvider, judge: Arc<dyn SemanticJudge>) -> Self {
-        Self {
-            provider,
-            judge,
-            usage: Arc::new(JevUsage::default()),
-        }
+        Self::assemble(provider, judge)
     }
 }
 
@@ -268,8 +354,83 @@ mod tests {
             JevProvider::parse(" TypeSafe "),
             Some(JevProvider::TypeSafe)
         );
-        assert_eq!(JevProvider::parse("openai"), None);
+        assert_eq!(JevProvider::parse(" OpenAI "), Some(JevProvider::OpenAi));
+        assert_eq!(JevProvider::parse("anthropic"), None);
         assert_eq!(JevProvider::TypeSafe.to_string(), "typesafe");
+        assert_eq!(JevProvider::OpenAi.to_string(), "openai");
+    }
+
+    /// Judge that always fails with a provider-reported denial.
+    #[derive(Debug)]
+    struct DeniedJudge;
+
+    #[async_trait]
+    impl SemanticJudge for DeniedJudge {
+        fn provider(&self) -> JevProvider {
+            JevProvider::OpenAi
+        }
+
+        async fn judge(&self, _request: JevRequest) -> Result<JevResponse, JevError> {
+            Err(JevError::Denied {
+                status: 403,
+                detail: "Decision API is not enabled for this user.".to_owned(),
+            })
+        }
+    }
+
+    #[actix_web::test]
+    async fn a_primary_is_shared_by_clones_and_falls_back_to_the_configured_judge() {
+        let runtime =
+            JevRuntime::with_judge(JevProvider::TypeSafe, Arc::new(StubJudge { fail: false }));
+        let autopilot_handle = runtime.clone();
+        assert_eq!(runtime.provider(), JevProvider::TypeSafe);
+
+        runtime.use_primary(Arc::new(DeniedJudge));
+        assert_eq!(autopilot_handle.provider(), JevProvider::OpenAi);
+        assert_eq!(
+            autopilot_handle.configured_provider(),
+            JevProvider::TypeSafe
+        );
+        assert_eq!(autopilot_handle.judge().provider(), JevProvider::OpenAi);
+
+        // The primary's failure never reaches the caller: the configured
+        // judge answers and the fallback is counted and persisted.
+        let answer = autopilot_handle
+            .evaluate(sample_request())
+            .await
+            .expect("fallback answers");
+        assert_eq!(answer.model(), "jev-test");
+        let usage = runtime.usage();
+        assert_eq!((usage.calls, usage.failures, usage.fallbacks), (1, 0, 1));
+        assert_eq!(runtime.state_snapshot()["fallbacks"], 1);
+
+        runtime.clear_primary();
+        assert_eq!(autopilot_handle.provider(), JevProvider::TypeSafe);
+        autopilot_handle
+            .evaluate(sample_request())
+            .await
+            .expect("configured judge answers");
+        assert_eq!(runtime.usage().fallbacks, 1);
+    }
+
+    #[test]
+    fn snapshots_without_fallbacks_still_restore() {
+        let runtime =
+            JevRuntime::with_judge(JevProvider::TypeSafe, Arc::new(StubJudge { fail: false }));
+        let legacy =
+            serde_json::json!({"calls": 3, "failures": 1, "inputTokens": 9, "outputTokens": 4});
+        runtime.restore_state(&legacy).expect("legacy snapshot");
+        assert_eq!(runtime.usage().fallbacks, 0);
+        assert_eq!(runtime.usage().calls, 3);
+
+        let mut malformed = legacy.clone();
+        malformed["fallbacks"] = serde_json::json!("two");
+        assert!(runtime.restore_state(&malformed).is_err());
+
+        let mut current = legacy;
+        current["fallbacks"] = serde_json::json!(2);
+        runtime.restore_state(&current).expect("current snapshot");
+        assert_eq!(runtime.usage().fallbacks, 2);
     }
 
     /// Stub judge returning the canonical contract sample, or failing.
@@ -375,6 +536,7 @@ mod tests {
                 .restore_state(&serde_json::json!({"calls": 1}))
                 .is_err()
         );
+        assert_eq!(snapshot["fallbacks"], 0);
     }
 
     #[actix_web::test]

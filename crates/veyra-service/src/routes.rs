@@ -41,6 +41,8 @@ struct StatusResponse {
     broker_provider: Option<&'static str>,
     market_provider: Option<&'static str>,
     model_provider: Option<&'static str>,
+    /// Judge answering first: `openai` while the operator selected it (with
+    /// TypeSafe Jev as fallback), else `typesafe`; null without a judge.
     jev_provider: Option<&'static str>,
     persistence: Option<&'static str>,
     /// Active economic-calendar provider, when one is configured.
@@ -50,7 +52,8 @@ struct StatusResponse {
     ea_live_orders: bool,
     autopilot: Option<serde_json::Value>,
     model_budget: Option<serde_json::Value>,
-    /// Process-lifetime judge usage (calls, failures, reported tokens).
+    /// Cumulative judge usage (calls, failures, reported tokens, and calls
+    /// the TypeSafe fallback answered for a selected OpenAI primary).
     jev_usage: Option<serde_json::Value>,
     /// Effective risk gate policy; always present (the gate never sleeps).
     risk_policy: serde_json::Value,
@@ -222,9 +225,12 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
             "calls": usage.calls,
             "failures": usage.failures,
             "inputTokens": usage.input_tokens,
-            "outputTokens": usage.output_tokens
+            "outputTokens": usage.output_tokens,
+            "fallbacks": usage.fallbacks
         })
     });
+    let last_entry = last_entry_decision(&state).await;
+    let next_check_ms = next_entry_check_ms(&state);
     let persistence = state.audit().map(|runtime| runtime.provider().as_str());
     let calendar_provider = state
         .calendar()
@@ -265,11 +271,86 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
                 "lastSuccessfulModel": state
                     .model()
                     .and_then(|runtime| runtime.last_successful_model()),
+                "lastEntry": last_entry,
+                "nextCheckMs": next_check_ms,
             })
         },
         model_route,
         model_cooldowns: state.model_cooldowns().snapshot(),
     })
+}
+
+/// Outcomes that end an entry sweep (as opposed to position reviews and stop
+/// moves), the decisions the overview explains.
+const ENTRY_OUTCOMES: [&str; 5] = [
+    "no_trade",
+    "queued",
+    "rejected",
+    "unavailable",
+    "approved_dry_run",
+];
+
+/// The autopilot's latest entry decision from the durable trail, so the
+/// overview can say why it is or is not trading even after a restart wiped
+/// the live feed. `None` without an audit trail or before any decision.
+async fn last_entry_decision(state: &AppState) -> Option<serde_json::Value> {
+    let audit = state.audit()?;
+    let rows = audit.trail().recent_decisions(60).await.ok()?;
+    let row = rows.iter().find(|row| {
+        row.kind == "proposal_evaluated"
+            && row
+                .payload
+                .get("outcome")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|outcome| ENTRY_OUTCOMES.contains(&outcome))
+            && row
+                .payload
+                .get("origin")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|origin| origin == "autopilot")
+    })?;
+    let text = |key: &str| {
+        row.payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(|value| crate::text::clip(value, 400))
+    };
+    Some(serde_json::json!({
+        "atMs": crate::audit::parse_trail_time(&row.at),
+        "outcome": text("outcome"),
+        "symbol": text("symbol"),
+        "side": text("side"),
+        "reason": text("reason"),
+        "rationale": text("rationale"),
+    }))
+}
+
+/// When the autopilot next asks the model about entries: the close of the
+/// current candle on its timeframe, on the broker's clock (candles open on
+/// broker-time boundaries). `None` while the autopilot is off.
+fn next_entry_check_ms(state: &AppState) -> Option<i64> {
+    let settings = state.autopilot().filter(|settings| settings.enabled())?;
+    let period = i64::from(settings.timeframe().minutes()) * 60;
+    if period <= 0 {
+        return None;
+    }
+    let utc = state
+        .now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())?;
+    let offset = crate::broker_clock::BrokerClock::from_state(state)
+        .map(crate::broker_clock::BrokerClock::offset_secs)
+        .unwrap_or(0);
+    Some(next_candle_close_ms(utc, offset, period))
+}
+
+/// The next close of a `period`-second candle that opens on broker-time
+/// boundaries, as UTC milliseconds.
+fn next_candle_close_ms(utc: i64, offset: i64, period: i64) -> i64 {
+    let server = utc.saturating_add(offset);
+    let next_server = (server.div_euclid(period) + 1) * period;
+    (next_server - offset).saturating_mul(1_000)
 }
 
 #[get("/metrics")]
@@ -506,15 +587,18 @@ pub(crate) async fn account_facts(state: &AppState) -> Option<AccountFacts> {
             None if open_orders == 0 => (Vec::new(), Vec::new(), Vec::new(), None, None),
             None => return None,
         };
-    let (day_drawdown_percent, peak_drawdown_percent) = match equity {
-        Some(equity) => {
-            let drawdowns = state
-                .equity_guard()
-                .observe(equity, std::time::SystemTime::now());
+    let account = runtime.link().last_account().filter(|_| equity.is_some());
+    let (day_drawdown_percent, peak_drawdown_percent) = match &account {
+        Some(account) => {
+            let drawdowns =
+                crate::risk::guard::observe_account(state, account, std::time::SystemTime::now());
             (Some(drawdowns.day_percent), Some(drawdowns.peak_percent))
         }
         None => (None, None),
     };
+    let account_currency = account
+        .as_ref()
+        .and_then(|account| account.account_currency());
     Some(AccountFacts {
         news: Default::default(),
         session: Default::default(),
@@ -529,6 +613,7 @@ pub(crate) async fn account_facts(state: &AppState) -> Option<AccountFacts> {
         free_margin,
         day_drawdown_percent,
         peak_drawdown_percent,
+        account_currency,
     })
 }
 
@@ -566,6 +651,67 @@ mod tests {
         async fn prune(&self, _keep_days: u32) -> Result<u64, AuditError> {
             Ok(0)
         }
+    }
+
+    #[test]
+    fn the_next_check_is_the_next_candle_close_on_the_broker_clock() {
+        // 12:05 UTC on a UTC+2 broker: the H4 candle that opened at 12:00
+        // broker time (10:00 UTC) closes at 16:00 broker, 14:00 UTC.
+        let day = 20_000 * 86_400;
+        let utc = day + 12 * 3_600 + 5 * 60;
+        assert_eq!(
+            super::next_candle_close_ms(utc, 7_200, 4 * 3_600),
+            (day + 14 * 3_600) * 1_000
+        );
+        // Exactly on a boundary, the next one.
+        assert_eq!(
+            super::next_candle_close_ms(day, 0, 3_600),
+            (day + 3_600) * 1_000
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_last_entry_decision_survives_a_cleared_feed() {
+        use crate::AppState;
+        use crate::audit::{AuditEvent, AuditKind, AuditRuntime, MemoryTrail};
+        use crate::risk::{RiskGate, RiskPolicy};
+
+        let trail = Arc::new(MemoryTrail::default());
+        let config = crate::config::ServiceConfig::from_source(|name| match name {
+            "VEYRA_BIND_HOST" => Ok("127.0.0.1".to_owned()),
+            "VEYRA_BIND_PORT" => Ok("8080".to_owned()),
+            "VEYRA_ENV" => Ok("development".to_owned()),
+            _ => Err(crate::config::ConfigError::MissingEnvironmentVariable { name }),
+        })
+        .expect("config");
+        // Written straight to the durable trail: nothing in the live feed.
+        trail
+            .record(AuditEvent::new(
+                AuditKind::ProposalEvaluated,
+                serde_json::json!({
+                    "outcome": "no_trade", "origin": "autopilot",
+                    "rationale": "USD setups wait for NFP"
+                }),
+            ))
+            .await
+            .expect("decision");
+        trail
+            .record(AuditEvent::new(
+                AuditKind::ProposalEvaluated,
+                serde_json::json!({"outcome": "held", "origin": "autopilot_review", "ticket": 9}),
+            ))
+            .await
+            .expect("review");
+        let state = AppState::new(config, None, None, RiskGate::new(RiskPolicy::default()))
+            .with_audit(Some(AuditRuntime::new(trail)));
+        let last = super::last_entry_decision(&state).await.expect("found");
+        assert_eq!(last["outcome"], "no_trade", "reviews are skipped");
+        assert_eq!(last["rationale"], "USD setups wait for NFP");
+        assert!(last["atMs"].as_i64().is_some());
+        assert!(
+            super::next_entry_check_ms(&state).is_none(),
+            "no autopilot, no next check"
+        );
     }
 
     #[actix_web::test]

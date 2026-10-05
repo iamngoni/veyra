@@ -3,7 +3,7 @@
  * editing its environment, grouped the way an operator thinks about them.
  */
 
-import { useId, useState } from 'react'
+import { Fragment, useId, useState } from 'react'
 import type { ChangeEvent, ReactNode } from 'react'
 
 import { changeModelCredential, type LiveSetting, type RuntimeConfigPatch, type SecretStatus } from '../lib/api'
@@ -176,7 +176,8 @@ const SETTING_HELP: Record<string, string> = {
   VEYRA_MODEL_APP_TITLE: 'Name shown on OpenRouter beside the attribution URL. Needs HTTP referer to be set.',
   VEYRA_MODEL_APP_HIDDEN:
     "Keeps the attributed app out of OpenRouter's public rankings. OpenRouter locks this on the first request it receives.",
-  VEYRA_JEV_PROVIDER: 'Service that answers the judgement questions. TypeSafe is the only one supported.',
+  VEYRA_JEV_PROVIDER:
+    'Service that answers the judgement questions, and the fallback when OpenAI is on. TypeSafe is the only one supported.',
   VEYRA_JEV_BASE_URL: 'Address of the judgement API; empty uses the TypeSafe default, https://api.typesafe.ai.',
   VEYRA_JEV_MODEL: 'Judgement model alias sent with every request; empty means jev-latest.',
   VEYRA_MARKET_PROVIDER:
@@ -460,12 +461,15 @@ export function LiveSettingsPanel({
   settings,
   secretStatus,
   secretStore = false,
+  judge,
   onApply,
   onRefresh,
 }: {
   settings?: Record<string, LiveSetting>
   secretStatus?: SecretStatus
   secretStore?: boolean
+  /** The judge section, placed after the model settings; it applies at once. */
+  judge?: ReactNode
   /** Applies a patch; resolves to an error message or undefined on success. */
   onApply?: (patch: RuntimeConfigPatch) => Promise<string | undefined>
   onRefresh?: () => void
@@ -584,135 +588,139 @@ export function LiveSettingsPanel({
     >
       {SETTING_GROUPS.map((group) => {
         const names = group.names.filter((name) => settings[name] !== undefined)
-        if (names.length === 0) return null
+        const after = group.title === 'Model' ? judge : null
+        if (names.length === 0) return <Fragment key={group.title}>{after}</Fragment>
         return (
-          <section key={group.title} className="tab-group">
-            <div className="tab-group-head">
-              <h3>{group.title}</h3>
-              {LIVE_GROUPS.has(group.title) ? null : <span className="tab-group-note">Applies on restart</span>}
-            </div>
-            {group.title === 'Model' ? (
-              <>
-                <SubscriptionConnections enabled={secretStore} selectedProvider={settingValue('VEYRA_MODEL_PROVIDER', settings.VEYRA_MODEL_PROVIDER?.value ?? '')} onRefresh={onRefresh} />
-                {settings.VEYRA_MODEL_PROVIDER && ['codex', 'claude_code'].includes(effective('VEYRA_MODEL_PROVIDER')) ? null : (
-                  <ProviderCredentialPanel status={secretStatus} enabled={secretStore} providerChanged={isDirty('VEYRA_MODEL_PROVIDER')} onRefresh={onRefresh} />
-                )}
-              </>
-            ) : null}
-            <div className="tab-group-fields">
-              {names.map((name) => {
-                const label = settingLabel(name, group.prefixes)
-                const help = SETTING_HELP[name]
-                const kind = SETTING_KINDS[name]
-                const aside = settings[name].overridden ? (
-                  <>
-                    <span className="tone-warn">Overridden</span>
-                    <button
-                      type="button"
-                      className="tab-link"
-                      onClick={() => void revert(name)}
-                      disabled={busy}
-                      title="Return to the deployed value"
-                    >
-                      Revert
-                    </button>
-                  </>
-                ) : undefined
-                // The picker below replaces the single Symbol box.
-                if (name === 'VEYRA_AUTOPILOT_SYMBOL' && settings.VEYRA_AUTOPILOT_SYMBOLS !== undefined) {
-                  return null
-                }
-                if (kind?.kind === 'symbols') {
-                  const listed = effective(name).trim()
-                  const chosen = listed !== '' ? listed : (settings.VEYRA_AUTOPILOT_SYMBOL ? effective('VEYRA_AUTOPILOT_SYMBOL').trim() : '')
-                  const overridden = settings[name].overridden || settings.VEYRA_AUTOPILOT_SYMBOL?.overridden
+          <Fragment key={group.title}>
+            <section className="tab-group">
+              <div className="tab-group-head">
+                <h3>{group.title}</h3>
+                {LIVE_GROUPS.has(group.title) ? null : <span className="tab-group-note">Applies on restart</span>}
+              </div>
+              {group.title === 'Model' ? (
+                <>
+                  <SubscriptionConnections enabled={secretStore} selectedProvider={settingValue('VEYRA_MODEL_PROVIDER', settings.VEYRA_MODEL_PROVIDER?.value ?? '')} onRefresh={onRefresh} />
+                  {settings.VEYRA_MODEL_PROVIDER && ['codex', 'claude_code'].includes(effective('VEYRA_MODEL_PROVIDER')) ? null : (
+                    <ProviderCredentialPanel status={secretStatus} enabled={secretStore} providerChanged={isDirty('VEYRA_MODEL_PROVIDER')} onRefresh={onRefresh} />
+                  )}
+                </>
+              ) : null}
+              <div className="tab-group-fields">
+                {names.map((name) => {
+                  const label = settingLabel(name, group.prefixes)
+                  const help = SETTING_HELP[name]
+                  const kind = SETTING_KINDS[name]
+                  const aside = settings[name].overridden ? (
+                    <>
+                      <span className="tone-warn">Overridden</span>
+                      <button
+                        type="button"
+                        className="tab-link"
+                        onClick={() => void revert(name)}
+                        disabled={busy}
+                        title="Return to the deployed value"
+                      >
+                        Revert
+                      </button>
+                    </>
+                  ) : undefined
+                  // The picker below replaces the single Symbol box.
+                  if (name === 'VEYRA_AUTOPILOT_SYMBOL' && settings.VEYRA_AUTOPILOT_SYMBOLS !== undefined) {
+                    return null
+                  }
+                  if (kind?.kind === 'symbols') {
+                    const listed = effective(name).trim()
+                    const chosen = listed !== '' ? listed : (settings.VEYRA_AUTOPILOT_SYMBOL ? effective('VEYRA_AUTOPILOT_SYMBOL').trim() : '')
+                    const overridden = settings[name].overridden || settings.VEYRA_AUTOPILOT_SYMBOL?.overridden
+                    return (
+                      <SymbolPicker
+                        key={name}
+                        label="Instruments"
+                        help={help}
+                        value={chosen}
+                        dirty={isDirty(name) || isDirty('VEYRA_AUTOPILOT_SYMBOL')}
+                        disabled={busy}
+                        aside={
+                          overridden ? (
+                            <>
+                              <span className="tone-warn">Overridden</span>
+                              <button
+                                type="button"
+                                className="tab-link"
+                                onClick={() => void revertMany([name, 'VEYRA_AUTOPILOT_SYMBOL'].filter((field) => settings[field] !== undefined))}
+                                disabled={busy}
+                                title="Return to the deployed value"
+                              >
+                                Revert
+                              </button>
+                            </>
+                          ) : undefined
+                        }
+                        onChange={chooseSymbols}
+                      />
+                    )
+                  }
+                  if (kind?.kind === 'switch') {
+                    return (
+                      <SwitchSetting
+                        key={name}
+                        label={label}
+                        help={help}
+                        checked={settingValue(name, effective(name)) === 'true'}
+                        disabled={busy}
+                        dirty={isDirty(name)}
+                        aside={aside}
+                        onFlip={() => flip(name)}
+                      />
+                    )
+                  }
+                  if (kind?.kind === 'choice') {
+                    return (
+                      <ChoiceSetting
+                        key={name}
+                        label={label}
+                        help={help}
+                        field={name}
+                        value={settingValue(name, effective(name))}
+                        options={kind.options}
+                        disabled={busy}
+                        dirty={isDirty(name)}
+                        aside={aside}
+                        note={
+                          name === 'VEYRA_MODEL_PROVIDER'
+                            ? isDirty(name)
+                              ? 'Provider changed. Replace model IDs and clear or replace fallback IDs with ones this provider supports before Apply.'
+                              : 'Connected subscriptions use the linked ChatGPT or Claude account. API providers use developer keys.'
+                            : undefined
+                        }
+                        onChange={handleChange}
+                      />
+                    )
+                  }
+                  if (kind?.kind === 'fixed') {
+                    return (
+                      <FixedSetting key={name} label={label} help={help} value={settingValue(name, effective(name))} aside={aside} />
+                    )
+                  }
                   return (
-                    <SymbolPicker
-                      key={name}
-                      label="Instruments"
-                      help={help}
-                      value={chosen}
-                      dirty={isDirty(name) || isDirty('VEYRA_AUTOPILOT_SYMBOL')}
-                      disabled={busy}
-                      aside={
-                        overridden ? (
-                          <>
-                            <span className="tone-warn">Overridden</span>
-                            <button
-                              type="button"
-                              className="tab-link"
-                              onClick={() => void revertMany([name, 'VEYRA_AUTOPILOT_SYMBOL'].filter((field) => settings[field] !== undefined))}
-                              disabled={busy}
-                              title="Return to the deployed value"
-                            >
-                              Revert
-                            </button>
-                          </>
-                        ) : undefined
-                      }
-                      onChange={chooseSymbols}
-                    />
-                  )
-                }
-                if (kind?.kind === 'switch') {
-                  return (
-                    <SwitchSetting
-                      key={name}
-                      label={label}
-                      help={help}
-                      checked={settingValue(name, effective(name)) === 'true'}
-                      disabled={busy}
-                      dirty={isDirty(name)}
-                      aside={aside}
-                      onFlip={() => flip(name)}
-                    />
-                  )
-                }
-                if (kind?.kind === 'choice') {
-                  return (
-                    <ChoiceSetting
+                    <TextControl
                       key={name}
                       label={label}
                       help={help}
                       field={name}
-                      value={settingValue(name, effective(name))}
-                      options={kind.options}
+                      value={effective(name)}
                       disabled={busy}
                       dirty={isDirty(name)}
-                      aside={aside}
-                      note={
-                        name === 'VEYRA_MODEL_PROVIDER'
-                          ? isDirty(name)
-                            ? 'Provider changed. Replace model IDs and clear or replace fallback IDs with ones this provider supports before Apply.'
-                            : 'Connected subscriptions use the linked ChatGPT or Claude account. API providers use developer keys.'
-                          : undefined
-                      }
+                      placeholder={['VEYRA_MODEL_FAST', 'VEYRA_MODEL_BALANCED', 'VEYRA_MODEL_REASONING'].includes(name) ? 'Model ID from this provider' : 'Not set'}
                       onChange={handleChange}
+                      aside={aside}
                     />
                   )
-                }
-                if (kind?.kind === 'fixed') {
-                  return (
-                    <FixedSetting key={name} label={label} help={help} value={settingValue(name, effective(name))} aside={aside} />
-                  )
-                }
-                return (
-                  <TextControl
-                    key={name}
-                    label={label}
-                    help={help}
-                    field={name}
-                    value={effective(name)}
-                    disabled={busy}
-                    dirty={isDirty(name)}
-                    placeholder={['VEYRA_MODEL_FAST', 'VEYRA_MODEL_BALANCED', 'VEYRA_MODEL_REASONING'].includes(name) ? 'Model ID from this provider' : 'Not set'}
-                    onChange={handleChange}
-                    aside={aside}
-                  />
-                )
-              })}
-            </div>
-          </section>
+                })}
+              </div>
+            </section>
+            {after}
+          </Fragment>
         )
       })}
 

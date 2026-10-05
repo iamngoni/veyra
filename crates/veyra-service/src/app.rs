@@ -60,7 +60,13 @@ pub fn create_app(
         .service(crate::control::balance_history)
         .service(crate::symbols::symbol_catalog)
         .service(crate::symbols::refresh_symbols)
+        .service(crate::advisories::advisories)
         .service(crate::notify::routes::notifications)
         .service(crate::notify::routes::update_notifications)
         .service(crate::notify::routes::test_notification)
+        .service(crate::judge::routes::judge)
+        .service(crate::judge::routes::select_judge)
+        .service(crate::judge::routes::set_openai_key)
+        .service(crate::judge::routes::delete_openai_key)
+        .service(crate::judge::routes::test_openai)
 }

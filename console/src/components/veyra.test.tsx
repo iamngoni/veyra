@@ -211,11 +211,47 @@ describe('AccountPanel', () => {
     expect(valueOf('Server').textContent).toBe('ICMarketsSC-MT4')
     expect(valueOf('Login').textContent).toBe('123456')
     expect(screen.getByText('Updated 3s ago').className).toBe('')
+    // An older EA reports no currency, build or clock.
+    for (const label of ['Currency', 'Terminal', 'Broker clock']) {
+      expect(valueOf(label).textContent).toBe('—')
+    }
+  })
+
+  it('names the currency, the terminal build and how the broker clock was read', () => {
+    const { rerender } = render(
+      <AccountPanel
+        account={{
+          ...account,
+          currency: 'USD',
+          terminalBuild: 1440,
+          eaVersion: '1.27',
+          brokerOffsetSecs: 7200,
+          clockBasis: 'quote',
+        }}
+      />,
+    )
+    expect(valueOf('Currency').textContent).toBe('USD')
+    expect(valueOf('Terminal').textContent).toBe('Build 1440 · EA 1.27')
+    expect(valueOf('Broker clock').textContent).toBe('UTC+02:00 · live quotes')
+    expect(valueOf('Broker clock').className).not.toContain('tone-warn')
+    // The host clock is a guess, and says so; a western zone reads negative.
+    rerender(
+      <AccountPanel
+        account={{ ...account, terminalBuild: 1440, brokerOffsetSecs: -16200, clockBasis: 'host_clock' }}
+      />,
+    )
+    expect(valueOf('Terminal').textContent).toBe('Build 1440')
+    expect(valueOf('Broker clock').textContent).toBe('UTC−04:30 · terminal host clock')
+    expect(valueOf('Broker clock').className).toContain('tone-warn')
+    rerender(<AccountPanel account={{ ...account, brokerOffsetSecs: 0 }} />)
+    expect(valueOf('Broker clock').textContent).toBe('UTC+00:00')
+    rerender(<AccountPanel account={{ ...account, brokerOffsetSecs: 10800, clockBasis: 'remembered' }} />)
+    expect(valueOf('Broker clock').textContent).toBe('UTC+03:00 · last live quote')
   })
 
   it('holds skeletons before the first poll and dashes after a failed one', () => {
     const { container, rerender } = render(<AccountPanel />)
-    expect(container.querySelectorAll('.skeleton').length).toBe(10)
+    expect(container.querySelectorAll('.skeleton').length).toBe(13)
     expect(screen.queryByText('Unavailable')).toBeNull()
 
     rerender(<AccountPanel error="account down" />)
@@ -643,7 +679,7 @@ describe('RiskPanel', () => {
 
     rerender(<RiskPanel />)
     expect(screen.queryByText('Gate active')).toBeNull()
-    expect(container.querySelectorAll('.skeleton').length).toBe(16)
+    expect(container.querySelectorAll('.skeleton').length).toBe(17)
   })
 
   it('renders an empty allowlist, a session window, and disarmed switches', () => {
@@ -773,6 +809,33 @@ describe('RiskPanel editing', () => {
     expect(patch.weekendSymbols).toEqual(['btcusd'])
     expect(patch.sessionUtc).toBe('8-17')
     expect(patch.weekendPositions).toBe('flatten')
+  })
+
+  it('edits how losses are measured and states it in the view', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+    // An older service reports none of the rules: the original guard.
+    expect(valueOf('Loss measured').textContent).toBe('UTC midnight · day-start equity · peak from high')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    fireEvent.change(screen.getByLabelText('Day starts'), { target: { value: 'broker' } })
+    fireEvent.change(screen.getByLabelText('Daily loss from'), { target: { value: 'balance' } })
+    fireEvent.change(screen.getByLabelText('Peak reference'), { target: { value: '10000' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await screen.findByText('Gate active')
+    const patch = onApply.mock.calls[0][0]
+    expect(patch.dailyLossReset).toBe('broker')
+    expect(patch.dailyLossBasis).toBe('balance')
+    expect(patch.drawdownReference).toBe(10000)
+
+    rerender(
+      <RiskPanel
+        policy={{ ...status.risk_policy, dailyLossReset: 'broker', dailyLossBasis: 'higher', drawdownReference: 10000 }}
+        status={status}
+        onApply={onApply}
+      />,
+    )
+    expect(valueOf('Loss measured').textContent).toBe('Broker midnight · higher of the two · peak from 10000')
   })
 
   it('offers no edit affordance without a handler', () => {

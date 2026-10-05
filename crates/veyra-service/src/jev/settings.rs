@@ -4,6 +4,11 @@
 //! `VEYRA_JEV_BASE_URL`, and `VEYRA_JEV_MODEL` refine it. An absent key with
 //! no related variables disables Jev entirely, and a partial section fails
 //! closed. The key is redacted from `Debug` output and never logged.
+//!
+//! These settings always describe the configured TypeSafe judge. OpenAI
+//! Decisions is never selected here: it is an operator choice made in the
+//! console (see [`crate::judge`]) and layered over this judge, which remains
+//! its fallback.
 
 use std::fmt;
 use std::time::Duration;
@@ -94,13 +99,20 @@ impl JevSettings {
             return Ok(None);
         }
 
+        // OpenAI is never the configured judge: it is an operator-selected
+        // primary layered over this one at runtime, which stays the fallback.
         let provider = if provider_raw.is_empty() {
             JevProvider::TypeSafe
         } else {
-            JevProvider::parse(&provider_raw).ok_or(ConfigError::InvalidEnvironmentVariable {
-                name: "VEYRA_JEV_PROVIDER",
-                reason: "unsupported provider; supported values: typesafe",
-            })?
+            match JevProvider::parse(&provider_raw) {
+                Some(JevProvider::TypeSafe) => JevProvider::TypeSafe,
+                Some(JevProvider::OpenAi) | None => {
+                    return Err(ConfigError::InvalidEnvironmentVariable {
+                        name: "VEYRA_JEV_PROVIDER",
+                        reason: "unsupported provider; supported values: typesafe (OpenAI is selected in the console)",
+                    });
+                }
+            }
         };
 
         let api_key = JevApiKey::parse(&key_raw)?;
@@ -108,13 +120,13 @@ impl JevSettings {
         let base_url = if base_raw.is_empty() {
             "https://api.typesafe.ai".to_owned()
         } else {
-            base_url(&base_raw)?
+            base_url("VEYRA_JEV_BASE_URL", &base_raw)?
         };
 
         let model = if model_raw.is_empty() {
             "jev-latest".to_owned()
         } else {
-            model_name(&model_raw)?
+            model_name("VEYRA_JEV_MODEL", &model_raw)?
         };
 
         Ok(Some(Self {
@@ -157,7 +169,8 @@ impl JevSettings {
     }
 }
 
-fn optional(
+/// Reads an optional variable, trimmed; absent reads as empty.
+pub(crate) fn optional(
     source: &mut impl FnMut(&'static str) -> Result<String, ConfigError>,
     name: &'static str,
 ) -> String {
@@ -166,11 +179,10 @@ fn optional(
         .unwrap_or_default()
 }
 
-fn base_url(value: &str) -> Result<String, ConfigError> {
-    let invalid = |reason: &'static str| ConfigError::InvalidEnvironmentVariable {
-        name: "VEYRA_JEV_BASE_URL",
-        reason,
-    };
+/// Validates an absolute base URL for variable `name`: https anywhere, plain
+/// http only on loopback (tests). Returns it without a trailing slash.
+pub(crate) fn base_url(name: &'static str, value: &str) -> Result<String, ConfigError> {
+    let invalid = |reason: &'static str| ConfigError::InvalidEnvironmentVariable { name, reason };
     let (scheme, rest) = value
         .split_once("://")
         .ok_or_else(|| invalid("must be an absolute http(s) URL"))?;
@@ -192,7 +204,8 @@ fn base_url(value: &str) -> Result<String, ConfigError> {
     Ok(format!("{scheme}://{rest}"))
 }
 
-fn model_name(value: &str) -> Result<String, ConfigError> {
+/// Validates a model alias for variable `name`.
+pub(crate) fn model_name(name: &'static str, value: &str) -> Result<String, ConfigError> {
     let valid = !value.is_empty()
         && value.len() <= 64
         && value
@@ -202,7 +215,7 @@ fn model_name(value: &str) -> Result<String, ConfigError> {
         Ok(value.to_owned())
     } else {
         Err(ConfigError::InvalidEnvironmentVariable {
-            name: "VEYRA_JEV_MODEL",
+            name,
             reason: "must be 1-64 characters of letters, digits, '.', '-', '_' or ':'",
         })
     }

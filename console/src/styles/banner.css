@@ -1,0 +1,161 @@
+/* Status banner (components/banner.tsx): the service's advisories, one strip
+ * each, between the view's name and its content on every tab. Severity is
+ * the dot plus a faint tint; the words stay plain. On a desktop window every
+ * strip is one fixed-height line, so the fitted overview gives up only the
+ * strips' own height (its chart gives way first). With nothing to say the
+ * banner keeps its empty live region and takes no room at all. */
+
+.banner {
+  display: flex;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-items: flex-end;
+  gap: var(--space-2);
+}
+.banner.is-shown { margin-bottom: var(--space-3); }
+
+.banner-live { min-width: 0; flex: 1 1 auto; }
+
+.banner-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.banner-row {
+  display: flex;
+  min-width: 0;
+  height: var(--control-md);
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 10px;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  background: var(--color-panel);
+  box-shadow: var(--shadow-panel);
+  color: var(--color-ink);
+  font-size: var(--text-base);
+  line-height: 20px;
+  white-space: nowrap;
+}
+.banner-row.is-warning {
+  border-color: color-mix(in srgb, var(--color-warn) 30%, transparent);
+  background-image: linear-gradient(var(--color-warn-dim), var(--color-warn-dim));
+}
+.banner-row.is-critical {
+  border-color: color-mix(in srgb, var(--color-bad) 34%, transparent);
+  background-image: linear-gradient(var(--color-bad-dim), var(--color-bad-dim));
+}
+
+/* The words between the dot and the end time. While wider than the strip
+   they crawl like a news ticker: two passes side by side, shifted by one
+   pass and its gap so the loop has no seam, paused under the pointer or
+   keyboard focus. The end time never gives way. */
+.ticker {
+  display: block;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  border-radius: 2px;
+}
+.ticker.is-moving {
+  mask-image: linear-gradient(90deg, transparent, #000 10px, #000 calc(100% - 24px), transparent);
+}
+.ticker:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+.ticker-track {
+  display: inline-flex;
+  width: max-content;
+  vertical-align: top;
+}
+.ticker.is-moving .ticker-track {
+  animation: ticker var(--ticker-duration) linear 1.5s infinite;
+}
+.banner-row:hover .ticker-track,
+.ticker:focus-visible .ticker-track { animation-play-state: paused; }
+.ticker-copy { display: inline-flex; flex: none; }
+.ticker.is-moving .ticker-copy { padding-right: var(--ticker-gap); }
+.ticker-content {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+@keyframes ticker {
+  to { transform: translateX(calc(-1 * var(--ticker-distance))); }
+}
+
+/* Still for anyone who asks for less motion: one pass, faded at the edge,
+   the full words on hover. */
+@media (prefers-reduced-motion: reduce) {
+  .ticker.is-moving .ticker-track { animation: none; }
+  .ticker-copy[aria-hidden='true'] { display: none; }
+}
+
+.banner-title { font-weight: var(--weight-semibold); }
+.banner-entry time {
+  margin-right: 2px;
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--weight-medium);
+}
+.banner-detail { color: var(--color-ink-muted); }
+.banner-until {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  padding-left: var(--space-3);
+  color: var(--color-ink-muted);
+  font-size: var(--text-sm);
+}
+
+/* Beside the last strip rather than under it, so folding costs no height;
+   framed like the header's own action so it closes the strip's right edge. */
+.banner-more {
+  display: inline-flex;
+  min-width: 80px;
+  height: var(--control-md);
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  padding: 0 10px;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  color: var(--color-ink-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+}
+.banner-more:hover { background: var(--color-hover); color: var(--color-ink); }
+
+/* A phone has height to spare and no room across: the words wrap beside the
+   dot instead of crawling, the end time keeps the first line's right edge,
+   and the disclosure moves below the strips. */
+@media (max-width: 660px) {
+  .banner { flex-direction: column; align-items: stretch; }
+  .banner-more { align-self: flex-end; }
+  .banner-row {
+    display: grid;
+    height: auto;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 2px var(--space-2);
+    padding-block: 3px;
+    white-space: normal;
+  }
+  .banner-row .dot { margin-top: 6px; }
+  .ticker { overflow: visible; }
+  .ticker.is-moving { mask-image: none; }
+  .ticker.is-moving .ticker-track { animation: none; }
+  .ticker-track, .ticker-copy, .ticker-content { display: flex; width: auto; }
+  .ticker-content { flex-wrap: wrap; gap: 2px var(--space-2); }
+  .ticker-copy[aria-hidden='true'] { display: none; }
+  .banner-until { grid-row: 1; grid-column: 3; padding-left: 0; }
+}
+
+@media (pointer: coarse) {
+  .banner-more { height: 36px; }
+}

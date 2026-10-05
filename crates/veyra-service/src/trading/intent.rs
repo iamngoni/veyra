@@ -646,7 +646,7 @@ mod tests {
         };
 
         assert!(message(json!({"volume": -1.0})).contains("volume"));
-        assert!(message(json!({"symbol": "not a symbol"})).contains("symbol"));
+        assert!(message(json!({"symbol": "not/a/symbol"})).contains("symbol"));
         assert!(message(json!({"side": "long"})).contains("side"));
         assert!(message(json!({"order_type": "iceberg"})).contains("order_type"));
         assert!(message(json!({"stop_loss": 0.0})).contains("stop_loss"));

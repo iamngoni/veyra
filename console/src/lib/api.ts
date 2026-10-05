@@ -50,8 +50,11 @@ export type Status = {
   autopilot: AutopilotStatus | null
   /** Model call usage against the configured caps; null without a model. */
   model_budget: { hourLimit: number; hourCalls: number; dayLimit: number; dayCalls: number } | null
-  /** Judge usage as this service observed it; null without a judge. */
-  jev_usage: { calls: number; failures: number; inputTokens: number; outputTokens: number } | null
+  /**
+   * Judge usage as this service observed it; null without a judge.
+   * `fallbacks` counts judgements Jev answered because OpenAI failed.
+   */
+  jev_usage: { calls: number; failures: number; inputTokens: number; outputTokens: number; fallbacks?: number } | null
   /** Effective risk gate policy; always present. */
   risk_policy: RiskPolicy
   /**
@@ -67,6 +70,17 @@ export type Status = {
     lastModel?: string | null
     /** Most recent model candidate that returned a structured answer. */
     lastSuccessfulModel?: string | null
+    /** The latest entry decision from the durable journal; survives restarts. */
+    lastEntry?: {
+      atMs: number | null
+      outcome: string | null
+      symbol: string | null
+      side: string | null
+      reason: string | null
+      rationale: string | null
+    } | null
+    /** When the autopilot next looks for entries (UTC ms); null while off. */
+    nextCheckMs?: number | null
   } | null
   /** Ordered model candidates currently in force, e.g. `chatgpt:gpt-6-luna` first. */
   model_route?: string[]
@@ -115,7 +129,19 @@ export type RiskPolicy = {
   allowTradingWithoutJev: boolean
   /** What happens to open positions in the final hours before Friday's close. */
   weekendPositions: WeekendPositions
+  /** When the daily-loss day starts; absent from older services (UTC). */
+  dailyLossReset?: DailyLossReset
+  /** What the daily loss is measured from; absent from older services (equity). */
+  dailyLossBasis?: DailyLossBasis
+  /** Fixed balance the peak brake measures from; 0 or absent uses the highest equity. */
+  drawdownReference?: number
 }
+
+/** When the daily-loss day starts: UTC midnight or the broker server's midnight. */
+export type DailyLossReset = 'utc' | 'broker'
+
+/** What the daily loss is measured from at the start of the day. */
+export type DailyLossBasis = 'equity' | 'balance' | 'higher'
 
 export type Metrics = {
   service: string
@@ -170,6 +196,16 @@ export type Account = {
   positions?: Position[]
   positionsTruncated?: boolean
   serverTime?: number
+  /** Account deposit currency, e.g. `USD`; absent from EAs before 1.27. */
+  currency?: string | null
+  /** Terminal build the EA reports; absent from EAs before 1.27. */
+  terminalBuild?: number | null
+  /** EA version the terminal runs; absent from EAs before 1.27. */
+  eaVersion?: string | null
+  /** The service's own broker clock offset from UTC, when it knows it. */
+  brokerOffsetSecs?: number
+  /** What that offset was measured from. */
+  clockBasis?: 'quote' | 'remembered' | 'host_clock'
 }
 
 export type FeedEvent = {
@@ -259,6 +295,21 @@ export type Performance = {
   trades: ClosedTrade[]
   total: number
   truncated: boolean
+  /** Balance operations in the window, by category; absent from older services. */
+  adjustments?: AdjustmentSummary
+}
+
+/** Non-trade account entries in a window, summed by what they most likely are. */
+export type AdjustmentSummary = {
+  count: number
+  /** Dividend adjustments on index and share CFDs. */
+  dividends: number
+  /** Other broker corrections. */
+  other: number
+  /** Deposits and withdrawals. */
+  transfers: number
+  /** Broker credit. */
+  credit: number
 }
 
 /** Why a closed Veyra trade left the book, as `/trades` reports it. */
@@ -413,6 +464,9 @@ export type RiskPolicyPatch = {
   minStopAtrFraction?: number
   allowTradingWithoutJev?: boolean
   weekendPositions?: WeekendPositions
+  dailyLossReset?: DailyLossReset
+  dailyLossBasis?: DailyLossBasis
+  drawdownReference?: number
 }
 
 export type CommandRecord = {
@@ -462,6 +516,41 @@ export type Reconciliation = {
   unknownTickets?: number[]
   positions?: Array<Record<string, unknown>>
 }
+
+/** How much an advisory matters: `critical` stops trading, `warning` limits it, `info` explains a quiet spell. */
+export type AdvisorySeverity = 'info' | 'warning' | 'critical'
+
+/**
+ * One condition the operator should know about right now, in plain words,
+ * e.g. `market_closed` or `kill_switch`. The console renders every id the same
+ * way, so a new condition needs no console change.
+ */
+export type Advisory = {
+  /** Stable identity, unique within one response. */
+  id: string
+  severity: AdvisorySeverity
+  /** Short headline, e.g. `FX, gold and indices are closed`. */
+  title: string
+  /** One more sentence of context; null when the title says it all. */
+  detail?: string | null
+  /** When the condition is expected to end, UTC milliseconds; null when unknown. */
+  untilMs?: number | null
+  /** When a condition announced ahead starts, UTC milliseconds; null once in effect. */
+  startsMs?: number | null
+  /** Timed entries the notice covers, soonest first, e.g. each release; empty for most. */
+  schedule?: ScheduleEntry[] | null
+}
+
+/** One timed entry of an advisory, shown on the viewer's clock. */
+export type ScheduleEntry = {
+  /** When it happens, UTC milliseconds. */
+  atMs: number
+  /** What happens, e.g. `USD Non-Farm Employment Change`. */
+  label: string
+}
+
+/** Current advisories from `/advisories`, most severe first; empty when nothing needs saying. */
+export type Advisories = { items: Advisory[]; generatedAtMs: number }
 
 /**
  * One live setting as the service reports it.
@@ -651,6 +740,55 @@ export function testNotification(token: string, provider: NotificationProviderId
   return notificationRequest<{ ok: boolean }>('/notifications/test', 'POST', token, { provider })
 }
 
+/** Which service answers the judgement questions. */
+export type JudgeProvider = 'typesafe' | 'openai'
+
+/** The latest OpenAI connection test, as the service saved it. */
+export type JudgeTest = { ok: boolean; atMs: number; latencyMs: number; detail: string; model: string }
+
+/**
+ * The judge selection. OpenAI can only be selected with a saved key, a
+ * passing latest test, and TypeSafe Jev configured as its fallback.
+ */
+export type JudgeSettings = {
+  provider: JudgeProvider
+  /** Whether TypeSafe Jev is configured, which OpenAI needs as its fallback. */
+  fallbackAvailable: boolean
+  /** False without encrypted credential storage; nothing can be saved. */
+  available: boolean
+  openai: {
+    key: { set: boolean; hint: string | null }
+    model: string
+    test: JudgeTest | null
+    /** Judgements Jev answered because OpenAI failed. */
+    fallbacks: number
+  }
+}
+
+/** An authenticated judge change; throws the service's reason on refusal. */
+async function judgeRequest<T>(path: string, method: 'PUT' | 'POST' | 'DELETE', token: string, body?: unknown): Promise<T> {
+  const response = await fetch(`${BASE}${path}`, {
+    method,
+    headers: { accept: 'application/json', 'content-type': 'application/json', 'x-veyra-admin-token': token },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  })
+  const payload = (await response.json().catch(() => null)) as (T & { error?: string; reason?: string }) | null
+  if (!response.ok) {
+    throw new Error(payload?.reason ?? payload?.error?.replaceAll('_', ' ') ?? `Request failed (${response.status})`)
+  }
+  if (!payload) throw new Error('The service did not confirm the change.')
+  return payload
+}
+
+/** Judge selection: OpenAI Decisions key, connection test, and the switch. */
+export const judge = {
+  select: (token: string, provider: JudgeProvider) => judgeRequest<JudgeSettings>('/judge', 'PUT', token, { provider }),
+  saveKey: (token: string, key: string) => judgeRequest<JudgeSettings>('/judge/openai/key', 'PUT', token, { key }),
+  removeKey: (token: string) => judgeRequest<JudgeSettings>('/judge/openai/key', 'DELETE', token),
+  test: (token: string) =>
+    judgeRequest<{ ok: boolean; latencyMs: number; detail: string }>('/judge/openai/test', 'POST', token),
+}
+
 const BASE = '/api'
 
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -816,6 +954,8 @@ export const api = {
   trades: (days = 30, page = 1, pageSize = 20) =>
     get<TradesPage>(`/trades?days=${days}&page=${page}&pageSize=${pageSize}`),
   sessions: () => get<MarketSessions>('/market/sessions'),
+  /** Conditions worth a banner (kill switch, market closed, stale terminal), most severe first. */
+  advisories: () => get<Advisories>('/advisories'),
   events: (after: number | undefined, waitMs = 15000, limit = 200) =>
     get<Feed>(after === undefined ? `/events?limit=${limit}` : `/events?after=${after}&wait_ms=${waitMs}&limit=${limit}`),
   logs: (after: number | undefined, level: LogLevel, limit = 300) =>
@@ -832,6 +972,8 @@ export const api = {
   config: () => get<RuntimeConfig>('/config'),
   /** Notification settings, delivery counters and recent deliveries. */
   notifications: () => get<NotificationSettings>('/notifications'),
+  /** Which judge answers first, the OpenAI key hint and its latest test. */
+  judge: () => get<JudgeSettings>('/judge'),
   updateConfig: (patch: RuntimeConfigPatch) =>
     post<{ changed: string[]; settings: Record<string, LiveSetting> }>('/config', patch),
   /** Returns every benched model to the route at once. */

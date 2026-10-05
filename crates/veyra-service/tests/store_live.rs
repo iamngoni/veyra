@@ -225,3 +225,116 @@ async fn postgres_filtered_queries_follow_the_shared_semantics() {
     assert_eq!(limited[0].kind, "position_closed");
     println!("filtered queries verified for ticket {ticket}");
 }
+
+#[actix_web::test]
+#[ignore = "requires VEYRA_DATABASE_URL and a running PostgreSQL server"]
+async fn postgres_ledger_upserts_and_reads_closed_trades() {
+    use veyra_service::broker::{ClosedTradePayload, ORDER_MAGIC, PositionKind};
+    use veyra_service::ledger::TradeLedger;
+
+    let url =
+        std::env::var("VEYRA_DATABASE_URL").expect("VEYRA_DATABASE_URL must be set (source .env)");
+    let store = Store::connect(&url)
+        .await
+        .expect("postgres must accept the connection");
+    store.migrate().await.expect("migrations must run");
+    let ticket = i64::from(uuid::Uuid::new_v4().as_u128() as u32) + 1_000_000_000;
+    let trade = |ticket: i64, close_time: i64, profit: f64| ClosedTradePayload {
+        ticket,
+        symbol: "SP500m".to_owned(),
+        kind: PositionKind::Sell,
+        lots: 0.01,
+        open_price: 6_500.5,
+        close_price: 6_480.25,
+        open_time: close_time - 3_600,
+        close_time,
+        profit,
+        swap: -0.12,
+        commission: 0.0,
+        magic: ORDER_MAGIC,
+    };
+    assert_eq!(
+        store
+            .record_trades(&[
+                trade(ticket, 4_000_000_000, 1.0),
+                trade(ticket + 1, 4_000_000_100, -0.5)
+            ])
+            .await
+            .expect("insert"),
+        2
+    );
+    // The same ticket again replaces its row.
+    store
+        .record_trades(&[trade(ticket, 4_000_000_000, 2.0)])
+        .await
+        .expect("upsert");
+    let found = store
+        .closed_since(4_000_000_000, ORDER_MAGIC)
+        .await
+        .expect("read");
+    let mine: Vec<_> = found
+        .iter()
+        .filter(|row| row.ticket == ticket || row.ticket == ticket + 1)
+        .collect();
+    assert_eq!(mine.len(), 2);
+    assert_eq!(mine[0].ticket, ticket + 1, "newest first");
+    assert_eq!(mine[1].profit, 2.0, "upsert replaced the row");
+    assert_eq!(mine[1].kind, PositionKind::Sell);
+    assert_eq!(mine[1].symbol, "SP500m");
+    assert!(
+        store
+            .closed_since(4_100_000_000, ORDER_MAGIC)
+            .await
+            .expect("read")
+            .is_empty()
+    );
+}
+
+#[actix_web::test]
+#[ignore = "requires VEYRA_DATABASE_URL and a running PostgreSQL server"]
+async fn postgres_ledger_upserts_and_reads_balance_operations() {
+    use veyra_service::broker::{BalanceOperationKind, BalanceOperationPayload};
+    use veyra_service::ledger::TradeLedger;
+
+    let url =
+        std::env::var("VEYRA_DATABASE_URL").expect("VEYRA_DATABASE_URL must be set (source .env)");
+    let store = Store::connect(&url)
+        .await
+        .expect("postgres must accept the connection");
+    store.migrate().await.expect("migrations must run");
+    let ticket = i64::from(uuid::Uuid::new_v4().as_u128() as u32) + 1_000_000_000;
+    let entry = |ticket: i64, time: i64, amount: f64, kind| BalanceOperationPayload {
+        ticket,
+        kind,
+        amount,
+        time,
+        comment: "Dividend \"SP500m\"".to_owned(),
+    };
+    assert_eq!(store.record_adjustments(&[]).await.expect("empty"), 0);
+    store
+        .record_adjustments(&[
+            entry(ticket, 4_000_000_000, -0.12, BalanceOperationKind::Balance),
+            entry(ticket + 1, 4_000_000_100, 5.0, BalanceOperationKind::Credit),
+        ])
+        .await
+        .expect("insert");
+    store
+        .record_adjustments(&[entry(
+            ticket,
+            4_000_000_000,
+            -0.15,
+            BalanceOperationKind::Balance,
+        )])
+        .await
+        .expect("upsert");
+    let found = store.adjustments_since(4_000_000_000).await.expect("read");
+    let mine: Vec<_> = found
+        .iter()
+        .filter(|row| row.ticket == ticket || row.ticket == ticket + 1)
+        .collect();
+    assert_eq!(mine.len(), 2);
+    assert_eq!(mine[0].ticket, ticket + 1, "newest first");
+    assert_eq!(mine[0].kind, BalanceOperationKind::Credit);
+    assert_eq!(mine[1].amount, -0.15, "upsert replaced the row");
+    assert_eq!(mine[1].comment, "Dividend \"SP500m\"");
+}

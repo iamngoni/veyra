@@ -34,6 +34,27 @@ function dateTime(ms: number): string {
 
 /* ---------- autopilot ---------- */
 
+/** The journal's latest entry decision as a feed event, so it reads like one. */
+function storedDecision(entry: NonNullable<Status['decisions']>['lastEntry']): FeedEvent | undefined {
+  if (!entry || entry.atMs == null) return undefined
+  const payload: Record<string, unknown> = {}
+  for (const key of ['outcome', 'symbol', 'side', 'reason', 'rationale'] as const) {
+    if (entry[key] != null) payload[key] = entry[key]
+  }
+  return { seq: 0, at_ms: entry.atMs, kind: 'proposal_evaluated', payload }
+}
+
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+/** `16:00` today, else `Mon 01:00`. */
+function upcoming(ms: number, now = Date.now()): string {
+  const date = new Date(ms)
+  const today = new Date(now)
+  return date.toDateString() === today.toDateString()
+    ? hourMinute(ms)
+    : `${WEEKDAYS[date.getDay()]} ${hourMinute(ms)}`
+}
+
 /** Consecutive failed decisions after which the loop counts as not deciding. */
 const FAILING_AFTER = 2
 
@@ -53,7 +74,12 @@ export function AutopilotCard({
   const on = autopilot?.enabled === true
   const decisions = status?.decisions
   const failing = (decisions?.consecutiveFailures ?? 0) >= FAILING_AFTER
-  const decision = events.find((event) => event.kind === 'proposal_evaluated')
+  // The live feed is newest; the journal's latest entry decision covers the
+  // gap after a restart, when the feed starts empty.
+  const live = events.find((event) => event.kind === 'proposal_evaluated')
+  const stored = storedDecision(decisions?.lastEntry)
+  const decision = live && (!stored || live.at_ms >= stored.at_ms) ? live : (stored ?? live)
+  const nextCheck = on ? decisions?.nextCheckMs ?? undefined : undefined
 
   // The dot carries the state; the word stays in the secondary voice unless
   // the loop needs attention.
@@ -104,6 +130,16 @@ export function AutopilotCard({
               <time dateTime={new Date(decision.at_ms).toISOString()}>{dateTime(decision.at_ms)}</time>
             ) : loading ? (
               <Skeleton width={130} height={14} />
+            ) : (
+              '—'
+            )}
+          </dd>
+        </div>
+        <div className="ap-row">
+          <dt>Next check</dt>
+          <dd title="When the autopilot next looks for entries: the close of the current candle.">
+            {nextCheck ? (
+              <time dateTime={new Date(nextCheck).toISOString()}>{upcoming(nextCheck)}</time>
             ) : (
               '—'
             )}

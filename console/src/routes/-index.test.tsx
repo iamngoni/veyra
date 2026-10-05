@@ -25,6 +25,9 @@ const mocks = vi.hoisted(() => ({
   updateConfig: vi.fn(),
   notifications: vi.fn(),
   updateNotifications: vi.fn(),
+  advisories: vi.fn(),
+  judge: vi.fn(),
+  selectJudge: vi.fn(),
 }))
 
 vi.mock('../lib/api', async (importOriginal) => {
@@ -35,6 +38,7 @@ vi.mock('../lib/api', async (importOriginal) => {
   NOTIFICATION_PROVIDERS: actual.NOTIFICATION_PROVIDERS,
   NotificationError: actual.NotificationError,
   updateNotifications: mocks.updateNotifications,
+  judge: { select: mocks.selectJudge },
   LOG_LEVELS: ['error', 'warn', 'info', 'debug', 'trace'],
   api: {
     status: mocks.status,
@@ -53,6 +57,8 @@ vi.mock('../lib/api', async (importOriginal) => {
     updatePolicy: mocks.updatePolicy,
     updateConfig: mocks.updateConfig,
     notifications: mocks.notifications,
+    advisories: mocks.advisories,
+    judge: mocks.judge,
   },
   }
 })
@@ -238,6 +244,13 @@ beforeEach(() => {
     live_sections: ['trading'],
   })
   mocks.notifications.mockResolvedValue(notificationSettings(true))
+  mocks.advisories.mockResolvedValue({ items: [], generatedAtMs: Date.now() })
+  mocks.judge.mockResolvedValue({
+    provider: 'openai',
+    fallbackAvailable: true,
+    available: true,
+    openai: { key: { set: true, hint: 'WXYZ' }, model: 'gpt-6-luna', test: null, fallbacks: 2 },
+  })
   mocks.updatePolicy.mockReset()
   mocks.updateConfig.mockReset()
   mocks.updateNotifications.mockReset()
@@ -286,6 +299,36 @@ describe('Dashboard', () => {
     expect(screen.getByRole('switch', { name: 'Kill switch' })).toBeTruthy()
     expect(screen.getByRole('switch', { name: 'Judge bypass' })).toBeTruthy()
     expect(within(screen.getByRole('navigation', { name: 'Main' })).getByRole('button', { name: 'Overview' }).getAttribute('aria-current')).toBe('page')
+    // Nothing to say, so no strip.
+    await waitFor(() => expect(mocks.advisories).toHaveBeenCalled())
+    expect(screen.queryByRole('list', { name: 'Notices' })).toBeNull()
+  })
+
+  it('shows advisories between the view name and its content on every view', async () => {
+    mocks.advisories.mockResolvedValue({
+      items: [
+        { id: 'kill_switch', severity: 'critical', title: 'Kill switch is on', detail: 'New trades are blocked.', untilMs: null },
+        { id: 'market_closed', severity: 'info', title: 'FX, gold and indices are closed', detail: 'BTC and ETH still trade.', untilMs: Date.now() + 3_600_000 },
+        { id: 'entry_cutoff', severity: 'info', title: 'No new trades before the weekend', detail: null, untilMs: null },
+      ],
+      generatedAtMs: Date.now(),
+    })
+    const { container } = render(<Dashboard />)
+    const notices = await screen.findByRole('list', { name: 'Notices' })
+    expect(within(notices).getAllByRole('listitem')).toHaveLength(2)
+    expect(within(notices).getByText('Kill switch is on')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '+1 more' })).toBeTruthy()
+    // Directly under the view's name, ahead of the overview itself.
+    const banner = notices.closest('.banner') as HTMLElement
+    expect(banner.previousElementSibling?.className).toBe('page-header')
+    expect(banner.nextElementSibling?.className).toBe('overview')
+    expect(container.querySelector('.app')?.className).toBe('app is-fit')
+
+    openTab('Trades')
+    expect(screen.getByRole('heading', { level: 1, name: 'Trades' })).toBeTruthy()
+    expect(within(screen.getByRole('list', { name: 'Notices' })).getByText('FX, gold and indices are closed')).toBeTruthy()
+    openTab('Settings')
+    expect(screen.getByRole('list', { name: 'Notices' })).toBeTruthy()
   })
 
   it('reaches every operational panel through the sidebar', async () => {
@@ -402,6 +445,26 @@ describe('Dashboard', () => {
     fireEvent.click(screen.getByRole('switch', { name: 'Trading enabled' }))
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
     expect((await screen.findByRole('alert')).textContent).toContain('setting rejected')
+  })
+
+  it('shows the judge in settings and reads it again after a change', async () => {
+    const polled = await mocks.judge()
+    mocks.selectJudge.mockResolvedValue({ ...polled, provider: 'typesafe' })
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+    openTab('Settings')
+    const judge = await screen.findByRole('heading', { level: 3, name: 'Judge' })
+    const section = judge.closest('section') as HTMLElement
+    await within(section).findByText('OpenAI, Jev fallback')
+    expect(within(section).getByText('Saved ····WXYZ')).toBeTruthy()
+    expect(within(section).getByText('2 answered by Jev')).toBeTruthy()
+
+    const polls = mocks.judge.mock.calls.length
+    fireEvent.change(within(section).getByLabelText('Operator token'), { target: { value: 'op-token' } })
+    fireEvent.click(within(section).getByRole('switch', { name: 'Use OpenAI Decisions instead of Jev' }))
+    await within(section).findByText('Jev answers.')
+    expect(mocks.selectJudge).toHaveBeenCalledWith('op-token', 'typesafe')
+    await waitFor(() => expect(mocks.judge.mock.calls.length).toBeGreaterThan(polls))
   })
 
   it('shows notifications on their own tab and reads them again after a change', async () => {

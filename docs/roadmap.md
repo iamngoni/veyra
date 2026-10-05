@@ -249,6 +249,7 @@
 - [x] Hybrid Docker profile (`compose.yaml`): service, PostgreSQL, tunnel,
       and console in Compose with MT4 native on the host, plus Docker backup,
       restore, and terminal-watch scripts (`docs/deployment-docker.md`).
-- [ ] Durable 24/7 host or VPS, managed secrets, and remote monitoring.
+- [ ] Harden the Mac mini as the 24/7 host (the chosen hosting environment;
+      no VPS): managed secrets and off-host monitoring.
 - [ ] Versioned deployment pipeline.
 - [ ] Staged rollout: local → paper account → minimal live exposure only after explicit owner approval.

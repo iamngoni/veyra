@@ -550,9 +550,8 @@ pub(crate) async fn sample(state: &AppState) -> HealthSample {
         if report.fresh
             && let Some(account) = broker.link().last_account()
         {
-            let drawdowns = state
-                .equity_guard()
-                .observe(account.equity, std::time::SystemTime::now());
+            let drawdowns =
+                crate::risk::guard::observe_account(state, &account, std::time::SystemTime::now());
             sample.drawdowns = Some((drawdowns.day_percent, drawdowns.peak_percent));
         }
     }

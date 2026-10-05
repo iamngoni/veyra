@@ -128,7 +128,18 @@ agents with `./scripts/install-docker-launchd.sh --uninstall`.
 
 The terminal LaunchAgent runs `scripts/watch-terminal.sh`: it checks the real
 Wine `terminal.exe` process every fifteen seconds and reopens MetaTrader 4 if
-the process exits. The launcher itself remains under launchd `KeepAlive`.
+the process exits. When no chart of the last-used profile carries VeyraProbe
+(MetaQuotes' LiveUpdate has come back with it detached), it reopens the
+terminal with a startup file that names the EA, symbol and period; whether
+that attaches the EA unattended is not yet verified, so check the terminal's
+log after an update. The launcher itself remains under launchd `KeepAlive`,
+with `AbandonProcessGroup` so a terminal it started survives a restart of
+the watcher.
+
+The watcher does not restart a running terminal whose EA has gone quiet. The
+EA's log file is not a liveness signal (since build 1490 the terminal writes
+it to disk only occasionally), and a restart rule based on it looped. Veyra's
+own "Broker link stale" alert is the signal that the EA has stopped.
 
 ## Final tunnel cutover
 

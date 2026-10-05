@@ -1397,16 +1397,17 @@ async fn manage_open_positions_after_link(
                 state.profit_harvest_book(),
                 server_time,
             ) {
-                let Some(symbol) = managed
+                let Some(position) = managed
                     .iter()
                     .find(|position| position.ticket == plan.ticket)
-                    .map(|position| position.symbol.as_str())
                 else {
                     return Some(TickOutcome::Unavailable {
                         reason: "profit-harvest stop lost its position context".to_owned(),
                     });
                 };
-                return Some(move_stop(state, symbol, plan).await);
+                if let Some(plan) = prepare_stop(state, position, plan).await {
+                    return Some(move_stop(state, &position.symbol, plan).await);
+                }
             }
         }
     }
@@ -1419,16 +1420,17 @@ async fn manage_open_positions_after_link(
             state.stop_basis(),
         )
     {
-        let Some(symbol) = managed
+        let Some(position) = managed
             .iter()
             .find(|position| position.ticket == plan.ticket)
-            .map(|position| position.symbol.as_str())
         else {
             return Some(TickOutcome::Unavailable {
                 reason: "stop policy lost its position context".to_owned(),
             });
         };
-        return Some(move_stop(state, symbol, plan).await);
+        if let Some(plan) = prepare_stop(state, position, plan).await {
+            return Some(move_stop(state, &position.symbol, plan).await);
+        }
     }
     None
 }
@@ -1887,7 +1889,7 @@ impl StopMoveKind {
 }
 
 /// A planned stop change for one position.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct StopMove {
     ticket: i64,
     stop: f64,
@@ -1919,7 +1921,17 @@ const STOP_MIN_STEP_RATIO: f64 = 0.1;
 #[derive(Debug, Default)]
 pub struct StopBasis {
     risks: std::sync::Mutex<std::collections::HashMap<i64, f64>>,
+    /// Stop levels recently sent per ticket, with when, so a move the venue
+    /// refused is not re-sent every tick. Process-lifetime only.
+    attempts: std::sync::Mutex<std::collections::HashMap<i64, (f64, i64)>>,
 }
+
+/// How long a stop move is not re-sent at (nearly) the same level.
+const STOP_RESEND_HOLD_SECS: i64 = 300;
+
+/// Longest wait for an instrument's contract before a stop move; without it
+/// the move is sent as planned.
+const STOP_SPEC_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Durable floating-profit memory and re-entry guard for the harvest policy.
 #[derive(Debug, Default)]
@@ -2480,8 +2492,33 @@ impl EntryWatch {
 }
 
 impl StopBasis {
+    /// Whether a stop within `tolerance` of `stop` was sent for `ticket` less
+    /// than [`STOP_RESEND_HOLD_SECS`] ago.
+    fn recently_attempted(&self, ticket: i64, stop: f64, tolerance: f64, now: i64) -> bool {
+        let attempts = match self.attempts.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        attempts.get(&ticket).is_some_and(|(sent, at)| {
+            (sent - stop).abs() <= tolerance && now.saturating_sub(*at) < STOP_RESEND_HOLD_SECS
+        })
+    }
+
+    /// Remembers that `stop` was sent for `ticket` at `now`.
+    fn record_attempt(&self, ticket: i64, stop: f64, now: i64) {
+        let mut attempts = match self.attempts.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        attempts.insert(ticket, (stop, now));
+    }
+
     /// Records the first observed risk for every live position.
     fn observe(&self, positions: &[ManagedPosition]) {
+        if let Ok(mut attempts) = self.attempts.lock() {
+            attempts
+                .retain(|ticket, _| positions.iter().any(|position| position.ticket == *ticket));
+        }
         let mut risks = match self.risks.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -2978,6 +3015,102 @@ async fn review_positions(
 }
 
 /// Submits one planned stop change through the shared modify path.
+/// Fits a planned stop to the venue's rules before it is sent.
+///
+/// MT4 refuses (code 130) a stop closer to the current price than the
+/// instrument's stop level, or inside its freeze level. The stop is pulled
+/// back to that distance (plus one tick, so rounding cannot land inside it)
+/// and onto the tick grid, rounding away from the price. `None` means the
+/// fitted stop no longer does its job: it would not improve the current stop,
+/// or a break-even or profit-lock stop would fall below entry.
+fn fit_to_venue(
+    plan: StopMove,
+    position: &ManagedPosition,
+    spec: &SymbolSpecPayload,
+) -> Option<StopMove> {
+    let tick = if spec.tick_size.is_finite() && spec.tick_size > 0.0 {
+        spec.tick_size
+    } else {
+        spec.point
+    };
+    if !(tick.is_finite() && tick > 0.0 && spec.point.is_finite() && spec.point > 0.0) {
+        return Some(plan);
+    }
+    let distance =
+        f64::from(spec.stop_level_points.max(spec.freeze_level_points)) * spec.point + tick;
+    // A hair of slack so values already on the grid are not pushed a tick.
+    const GRID_SLACK: f64 = 1e-6;
+    let stop = match position.side {
+        ManagedSide::Buy => {
+            let fitted = plan.stop.min(position.current - distance);
+            ((fitted / tick) + GRID_SLACK).floor() * tick
+        }
+        ManagedSide::Sell => {
+            let fitted = plan.stop.max(position.current + distance);
+            ((fitted / tick) - GRID_SLACK).ceil() * tick
+        }
+    };
+    let locks_entry = matches!(
+        plan.kind,
+        StopMoveKind::BreakEven | StopMoveKind::ProfitHarvest
+    );
+    let keeps_entry = !locks_entry
+        || match position.side {
+            ManagedSide::Buy => stop >= position.entry - tick * GRID_SLACK,
+            ManagedSide::Sell => stop <= position.entry + tick * GRID_SLACK,
+        };
+    let improves = match position.side {
+        ManagedSide::Buy => stop > position.stop_loss + tick / 2.0,
+        ManagedSide::Sell => position.stop_loss <= 0.0 || stop < position.stop_loss - tick / 2.0,
+    };
+    (stop.is_finite() && stop > 0.0 && keeps_entry && improves).then_some(StopMove { stop, ..plan })
+}
+
+/// Readies a planned stop move: fitted to the venue's stop level when the
+/// contract can be read, and held back when the same level was sent less than
+/// [`STOP_RESEND_HOLD_SECS`] ago (the venue refused it, or it is still in
+/// flight). `None` means do not send this tick.
+async fn prepare_stop(
+    state: &AppState,
+    position: &ManagedPosition,
+    plan: StopMove,
+) -> Option<StopMove> {
+    let spec = match (state.market(), Symbol::parse(&position.symbol)) {
+        (Some(market), Ok(symbol)) => {
+            match actix_web::rt::time::timeout(
+                STOP_SPEC_TIMEOUT,
+                market.feed().symbol_spec(&symbol),
+            )
+            .await
+            {
+                Ok(Ok(spec)) => Some(spec),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let plan = match &spec {
+        Some(spec) => fit_to_venue(plan, position, spec)?,
+        None => plan,
+    };
+    let tolerance = spec
+        .as_ref()
+        .map(|spec| spec.tick_size.max(spec.point))
+        .filter(|tick| tick.is_finite() && *tick > 0.0)
+        .unwrap_or_else(|| position.current.abs() * 1e-6);
+    let now = unix_secs(state.now());
+    if state
+        .stop_basis()
+        .recently_attempted(plan.ticket, plan.stop, tolerance, now)
+    {
+        return None;
+    }
+    state
+        .stop_basis()
+        .record_attempt(plan.ticket, plan.stop, now);
+    Some(plan)
+}
+
 async fn move_stop(state: &AppState, symbol: &str, plan: StopMove) -> TickOutcome {
     match queue_staged_modify(state, plan.ticket, Some(plan.stop), None).await {
         StagedModify::Queued { command, ticket } => {
@@ -4334,10 +4467,10 @@ mod tests {
 
         for (name, value) in [
             ("VEYRA_AUTOPILOT_ENABLED", "sure"),
-            ("VEYRA_AUTOPILOT_SYMBOL", "bad symbol"),
+            ("VEYRA_AUTOPILOT_SYMBOL", "bad/symbol"),
             ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,,GBPUSD"),
             ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,"),
-            ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,bad symbol"),
+            ("VEYRA_AUTOPILOT_SYMBOLS", "EURUSD,bad/symbol"),
             (
                 "VEYRA_AUTOPILOT_SYMBOLS",
                 "A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q",
@@ -5860,6 +5993,8 @@ mod tests {
             server_time,
             leverage: 100,
             margin_level: 357.5,
+            currency: None,
+            trade_server_time: None,
         }
     }
 
@@ -5877,6 +6012,8 @@ mod tests {
             server_time: 1_758_003_600,
             leverage: 100,
             margin_level: 0.0,
+            currency: None,
+            trade_server_time: None,
         }
     }
 
@@ -6843,6 +6980,137 @@ mod tests {
         }
     }
 
+    /// A USDCAD-like contract: 60-point stop level, 0.00001 ticks.
+    fn usdcad_spec() -> SymbolSpecPayload {
+        let mut spec = canned_spec("USDCAD");
+        spec.stop_level_points = 60;
+        spec
+    }
+
+    fn close(left: f64, right: f64) -> bool {
+        (left - right).abs() < 1e-9
+    }
+
+    #[test]
+    fn a_profit_lock_too_close_to_price_is_pulled_back_to_the_stop_level() {
+        // The case the broker refused 66 times: 1.41794 sat 2.6 pips from a
+        // 1.41820 bid under a 6-pip stop level.
+        let position = managed_position(ManagedSide::Buy, 1.41500, 1.41180, 1.41820);
+        let plan = StopMove {
+            ticket: 1,
+            stop: 1.41794,
+            kind: StopMoveKind::ProfitHarvest,
+        };
+        let fitted = fit_to_venue(plan, &position, &usdcad_spec()).expect("still worth sending");
+        assert!(close(fitted.stop, 1.41759), "{}", fitted.stop);
+        assert_eq!(fitted.kind, StopMoveKind::ProfitHarvest);
+
+        // A stop already far enough away is left where it was planned.
+        let spaced = StopMove {
+            stop: 1.41700,
+            ..plan
+        };
+        assert!(close(
+            fit_to_venue(spaced, &position, &usdcad_spec())
+                .expect("kept")
+                .stop,
+            1.41700
+        ));
+    }
+
+    #[test]
+    fn a_fitted_stop_that_no_longer_does_its_job_is_not_sent() {
+        let spec = usdcad_spec();
+        // Pulling back would drop the profit lock below entry.
+        let near_entry = managed_position(ManagedSide::Buy, 1.41780, 1.41500, 1.41820);
+        let lock = StopMove {
+            ticket: 1,
+            stop: 1.41800,
+            kind: StopMoveKind::ProfitHarvest,
+        };
+        assert!(fit_to_venue(lock, &near_entry, &spec).is_none());
+        let breakeven = StopMove {
+            kind: StopMoveKind::BreakEven,
+            ..lock
+        };
+        assert!(fit_to_venue(breakeven, &near_entry, &spec).is_none());
+        // A trailing stop may sit below entry, so it is still sent.
+        let trail = StopMove {
+            kind: StopMoveKind::Trail,
+            ..lock
+        };
+        assert!(close(
+            fit_to_venue(trail, &near_entry, &spec).expect("trail").stop,
+            1.41759
+        ));
+        // Pulling back would not improve the current stop.
+        let already = managed_position(ManagedSide::Buy, 1.41500, 1.41760, 1.41820);
+        assert!(fit_to_venue(lock, &already, &spec).is_none());
+    }
+
+    #[test]
+    fn short_positions_are_fitted_above_the_ask() {
+        let spec = usdcad_spec();
+        let position = managed_position(ManagedSide::Sell, 1.42000, 1.42300, 1.41700);
+        let plan = StopMove {
+            ticket: 1,
+            stop: 1.41720,
+            kind: StopMoveKind::ProfitHarvest,
+        };
+        let fitted = fit_to_venue(plan, &position, &spec).expect("fitted");
+        assert!(close(fitted.stop, 1.41761), "{}", fitted.stop);
+        // Above entry would give profit back: refused.
+        let late = managed_position(ManagedSide::Sell, 1.41740, 1.42300, 1.41700);
+        assert!(fit_to_venue(plan, &late, &spec).is_none());
+        // A larger freeze level wins over the stop level.
+        let mut frozen = spec;
+        frozen.freeze_level_points = 100;
+        let fitted = fit_to_venue(plan, &position, &frozen).expect("fitted");
+        assert!(close(fitted.stop, 1.41801), "{}", fitted.stop);
+    }
+
+    #[test]
+    fn a_contract_without_usable_ticks_leaves_the_plan_alone() {
+        let mut spec = usdcad_spec();
+        spec.tick_size = 0.0;
+        spec.point = 0.0;
+        let position = managed_position(ManagedSide::Buy, 1.41500, 1.41180, 1.41820);
+        let plan = StopMove {
+            ticket: 1,
+            stop: 1.41794,
+            kind: StopMoveKind::ProfitHarvest,
+        };
+        assert_eq!(fit_to_venue(plan, &position, &spec), Some(plan));
+    }
+
+    #[test]
+    fn the_same_stop_is_not_resent_within_the_hold() {
+        let basis = StopBasis::default();
+        basis.record_attempt(7, 1.41759, 1_000);
+        assert!(basis.recently_attempted(7, 1.41759, 0.00001, 1_000 + 60));
+        assert!(
+            basis.recently_attempted(7, 1.417595, 0.00001, 1_000 + 60),
+            "within a tick"
+        );
+        assert!(
+            !basis.recently_attempted(7, 1.41790, 0.00001, 1_000 + 60),
+            "a new level goes out"
+        );
+        assert!(
+            !basis.recently_attempted(8, 1.41759, 0.00001, 1_000 + 60),
+            "per ticket"
+        );
+        assert!(
+            !basis.recently_attempted(7, 1.41759, 0.00001, 1_000 + STOP_RESEND_HOLD_SECS),
+            "the hold expires"
+        );
+        basis.observe(&[]);
+        assert!(
+            !basis.recently_attempted(7, 1.41759, 0.00001, 1_000 + 60),
+            "closed tickets are forgotten"
+        );
+    }
+
     fn managed_position_named(symbol: &str) -> ManagedPosition {
         let mut position = managed_position(ManagedSide::Buy, 1.1, 1.09, 1.1);
         position.symbol = symbol.to_owned();
@@ -6910,6 +7178,7 @@ mod tests {
             free_margin: None,
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
+            account_currency: None,
         };
 
         let priced = with_reference_prices(facts, &markets);
@@ -7233,10 +7502,10 @@ mod tests {
 
         for broken in [
             json!({"positions": {"0": {"symbol": "EURUSD", "highNetProfit": 1.0, "armed": true}}, "cooldowns": {}, "pendingFreshBaselines": []}),
-            json!({"positions": {"1": {"symbol": "bad symbol", "highNetProfit": 1.0, "armed": true}}, "cooldowns": {}, "pendingFreshBaselines": []}),
+            json!({"positions": {"1": {"symbol": "bad/symbol", "highNetProfit": 1.0, "armed": true}}, "cooldowns": {}, "pendingFreshBaselines": []}),
             json!({"positions": {"1": {"symbol": "EURUSD", "highNetProfit": -1.0, "armed": true}}, "cooldowns": {}, "pendingFreshBaselines": []}),
             json!({"positions": {}, "cooldowns": {"EURUSD": -1}, "pendingFreshBaselines": []}),
-            json!({"positions": {}, "cooldowns": {}, "pendingFreshBaselines": [], "freshMarketRequired": ["bad symbol"]}),
+            json!({"positions": {}, "cooldowns": {}, "pendingFreshBaselines": [], "freshMarketRequired": ["bad/symbol"]}),
         ] {
             assert!(
                 after_close_restart.restore_state(&broken).is_err(),

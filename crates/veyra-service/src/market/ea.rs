@@ -252,7 +252,7 @@ mod tests {
             payload
         };
 
-        let error = series_from_payload(&mutate(&|p| p.symbol = "EUR USD".to_owned()))
+        let error = series_from_payload(&mutate(&|p| p.symbol = "EUR/USD".to_owned()))
             .expect_err("invalid symbols are rejected");
         assert!(error.to_string().contains("symbol"), "{error}");
 

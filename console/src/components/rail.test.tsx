@@ -150,6 +150,76 @@ describe('AutopilotCard', () => {
     expect(value('Last decision').textContent).toBe('23 Sep 2026, 17:40')
   })
 
+  it('falls back to the journal when the feed has no decision, as after a restart', () => {
+    const journaled: Status = {
+      ...status,
+      decisions: {
+        consecutiveFailures: 0,
+        lastFailure: null,
+        lastFailureAt: null,
+        lastEntry: {
+          atMs: at(16, 0),
+          outcome: 'no_trade',
+          symbol: 'USDJPY',
+          side: null,
+          reason: 'USD-heavy setups ahead of NFP.',
+          rationale: null,
+        },
+        nextCheckMs: at(20, 0),
+      },
+    }
+    render(<AutopilotCard status={journaled} events={[event('agent_turn', at(16, 5))]} />)
+    expect(value('Last decision').textContent).toBe('23 Sep 2026, 16:00')
+    expect(value('Status').querySelector('.ap-outcome')?.textContent).toBe('No trade')
+    expect(value('Status').querySelector('.ap-note')?.textContent).toBe('USDJPY — USD-heavy setups ahead of NFP.')
+  })
+
+  it('prefers whichever decision is newer, feed or journal', () => {
+    const journaled: Status = {
+      ...status,
+      decisions: {
+        consecutiveFailures: 0,
+        lastFailure: null,
+        lastFailureAt: null,
+        lastEntry: { atMs: at(12, 0), outcome: 'queued', symbol: 'EURUSD', side: 'buy', reason: null, rationale: null },
+      },
+    }
+    const events = [event('proposal_evaluated', at(16, 0), { outcome: 'no_trade', symbol: 'GBPUSD' })]
+    render(<AutopilotCard status={journaled} events={events} />)
+    expect(value('Last decision').textContent).toBe('23 Sep 2026, 16:00')
+    expect(value('Status').querySelector('.ap-outcome')?.textContent).toBe('No trade')
+  })
+
+  it('states the next check while running, with the weekday when it is not today', () => {
+    const now = new Date(at(17, 56))
+    vi.useFakeTimers({ now, toFake: ['Date'] })
+    try {
+      const later: Status = {
+        ...status,
+        decisions: { consecutiveFailures: 0, lastFailure: null, lastFailureAt: null, nextCheckMs: at(20, 0) },
+      }
+      const { rerender } = render(<AutopilotCard status={later} events={[]} />)
+      expect(value('Next check').textContent).toBe('20:00')
+
+      const monday = at(1, 0, 28)
+      rerender(
+        <AutopilotCard
+          status={{ ...later, decisions: { ...later.decisions!, nextCheckMs: monday } }}
+          events={[]}
+        />,
+      )
+      expect(value('Next check').textContent).toBe('Mon 01:00')
+
+      // Off, there is no next check.
+      rerender(
+        <AutopilotCard status={{ ...later, autopilot: { ...later.autopilot!, enabled: false } }} events={[]} />,
+      )
+      expect(value('Next check').textContent).toBe('—')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('omits the failure line when the service gives no reason', () => {
     const failing: Status = {
       ...status,

@@ -24,7 +24,7 @@ export const MAX_AUTOPILOT_SYMBOLS = 16
 /** Rows drawn at once; a broker can list thousands, so the rest wait for a search. */
 const VISIBLE_ROWS = 120
 /** The shape the service accepts for an instrument name. */
-const SYMBOL_NAME = /^[A-Za-z0-9._#+-]{1,24}$/
+const SYMBOL_NAME = /^(?!.* {2})[A-Za-z0-9._#+() -]{1,32}$/
 
 type CategoryFilter = SymbolCategoryId | 'all'
 

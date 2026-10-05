@@ -44,6 +44,12 @@ pub enum StateKey {
     NotifyPrefs,
     /// Encrypted notification provider credentials.
     NotifySecrets,
+    /// Judge selection (TypeSafe or OpenAI) and the last OpenAI test result.
+    JudgePrefs,
+    /// Encrypted OpenAI Decisions API key.
+    JudgeOpenAiKey,
+    /// Last broker-clock offset and terminal build (see [`crate::terminal`]).
+    Terminal,
 }
 
 impl StateKey {
@@ -62,6 +68,9 @@ impl StateKey {
             Self::SubscriptionClaudeCode => "subscription_claude_code",
             Self::NotifyPrefs => "notify_prefs",
             Self::NotifySecrets => "notify_secrets",
+            Self::JudgePrefs => "judge_prefs",
+            Self::JudgeOpenAiKey => "judge_openai_key",
+            Self::Terminal => "terminal",
         }
     }
 }
@@ -294,6 +303,8 @@ mod tests {
         assert_eq!(StateKey::RiskPolicy.as_str(), "risk_policy");
         assert_eq!(StateKey::NotifyPrefs.as_str(), "notify_prefs");
         assert_eq!(StateKey::NotifySecrets.as_str(), "notify_secrets");
+        assert_eq!(StateKey::JudgePrefs.as_str(), "judge_prefs");
+        assert_eq!(StateKey::JudgeOpenAiKey.as_str(), "judge_openai_key");
     }
 
     #[actix_web::test]

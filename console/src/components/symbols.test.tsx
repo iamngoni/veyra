@@ -211,7 +211,7 @@ describe('SymbolPicker', () => {
     expect(within(dialog).queryByRole('group', { name: 'Filter by market' })).toBeNull()
 
     const search = within(dialog).getByLabelText('Search instruments')
-    fireEvent.change(search, { target: { value: 'bad name' } })
+    fireEvent.change(search, { target: { value: 'bad$name' } })
     expect(within(dialog).queryByRole('button', { name: /by name/ })).toBeNull()
 
     fireEvent.change(search, { target: { value: 'US500.cash' } })

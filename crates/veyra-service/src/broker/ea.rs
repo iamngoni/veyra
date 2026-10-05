@@ -95,6 +95,10 @@ pub struct EaPoll {
     lots: Option<f64>,
     #[serde(default)]
     balance: Option<Value>,
+    #[serde(default)]
+    build: Option<u32>,
+    #[serde(rename = "ea", default)]
+    ea_version: Option<String>,
     #[serde(rename = "id", default)]
     command_id: Option<CommandId>,
     #[serde(default)]
@@ -165,7 +169,27 @@ impl EaPoll {
             open_orders,
             open_lots,
         )
-        .with_live_orders(self.live_orders.unwrap_or(false)))
+        .with_live_orders(self.live_orders.unwrap_or(false))
+        .with_terminal(self.build, self.ea_version()?))
+    }
+
+    /// The reported EA version, refused when it is not a short version text.
+    fn ea_version(&self) -> Result<Option<String>, BrokerError> {
+        match self.ea_version.as_deref().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(version)
+                if version.len() <= 16
+                    && version
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')) =>
+            {
+                Ok(Some(version.to_owned()))
+            }
+            Some(_) => Err(BrokerError::InvalidPayload {
+                field: "ea",
+                reason: "must be at most 16 letters, digits, '.' or '-'",
+            }),
+        }
     }
 }
 
@@ -1496,7 +1520,7 @@ mod tests {
         };
 
         assert!(
-            broken(&|p| p.symbol = "no spaces".to_owned())
+            broken(&|p| p.symbol = "no/slashes".to_owned())
                 .validate()
                 .is_err()
         );
@@ -1720,6 +1744,8 @@ mod tests {
             server_time: 0,
             leverage: 100,
             margin_level: 0.0,
+            currency: None,
+            trade_server_time: None,
         }
     }
 
@@ -1892,6 +1918,32 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_reports_the_terminal_build_and_ea_version() {
+        let parse = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "t": "hb", "token": "test-token-1234567890", "acct": 123456,
+                "server": "Broker-Test", "symbol": "EURUSD", "connected": true,
+                "tradeAllowed": true, "orders": 0, "lots": 0.0
+            });
+            if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+                body.extend(extra.clone());
+            }
+            serde_json::from_value::<super::EaPoll>(body)
+                .expect("poll parses")
+                .snapshot()
+        };
+        let reported = parse(serde_json::json!({"build": 1440, "ea": " 1.27 "})).expect("valid");
+        assert_eq!(reported.terminal_build(), Some(1440));
+        assert_eq!(reported.ea_version(), Some("1.27"));
+        let older = parse(serde_json::json!({})).expect("an older EA");
+        assert_eq!((older.terminal_build(), older.ea_version()), (None, None));
+        let zero = parse(serde_json::json!({"build": 0, "ea": ""})).expect("unknowns");
+        assert_eq!((zero.terminal_build(), zero.ea_version()), (None, None));
+        assert!(parse(serde_json::json!({"ea": "1.27; drop"})).is_err());
+        assert!(parse(serde_json::json!({"ea": "1".repeat(17)})).is_err());
+    }
+
+    #[test]
     fn non_finite_money_is_rejected() {
         let payload = AccountSnapshotPayload {
             balance: f64::NAN,
@@ -1904,6 +1956,8 @@ mod tests {
             server_time: 0,
             leverage: 100,
             margin_level: 0.0,
+            currency: None,
+            trade_server_time: None,
         };
         let error = payload.validate().expect_err("NaN must be rejected");
         assert!(error.contains("balance"), "unexpected error: {error}");
@@ -2018,7 +2072,27 @@ mod tests {
             server_time: 1_700_000_000,
             leverage: 100,
             margin_level: 0.0,
+            currency: None,
+            trade_server_time: None,
         };
+
+        // Currency and the broker's quote clock are optional, checked when present.
+        let mut reported = base();
+        reported.currency = Some("zar".to_owned());
+        reported.trade_server_time = Some(1_700_007_200);
+        reported.validate().expect("reported fields are valid");
+        assert_eq!(reported.account_currency().as_deref(), Some("ZAR"));
+        for (currency, time) in [
+            (Some(""), None),
+            (Some("US$"), None),
+            (Some("TOOLONGCCY"), None),
+            (None, Some(-1)),
+        ] {
+            let mut bad = base();
+            bad.currency = currency.map(str::to_owned);
+            bad.trade_server_time = time;
+            assert!(bad.validate().is_err(), "{currency:?} {time:?}");
+        }
 
         let mut negative_margin_level = base();
         negative_margin_level.margin_level = -1.0;
@@ -2740,6 +2814,90 @@ mod tests {
         let summary = listed[0].summary.as_ref().expect("summary");
         assert_eq!(summary["orders"], 1);
         assert_eq!(summary["truncated"], false);
+
+        // Balance operations ride along and are validated too.
+        let with_adjustments =
+            link.enqueue_order_history(OrderHistoryRequest::new(30, ORDER_MAGIC).expect("request"));
+        let mut answer = history_json();
+        answer["adjustments"] = serde_json::json!([
+            {"ticket": 7, "kind": "balance", "amount": -0.12, "time": 1_700_000_000,
+             "comment": "Dividend US500"},
+            {"ticket": 8, "kind": "credit", "amount": 5.0, "time": 1_700_000_100}
+        ]);
+        link.apply_ack(&EaAck {
+            id: with_adjustments,
+            ok: true,
+            data: Some(answer),
+            error: None,
+        });
+        let CommandState::Completed {
+            payload: CommandPayload::OrderHistory(history),
+        } = link.command(with_adjustments).expect("record").state
+        else {
+            panic!("expected a completed order history");
+        };
+        assert_eq!(history.adjustments.len(), 2);
+        assert_eq!(
+            history.adjustments[0].category(),
+            crate::broker::AdjustmentCategory::Dividend
+        );
+        assert_eq!(
+            history.adjustments[1].category(),
+            crate::broker::AdjustmentCategory::Credit
+        );
+        assert_eq!(
+            history.adjustments[1].comment, "",
+            "a missing comment is empty"
+        );
+        for (field, value) in [
+            ("ticket", serde_json::json!(0)),
+            ("amount", serde_json::json!(null)),
+            ("time", serde_json::json!(-5)),
+            ("comment", serde_json::json!("x".repeat(257))),
+            ("kind", serde_json::json!("bonus")),
+        ] {
+            let id = link
+                .enqueue_order_history(OrderHistoryRequest::new(30, ORDER_MAGIC).expect("request"));
+            let mut answer = history_json();
+            let mut entry = serde_json::json!(
+                {"ticket": 9, "kind": "balance", "amount": 1.0, "time": 1, "comment": ""}
+            );
+            entry[field] = value;
+            answer["adjustments"] = serde_json::json!([entry]);
+            link.apply_ack(&EaAck {
+                id,
+                ok: true,
+                data: Some(answer),
+                error: None,
+            });
+            assert!(
+                matches!(
+                    link.command(id).expect("record").state,
+                    CommandState::Failed { .. }
+                ),
+                "{field}"
+            );
+        }
+        let too_many =
+            link.enqueue_order_history(OrderHistoryRequest::new(30, ORDER_MAGIC).expect("request"));
+        let mut answer = history_json();
+        answer["adjustments"] = serde_json::Value::Array(
+            (1..=129)
+                .map(|ticket| {
+                    serde_json::json!({"ticket": ticket, "kind": "balance", "amount": 1.0, "time": 1})
+                })
+                .collect(),
+        );
+        link.apply_ack(&EaAck {
+            id: too_many,
+            ok: true,
+            data: Some(answer),
+            error: None,
+        });
+        assert!(matches!(
+            link.command(too_many).expect("record").state,
+            CommandState::Failed { .. }
+        ));
 
         // A malformed acknowledgement fails the command instead of storing junk.
         let bad =

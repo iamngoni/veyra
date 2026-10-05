@@ -5,6 +5,7 @@
 
 #![deny(missing_docs)]
 
+pub mod advisories;
 pub mod app;
 pub mod assistant_chat;
 pub mod audit;
@@ -16,6 +17,8 @@ pub mod config;
 pub mod control;
 pub mod credential;
 pub mod jev;
+pub mod judge;
+pub mod ledger;
 pub mod logs;
 pub mod market;
 pub mod model;
@@ -31,6 +34,7 @@ pub mod state;
 pub mod store;
 pub mod subscription_auth;
 pub mod symbols;
+pub mod terminal;
 pub mod text;
 pub mod trade_journal;
 pub mod trades;
@@ -76,7 +80,11 @@ pub struct AppState {
     credential_vault: Option<crate::credential::CredentialVault>,
     subscription_auth: crate::subscription_auth::SubscriptionAuthState,
     jev: Option<JevRuntime>,
+    /// Operator choice of judge (TypeSafe or OpenAI with Jev fallback).
+    judge_control: Option<crate::judge::JudgeControl>,
     audit: Option<AuditRuntime>,
+    /// Veyra's own record of closed trades (see [`crate::ledger`]).
+    ledger: Option<crate::ledger::SharedLedger>,
     logs: Option<Arc<LogBuffer>>,
     risk: RiskGate,
     runtime_state: RuntimeState,
@@ -91,6 +99,7 @@ pub struct AppState {
     decision_health: Arc<crate::trading::autopilot::DecisionHealth>,
     rotation: Arc<AtomicUsize>,
     equity_guard: Arc<EquityGuard>,
+    terminal_memory: Arc<crate::terminal::TerminalMemory>,
     order_admission: Arc<tokio::sync::Mutex<()>>,
     /// Operator notification queue; a disabled notifier drops everything.
     notifier: crate::notify::Notifier,
@@ -121,7 +130,9 @@ impl AppState {
             credential_vault: None,
             subscription_auth: crate::subscription_auth::SubscriptionAuthState::new(),
             jev: None,
+            judge_control: None,
             audit: None,
+            ledger: None,
             logs: None,
             risk,
             runtime_state: RuntimeState::disabled(),
@@ -135,6 +146,7 @@ impl AppState {
             decision_health: Arc::new(crate::trading::autopilot::DecisionHealth::default()),
             rotation: Arc::new(AtomicUsize::new(0)),
             equity_guard: Arc::new(EquityGuard::new()),
+            terminal_memory: Arc::new(crate::terminal::TerminalMemory::new()),
             order_admission: Arc::new(tokio::sync::Mutex::new(())),
             notifier: crate::notify::Notifier::disabled(),
             symbols: Arc::new(crate::symbols::SymbolCatalog::new()),
@@ -222,7 +234,18 @@ impl AppState {
         &self.subscription_auth
     }
 
-    /// Attaches the configured audit trail, if any.
+    /// Attaches Veyra's closed-trade ledger, if any.
+    pub fn with_ledger(mut self, ledger: Option<crate::ledger::SharedLedger>) -> Self {
+        self.ledger = ledger;
+        self
+    }
+
+    /// Veyra's own record of closed trades, when a database is configured.
+    pub fn ledger(&self) -> Option<&crate::ledger::SharedLedger> {
+        self.ledger.as_ref()
+    }
+
+    /// Attaches the audit trail, if any.
     pub fn with_audit(mut self, audit: Option<AuditRuntime>) -> Self {
         self.audit = audit;
         self
@@ -231,6 +254,12 @@ impl AppState {
     /// Attaches the configured judgement integration, if any.
     pub fn with_jev(mut self, jev: Option<JevRuntime>) -> Self {
         self.jev = jev;
+        self
+    }
+
+    /// Attaches the operator's judge selection, restored at startup.
+    pub fn with_judge_control(mut self, control: Option<crate::judge::JudgeControl>) -> Self {
+        self.judge_control = control;
         self
     }
 
@@ -424,8 +453,16 @@ impl AppState {
     }
 
     /// Returns the active judgement integration, if one is configured.
+    ///
+    /// The runtime answers through the operator-selected judge (see
+    /// [`crate::judge`]); callers need not know which one it is.
     pub fn jev(&self) -> Option<&JevRuntime> {
         self.jev.as_ref()
+    }
+
+    /// Operator judge selection, when the service was started with one.
+    pub fn judge_control(&self) -> Option<&crate::judge::JudgeControl> {
+        self.judge_control.as_ref()
     }
 
     /// Returns the active audit trail, if one is configured.
@@ -452,6 +489,12 @@ impl AppState {
     /// Equity baseline tracker feeding the daily and peak drawdown breakers.
     pub fn equity_guard(&self) -> &Arc<EquityGuard> {
         &self.equity_guard
+    }
+
+    /// Broker-clock offset and terminal build remembered across snapshots
+    /// and restarts (see [`crate::terminal`]).
+    pub fn terminal_memory(&self) -> &Arc<crate::terminal::TerminalMemory> {
+        &self.terminal_memory
     }
 
     /// Serializes the final account revalidation and open-order enqueue so two

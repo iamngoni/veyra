@@ -15,6 +15,7 @@ pub mod valuation;
 pub mod window;
 
 pub use gate::{AccountFacts, RiskCode, RiskDecision, RiskGate, RiskRejection};
+pub use guard::{DailyBasis, DailyReset, LossRules};
 
 use std::time::Duration;
 
@@ -73,6 +74,12 @@ const SESSION_RULE: &str = "must be `HH-HH` with UTC hours 0-23 and different bo
 const KILL_SWITCH_RULE: &str = "must be `true` or `false`";
 const WITHOUT_JEV_RULE: &str = "must be `true` or `false`";
 const WEEKEND_RULE: &str = "must be `agent`, `hold`, or `flatten`";
+const DAILY_RESET_RULE: &str = "must be `utc` or `broker`";
+const DAILY_BASIS_RULE: &str = "must be `equity`, `balance`, or `higher`";
+const DRAWDOWN_REFERENCE_RULE: &str =
+    "must be a finite amount from 0 (highest equity) to 1,000,000,000";
+/// Largest fixed drawdown reference accepted, in account currency.
+const MAX_DRAWDOWN_REFERENCE: f64 = 1_000_000_000.0;
 
 /// Errors raised while parsing risk policy settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -131,6 +138,17 @@ pub struct RiskPolicyPatch {
     /// What happens to open positions in the final hours before Friday's
     /// close: `agent`, `hold`, or `flatten`.
     pub weekend_positions: Option<String>,
+    /// When the daily-loss day starts: `utc` or `broker`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily_loss_reset: Option<String>,
+    /// What the daily loss is measured from: `equity`, `balance`, or
+    /// `higher`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily_loss_basis: Option<String>,
+    /// Fixed balance the peak-drawdown breaker measures from; 0 measures from
+    /// the highest equity reached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drawdown_reference: Option<f64>,
 }
 
 /// Validates one symbol list from the control surface.
@@ -374,6 +392,7 @@ pub struct RiskPolicy {
     min_stop_atr_fraction: f64,
     allow_trading_without_jev: bool,
     weekend_positions: WeekendPositions,
+    loss_rules: LossRules,
 }
 
 impl RiskPolicy {
@@ -411,6 +430,9 @@ impl RiskPolicy {
             // The constructor is a baseline too: weekend positions are the
             // analyst's call unless the operator says hold or flatten.
             weekend_positions: WeekendPositions::default(),
+            // UTC days measured from equity, maximum loss from the highest
+            // equity: the original guard.
+            loss_rules: LossRules::default(),
         }
     }
 
@@ -431,6 +453,15 @@ impl RiskPolicy {
     #[must_use]
     pub fn with_weekend_positions(mut self, weekend_positions: WeekendPositions) -> Self {
         self.weekend_positions = weekend_positions;
+        self
+    }
+
+    /// Sets how losses are measured for the breakers (see
+    /// [`guard`](crate::risk::guard)): when the day starts, what the daily
+    /// loss is measured from, and an optional fixed drawdown reference.
+    #[must_use]
+    pub fn with_loss_rules(mut self, loss_rules: LossRules) -> Self {
+        self.loss_rules = loss_rules;
         self
     }
 
@@ -666,6 +697,30 @@ impl RiskPolicy {
                 reason: WEEKEND_RULE,
             })?,
         };
+        let reset = match trimmed(&mut source, "VEYRA_RISK_DAILY_LOSS_RESET") {
+            None => DailyReset::default(),
+            Some(raw) => DailyReset::parse(&raw).ok_or(RiskError {
+                name: "VEYRA_RISK_DAILY_LOSS_RESET",
+                reason: DAILY_RESET_RULE,
+            })?,
+        };
+        let basis = match trimmed(&mut source, "VEYRA_RISK_DAILY_LOSS_BASIS") {
+            None => DailyBasis::default(),
+            Some(raw) => DailyBasis::parse(&raw).ok_or(RiskError {
+                name: "VEYRA_RISK_DAILY_LOSS_BASIS",
+                reason: DAILY_BASIS_RULE,
+            })?,
+        };
+        let drawdown_reference = match trimmed(&mut source, "VEYRA_RISK_DRAWDOWN_REFERENCE") {
+            None => 0.0,
+            Some(raw) => drawdown_reference_value(
+                "VEYRA_RISK_DRAWDOWN_REFERENCE",
+                raw.parse::<f64>().map_err(|_| RiskError {
+                    name: "VEYRA_RISK_DRAWDOWN_REFERENCE",
+                    reason: DRAWDOWN_REFERENCE_RULE,
+                })?,
+            )?,
+        };
 
         let mut policy = Self::new(
             kill_switch,
@@ -685,7 +740,12 @@ impl RiskPolicy {
         .with_calendar_blackout(calendar_blackout_minutes)
         .with_min_stop_atr_fraction(min_stop_atr_fraction)
         .with_trading_without_jev(allow_trading_without_jev)
-        .with_weekend_positions(weekend_positions);
+        .with_weekend_positions(weekend_positions)
+        .with_loss_rules(LossRules {
+            reset,
+            basis,
+            drawdown_reference,
+        });
         policy.weekend_symbols = weekend_symbols;
         policy.correlated_groups = correlated_groups;
         Ok(policy)
@@ -825,6 +885,26 @@ impl RiskPolicy {
                 reason: WEEKEND_RULE,
             })?,
         };
+        let loss_rules = LossRules {
+            reset: match &patch.daily_loss_reset {
+                None => self.loss_rules.reset,
+                Some(raw) => DailyReset::parse(raw).ok_or(RiskError {
+                    name: "dailyLossReset",
+                    reason: DAILY_RESET_RULE,
+                })?,
+            },
+            basis: match &patch.daily_loss_basis {
+                None => self.loss_rules.basis,
+                Some(raw) => DailyBasis::parse(raw).ok_or(RiskError {
+                    name: "dailyLossBasis",
+                    reason: DAILY_BASIS_RULE,
+                })?,
+            },
+            drawdown_reference: match patch.drawdown_reference {
+                None => self.loss_rules.drawdown_reference,
+                Some(value) => drawdown_reference_value("drawdownReference", value)?,
+            },
+        };
 
         let mut policy = Self::new(
             kill_switch,
@@ -844,7 +924,8 @@ impl RiskPolicy {
         .with_calendar_blackout(calendar_blackout_minutes)
         .with_min_stop_atr_fraction(min_stop_atr_fraction)
         .with_trading_without_jev(allow_trading_without_jev)
-        .with_weekend_positions(weekend_positions);
+        .with_weekend_positions(weekend_positions)
+        .with_loss_rules(loss_rules);
         policy.weekend_symbols = weekend_symbols;
         policy.correlated_groups = correlated_groups;
         Ok(policy)
@@ -944,6 +1025,9 @@ impl RiskPolicy {
             min_stop_atr_fraction: Some(self.min_stop_atr_fraction),
             allow_trading_without_jev: Some(self.allow_trading_without_jev),
             weekend_positions: Some(self.weekend_positions.as_str().to_owned()),
+            daily_loss_reset: Some(self.loss_rules.reset.as_str().to_owned()),
+            daily_loss_basis: Some(self.loss_rules.basis.as_str().to_owned()),
+            drawdown_reference: Some(self.loss_rules.drawdown_reference),
         }
     }
 
@@ -960,6 +1044,11 @@ impl RiskPolicy {
     /// close.
     pub fn weekend_positions(&self) -> WeekendPositions {
         self.weekend_positions
+    }
+
+    /// How the daily-loss and peak-drawdown breakers measure losses.
+    pub fn loss_rules(&self) -> LossRules {
+        self.loss_rules
     }
 
     /// Replaces the correlated groups (members must be allowlisted; used by
@@ -1044,7 +1133,10 @@ impl RiskPolicy {
             "calendarBlackoutMinutes": self.calendar_blackout_minutes,
             "minStopAtrFraction": self.min_stop_atr_fraction,
             "allowTradingWithoutJev": self.allow_trading_without_jev,
-            "weekendPositions": self.weekend_positions.as_str()
+            "weekendPositions": self.weekend_positions.as_str(),
+            "dailyLossReset": self.loss_rules.reset.as_str(),
+            "dailyLossBasis": self.loss_rules.basis.as_str(),
+            "drawdownReference": self.loss_rules.drawdown_reference
         })
     }
 
@@ -1081,6 +1173,18 @@ impl Default for RiskPolicy {
 }
 
 /// Parses an optional percentage with a default; malformed values fail.
+/// A fixed drawdown reference: 0 (highest equity) up to the cap.
+fn drawdown_reference_value(name: &'static str, value: f64) -> Result<f64, RiskError> {
+    if value.is_finite() && (0.0..=MAX_DRAWDOWN_REFERENCE).contains(&value) {
+        Ok(value)
+    } else {
+        Err(RiskError {
+            name,
+            reason: DRAWDOWN_REFERENCE_RULE,
+        })
+    }
+}
+
 fn percent(
     source: &mut impl FnMut(&'static str) -> Option<String>,
     name: &'static str,
@@ -1367,6 +1471,88 @@ mod tests {
         assert_eq!(WeekendPositions::Agent.as_str(), "agent");
         assert_eq!(WeekendPositions::Hold.as_str(), "hold");
         assert_eq!(WeekendPositions::Flatten.as_str(), "flatten");
+    }
+
+    #[test]
+    fn loss_rules_default_to_the_original_guard_and_follow_the_console() {
+        let unset = RiskPolicy::from_source(source(&[])).expect("valid settings");
+        assert_eq!(unset.loss_rules(), LossRules::default());
+        assert_eq!(unset.summary()["dailyLossReset"], "utc");
+        assert_eq!(unset.summary()["dailyLossBasis"], "equity");
+        assert_eq!(unset.summary()["drawdownReference"], 0.0);
+
+        let prop = RiskPolicy::from_source(source(&[
+            ("VEYRA_RISK_DAILY_LOSS_RESET", "broker"),
+            ("VEYRA_RISK_DAILY_LOSS_BASIS", "balance"),
+            ("VEYRA_RISK_DRAWDOWN_REFERENCE", "10000"),
+        ]))
+        .expect("valid settings");
+        assert_eq!(
+            prop.loss_rules(),
+            LossRules {
+                reset: DailyReset::Broker,
+                basis: DailyBasis::Balance,
+                drawdown_reference: 10_000.0,
+            }
+        );
+        for (name, value) in [
+            ("VEYRA_RISK_DAILY_LOSS_RESET", "prague"),
+            ("VEYRA_RISK_DAILY_LOSS_BASIS", "lowest"),
+            ("VEYRA_RISK_DRAWDOWN_REFERENCE", "-1"),
+            ("VEYRA_RISK_DRAWDOWN_REFERENCE", "lots"),
+            ("VEYRA_RISK_DRAWDOWN_REFERENCE", "1e12"),
+        ] {
+            let error = RiskPolicy::from_source(source(&[(name, value)]))
+                .expect_err("invalid loss rule must fail startup");
+            assert_eq!(error.name, name, "{value}");
+        }
+
+        // A console edit changes only what it names and round-trips through
+        // the persisted snapshot.
+        let patched = unset
+            .apply_patch(&RiskPolicyPatch {
+                daily_loss_basis: Some("higher".to_owned()),
+                drawdown_reference: Some(5_000.0),
+                ..Default::default()
+            })
+            .expect("patch applies");
+        assert_eq!(patched.loss_rules().reset, DailyReset::Utc);
+        assert_eq!(patched.loss_rules().basis, DailyBasis::Higher);
+        assert_eq!(patched.summary()["drawdownReference"], 5_000.0);
+        let value = serde_json::to_value(patched.snapshot_patch()).expect("snapshot serializes");
+        let patch: RiskPolicyPatch = serde_json::from_value(value).expect("snapshot deserializes");
+        assert_eq!(
+            RiskPolicy::default()
+                .apply_patch(&patch)
+                .expect("snapshot applies")
+                .loss_rules(),
+            patched.loss_rules()
+        );
+        for (patch, name) in [
+            (
+                RiskPolicyPatch {
+                    daily_loss_reset: Some("noon".to_owned()),
+                    ..Default::default()
+                },
+                "dailyLossReset",
+            ),
+            (
+                RiskPolicyPatch {
+                    daily_loss_basis: Some("margin".to_owned()),
+                    ..Default::default()
+                },
+                "dailyLossBasis",
+            ),
+            (
+                RiskPolicyPatch {
+                    drawdown_reference: Some(f64::NAN),
+                    ..Default::default()
+                },
+                "drawdownReference",
+            ),
+        ] {
+            assert_eq!(unset.apply_patch(&patch).expect_err("invalid").name, name);
+        }
     }
 
     #[test]
