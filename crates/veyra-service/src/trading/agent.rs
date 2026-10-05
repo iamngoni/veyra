@@ -119,6 +119,7 @@ pub(crate) async fn run(
 ) -> Result<AgentOutcome, PipelineError> {
     let mut transcript: Vec<String> = Vec::new();
     let mut tools: Vec<AgentToolUse> = Vec::new();
+    let format = format_for(session.mode, judgements_offered(session));
 
     for step in 0..MAX_STEPS {
         let step_input = render_input(input, &transcript);
@@ -127,7 +128,7 @@ pub(crate) async fn run(
             .answer(DecisionRequest {
                 instructions: instructions.to_owned(),
                 input: step_input.clone(),
-                format: format_for(session.mode),
+                format: format.clone(),
                 tier: session.tier,
             })
             .await?;
@@ -279,8 +280,19 @@ fn action_name(answer: &RawAnswer) -> &'static str {
     }
 }
 
-/// Builds the forced schema for the loop's mode.
-pub(crate) fn format_for(mode: AgentMode) -> AnswerFormat {
+/// Whether `get_judgements` can answer in this session: a judge is configured,
+/// or the tick already holds its judgements.
+///
+/// The tool is only offered when it can answer. A model that finds a tool in
+/// its menu keeps asking for it, and with no judge every call fails, so the
+/// whole step budget goes on errors and no decision is ever made.
+fn judgements_offered(session: &AgentSession<'_>) -> bool {
+    session.state.jev().is_some() || !session.judgements.is_empty()
+}
+
+/// Builds the forced schema for the loop's mode; `judgements` says whether the
+/// `get_judgements` tool is offered (see [`judgements_offered`]).
+pub(crate) fn format_for(mode: AgentMode, judgements: bool) -> AnswerFormat {
     let (actions, extra) = match mode {
         AgentMode::Proposal => (
             json!(["none", "open", "tool"]),
@@ -291,6 +303,16 @@ pub(crate) fn format_for(mode: AgentMode) -> AnswerFormat {
             Some(("ticket", ticket_schema())),
         ),
     };
+    let mut tool_names = vec![
+        "get_market",
+        "get_account",
+        "get_positions",
+        "get_market_window",
+        "check_risk",
+    ];
+    if judgements {
+        tool_names.insert(0, "get_judgements");
+    }
     let mut properties = json!({
         "action": { "type": "string", "enum": actions },
         "rationale": {
@@ -305,14 +327,7 @@ pub(crate) fn format_for(mode: AgentMode) -> AnswerFormat {
             "properties": {
                 "name": {
                     "type": "string",
-                    "enum": [
-                        "get_judgements",
-                        "get_market",
-                        "get_account",
-                        "get_positions",
-                        "get_market_window",
-                        "check_risk"
-                    ]
+                    "enum": tool_names
                 },
                 "arguments": { "type": "object" }
             }
@@ -782,8 +797,9 @@ mod tests {
         // truncate a tool call's arguments when a parameter is a union such
         // as ["string", "null"]. Optional fields are omitted instead.
         for schema in [
-            format_for(AgentMode::Proposal).schema,
-            format_for(AgentMode::Review).schema,
+            format_for(AgentMode::Proposal, true).schema,
+            format_for(AgentMode::Review, true).schema,
+            format_for(AgentMode::Proposal, false).schema,
             pipeline::proposal_format().schema,
         ] {
             let mut types = Vec::new();
@@ -792,6 +808,32 @@ mod tests {
             assert!(
                 types.iter().all(serde_json::Value::is_string),
                 "union type in {schema}"
+            );
+        }
+    }
+
+    fn offered_tools(format: &AnswerFormat) -> Vec<String> {
+        format.schema["properties"]["tool"]["properties"]["name"]["enum"]
+            .as_array()
+            .expect("tool names")
+            .iter()
+            .map(|name| name.as_str().expect("tool name").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn judgements_tool_is_offered_only_when_a_judge_can_answer() {
+        for mode in [AgentMode::Proposal, AgentMode::Review] {
+            let with = offered_tools(&format_for(mode, true));
+            let without = offered_tools(&format_for(mode, false));
+            assert!(with.iter().any(|name| name == "get_judgements"));
+            assert!(!without.iter().any(|name| name == "get_judgements"));
+            // Every other tool is unaffected, so only the judge is gated.
+            assert_eq!(
+                with.iter()
+                    .filter(|name| *name != "get_judgements")
+                    .collect::<Vec<_>>(),
+                without.iter().collect::<Vec<_>>()
             );
         }
     }

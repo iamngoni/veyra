@@ -8,6 +8,7 @@ import type { ChangeEvent, ReactNode } from 'react'
 
 import { changeModelCredential, type LiveSetting, type RuntimeConfigPatch, type SecretStatus } from '../lib/api'
 import { Button, Control, ControlHead, SkeletonRows, TextControl } from './form'
+import { SymbolPicker, joinSymbolList, parseSymbolList } from './symbols'
 import { SubscriptionConnections } from './subscriptions'
 import { Icon, Panel, Toggle } from './ui'
 import '../styles/provider.css'
@@ -114,7 +115,7 @@ const SETTING_HELP: Record<string, string> = {
   VEYRA_AUTOPILOT_SYMBOL:
     "The one instrument the autopilot trades; empty uses the terminal's chart symbol. Leave empty when Symbols is set.",
   VEYRA_AUTOPILOT_SYMBOLS:
-    'Comma-separated instruments, up to 16, the autopilot chooses from, opening at most one per cycle. Use this or Symbol, not both.',
+    "Instruments the autopilot chooses from, up to 16, one trade per cycle. Each must also be on the risk gate's allowed list.",
   VEYRA_AUTOPILOT_TIMEFRAME:
     'Candle size the autopilot reads market data and judgements on. Defaults to H4, four-hour candles.',
   VEYRA_AUTOPILOT_BARS: 'Closed candles the autopilot reads per instrument each cycle, 10–240; empty means 48.',
@@ -203,6 +204,8 @@ type SettingKind =
   | { kind: 'choice'; fallback: string; options: ReadonlyArray<{ value: string; label: string }> }
   /** Exactly one supported value: shown, not edited. */
   | { kind: 'fixed'; fallback: string }
+  /** A comma-separated list of broker instruments, chosen from the broker's own list. */
+  | { kind: 'symbols'; fallback: string }
 
 const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN1'].map((value) => ({ value, label: value }))
 
@@ -250,6 +253,7 @@ const SETTING_KINDS: Record<string, SettingKind> = {
       { value: 'custom', label: 'Custom OpenAI-compatible' },
     ],
   },
+  VEYRA_AUTOPILOT_SYMBOLS: { kind: 'symbols', fallback: '' },
   VEYRA_JEV_PROVIDER: { kind: 'fixed', fallback: 'typesafe' },
   VEYRA_MARKET_PROVIDER: { kind: 'fixed', fallback: '' },
 }
@@ -525,6 +529,43 @@ export function LiveSettingsPanel({
     onRefresh?.()
   }
 
+  const revertMany = async (names: string[]) => {
+    if (!onApply) return
+    setBusy(true)
+    setError(undefined)
+    const failure = await onApply(Object.fromEntries(names.map((name) => [name, null])))
+    setBusy(false)
+    if (failure) {
+      setError(failure)
+      return
+    }
+    setDraft((current) => {
+      const next = { ...current }
+      for (const name of names) delete next[name]
+      return next
+    })
+    onRefresh?.()
+  }
+
+  // The autopilot takes either one Symbol or a Symbols list, never both, so the
+  // picker owns both fields: choosing instruments clears the single Symbol in the
+  // same Apply, and arriving back at what is deployed drops the draft entirely.
+  const chooseSymbols = (next: string) =>
+    setDraft((current) => {
+      const draftNext = { ...current }
+      const deployedList = settings.VEYRA_AUTOPILOT_SYMBOLS?.value.trim() ?? ''
+      const deployedSingle = settings.VEYRA_AUTOPILOT_SYMBOL?.value.trim() ?? ''
+      const deployed = deployedList !== '' ? deployedList : deployedSingle
+      if (joinSymbolList(parseSymbolList(next)).toLowerCase() === joinSymbolList(parseSymbolList(deployed)).toLowerCase()) {
+        delete draftNext.VEYRA_AUTOPILOT_SYMBOLS
+        delete draftNext.VEYRA_AUTOPILOT_SYMBOL
+        return draftNext
+      }
+      draftNext.VEYRA_AUTOPILOT_SYMBOLS = next
+      if (settings.VEYRA_AUTOPILOT_SYMBOL !== undefined) draftNext.VEYRA_AUTOPILOT_SYMBOL = ''
+      return draftNext
+    })
+
   const handleChange = (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const name = event.target.dataset.field as string
     const value = event.target.value
@@ -583,6 +624,42 @@ export function LiveSettingsPanel({
                       </button>
                     </>
                   ) : undefined
+                  // The picker below replaces the single Symbol box.
+                  if (name === 'VEYRA_AUTOPILOT_SYMBOL' && settings.VEYRA_AUTOPILOT_SYMBOLS !== undefined) {
+                    return null
+                  }
+                  if (kind?.kind === 'symbols') {
+                    const listed = effective(name).trim()
+                    const chosen = listed !== '' ? listed : (settings.VEYRA_AUTOPILOT_SYMBOL ? effective('VEYRA_AUTOPILOT_SYMBOL').trim() : '')
+                    const overridden = settings[name].overridden || settings.VEYRA_AUTOPILOT_SYMBOL?.overridden
+                    return (
+                      <SymbolPicker
+                        key={name}
+                        label="Instruments"
+                        help={help}
+                        value={chosen}
+                        dirty={isDirty(name) || isDirty('VEYRA_AUTOPILOT_SYMBOL')}
+                        disabled={busy}
+                        aside={
+                          overridden ? (
+                            <>
+                              <span className="tone-warn">Overridden</span>
+                              <button
+                                type="button"
+                                className="tab-link"
+                                onClick={() => void revertMany([name, 'VEYRA_AUTOPILOT_SYMBOL'].filter((field) => settings[field] !== undefined))}
+                                disabled={busy}
+                                title="Return to the deployed value"
+                              >
+                                Revert
+                              </button>
+                            </>
+                          ) : undefined
+                        }
+                        onChange={chooseSymbols}
+                      />
+                    )
+                  }
                   if (kind?.kind === 'switch') {
                     return (
                       <SwitchSetting

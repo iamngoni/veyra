@@ -1,0 +1,249 @@
+/* Instrument picker (components/symbols.tsx): chosen instruments as chips in
+ * the field, a popover with search, one filter per market, and checkable rows.
+ * Uses the design tokens only; the popover is an elevated surface. */
+
+.sym-picker {
+  position: relative;
+}
+
+.tab-input.sym-field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  height: auto;
+  min-height: var(--control-lg);
+  padding: 4px 10px;
+}
+
+.sym-empty {
+  color: var(--color-ink-faint);
+  font-size: var(--text-base);
+}
+
+.sym-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: var(--control-sm);
+  padding: 0 4px 0 9px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: var(--radius-full);
+  background: var(--color-fill);
+  color: var(--color-ink);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.sym-chip.is-warn {
+  border-color: var(--color-warn);
+}
+
+.sym-chip button {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--color-ink-muted);
+  cursor: pointer;
+}
+
+.sym-chip button:hover:not(:disabled) {
+  background: var(--color-active);
+  color: var(--color-ink);
+}
+
+.sym-open {
+  margin-left: auto;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: var(--color-accent-text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+}
+
+.sym-open:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+.sym-open:focus-visible,
+.sym-chip button:focus-visible,
+.sym-cat:focus-visible,
+.sym-manual:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 1px;
+}
+
+.sym-note.is-warn {
+  color: var(--color-warn);
+}
+
+.sym-pop {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  display: grid;
+  gap: 10px;
+  max-height: min(560px, 72vh);
+  padding: 12px;
+  overflow: hidden auto;
+  border: 1px solid var(--color-line-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-elevated);
+  box-shadow: var(--shadow-popover);
+}
+
+.sym-cats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.sym-cat {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--control-sm);
+  padding: 0 10px;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--color-ink-muted);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+
+.sym-cat span {
+  color: var(--color-ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.sym-cat:hover {
+  background: var(--color-hover);
+  color: var(--color-ink);
+}
+
+.sym-cat.is-on {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-ink);
+}
+
+.sym-status {
+  margin: 0;
+  color: var(--color-ink-faint);
+  font-size: var(--text-sm);
+}
+
+.sym-status.is-warn {
+  color: var(--color-warn);
+}
+
+.sym-list {
+  max-height: 280px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  border-top: 1px solid var(--color-line-soft);
+  list-style: none;
+}
+
+.sym-row {
+  display: grid;
+  grid-template-columns: auto minmax(70px, 120px) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--color-line-soft);
+  cursor: pointer;
+}
+
+.sym-row:hover {
+  background: var(--color-hover);
+}
+
+.sym-row input {
+  accent-color: var(--color-accent);
+}
+
+.sym-name {
+  color: var(--color-ink);
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+}
+
+.sym-desc {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-ink-muted);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sym-tags {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.sym-tag {
+  color: var(--color-ink-faint);
+  font-size: var(--text-xs);
+  text-transform: capitalize;
+}
+
+.sym-tag.is-warn {
+  color: var(--color-warn);
+}
+
+.sym-manual {
+  justify-self: start;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-accent-text);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.sym-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--color-ink-muted);
+  font-size: var(--text-sm);
+}
+
+.sym-foot-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+@media (max-width: 640px) {
+  .sym-row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+  .sym-desc {
+    display: none;
+  }
+}
+
+.sym-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}

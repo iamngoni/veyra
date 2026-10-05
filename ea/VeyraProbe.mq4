@@ -6,8 +6,8 @@
 // Requires the endpoint to be listed in
 // Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL".
 #property strict
-#property version   "1.27"
-#property description "Veyra control channel: heartbeat, account/position snapshots, market rates, order validation, gated live execution, and Veyra-owned closes and stop changes."
+#property version   "1.28"
+#property description "Veyra control channel: heartbeat, account/position snapshots, market rates, the broker's instrument list, order validation, gated live execution, and Veyra-owned closes and stop changes."
 
 input string InUrl         = "__VEYRA_URL__";            // Veyra endpoint (loopback or tunnel)
 input string InToken       = "__VEYRA_TOKEN__";          // shared token
@@ -18,7 +18,7 @@ input bool   InAllowLiveOrders = __VEYRA_ALLOW_LIVE__;   // arm live order place
 uint g_last       = 0;
 bool g_said_hello = false;
 
-#define VEYRA_EA_VERSION "1.27"
+#define VEYRA_EA_VERSION "1.28"
 #define MAX_ADJUSTMENTS  64
 
 int OnInit()
@@ -755,6 +755,38 @@ void HandleSymbolSpec(string response, string id)
    SendAck(id, json);
   }
 
+// Reports one page of every symbol the broker's server lists, not only those
+// in Market Watch, so the console can offer them to the autopilot. `next` is
+// where the scan stopped: unnamed entries are skipped without filling the page,
+// so the service continues from `next` rather than counting what it received.
+void HandleListSymbols(string response, string id)
+  {
+   int offset = (int)JsonNumber(response, "offset");
+   int limit = (int)JsonNumber(response, "limit");
+   if(offset < 0) offset = 0;
+   if(limit <= 0 || limit > 200) limit = 200;
+
+   int total = SymbolsTotal(false);
+   string items = "";
+   int included = 0;
+   int next = offset;
+   for(; next < total && included < limit; next++)
+     {
+      string name = SymbolName(next, false);
+      if(StringLen(name) == 0) continue;
+      if(included > 0) items += ",";
+      items += "{\"name\":\"" + EscapeJson(name) + "\""
+               + ",\"description\":\"" + EscapeJson(SymbolInfoString(name, SYMBOL_DESCRIPTION)) + "\""
+               + ",\"path\":\"" + EscapeJson(SymbolInfoString(name, SYMBOL_PATH)) + "\"}";
+      included++;
+     }
+   string json = "{\"total\":" + (string)total
+                 + ",\"offset\":" + (string)offset
+                 + ",\"next\":" + (string)next
+                 + ",\"symbols\":[" + items + "]}";
+   SendAck(id, json);
+  }
+
 // Reports closed orders from the account history, newest first: realized
 // fills with profit, swap, and commission, so the service computes
 // performance from what actually happened instead of floating snapshots.
@@ -875,6 +907,12 @@ void HandleCommand(string response)
    if(kind == "order_history")
      {
       HandleOrderHistory(response, id);
+      return;
+     }
+
+   if(kind == "list_symbols")
+     {
+      HandleListSymbols(response, id);
       return;
      }
 

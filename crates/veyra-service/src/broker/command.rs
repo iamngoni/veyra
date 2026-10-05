@@ -70,6 +70,8 @@ pub enum CommandKind {
     SymbolSpec,
     /// Report closed orders from the terminal's account history.
     OrderHistory,
+    /// Report one page of every instrument the connected broker offers.
+    ListSymbols,
 }
 
 impl CommandKind {
@@ -85,6 +87,7 @@ impl CommandKind {
             Self::Rates => "rates",
             Self::SymbolSpec => "symbol_spec",
             Self::OrderHistory => "order_history",
+            Self::ListSymbols => "list_symbols",
         }
     }
 }
@@ -1065,6 +1068,139 @@ impl OrderHistoryPayload {
     }
 }
 
+/// Instrument-list request sent to the EA: one page of every symbol the
+/// connected broker offers, whether or not it is in Market Watch.
+///
+/// Paged because a broker can list thousands of instruments and one HTTP
+/// answer from the terminal must stay small.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SymbolListRequest {
+    offset: u32,
+    limit: u32,
+}
+
+impl SymbolListRequest {
+    /// Largest page the terminal is asked for.
+    pub const MAX_LIMIT: u32 = 200;
+    /// Largest offset accepted; far above any real broker's catalogue.
+    pub const MAX_OFFSET: u32 = 20_000;
+
+    /// Builds a validated page request.
+    ///
+    /// # Errors
+    /// Returns [`BrokerError::InvalidPayload`] for an empty or oversized page
+    /// or an offset beyond [`Self::MAX_OFFSET`].
+    pub fn new(offset: u32, limit: u32) -> Result<Self, BrokerError> {
+        if limit == 0 || limit > Self::MAX_LIMIT {
+            return Err(BrokerError::InvalidPayload {
+                field: "limit",
+                reason: "must be from 1 through 200",
+            });
+        }
+        if offset > Self::MAX_OFFSET {
+            return Err(BrokerError::InvalidPayload {
+                field: "offset",
+                reason: "must be at most 20000",
+            });
+        }
+        Ok(Self { offset, limit })
+    }
+
+    /// Index of the first symbol of the page.
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// Largest number of symbols the page may hold.
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+}
+
+/// One instrument as the broker lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SymbolListEntry {
+    /// Terminal symbol name, for example `EURUSD` or `US30.cash`.
+    pub name: String,
+    /// Broker's human description; empty when it gives none.
+    #[serde(default)]
+    pub description: String,
+    /// Broker's folder path, for example `Forex\\Majors\\EURUSD`; the best
+    /// available hint for which kind of market the instrument is.
+    #[serde(default)]
+    pub path: String,
+}
+
+/// Result of a `list_symbols` command: one page of the broker's catalogue.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SymbolListPayload {
+    /// Instruments the broker lists in total, across all pages.
+    pub total: u32,
+    /// Index of the first entry of this page.
+    pub offset: u32,
+    /// Index the terminal's scan ended at, which is where the next page
+    /// starts. A terminal may skip unnamed entries, so this can exceed
+    /// `offset` plus the entries returned; an older EA omits it.
+    #[serde(default)]
+    pub next: Option<u32>,
+    /// This page's instruments.
+    pub symbols: Vec<SymbolListEntry>,
+}
+
+impl SymbolListPayload {
+    /// Where the next page starts: the terminal's own scan position, or the
+    /// end of the returned entries when it reported none.
+    pub fn next_offset(&self) -> u32 {
+        self.next
+            .unwrap_or_else(|| self.offset.saturating_add(self.symbols.len() as u32))
+    }
+
+    /// Largest page the payload accepts.
+    pub const MAX_SYMBOLS: usize = SymbolListRequest::MAX_LIMIT as usize;
+    /// Longest name, description, or path kept; longer text is a parse error
+    /// rather than something silently cut.
+    const MAX_TEXT: usize = 256;
+
+    /// Rejects unusable catalogue data before it reaches the console.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.symbols.len() > Self::MAX_SYMBOLS {
+            return Err(format!(
+                "symbols must contain at most {} entries",
+                Self::MAX_SYMBOLS
+            ));
+        }
+        if self.offset as usize + self.symbols.len() > self.total as usize {
+            return Err("page must not extend beyond total".to_owned());
+        }
+        if self
+            .next
+            .is_some_and(|next| next < self.offset || next > self.total)
+        {
+            return Err("next must lie between offset and total".to_owned());
+        }
+        for entry in &self.symbols {
+            if entry.name.trim().is_empty() {
+                return Err("symbol name must not be blank".to_owned());
+            }
+            for (field, value) in [
+                ("name", &entry.name),
+                ("description", &entry.description),
+                ("path", &entry.path),
+            ] {
+                if value.len() > Self::MAX_TEXT {
+                    return Err(format!("symbol {field} is too long"));
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(format!(
+                        "symbol {field} must not contain control characters"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Order request sent to the EA for validation or execution, derived only from
 /// an approved intent. Fields mirror the intent wire contract so the EA can
 /// read them without a nested parser.
@@ -1124,6 +1260,8 @@ pub enum CommandPayload {
     SymbolSpec(SymbolSpecPayload),
     /// Result of `order_history`; realized fills from the account history.
     OrderHistory(OrderHistoryPayload),
+    /// Result of `list_symbols`; one page of the broker's instrument list.
+    SymbolList(SymbolListPayload),
 }
 
 /// Lifecycle state of one command.

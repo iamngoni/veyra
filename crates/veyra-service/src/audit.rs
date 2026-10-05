@@ -35,12 +35,13 @@ use crate::balance::BalancePoint;
 
 /// Read-only broker commands whose queue and completion events are not
 /// stored (see the module notes). Failures of these commands are stored.
-pub const ROUTINE_READS: [&str; 5] = [
+pub const ROUTINE_READS: [&str; 6] = [
     "ping",
     "account_snapshot",
     "rates",
     "symbol_spec",
     "order_history",
+    "list_symbols",
 ];
 
 /// Whether an event is a routine read's queue or completion, which the live
