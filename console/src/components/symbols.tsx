@@ -19,7 +19,7 @@ import { useSymbolCatalog } from '../lib/hooks'
 import { Button, ControlHead } from './form'
 import { Icon } from './ui'
 
-/** The service rotates through at most this many instruments. */
+/** Instruments the service rotates through when VEYRA_AUTOPILOT_MAX_SYMBOLS is empty. */
 export const MAX_AUTOPILOT_SYMBOLS = 16
 /** Rows per page; a broker can list thousands, so the list is paged rather than cut off. */
 export const PAGE_ROWS = 50
@@ -70,6 +70,7 @@ export function SymbolPicker({
   dirty = false,
   disabled = false,
   aside,
+  max = MAX_AUTOPILOT_SYMBOLS,
   onChange,
 }: {
   label: string
@@ -79,6 +80,8 @@ export function SymbolPicker({
   dirty?: boolean
   disabled?: boolean
   aside?: ReactNode
+  /** Most instruments that may be chosen; the service's VEYRA_AUTOPILOT_MAX_SYMBOLS. */
+  max?: number
   onChange: (value: string) => void
 }) {
   const { catalog, error, refreshing, reload, refresh } = useSymbolCatalog()
@@ -127,7 +130,7 @@ export function SymbolPicker({
   const first = current * PAGE_ROWS
   const shown = rows.slice(first, first + PAGE_ROWS)
 
-  const full = selected.length >= MAX_AUTOPILOT_SYMBOLS
+  const full = selected.length >= max
   const refused = selected.filter((name) => known.get(name.toLowerCase())?.riskAllowed === false)
 
   const toggle = (name: string) => {
@@ -323,7 +326,7 @@ export function SymbolPicker({
 
           <div className="sym-foot">
             <span className={full ? 'tone-warn' : ''}>
-              {selected.length} of {MAX_AUTOPILOT_SYMBOLS} chosen
+              {selected.length} of {max} chosen
             </span>
             <span className="sym-foot-actions">
               <Button onClick={() => void refresh()} disabled={refreshing || disabled}>

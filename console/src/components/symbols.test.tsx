@@ -48,12 +48,13 @@ afterEach(() => {
 })
 
 /** A controlled host, as the settings panel is. */
-function Harness({ initial = '', onValue }: { initial?: string; onValue?: (value: string) => void }) {
+function Harness({ initial = '', max, onValue }: { initial?: string; max?: number; onValue?: (value: string) => void }) {
   const [value, setValue] = useState(initial)
   return (
     <SymbolPicker
       label="Instruments"
       value={value}
+      max={max}
       onChange={(next) => {
         setValue(next)
         onValue?.(next)
@@ -161,6 +162,18 @@ describe('SymbolPicker', () => {
     const boxes = within(dialog).getAllByRole('checkbox') as HTMLInputElement[]
     expect(boxes.filter((box) => !box.checked).every((box) => box.disabled)).toBe(true)
     expect(boxes.filter((box) => box.checked).every((box) => !box.disabled)).toBe(true)
+  })
+
+  it('stops at the configured limit instead of the default', async () => {
+    const many = Array.from({ length: 5 }, (_, index) => entry(`PAIR${index + 1}`, 'forex'))
+    vi.spyOn(api, 'symbols').mockResolvedValue(readyCatalog(many))
+    render(<Harness initial="PAIR1,PAIR2" max={2} />)
+    const dialog = await openPicker()
+    await within(dialog).findByText(/5 instruments/)
+
+    expect(within(dialog).getByText('2 of 2 chosen')).toBeTruthy()
+    const boxes = within(dialog).getAllByRole('checkbox') as HTMLInputElement[]
+    expect(boxes.filter((box) => !box.checked).every((box) => box.disabled)).toBe(true)
   })
 
   it('pages a very long list so every instrument can be reached', async () => {

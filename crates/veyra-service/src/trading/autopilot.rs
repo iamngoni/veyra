@@ -61,8 +61,14 @@ use crate::trading::pipeline::{PipelineError, PipelineOutcome};
 
 /// Default proposal cadence in seconds.
 const DEFAULT_INTERVAL_SECS: u64 = 300;
-/// Largest number of instruments one autopilot rotation accepts.
-const MAX_SYMBOLS: usize = 16;
+/// Instruments one autopilot rotation accepts when
+/// `VEYRA_AUTOPILOT_MAX_SYMBOLS` is empty.
+const DEFAULT_MAX_SYMBOLS: usize = 16;
+/// Highest accepted `VEYRA_AUTOPILOT_MAX_SYMBOLS`: the risk gate's own
+/// allowlist ceiling, so the rotation can never outgrow what the gate admits.
+/// Every instrument costs terminal round trips and prompt space on every
+/// tick, which is why the default stays well below it.
+const MAX_SYMBOLS_CEILING: usize = 64;
 /// Smallest accepted cadence: frequent enough to act, slow enough to be sane.
 const MIN_INTERVAL_SECS: u64 = 30;
 /// Largest accepted cadence.
@@ -211,6 +217,7 @@ impl AutopilotSettings {
         let enabled_raw = optional(&mut source, "VEYRA_AUTOPILOT_ENABLED");
         let symbol_raw = optional(&mut source, "VEYRA_AUTOPILOT_SYMBOL");
         let symbols_raw = optional(&mut source, "VEYRA_AUTOPILOT_SYMBOLS");
+        let max_symbols_raw = optional(&mut source, "VEYRA_AUTOPILOT_MAX_SYMBOLS");
         let timeframe_raw = optional(&mut source, "VEYRA_AUTOPILOT_TIMEFRAME");
         let bars_raw = optional(&mut source, "VEYRA_AUTOPILOT_BARS");
         let tier_raw = optional(&mut source, "VEYRA_AUTOPILOT_TIER");
@@ -232,6 +239,7 @@ impl AutopilotSettings {
         if enabled_raw.is_empty()
             && symbol_raw.is_empty()
             && symbols_raw.is_empty()
+            && max_symbols_raw.is_empty()
             && timeframe_raw.is_empty()
             && bars_raw.is_empty()
             && tier_raw.is_empty()
@@ -268,8 +276,22 @@ impl AutopilotSettings {
                 reason: "set either VEYRA_AUTOPILOT_SYMBOL or VEYRA_AUTOPILOT_SYMBOLS, not both",
             });
         }
+        let max_symbols = match max_symbols_raw.as_str() {
+            "" => DEFAULT_MAX_SYMBOLS,
+            other => {
+                let invalid = || ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_AUTOPILOT_MAX_SYMBOLS",
+                    reason: "must be an integer from 1 through 64",
+                };
+                let max = other.parse::<usize>().map_err(|_| invalid())?;
+                if !(1..=MAX_SYMBOLS_CEILING).contains(&max) {
+                    return Err(invalid());
+                }
+                max
+            }
+        };
         let symbols = if !symbols_raw.is_empty() {
-            parse_symbol_list(&symbols_raw)?
+            parse_symbol_list(&symbols_raw, max_symbols)?
         } else if !symbol_raw.is_empty() {
             vec![Symbol::parse(&symbol_raw).map_err(|_| {
                 ConfigError::InvalidEnvironmentVariable {
@@ -1713,8 +1735,9 @@ fn judgement_for_symbol<'a>(judgements: &'a [(Symbol, Value)], symbol: &str) -> 
         .map(|(_, summary)| summary)
 }
 
-/// Parses a comma-separated symbol list: 1-16 distinct validated instruments.
-fn parse_symbol_list(raw: &str) -> Result<Vec<Symbol>, ConfigError> {
+/// Parses a comma-separated symbol list: 1 to `max` distinct validated
+/// instruments.
+fn parse_symbol_list(raw: &str, max: usize) -> Result<Vec<Symbol>, ConfigError> {
     let invalid = |reason: &'static str| ConfigError::InvalidEnvironmentVariable {
         name: "VEYRA_AUTOPILOT_SYMBOLS",
         reason,
@@ -1742,8 +1765,10 @@ fn parse_symbol_list(raw: &str) -> Result<Vec<Symbol>, ConfigError> {
     if symbols.is_empty() {
         return Err(invalid("at least one symbol is required"));
     }
-    if symbols.len() > MAX_SYMBOLS {
-        return Err(invalid("at most 16 symbols may rotate"));
+    if symbols.len() > max {
+        return Err(invalid(
+            "lists more instruments than VEYRA_AUTOPILOT_MAX_SYMBOLS allows (16 when empty)",
+        ));
     }
     Ok(symbols)
 }
@@ -4446,6 +4471,33 @@ mod tests {
             "lists trim, validate, and de-duplicate in order"
         );
 
+        // The rotation cap is a setting: a raised cap admits a longer list, a
+        // lowered one refuses a list it no longer fits.
+        let seventeen = (1..=17)
+            .map(|i| format!("S{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let raised = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_SYMBOLS" => Ok(seventeen.clone()),
+            "VEYRA_AUTOPILOT_MAX_SYMBOLS" => Ok("17".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        assert_eq!(raised.symbols().len(), 17);
+        let lowered = AutopilotSettings::from_source(|requested| match requested {
+            "VEYRA_AUTOPILOT_SYMBOLS" => Ok("EURUSD,GBPUSD,XAUUSD".to_owned()),
+            "VEYRA_AUTOPILOT_MAX_SYMBOLS" => Ok("2".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name: requested }),
+        })
+        .expect_err("a list longer than the cap is refused");
+        assert!(matches!(
+            lowered,
+            ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_AUTOPILOT_SYMBOLS",
+                ..
+            }
+        ));
+
         let conflict = AutopilotSettings::from_source(|requested| match requested {
             "VEYRA_AUTOPILOT_SYMBOL" => Ok("EURUSD".to_owned()),
             "VEYRA_AUTOPILOT_SYMBOLS" => Ok("GBPUSD".to_owned()),
@@ -4475,6 +4527,9 @@ mod tests {
                 "VEYRA_AUTOPILOT_SYMBOLS",
                 "A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q",
             ),
+            ("VEYRA_AUTOPILOT_MAX_SYMBOLS", "0"),
+            ("VEYRA_AUTOPILOT_MAX_SYMBOLS", "65"),
+            ("VEYRA_AUTOPILOT_MAX_SYMBOLS", "lots"),
             ("VEYRA_AUTOPILOT_TIMEFRAME", "H6"),
             ("VEYRA_AUTOPILOT_BARS", "9"),
             ("VEYRA_AUTOPILOT_BARS", "241"),

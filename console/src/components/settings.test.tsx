@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { api, subscriptions, type CatalogSymbol, type LiveSetting, type SymbolCatalog } from '../lib/api'
 import { forgetSymbolCatalog } from '../lib/hooks'
-import { LiveSettingsPanel } from './settings'
+import { LiveSettingsPanel, symbolLimit } from './settings'
 
 beforeEach(() => {
   vi.spyOn(subscriptions, 'status').mockResolvedValue({ subscriptions: { codex: { connected: false }, claude_code: { connected: false } } })
@@ -555,5 +555,13 @@ describe('LiveSettingsPanel instruments', () => {
     )
     fireEvent.click(screen.getByRole('button', { name: 'Revert' }))
     expect(await screen.findByRole('alert')).toHaveProperty('textContent', 'VEYRA_AUTOPILOT_SYMBOLS: set either Symbol or Symbols')
+  })
+})
+
+describe('symbolLimit', () => {
+  it('uses a valid instrument limit and falls back to the service default', () => {
+    expect(symbolLimit('40')).toBe(40)
+    expect(symbolLimit(' 1 ')).toBe(1)
+    for (const raw of ['', '0', '65', '2.5', 'many']) expect(symbolLimit(raw)).toBe(16)
   })
 })

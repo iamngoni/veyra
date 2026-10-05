@@ -3,7 +3,8 @@
 Settings -> Autopilot -> **Instruments** is a multi-select over every
 instrument the connected broker offers, with a search box and one filter per
 kind of market (Forex, Indices, Metals, Energies, Commodities, Crypto, Stocks,
-Bonds, Other). Up to 16 can be chosen; the autopilot picks at most one per
+Bonds, Other). Up to 16 can be chosen, or as many as **Max symbols**
+(`VEYRA_AUTOPILOT_MAX_SYMBOLS`, 1-64) allows; the autopilot picks at most one per
 cycle from them.
 
 ## Where the list comes from

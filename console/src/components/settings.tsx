@@ -8,7 +8,7 @@ import type { ChangeEvent, ReactNode } from 'react'
 
 import { changeModelCredential, type LiveSetting, type RuntimeConfigPatch, type SecretStatus } from '../lib/api'
 import { Button, Control, ControlHead, SkeletonRows, TextControl } from './form'
-import { SymbolPicker, joinSymbolList, parseSymbolList } from './symbols'
+import { MAX_AUTOPILOT_SYMBOLS, SymbolPicker, joinSymbolList, parseSymbolList } from './symbols'
 import { SubscriptionConnections } from './subscriptions'
 import { Icon, Panel, Toggle } from './ui'
 import '../styles/provider.css'
@@ -31,6 +31,7 @@ const SETTING_GROUPS: Array<{ title: string; prefixes: string[]; names: string[]
       'VEYRA_AUTOPILOT_ENABLED',
       'VEYRA_AUTOPILOT_SYMBOL',
       'VEYRA_AUTOPILOT_SYMBOLS',
+      'VEYRA_AUTOPILOT_MAX_SYMBOLS',
       'VEYRA_AUTOPILOT_TIMEFRAME',
       'VEYRA_AUTOPILOT_BARS',
       'VEYRA_AUTOPILOT_TIER',
@@ -115,7 +116,9 @@ const SETTING_HELP: Record<string, string> = {
   VEYRA_AUTOPILOT_SYMBOL:
     "The one instrument the autopilot trades; empty uses the terminal's chart symbol. Leave empty when Symbols is set.",
   VEYRA_AUTOPILOT_SYMBOLS:
-    "Instruments the autopilot chooses from, up to 16, one trade per cycle. Each must also be on the risk gate's allowed list.",
+    "Instruments the autopilot chooses from, one trade per cycle, up to the instrument limit. Each must also be on the risk gate's allowed list.",
+  VEYRA_AUTOPILOT_MAX_SYMBOLS:
+    'Most instruments the autopilot may rotate through, 1–64; empty means 16. Each one adds terminal reads and prompt length to every cycle.',
   VEYRA_AUTOPILOT_TIMEFRAME:
     'Candle size the autopilot reads market data and judgements on. Defaults to H4, four-hour candles.',
   VEYRA_AUTOPILOT_BARS: 'Closed candles the autopilot reads per instrument each cycle, 10–240; empty means 48.',
@@ -259,6 +262,12 @@ const SETTING_KINDS: Record<string, SettingKind> = {
 }
 
 /** A value as the service reads it: empty means the setting's fallback. */
+/** The picker's limit: the instrument-limit setting when it is a valid 1–64, else the service default. */
+export function symbolLimit(raw: string): number {
+  const value = Number(raw.trim())
+  return raw.trim() !== '' && Number.isInteger(value) && value >= 1 && value <= 64 ? value : MAX_AUTOPILOT_SYMBOLS
+}
+
 function settingValue(name: string, raw: string): string {
   const kind = SETTING_KINDS[name]
   if (!kind || raw.trim() !== '') return raw.trim()
@@ -638,6 +647,7 @@ export function LiveSettingsPanel({
                         label="Instruments"
                         help={help}
                         value={chosen}
+                        max={symbolLimit(settings.VEYRA_AUTOPILOT_MAX_SYMBOLS ? effective('VEYRA_AUTOPILOT_MAX_SYMBOLS') : '')}
                         dirty={isDirty(name) || isDirty('VEYRA_AUTOPILOT_SYMBOL')}
                         disabled={busy}
                         aside={
