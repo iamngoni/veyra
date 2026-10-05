@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { api, subscriptions, type CatalogSymbol, type LiveSetting, type SymbolCatalog } from '../lib/api'
 import { forgetSymbolCatalog } from '../lib/hooks'
-import { LiveSettingsPanel, symbolLimit } from './settings'
+import { LiveSettingsPanel, SETTINGS_DRAFT_KEY, symbolLimit } from './settings'
 
 /** Real responses can be read twice through `clone()`; the console's request wrapper relies on it. */
 function withClone(response: Response): Response {
@@ -19,7 +19,7 @@ function withClone(response: Response): Response {
 beforeEach(() => {
   vi.spyOn(subscriptions, 'status').mockResolvedValue({ subscriptions: { codex: { connected: false }, claude_code: { connected: false } } })
 })
-afterEach(() => { cleanup(); vi.restoreAllMocks() })
+afterEach(() => { cleanup(); vi.restoreAllMocks(); sessionStorage.clear() })
 
 /** A promise the test resolves by hand, to observe in-flight states. */
 function deferred<T>() {
@@ -171,6 +171,39 @@ describe('LiveSettingsPanel', () => {
     await act(async () => pending.resolve(undefined))
     expect(screen.getByText('Applied')).toBeTruthy()
     expect(onRefresh).toHaveBeenCalledOnce()
+  })
+
+  it('keeps an unapplied draft through a reload, warns before leaving, and forgets it once applied', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    const first = render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+    fireEvent.change(field('VEYRA_AUTOPILOT_TRAIL_R'), { target: { value: '1.5' } })
+    expect(screen.getByText('1 unsaved change. Nothing is in force until Apply.')).toBeTruthy()
+    const leaving = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(leaving)
+    expect(leaving.defaultPrevented).toBe(true)
+
+    // A console redeploy reloads the page: the draft must come back.
+    first.unmount()
+    render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+    expect(field('VEYRA_AUTOPILOT_TRAIL_R').value).toBe('1.5')
+    expect(field('VEYRA_AUTOPILOT_TRAIL_R').className).toBe('tab-input is-dirty')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    await waitFor(() => expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_TRAIL_R: '1.5' }))
+    await waitFor(() => expect(sessionStorage.getItem(SETTINGS_DRAFT_KEY)).toBeNull())
+    const after = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(after)
+    expect(after.defaultPrevented).toBe(false)
+  })
+
+  it('ignores a stored draft it cannot read', () => {
+    sessionStorage.setItem(SETTINGS_DRAFT_KEY, '[not json')
+    render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} />)
+    expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(true)
+    sessionStorage.setItem(SETTINGS_DRAFT_KEY, '["array"]')
+    cleanup()
+    render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} />)
+    expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it('holds skeleton rows before the config response arrives', () => {

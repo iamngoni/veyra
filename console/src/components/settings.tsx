@@ -3,7 +3,7 @@
  * editing its environment, grouped the way an operator thinks about them.
  */
 
-import { Fragment, useId, useState } from 'react'
+import { Fragment, useEffect, useId, useState } from 'react'
 import type { ChangeEvent, ReactNode } from 'react'
 
 import { changeModelCredential, type LiveSetting, type RuntimeConfigPatch, type SecretStatus } from '../lib/api'
@@ -262,6 +262,28 @@ const SETTING_KINDS: Record<string, SettingKind> = {
 }
 
 /** A value as the service reads it: empty means the setting's fallback. */
+/** Where unapplied edits wait, so a reload (a console redeploy reloads the page) does not lose them. */
+export const SETTINGS_DRAFT_KEY = 'veyra.settingsDraft.v1'
+
+function readDraft(): Record<string, string> {
+  try {
+    const parsed: unknown = JSON.parse(sessionStorage.getItem(SETTINGS_DRAFT_KEY) ?? '{}')
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+  } catch {
+    return {}
+  }
+}
+
+function writeDraft(draft: Record<string, string>) {
+  try {
+    if (Object.keys(draft).length === 0) sessionStorage.removeItem(SETTINGS_DRAFT_KEY)
+    else sessionStorage.setItem(SETTINGS_DRAFT_KEY, JSON.stringify(draft))
+  } catch {
+    // Private windows and full storage still work; the draft just lives in the page.
+  }
+}
+
 /** The picker's limit: the instrument-limit setting when it is a valid 1–64, else the service default. */
 export function symbolLimit(raw: string): number {
   const value = Number(raw.trim())
@@ -483,10 +505,25 @@ export function LiveSettingsPanel({
   onApply?: (patch: RuntimeConfigPatch) => Promise<string | undefined>
   onRefresh?: () => void
 }) {
-  const [draft, setDraft] = useState<Record<string, string>>({})
+  const [draft, setDraft] = useState<Record<string, string>>(readDraft)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const [saved, setSaved] = useState(false)
+
+  // Names this service still offers whose drafted value differs from what is applied.
+  const dirty = settings
+    ? Object.keys(draft).filter((name) => settings[name] !== undefined && settingValue(name, draft[name]) !== settingValue(name, settings[name].value))
+    : []
+  const unsaved = dirty.length > 0
+
+  useEffect(() => writeDraft(draft), [draft])
+  // Leaving with unapplied edits asks first; a reload keeps them either way.
+  useEffect(() => {
+    if (!unsaved) return
+    const warn = (event: BeforeUnloadEvent) => event.preventDefault()
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [unsaved])
 
   if (!settings) {
     return (
@@ -498,9 +535,7 @@ export function LiveSettingsPanel({
 
   // Only rendered names ever reach the draft, and those exist in `settings`.
   const effective = (name: string) => draft[name] ?? settings[name].value
-  const isDirty = (name: string) =>
-    name in draft && settingValue(name, draft[name]) !== settingValue(name, settings[name].value)
-  const dirty = Object.keys(draft).filter(isDirty)
+  const isDirty = (name: string) => dirty.includes(name)
 
   const submit = async () => {
     if (!onApply || dirty.length === 0) return
@@ -738,6 +773,10 @@ export function LiveSettingsPanel({
         {error ? (
           <p className="tab-error" role="alert">
             {error}
+          </p>
+        ) : unsaved ? (
+          <p className="tab-settings-pending" role="status">
+            {dirty.length === 1 ? '1 unsaved change' : `${dirty.length} unsaved changes`}. Nothing is in force until Apply.
           </p>
         ) : (
           <span />

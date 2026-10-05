@@ -670,6 +670,12 @@
   padding-bottom: 0;
 }
 
+.tab-settings-pending {
+  margin: 0;
+  color: var(--color-warn);
+  font-size: var(--text-base);
+}
+
 .tab-settings-foot .tab-error {
   margin: 0;
 }
