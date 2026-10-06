@@ -916,6 +916,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             std::slice::from_ref(&position),
             Some(prep),
             "autopilot_weekend",
+            None,
         )
         .await;
         if !matches!(outcome, TickOutcome::Held) {
@@ -925,7 +926,71 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
         reviewed_hold = true;
     }
 
+    // Loss checkpoint: a position that has turned against its entry by a
+    // review level is asked now, with its trajectory, instead of at the next
+    // closed candle. It takes this tick's review, and marks the candle as
+    // reviewed so the same bars are not asked about again.
+    state
+        .loss_watch()
+        .retain(&managed.iter().map(|p| p.ticket).collect::<Vec<_>>());
+    let mut reviewed_loss = false;
     if !reviewed_weekend
+        && let Some((position, level, _)) = loss_review_target(state, &managed)
+        && matches!(
+            position_age_secs(server_time, position.opened_at),
+            Some(age) if age >= settings.min_hold().as_secs()
+        )
+        && let Some(series) = series_for_symbol(&markets, &position.symbol)
+        && let Some(risk) = state.stop_basis().risk(position.ticket)
+    {
+        let candle_time = series.last().map(|candle| candle.time()).unwrap_or(0);
+        state.loss_watch().record(position.ticket, level);
+        state.review_watch().record(position.ticket, candle_time);
+        let bars =
+            match CandleRequest::new(series.symbol().clone(), Timeframe::M15, LOSS_REVIEW_BARS) {
+                Ok(request) => match market.feed().candles(request).await {
+                    Ok(intraday) => intraday.candles().to_vec(),
+                    Err(error) => {
+                        tracing::warn!(%error, "loss review continues without intraday bars");
+                        Vec::new()
+                    }
+                },
+                Err(_) => Vec::new(),
+            };
+        let equity = snapshot.as_ref().map(|snapshot| snapshot.equity);
+        if let Some(path) = trajectory(&position, risk, equity, server_time, &bars) {
+            let engine = model.engine();
+            let session = AgentSession {
+                state,
+                engine: engine.as_ref(),
+                mode: AgentMode::Review,
+                markets: &markets,
+                account: &account,
+                judgements: &judgements,
+                tier: settings.tier(),
+                now: state.now(),
+            };
+            let outcome = review_positions(
+                state,
+                &settings,
+                &session,
+                series,
+                std::slice::from_ref(&position),
+                None,
+                "autopilot_loss_review",
+                Some(&path),
+            )
+            .await;
+            if !matches!(outcome, TickOutcome::Held) {
+                return outcome;
+            }
+            reviewed_loss = true;
+            reviewed_hold = true;
+        }
+    }
+
+    if !reviewed_weekend
+        && !reviewed_loss
         && let Some(position) = next_review_position(&managed, state.rotation())
         && matches!(
             position_age_secs(server_time, position.opened_at),
@@ -968,6 +1033,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             std::slice::from_ref(&position),
             position_weekend_context,
             "autopilot_review",
+            None,
         )
         .await;
         if !matches!(outcome, TickOutcome::Held) {
@@ -2266,6 +2332,177 @@ pub struct EntryWatch {
 /// leave nothing for the recovery.
 pub const ENTRY_RETRY_AFTER_SECS: i64 = 300;
 
+/// Losses, in R, at which an open position gets a loss review: a review
+/// outside the candle cadence, with the trade's trajectory in front of the
+/// analyst. Each level is asked once per position.
+const LOSS_REVIEW_LEVELS: [f64; 2] = [0.5, 0.75];
+
+/// Fifteen-minute bars fetched for a loss review: enough to cover a day.
+const LOSS_REVIEW_BARS: u16 = 96;
+
+/// Which loss levels each open position has been reviewed at.
+///
+/// The candle review asks once per closed bar, so a trade that turns against
+/// its entry early can run all the way to its stop before anyone looks again.
+/// This watch lets the management tick ask as soon as a position first
+/// crosses each level in [`LOSS_REVIEW_LEVELS`], and never twice for the same
+/// level. Process-lifetime: after a restart a position still below a level is
+/// asked once more, which is the safe direction.
+#[derive(Debug, Default)]
+pub struct LossWatch {
+    reviewed: std::sync::Mutex<std::collections::HashMap<i64, usize>>,
+}
+
+impl LossWatch {
+    /// The deepest level (index into [`LOSS_REVIEW_LEVELS`]) `r` has crossed
+    /// that this position has not been reviewed at; `None` when there is none.
+    pub fn due_level(&self, ticket: i64, r: f64) -> Option<usize> {
+        let crossed = LOSS_REVIEW_LEVELS
+            .iter()
+            .rposition(|level| r.is_finite() && r <= -level)?;
+        let Ok(reviewed) = self.reviewed.lock() else {
+            // A poisoned lock must not stop a losing position being asked.
+            return Some(crossed);
+        };
+        match reviewed.get(&ticket) {
+            Some(done) if *done >= crossed => None,
+            _ => Some(crossed),
+        }
+    }
+
+    /// Marks this position as reviewed at `level` (and every level above it).
+    pub fn record(&self, ticket: i64, level: usize) {
+        let Ok(mut reviewed) = self.reviewed.lock() else {
+            return;
+        };
+        let entry = reviewed.entry(ticket).or_insert(level);
+        *entry = (*entry).max(level);
+    }
+
+    /// Forgets tickets that are no longer open.
+    pub fn retain(&self, open: &[i64]) {
+        let Ok(mut reviewed) = self.reviewed.lock() else {
+            return;
+        };
+        reviewed.retain(|ticket, _| open.contains(ticket));
+    }
+}
+
+/// A position's progress in R: the move from entry in its favour divided by
+/// the entry risk, negative while it loses. `None` without a usable risk.
+fn r_multiple(position: &ManagedPosition, risk: f64) -> Option<f64> {
+    if !risk.is_finite() || risk <= 0.0 || position.entry <= 0.0 || position.current <= 0.0 {
+        return None;
+    }
+    let direction = match position.side {
+        ManagedSide::Buy => 1.0,
+        ManagedSide::Sell => -1.0,
+    };
+    Some((position.current - position.entry) * direction / risk)
+}
+
+/// How an open trade has travelled since entry, for a loss review. Built from
+/// the live position, its entry risk, and fifteen-minute bars; every figure is
+/// deterministic so the analyst judges the evidence rather than computing it.
+#[derive(Debug, Clone, PartialEq)]
+struct Trajectory {
+    /// Progress now, in R.
+    r_now: f64,
+    /// Best progress reached since entry, in R (from bar extremes).
+    best_r: f64,
+    /// Worst progress reached since entry, in R.
+    worst_r: f64,
+    /// Minutes since the position opened.
+    minutes_open: i64,
+    /// Change in R over the last hour of bars; negative is moving against.
+    last_hour_r: Option<f64>,
+    /// How many of the last four bars closed against the position.
+    bars_against: usize,
+    /// Open result in account currency (negative while losing).
+    open_result: f64,
+    /// Open result as a percentage of equity.
+    open_result_pct: Option<f64>,
+    /// Approximate result at the stop in account currency.
+    result_at_stop: Option<f64>,
+    /// Result at the stop as a percentage of equity.
+    result_at_stop_pct: Option<f64>,
+    /// Fifteen-minute bars since entry (at most the last twelve), oldest first.
+    bars: Vec<Candle>,
+}
+
+/// Builds the trajectory of `position` from its entry `risk`, the account
+/// `equity`, the broker's `server_time`, and fifteen-minute `bars`.
+fn trajectory(
+    position: &ManagedPosition,
+    risk: f64,
+    equity: Option<f64>,
+    server_time: i64,
+    bars: &[Candle],
+) -> Option<Trajectory> {
+    let r_now = r_multiple(position, risk)?;
+    let direction = match position.side {
+        ManagedSide::Buy => 1.0,
+        ManagedSide::Sell => -1.0,
+    };
+    // The bar holding the entry counts: it is where the trade started.
+    let since: Vec<Candle> = bars
+        .iter()
+        .filter(|bar| bar.time() + 900 > position.opened_at)
+        .cloned()
+        .collect();
+    let progress = |price: f64| (price - position.entry) * direction / risk;
+    let (mut best_r, mut worst_r) = (r_now, r_now);
+    for bar in &since {
+        for price in [bar.high(), bar.low()] {
+            best_r = best_r.max(progress(price));
+            worst_r = worst_r.min(progress(price));
+        }
+    }
+    let last_hour_r = since
+        .len()
+        .checked_sub(5)
+        .map(|start| progress(since[since.len() - 1].close()) - progress(since[start].close()));
+    let bars_against = since
+        .iter()
+        .rev()
+        .take(4)
+        .filter(|bar| (bar.close() - bar.open()) * direction < 0.0)
+        .count();
+    let open_result = position.net_profit();
+    let equity = equity.filter(|equity| equity.is_finite() && *equity > 0.0);
+    let result_at_stop = (r_now < -0.05).then(|| open_result / -r_now);
+    let percent = |amount: f64| equity.map(|equity| amount / equity * 100.0);
+    Some(Trajectory {
+        r_now,
+        best_r,
+        worst_r,
+        minutes_open: ((server_time - position.opened_at) / 60).max(0),
+        last_hour_r,
+        bars_against,
+        open_result,
+        open_result_pct: percent(open_result),
+        result_at_stop,
+        result_at_stop_pct: result_at_stop.and_then(percent),
+        bars: since.iter().rev().take(12).rev().cloned().collect(),
+    })
+}
+
+/// The open position most in need of a loss review: the deepest loser that
+/// has crossed a level it has not been reviewed at, with that level and its R.
+fn loss_review_target(
+    state: &AppState,
+    managed: &[ManagedPosition],
+) -> Option<(ManagedPosition, usize, f64)> {
+    managed
+        .iter()
+        .filter_map(|position| {
+            let r = r_multiple(position, state.stop_basis().risk(position.ticket)?)?;
+            let level = state.loss_watch().due_level(position.ticket, r)?;
+            Some((position.clone(), level, r))
+        })
+        .min_by(|left, right| left.2.total_cmp(&right.2))
+}
+
 /// The candle each open position was last reviewed on.
 ///
 /// A review asks whether the reason for holding still stands, and that reason
@@ -2862,6 +3099,7 @@ pub(crate) fn parse_review(value: &serde_json::Value) -> Result<ReviewDecision, 
 /// the prompt then carries the weekend trade-off (gap risk against the cost of
 /// flattening), and `origin` names which question produced the verdict so the
 /// journal can tell the two apart.
+#[allow(clippy::too_many_arguments)]
 async fn review_positions(
     state: &AppState,
     settings: &AutopilotSettings,
@@ -2870,10 +3108,11 @@ async fn review_positions(
     positions: &[ManagedPosition],
     weekend: Option<WeekendPrep>,
     origin: &'static str,
+    loss: Option<&Trajectory>,
 ) -> TickOutcome {
     let judgements = judgement_for_symbol(session.judgements, series.symbol().as_str());
-    let instructions = review_instructions(series, positions, weekend, state.jev().is_some());
-    let input = review_input(state, series, positions, judgements, weekend);
+    let instructions = review_instructions(series, positions, weekend, state.jev().is_some(), loss);
+    let input = review_input(state, series, positions, judgements, weekend, loss);
     let outcome = match agent::run(session, &instructions, &input).await {
         Ok(outcome) => {
             state.decision_health().succeeded();
@@ -3255,6 +3494,7 @@ fn review_instructions(
     positions: &[ManagedPosition],
     weekend: Option<WeekendPrep>,
     judge: bool,
+    loss: Option<&Trajectory>,
 ) -> String {
     let tickets: Vec<String> = positions
         .iter()
@@ -3271,13 +3511,44 @@ fn review_instructions(
     format!(
         "You are the analyst for Veyra, a single-instrument trading bot. Your open {symbol}          {timeframe} position(s) (ticket(s) {tickets}) were entered by this bot with a stop loss          and take profit attached.
          Decide for the reported position: `hold` keeps the entry bracket and lets the plan play          out; `close` flattens the ticket now because the thesis that justified the entry is no          longer supported by the latest candles and judgements.
-         Closing costs the spread and abandons the bracket, so hold unless the evidence has          genuinely shifted; do not close merely because the position shows a small loss — the          attached stop defines the risk.{weekend_rules}
+         {risk_rules}{weekend_rules}
          Answer with the provided schema only, including the ticket when you close, and a short `rationale` (a sentence or two, at most 280 characters) explaining the decision. Before answering you may call read-only tools: get_market(symbol, timeframe?, bars?),{judgement_tool} get_account(), get_positions(), and get_market_window(). Call a tool only when its result would change your decision.",
         symbol = series.symbol().as_str(),
         timeframe = series.timeframe().as_str(),
         tickets = tickets.join(", "),
+        risk_rules = match loss {
+            Some(path) => loss_rules(path),
+            None => "Closing costs the spread and abandons the bracket, so hold unless the evidence          has genuinely shifted; do not close merely because the position shows a small loss —          the attached stop defines the risk.".to_owned(),
+        },
         weekend_rules = weekend_rules,
         judgement_tool = if judge { " get_judgements(symbol)," } else { "" }
+    )
+}
+
+/// The loss-checkpoint framing: where the trade stands, what the stop would
+/// cost, and how to weigh its path. It replaces the candle review's "the stop
+/// defines the risk" rule, because here the question is whether to let the
+/// stop be reached at all.
+fn loss_rules(path: &Trajectory) -> String {
+    let money = |amount: Option<f64>, pct: Option<f64>| match (amount, pct) {
+        (Some(amount), Some(pct)) => format!("{amount:.2} ({pct:.1}% of equity)"),
+        (Some(amount), None) => format!("{amount:.2}"),
+        _ => "unknown".to_owned(),
+    };
+    format!(
+        "This is a loss checkpoint, asked as soon as the position reached {r:.2} R against its          plan rather than at the next candle. It is {open} in the account currency after          {minutes} minutes; at its stop it would be about {stop}. Judge the trade's path, not only          the higher-timeframe bias: its best point since entry was {best:+.2} R, it is moving          {pace} over the last hour, and {against} of the last four 15-minute bars closed against          it (the `trajectory` and `intraday` blocks). A trade that went against its entry from          the start and never made meaningful progress is more likely wrong than early; one that          has broken the structure its entry relied on is wrong. Close now to keep the loss near          its current size when the path says the stop is likely to be reached. Hold only for          concrete evidence that this is a pullback inside a thesis that still stands, such as          price holding a level the entry relied on or the move against losing pace — not because          the bias still points your way or in hope of a reversal. Closing costs the spread;          reaching the stop costs the rest of the risk.",
+        r = path.r_now,
+        open = money(Some(path.open_result), path.open_result_pct),
+        minutes = path.minutes_open,
+        stop = money(path.result_at_stop, path.result_at_stop_pct),
+        best = path.best_r,
+        pace = match path.last_hour_r {
+            Some(change) if change < -0.05 => format!("against it ({change:+.2} R)"),
+            Some(change) if change > 0.05 => format!("back in its favour ({change:+.2} R)"),
+            Some(change) => format!("sideways ({change:+.2} R)"),
+            None => "at an unknown pace".to_owned(),
+        },
+        against = path.bars_against,
     )
 }
 
@@ -3306,6 +3577,7 @@ fn review_input(
     positions: &[ManagedPosition],
     judgements: Option<&Value>,
     weekend: Option<WeekendPrep>,
+    loss: Option<&Trajectory>,
 ) -> String {
     let recent: Vec<Value> = series
         .candles()
@@ -3375,6 +3647,34 @@ fn review_input(
             "market_closes_in_secs": prep.closes_in_secs
         });
     }
+    if let Some(path) = loss {
+        input["trajectory"] = json!({
+            "r_now": round4(path.r_now),
+            "best_r": round4(path.best_r),
+            "worst_r": round4(path.worst_r),
+            "minutes_open": path.minutes_open,
+            "last_hour_r": path.last_hour_r.map(round4),
+            "last_four_bars_against": path.bars_against,
+            "open_result": round4(path.open_result),
+            "open_result_pct_equity": path.open_result_pct.map(round4),
+            "result_at_stop": path.result_at_stop.map(round4),
+            "result_at_stop_pct_equity": path.result_at_stop_pct.map(round4)
+        });
+        input["intraday"] = json!({
+            "timeframe": "M15",
+            "since_entry": path
+                .bars
+                .iter()
+                .map(|bar| json!({
+                    "t": bar.time(),
+                    "o": bar.open(),
+                    "h": bar.high(),
+                    "l": bar.low(),
+                    "c": bar.close()
+                }))
+                .collect::<Vec<_>>()
+        });
+    }
     if let Some(snapshot) = &snapshot {
         input["account"] = json!({
             "free_margin": snapshot.free_margin,
@@ -3383,6 +3683,11 @@ fn review_input(
         });
     }
     input.to_string()
+}
+
+/// Rounds a figure for the prompt: four decimals are plenty for R and money.
+fn round4(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
 }
 
 /// Optional model context journaled alongside a proposal event: the model's
@@ -8004,5 +8309,272 @@ mod tests {
             other => panic!("expected unavailable, got {other:?}"),
         }
         assert_eq!(outcomes(&harness.trail), vec!["unavailable".to_owned()]);
+    }
+
+    #[test]
+    fn loss_levels_are_asked_once_each_and_deepest_first() {
+        let watch = LossWatch::default();
+        assert_eq!(
+            watch.due_level(1, -0.2),
+            None,
+            "a small loss is the candle review's"
+        );
+        assert_eq!(watch.due_level(1, -0.5), Some(0));
+        assert_eq!(
+            watch.due_level(1, -0.9),
+            Some(1),
+            "a gap past both levels asks the deeper one"
+        );
+        watch.record(1, 0);
+        assert_eq!(watch.due_level(1, -0.6), None, "each level is asked once");
+        assert_eq!(watch.due_level(1, -0.8), Some(1));
+        watch.record(1, 1);
+        assert_eq!(watch.due_level(1, -2.0), None);
+        assert_eq!(watch.due_level(1, f64::NAN), None);
+        watch.retain(&[]);
+        assert_eq!(
+            watch.due_level(1, -0.6),
+            Some(0),
+            "a closed ticket is forgotten"
+        );
+        // A deeper review covers the shallower level.
+        watch.record(2, 1);
+        assert_eq!(watch.due_level(2, -0.6), None);
+        watch.record(2, 0);
+        assert_eq!(
+            watch.due_level(2, -0.8),
+            None,
+            "recording lower never lowers"
+        );
+    }
+
+    fn open_position(side: ManagedSide, entry: f64, current: f64, profit: f64) -> ManagedPosition {
+        ManagedPosition {
+            ticket: 7,
+            symbol: "EURUSD".to_owned(),
+            side,
+            lots: 0.01,
+            entry,
+            profit,
+            stop_loss: 0.0,
+            take_profit: 0.0,
+            opened_at: 1_000_000,
+            current,
+            swap: 0.0,
+            commission: 0.0,
+            is_market: true,
+        }
+    }
+
+    #[test]
+    fn the_trajectory_reads_the_path_since_entry() {
+        // A short from 1.12100 with 43 pips of risk, now 26 pips against:
+        // today's EURUSD loss an hour in.
+        let short = open_position(ManagedSide::Sell, 1.12100, 1.12360, -2.60);
+        let risk = 0.00430;
+        let bar =
+            |t: i64, o: f64, h: f64, l: f64, c: f64| Candle::from_validated(t, o, h, l, c, 10);
+        let bars = vec![
+            bar(1_000_000 - 3_600, 1.1200, 1.1210, 1.1190, 1.1205),
+            bar(1_000_000 - 300, 1.1209, 1.1211, 1.1200, 1.1210),
+            bar(1_000_600, 1.1210, 1.1220, 1.1205, 1.1218),
+            bar(1_001_500, 1.1218, 1.1225, 1.1215, 1.1224),
+            bar(1_002_400, 1.1224, 1.1230, 1.1222, 1.1228),
+            bar(1_003_300, 1.1228, 1.1238, 1.1226, 1.1236),
+        ];
+        let path = trajectory(&short, risk, Some(40.0), 1_003_600, &bars).expect("path");
+        assert!((path.r_now + 0.0026 / 0.0043).abs() < 1e-9);
+        // The bar before entry is ignored; the one holding it counts.
+        assert!(
+            (path.best_r - 0.0010 / 0.0043).abs() < 1e-9,
+            "{}",
+            path.best_r
+        );
+        assert!(
+            (path.worst_r + 0.0028 / 0.0043).abs() < 1e-9,
+            "{}",
+            path.worst_r
+        );
+        assert_eq!(path.minutes_open, 60);
+        let hour = path.last_hour_r.expect("an hour of bars");
+        assert!((hour + 0.0026 / 0.0043).abs() < 1e-9, "{hour}");
+        assert_eq!(path.bars_against, 4, "every bar since entry closed up");
+        assert!((path.open_result_pct.expect("percent") + 6.5).abs() < 1e-9);
+        assert!((path.result_at_stop.expect("at stop") + 4.30).abs() < 1e-6);
+        assert!((path.result_at_stop_pct.expect("at stop %") + 10.75).abs() < 1e-6);
+        assert_eq!(path.bars.len(), 5);
+
+        // A long reads the other way, and without bars the path is just now.
+        let long = open_position(ManagedSide::Buy, 1.12100, 1.11885, -2.15);
+        let path = trajectory(&long, risk, None, 1_000_600, &[]).expect("path");
+        assert!((path.r_now + 0.5).abs() < 1e-9);
+        assert_eq!((path.best_r, path.worst_r), (path.r_now, path.r_now));
+        assert_eq!(path.last_hour_r, None);
+        assert_eq!(path.bars_against, 0);
+        assert_eq!(path.open_result_pct, None, "no equity, no percentage");
+        assert!((path.result_at_stop.expect("at stop") + 4.30).abs() < 1e-6);
+        // Barely negative is too close to zero to extrapolate a stop result.
+        let flat = open_position(ManagedSide::Buy, 1.12100, 1.12099, -0.01);
+        assert_eq!(
+            trajectory(&flat, risk, Some(40.0), 1_000_600, &[])
+                .expect("path")
+                .result_at_stop,
+            None
+        );
+        // No usable risk or price, no trajectory.
+        assert!(trajectory(&long, 0.0, None, 0, &[]).is_none());
+        assert!(
+            trajectory(
+                &open_position(ManagedSide::Buy, 1.1, 0.0, 0.0),
+                risk,
+                None,
+                0,
+                &[]
+            )
+            .is_none()
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_position_running_against_its_entry_gets_a_loss_review() {
+        let engine = StubEngine::answering(json!({
+            "action": "close",
+            "ticket": 10650805,
+            "rationale": "Never progressed and still climbing; the stop is likely."
+        }));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        // A short from 1.14757 with its stop at 1.1497 (21.3 pips of risk);
+        // at 1.14885 it is 0.6 R against.
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot_at(
+                10650805,
+                1_758_000_000,
+                1_758_003_600,
+                1.14885,
+            ));
+
+        let outcome = tick(&harness.state).await;
+        assert!(
+            matches!(outcome, TickOutcome::CloseQueued { .. }),
+            "{outcome:?}"
+        );
+        let request = &engine.requests()[0];
+        assert!(
+            request.instructions.contains("loss checkpoint"),
+            "{}",
+            request.instructions
+        );
+        assert!(
+            !request
+                .instructions
+                .contains("the attached stop defines the risk"),
+            "the candle review's hold-on-small-losses rule is replaced"
+        );
+        let input: Value = serde_json::from_str(&request.input).expect("input is JSON");
+        let r_now = input["trajectory"]["r_now"].as_f64().expect("r");
+        assert!((r_now + 0.6).abs() < 0.01, "{r_now}");
+        assert_eq!(input["trajectory"]["minutes_open"], 60);
+        assert_eq!(input["intraday"]["timeframe"], "M15");
+        let close = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "close_queued")
+            .expect("close recorded");
+        assert_eq!(close.payload()["origin"], "autopilot_loss_review");
+    }
+
+    #[actix_web::test]
+    async fn a_held_loss_is_asked_again_only_at_the_next_level() {
+        let engine = StubEngine::answering_review(
+            json!({"action": "hold", "rationale": "Pullback into the breakdown level."}),
+            json!({"action": "none"}),
+        );
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let link = harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link");
+        let loss_reviews = |engine: &StubEngine| {
+            engine
+                .requests()
+                .iter()
+                .filter(|request| request.instructions.contains("loss checkpoint"))
+                .count()
+        };
+        link.retain_snapshot(managed_snapshot_at(
+            10650805,
+            1_758_000_000,
+            1_758_003_600,
+            1.14885,
+        ));
+        assert_eq!(tick(&harness.state).await, TickOutcome::Held);
+        assert_eq!(loss_reviews(&engine), 1);
+        let held = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "held")
+            .expect("hold recorded");
+        assert_eq!(held.payload()["origin"], "autopilot_loss_review");
+
+        // Same level, next tick: not asked again, and the candle it was asked
+        // on is not reviewed again either.
+        let reviews_before = engine
+            .requests()
+            .iter()
+            .filter(|request| request.instructions.contains("ticket(s) 10650805"))
+            .count();
+        tick(&harness.state).await;
+        assert_eq!(loss_reviews(&engine), 1);
+        assert_eq!(
+            engine
+                .requests()
+                .iter()
+                .filter(|request| request.instructions.contains("ticket(s) 10650805"))
+                .count(),
+            reviews_before
+        );
+
+        // Deeper, past 0.75 R: asked once more.
+        link.retain_snapshot(managed_snapshot_at(
+            10650805,
+            1_758_000_000,
+            1_758_003_900,
+            1.14935,
+        ));
+        tick(&harness.state).await;
+        assert_eq!(loss_reviews(&engine), 2);
     }
 }

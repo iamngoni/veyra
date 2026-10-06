@@ -95,6 +95,7 @@ pub struct AppState {
     entry_watch: Arc<crate::trading::autopilot::EntryWatch>,
     judgements: Arc<crate::trading::autopilot::JudgementCache>,
     review_watch: Arc<crate::trading::autopilot::ReviewWatch>,
+    loss_watch: Arc<crate::trading::autopilot::LossWatch>,
     weekend_watch: Arc<crate::trading::autopilot::ReviewWatch>,
     decision_health: Arc<crate::trading::autopilot::DecisionHealth>,
     rotation: Arc<AtomicUsize>,
@@ -142,6 +143,7 @@ impl AppState {
             entry_watch: Arc::new(crate::trading::autopilot::EntryWatch::default()),
             judgements: Arc::new(crate::trading::autopilot::JudgementCache::default()),
             review_watch: Arc::new(crate::trading::autopilot::ReviewWatch::default()),
+            loss_watch: Arc::new(crate::trading::autopilot::LossWatch::default()),
             weekend_watch: Arc::new(crate::trading::autopilot::ReviewWatch::default()),
             decision_health: Arc::new(crate::trading::autopilot::DecisionHealth::default()),
             rotation: Arc::new(AtomicUsize::new(0)),
@@ -366,6 +368,12 @@ impl AppState {
     /// Candle each open position was last reviewed on.
     pub fn review_watch(&self) -> &Arc<crate::trading::autopilot::ReviewWatch> {
         &self.review_watch
+    }
+
+    /// Loss levels each open position has been reviewed at (see
+    /// [`crate::trading::autopilot::LossWatch`]).
+    pub fn loss_watch(&self) -> &Arc<crate::trading::autopilot::LossWatch> {
+        &self.loss_watch
     }
 
     /// Friday close each open position was last given a weekend verdict on;
