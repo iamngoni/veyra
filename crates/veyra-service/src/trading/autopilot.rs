@@ -3526,9 +3526,10 @@ fn review_instructions(
 }
 
 /// The loss-checkpoint framing: where the trade stands, what the stop would
-/// cost, and how to weigh its path. It replaces the candle review's "the stop
-/// defines the risk" rule, because here the question is whether to let the
-/// stop be reached at all.
+/// cost, and how to weigh its path. Holding is the default: replaying this
+/// bot's history (2026-10-06) showed 17 of 21 trades that reached -0.5 R still
+/// closed in profit, so cutting on the size of a loss alone would have cost
+/// more than every loss it saved. A close needs the entry's reason to be gone.
 fn loss_rules(path: &Trajectory) -> String {
     let money = |amount: Option<f64>, pct: Option<f64>| match (amount, pct) {
         (Some(amount), Some(pct)) => format!("{amount:.2} ({pct:.1}% of equity)"),
@@ -3536,7 +3537,7 @@ fn loss_rules(path: &Trajectory) -> String {
         _ => "unknown".to_owned(),
     };
     format!(
-        "This is a loss checkpoint, asked as soon as the position reached {r:.2} R against its          plan rather than at the next candle. It is {open} in the account currency after          {minutes} minutes; at its stop it would be about {stop}. Judge the trade's path, not only          the higher-timeframe bias: its best point since entry was {best:+.2} R, it is moving          {pace} over the last hour, and {against} of the last four 15-minute bars closed against          it (the `trajectory` and `intraday` blocks). A trade that went against its entry from          the start and never made meaningful progress is more likely wrong than early; one that          has broken the structure its entry relied on is wrong. Close now to keep the loss near          its current size when the path says the stop is likely to be reached. Hold only for          concrete evidence that this is a pullback inside a thesis that still stands, such as          price holding a level the entry relied on or the move against losing pace — not because          the bias still points your way or in hope of a reversal. Closing costs the spread;          reaching the stop costs the rest of the risk.",
+        "This is a loss checkpoint, asked as soon as the position reached {r:.2} R against its          plan rather than at the next candle. It is {open} in the account currency after          {minutes} minutes; at its stop it would be about {stop}. Its best point since entry was          {best:+.2} R, it is moving {pace} over the last hour, and {against} of the last four          15-minute bars closed against it (the `trajectory` and `intraday` blocks). Most trades          that dip this far recover: in this bot's own history most positions that reached          -0.5 R still closed in profit, so a loss of this size is not by itself a reason to          close, and cutting a trade that would have recovered turns a winner into a certain loss.          Hold by default. Close only when the evidence shows the entry's reason is gone: price          has broken and held beyond the structure the entry relied on, momentum has turned          decisively against it on the candles as well as the intraday bars, or the judgements          have flipped against the position. Do not close on the size of the loss, its speed, or          discomfort alone; the stop at the broker still caps the risk.",
         r = path.r_now,
         open = money(Some(path.open_result), path.open_result_pct),
         minutes = path.minutes_open,
