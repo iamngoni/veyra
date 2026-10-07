@@ -136,10 +136,15 @@ log after an update. The launcher itself remains under launchd `KeepAlive`,
 with `AbandonProcessGroup` so a terminal it started survives a restart of
 the watcher.
 
-The watcher does not restart a running terminal whose EA has gone quiet. The
-EA's log file is not a liveness signal (since build 1490 the terminal writes
-it to disk only occasionally), and a restart rule based on it looped. Veyra's
-own "Broker link stale" alert is the signal that the EA has stopped.
+The watcher also restarts a running terminal whose EA Veyra has not heard
+from: the service's `/account` reads stale for ten minutes in a row, the
+terminal has been up that long, and the EA's endpoint (`VEYRA_EA_URL` from
+`.env`) answers from this Mac, so an internet outage is waited out. It waits
+15 minutes between restarts, an hour after three that did not bring the link
+back, and does nothing when Veyra cannot be asked. This is what clears the
+EA after a network drop (2026-10-06: down 15:41–23:36 until restarted by
+hand). The EA's log file is not used as a signal: since build 1490 the
+terminal writes it to disk only occasionally.
 
 ## Final tunnel cutover
 

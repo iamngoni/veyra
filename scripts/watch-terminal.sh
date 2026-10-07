@@ -17,9 +17,19 @@
 # loaded, so a detached EA may still need attaching by hand; the terminal's
 # log says which.
 #
-# The watcher does not restart a running terminal whose EA has gone quiet:
-# the EA's log file is not a liveness signal (since build 1490 the terminal
-# writes it to disk only occasionally), and restarting on it looped.
+# A running terminal whose EA Veyra has not heard from is restarted too, which
+# is what clears the EA after a network drop or an update. The signal is
+# Veyra's own: the service's `/account` reports whether the EA's polls are
+# fresh (read through the console container, VEYRA_MT4_LINK_CHECK). The
+# terminal is restarted only when that answer says stale for
+# VEYRA_MT4_STALE_SECS in a row, the terminal has been up at least that long,
+# and the EA's endpoint (VEYRA_EA_URL, read from the repository's .env) is
+# reachable from this Mac, so an internet outage is waited out rather than
+# restarted through. After a restart it waits RESTART_GAP_SECS before another;
+# after three restarts without the link coming back, an hour. No answer from
+# Veyra at all (Docker down) never restarts anything. The EA's log file is not
+# used: since build 1490 the terminal writes it to disk only occasionally, and
+# a restart rule based on it looped.
 set -u
 
 APP_NAME="${VEYRA_MT4_APP_NAME:-MetaTrader 4}"
@@ -33,6 +43,13 @@ WINE_PREFIX="${MT4_WINEPREFIX:-$HOME/Library/Application Support/net.metaquotes.
 WINE_SUPPORT="${MT4_SUPPORT:-/Applications/MetaTrader 4.app/Contents/SharedSupport/wine}"
 MT4_DIR="$WINE_PREFIX/drive_c/Program Files (x86)/MetaTrader 4"
 STARTUP_FILE="$WINE_PREFIX/drive_c/veyra_startup.ini"
+STALE_SECS="${VEYRA_MT4_STALE_SECS:-600}"
+RESTART_GAP_SECS=900
+RESTART_BACKOFF_SECS=3600
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+LINK_CHECK="${VEYRA_MT4_LINK_CHECK:-docker exec veyra-console-1 wget -qO- -T 5 http://veyra:8080/account}"
+REPO_ENV="$(cd "$(dirname "$0")/.." && pwd)/.env"
+EA_URL="${VEYRA_EA_URL:-$(/usr/bin/sed -n 's/^VEYRA_EA_URL=//p' "$REPO_ENV" 2>/dev/null | /usr/bin/head -n 1)}"
 
 log() {
   printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
@@ -57,6 +74,34 @@ profile_has_ea() {
   return 1
 }
 
+# Prints `fresh` or `stale` from Veyra's view of the EA; nothing when Veyra
+# cannot be asked.
+link_state() {
+  local answer
+  answer="$($LINK_CHECK 2>/dev/null)" || return 0
+  case "$answer" in
+    *'"fresh":true'*) echo fresh ;;
+    *'"fresh":false'*) echo stale ;;
+  esac
+}
+
+# Whether the EA's endpoint answers from this Mac (any HTTP status counts).
+endpoint_reachable() {
+  [ -n "$EA_URL" ] || return 1
+  local code
+  code="$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$EA_URL" 2>/dev/null)"
+  [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+restart_terminal() {
+  /usr/bin/osascript -e "quit app \"${APP_NAME}\"" >/dev/null 2>&1
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -z "$(terminal_pid)" ] && return
+    /bin/sleep 2
+  done
+  /usr/bin/pkill -f -- "$PROCESS_PATTERN"
+}
+
 open_terminal() {
   if profile_has_ea; then
     log "opening ${APP_NAME}; its saved charts carry ${EA_NAME}"
@@ -70,12 +115,46 @@ open_terminal() {
     /portable '/config:C:\veyra_startup.ini' >/dev/null 2>&1 &
 }
 
+watched_pid=""
+watched_since=0
+stale_since=0
+last_restart=0
+failed_restarts=0
 while :; do
-  if [ -n "$(terminal_pid)" ]; then
-    /bin/sleep "$CHECK_SECS"
+  pid="$(terminal_pid)"
+  if [ -z "$pid" ]; then
+    log "MetaTrader terminal process is absent; reopening"
+    open_terminal
+    /bin/sleep "$START_GRACE_SECS"
     continue
   fi
-  log "MetaTrader terminal process is absent; reopening"
-  open_terminal
-  /bin/sleep "$START_GRACE_SECS"
+  now="$(/bin/date +%s)"
+  if [ "$pid" != "$watched_pid" ]; then
+    watched_pid="$pid"
+    watched_since="$now"
+    stale_since=0
+  fi
+  case "$(link_state)" in
+    fresh)
+      stale_since=0
+      failed_restarts=0
+      ;;
+    stale)
+      [ "$stale_since" -eq 0 ] && stale_since="$now"
+      gap="$RESTART_GAP_SECS"
+      [ "$failed_restarts" -ge 3 ] && gap="$RESTART_BACKOFF_SECS"
+      if [ $(( now - stale_since )) -ge "$STALE_SECS" ] \
+        && [ $(( now - watched_since )) -ge "$STALE_SECS" ] \
+        && [ $(( now - last_restart )) -ge "$gap" ]; then
+        if endpoint_reachable; then
+          failed_restarts=$(( failed_restarts + 1 ))
+          last_restart="$now"
+          log "Veyra has not heard the EA for $(( now - stale_since ))s while ${EA_URL} answers; restarting terminal ${pid} (attempt ${failed_restarts})"
+          restart_terminal
+          continue
+        fi
+      fi
+      ;;
+  esac
+  /bin/sleep "$CHECK_SECS"
 done
