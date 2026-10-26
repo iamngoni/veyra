@@ -86,6 +86,7 @@ const status: Status = {
     duplicateWindowSecs: 60,
     sessionUtc: null,
     maxRiskPercent: 12,
+    maxOpenRiskPercent: 15,
     maxDailyLossPercent: 10,
     maxPeakDrawdownPercent: 25,
     maxNetFactorLots: 0.01,
@@ -662,6 +663,7 @@ describe('RiskPanel', () => {
     expect(valueOf('Max open orders').textContent).toBe('1')
     expect(valueOf('Duplicate window').textContent).toBe('60s')
     expect(valueOf('Max risk').textContent).toBe('12% per trade')
+    expect(valueOf('Max open risk').textContent).toBe('15% across open stops')
     expect(valueOf('Loss brakes').textContent).toBe('Day 10% · peak 25%')
     expect(valueOf('Currency cap').textContent).toBe('0.01 lots')
     expect(valueOf('News blackout').textContent).toBe('30m')
@@ -679,6 +681,7 @@ describe('RiskPanel', () => {
         policy={{
           ...status.risk_policy,
           maxRiskPercent: 0,
+          maxOpenRiskPercent: 0,
           maxDailyLossPercent: 0,
           maxPeakDrawdownPercent: 0,
           maxNetFactorLots: 0,
@@ -688,7 +691,7 @@ describe('RiskPanel', () => {
         status={status}
       />,
     )
-    for (const label of ['Max risk', 'Loss brakes', 'Currency cap', 'News blackout', 'Stop floor']) {
+    for (const label of ['Max risk', 'Max open risk', 'Loss brakes', 'Currency cap', 'News blackout', 'Stop floor']) {
       expect(valueOf(label).textContent).toBe('Off')
     }
     rerender(<RiskPanel policy={{ ...status.risk_policy, maxDailyLossPercent: 0 }} status={status} />)
@@ -708,7 +711,7 @@ describe('RiskPanel', () => {
 
     rerender(<RiskPanel />)
     expect(screen.queryByText('Gate active')).toBeNull()
-    expect(container.querySelectorAll('.skeleton').length).toBe(17)
+    expect(container.querySelectorAll('.skeleton').length).toBe(18)
   })
 
   it('renders an empty allowlist, a session window, and disarmed switches', () => {

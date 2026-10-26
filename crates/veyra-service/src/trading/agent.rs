@@ -950,6 +950,7 @@ mod tests {
             open_lots: 0.0,
             open_symbols: Vec::new(),
             equity: Some(1_000.0),
+            open_stop_risk: Some(0.0),
             free_margin: Some(1_000.0),
             open_positions: Vec::new(),
             prices: Vec::new(),

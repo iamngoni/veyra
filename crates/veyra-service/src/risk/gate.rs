@@ -67,6 +67,11 @@ pub struct AccountFacts {
     pub symbol_specs: Vec<SymbolSpecPayload>,
     /// Account equity reported by the latest validated snapshot, when known.
     pub equity: Option<f64>,
+    /// What the account would lose, in account currency, if every open
+    /// position's stop were hit from its current price. `None` when any open
+    /// position has no stop or cannot be valued: the open-risk cap then
+    /// fails closed.
+    pub open_stop_risk: Option<f64>,
     /// Account deposit currency (upper case) from the latest validated
     /// snapshot, when the terminal reports it. Without a live contract an
     /// instrument can only be valued in USD, so a non-USD account then fails
@@ -118,6 +123,9 @@ pub enum RiskCode {
     MarketWindowClosed,
     /// The draft's stop risk exceeds the configured per-trade cap.
     RiskAboveLimit,
+    /// The open stops plus this one would risk more of the account than the
+    /// open-risk cap allows.
+    OpenRiskAboveLimit,
     /// A draft price is known but the risk cannot be valued (unknown pair).
     RiskUnverifiable,
     /// Equity is below the daily-loss breaker.
@@ -154,6 +162,7 @@ impl RiskCode {
             Self::SymbolAlreadyOpen => "symbol_already_open",
             Self::MarketWindowClosed => "market_window_closed",
             Self::RiskAboveLimit => "risk_above_limit",
+            Self::OpenRiskAboveLimit => "open_risk_above_limit",
             Self::RiskUnverifiable => "risk_unverifiable",
             Self::DailyLossLimitReached => "daily_loss_limit",
             Self::PeakDrawdownLimitReached => "peak_drawdown_limit",
@@ -180,6 +189,9 @@ impl RiskCode {
                 "the entry window is closed (rollover blackout or weekend guard)"
             }
             Self::RiskAboveLimit => "the stop would risk more than the per-trade cap allows",
+            Self::OpenRiskAboveLimit => {
+                "every open stop plus this one would risk more of the account than the open-risk cap allows"
+            }
             Self::RiskUnverifiable => {
                 "the draft price is known but the instrument cannot be valued"
             }
@@ -454,7 +466,8 @@ impl RiskGate {
         {
             return Err(RiskCode::ExposureAboveLimit);
         }
-        if policy.max_risk_percent() > 0.0 && draft.stop_loss().is_some() {
+        let caps_risk = policy.max_risk_percent() > 0.0 || policy.max_open_risk_percent() > 0.0;
+        if caps_risk && draft.stop_loss().is_some() {
             // Entry price, in order of preference: the draft's own (limit and
             // stop orders), a price the caller vouches for, then the live
             // quote on the side a market order would fill. Without any, the
@@ -493,8 +506,25 @@ impl RiskGate {
                     &account.prices,
                     spec,
                 ) {
-                    Some(risk) if risk > policy.max_risk_percent() + EXPOSURE_EPSILON => {
+                    Some(risk)
+                        if policy.max_risk_percent() > 0.0
+                            && risk > policy.max_risk_percent() + EXPOSURE_EPSILON =>
+                    {
                         return Err(RiskCode::RiskAboveLimit);
+                    }
+                    Some(risk) if policy.max_open_risk_percent() > 0.0 => {
+                        // Positions already open lose this much more if
+                        // their stops are hit; a book of correlated trades
+                        // can all be hit in the same hour.
+                        let Some(open) = account.open_stop_risk else {
+                            return Err(RiskCode::RiskUnverifiable);
+                        };
+                        let total = open / equity * 100.0 + risk;
+                        if equity <= 0.0
+                            || total > policy.max_open_risk_percent() + EXPOSURE_EPSILON
+                        {
+                            return Err(RiskCode::OpenRiskAboveLimit);
+                        }
                     }
                     Some(_) => {}
                     None => return Err(RiskCode::RiskUnverifiable),
@@ -632,6 +662,7 @@ mod tests {
             open_lots,
             open_symbols: Vec::new(),
             equity: Some(1_000.0),
+            open_stop_risk: Some(0.0),
             free_margin: Some(1_000.0),
             open_positions: Vec::new(),
             prices: Vec::new(),
@@ -804,6 +835,43 @@ mod tests {
                 "SP500m"
             );
         }
+    }
+
+    #[test]
+    fn the_open_risk_cap_counts_every_open_stop_with_the_new_one() {
+        let sp = Symbol::parse("SP500m").expect("symbol");
+        let gate = RiskGate::new(policy_with_symbols(policy(), vec![sp]).with_open_risk_cap(10.0));
+        let wednesday = UNIX_EPOCH + Duration::from_secs(1_767_787_200);
+        let mut facts = facts_test(0);
+        facts.symbol_specs = vec![venue_spec("SP500m", true)];
+        // The draft risks 1.00 of 1 000 equity (0.1%).
+        let draft = draft_with_stop("SP500m", 0.1, 99_991.0);
+        let with_open = |open: Option<f64>| AccountFacts {
+            open_stop_risk: open,
+            ..facts.clone()
+        };
+        assert!(matches!(
+            gate.preview(&draft, Some(with_open(Some(85.0))), wednesday),
+            RiskDecision::Approved(_)
+        ));
+        let over = expect_rejection(gate.preview(&draft, Some(with_open(Some(99.5))), wednesday));
+        assert_eq!(over.code(), RiskCode::OpenRiskAboveLimit);
+        assert_eq!(over.code().as_str(), "open_risk_above_limit");
+        assert!(over.code().detail().contains("open-risk cap"));
+        assert_eq!(
+            expect_rejection(gate.preview(&draft, Some(with_open(None)), wednesday)).code(),
+            RiskCode::RiskUnverifiable,
+            "an open book it cannot value fails closed"
+        );
+        // Off, the same book passes.
+        let off = RiskGate::new(policy_with_symbols(
+            policy(),
+            vec![Symbol::parse("SP500m").expect("symbol")],
+        ));
+        assert!(matches!(
+            off.preview(&draft, Some(with_open(None)), wednesday),
+            RiskDecision::Approved(_)
+        ));
     }
 
     #[test]
@@ -980,6 +1048,7 @@ mod tests {
             prices: Vec::new(),
             symbol_specs: Vec::new(),
             equity: Some(1_000.0),
+            open_stop_risk: Some(0.0),
             free_margin: Some(1_000.0),
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
@@ -1214,6 +1283,7 @@ mod tests {
             open_lots: 0.0,
             open_symbols: Vec::new(),
             equity: Some(1_000.0),
+            open_stop_risk: Some(0.0),
             free_margin: Some(1_000.0),
             open_positions: Vec::new(),
             prices: Vec::new(),

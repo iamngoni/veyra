@@ -3178,6 +3178,35 @@ async fn review_positions(
     loss: Option<&Trajectory>,
 ) -> TickOutcome {
     let judgements = judgement_for_symbol(session.judgements, series.symbol().as_str());
+    // A loss checkpoint whose judge now reads against the position closes it
+    // by rule instead of asking. In the replay of every checkpoint from
+    // 2026-10-08 to 10-22, none of the trades held through a flipped reading
+    // recovered, while holding the rest beat closing them.
+    if let Some(trajectory) = loss
+        && let Some(position) = positions.first()
+        && let Some(against) = judge_against(judgements, position.side)
+    {
+        let rationale = format!(
+            "Closed by rule at {:.2} R: the trend reading now favours {against}, against the position.",
+            trajectory.r_now
+        );
+        let context = DecisionContext {
+            rationale: Some(&rationale),
+            judgements,
+            forecast: None,
+            tool_names: None,
+        };
+        return close_reviewed(
+            state,
+            settings,
+            series,
+            positions,
+            position.ticket,
+            origin,
+            context,
+        )
+        .await;
+    }
     let instructions = review_instructions(series, positions, weekend, state.jev().is_some(), loss);
     let input = review_input(state, series, positions, judgements, weekend, loss);
     let outcome = match agent::run(session, &instructions, &input).await {
@@ -3252,96 +3281,122 @@ async fn review_positions(
             TickOutcome::Held
         }
         ReviewDecision::Close(ticket) => {
-            let Some(position) = positions.iter().find(|position| position.ticket == ticket) else {
-                record_position_context(
-                    state,
-                    "close_rejected",
-                    origin,
-                    series,
-                    Some(ticket),
-                    Some("unknown_ticket"),
-                    None,
-                    context,
-                )
-                .await;
-                return TickOutcome::Rejected {
-                    code: "unknown_ticket",
-                };
+            close_reviewed(state, settings, series, positions, ticket, origin, context).await
+        }
+    }
+}
+
+/// The side the judge now favours when it reads against `side` (`short`
+/// for a long, `long` for a short); `None` when it agrees, is flat, or is
+/// absent.
+fn judge_against(judgements: Option<&Value>, side: ManagedSide) -> Option<&'static str> {
+    let choice = judgements?.get("direction")?.get("choice")?.as_str()?;
+    match (side, choice) {
+        (ManagedSide::Buy, "short") => Some("short"),
+        (ManagedSide::Sell, "long") => Some("long"),
+        _ => None,
+    }
+}
+
+/// Closes a reviewed ticket through the shared staged close, after the same
+/// minimum-hold and age checks every review close passes.
+async fn close_reviewed(
+    state: &AppState,
+    settings: &AutopilotSettings,
+    series: &CandleSeries,
+    positions: &[ManagedPosition],
+    ticket: i64,
+    origin: &'static str,
+    context: DecisionContext<'_>,
+) -> TickOutcome {
+    let Some(position) = positions.iter().find(|position| position.ticket == ticket) else {
+        record_position_context(
+            state,
+            "close_rejected",
+            origin,
+            series,
+            Some(ticket),
+            Some("unknown_ticket"),
+            None,
+            context,
+        )
+        .await;
+        return TickOutcome::Rejected {
+            code: "unknown_ticket",
+        };
+    };
+    let snapshot_server_time = state
+        .broker()
+        .and_then(|broker| broker.link().last_account())
+        .map(|snapshot| snapshot.server_time)
+        .unwrap_or(0);
+    match position_age_secs(snapshot_server_time, position.opened_at) {
+        Some(age) if age >= settings.min_hold().as_secs() => {}
+        Some(_) => {
+            record_position_context(
+                state,
+                "close_rejected",
+                origin,
+                series,
+                Some(ticket),
+                Some("position_too_young"),
+                None,
+                context,
+            )
+            .await;
+            return TickOutcome::Rejected {
+                code: "position_too_young",
             };
-            let snapshot_server_time = state
-                .broker()
-                .and_then(|broker| broker.link().last_account())
-                .map(|snapshot| snapshot.server_time)
-                .unwrap_or(0);
-            match position_age_secs(snapshot_server_time, position.opened_at) {
-                Some(age) if age >= settings.min_hold().as_secs() => {}
-                Some(_) => {
-                    record_position_context(
-                        state,
-                        "close_rejected",
-                        origin,
-                        series,
-                        Some(ticket),
-                        Some("position_too_young"),
-                        None,
-                        context,
-                    )
-                    .await;
-                    return TickOutcome::Rejected {
-                        code: "position_too_young",
-                    };
-                }
-                None => {
-                    record_position_context(
-                        state,
-                        "close_rejected",
-                        origin,
-                        series,
-                        Some(ticket),
-                        Some("position_age_unknown"),
-                        None,
-                        context,
-                    )
-                    .await;
-                    return TickOutcome::Rejected {
-                        code: "position_age_unknown",
-                    };
-                }
+        }
+        None => {
+            record_position_context(
+                state,
+                "close_rejected",
+                origin,
+                series,
+                Some(ticket),
+                Some("position_age_unknown"),
+                None,
+                context,
+            )
+            .await;
+            return TickOutcome::Rejected {
+                code: "position_age_unknown",
+            };
+        }
+    }
+    match queue_staged_close(state, ticket).await {
+        StagedClose::Queued { command, ticket } => {
+            let command_id = command.to_string();
+            record_position_context(
+                state,
+                "close_queued",
+                origin,
+                series,
+                Some(ticket),
+                None,
+                Some(&command_id),
+                context,
+            )
+            .await;
+            TickOutcome::CloseQueued {
+                command: command.to_string(),
             }
-            match queue_staged_close(state, ticket).await {
-                StagedClose::Queued { command, ticket } => {
-                    let command_id = command.to_string();
-                    record_position_context(
-                        state,
-                        "close_queued",
-                        origin,
-                        series,
-                        Some(ticket),
-                        None,
-                        Some(&command_id),
-                        context,
-                    )
-                    .await;
-                    TickOutcome::CloseQueued {
-                        command: command.to_string(),
-                    }
-                }
-                failed => {
-                    let (label, reason, outcome) = close_refusal(&failed);
-                    record_position_context(
-                        state,
-                        label,
-                        origin,
-                        series,
-                        Some(ticket),
-                        Some(&reason),
-                        None,
-                        context,
-                    )
-                    .await;
-                    outcome
-                }
-            }
+        }
+        failed => {
+            let (label, reason, outcome) = close_refusal(&failed);
+            record_position_context(
+                state,
+                label,
+                origin,
+                series,
+                Some(ticket),
+                Some(&reason),
+                None,
+                context,
+            )
+            .await;
+            outcome
         }
     }
 }
@@ -4354,7 +4409,7 @@ fn judge_note(judge: bool, record: bool) -> &'static str {
             " The trend readings come from a second model that sees only a one-line summary of each window (first and last close, high, low, change, and the last three closes): `direction` says which way the price has already moved, and its probabilities grow with the size of that move. They describe the move so far; they are not odds that a trade will win."
         }
         (true, true) => {
-            " The trend readings come from a second model that sees only a one-line summary of each window (first and last close, high, low, change, and the last three closes): `direction` says which way the price has already moved, and its probabilities grow with the size of that move. They describe the move so far; they are not odds that a trade will win. `judge_record` shows how the trades opened on each band of readings under the current timeframe have actually done: how many won, and their average result in multiples of the risk taken (`average_r`; below zero loses money). Weigh a reading by that record, not by its size."
+            " The trend readings come from a second model that sees only a one-line summary of each window (first and last close, high, low, change, and the last three closes): `direction` says which way the price has already moved, and its probabilities grow with the size of that move. They describe the move so far; they are not odds that a trade will win. `judge_record` shows how the trades opened on each band of readings under the current timeframe have actually done: how many won, and their average result in multiples of the risk taken (`average_r`; below zero loses money). A band whose `average_r` is below zero means readings in it carry no edge: they are no reason to open, and no reason to skip either. Decide such instruments on the candles themselves: structure, where the stop and target sit, and the cost of the spread."
         }
     }
 }
@@ -4370,7 +4425,7 @@ fn forecast_note(forecasts: Option<&ForecastInputs<'_>>) -> String {
         " Each instrument's `forecast` comes from a third model that reads only that instrument's candles and estimates the next {horizon} candles: the highest high (`high`), the lowest low (`low`) and the last close (`close`), each as a `median` with an 80% interval from `p10` to `p90`. They are estimates, not facts. `{FORECAST_UNAVAILABLE}` means no forecast was made this time and says nothing about the instrument."
     );
     if forecasts.record.is_some() {
-        note.push_str(" `forecast_record` scores earlier forecasts on this timeframe against what price then did: for sound forecasts about 10% of outcomes land below `p10`, 80% inside and 10% above `p90`, and `close_direction_right` is how often the median close pointed the way price closed (0.5 is a coin flip). Rely on the ranges only as far as that record supports them.");
+        note.push_str(" `forecast_record` scores earlier forecasts on this timeframe against what price then did: for sound forecasts about 10% of outcomes land below `p10`, 80% inside and 10% above `p90`, and `close_direction_right` is how often the median close pointed the way price closed (0.5 is a coin flip). Rely on the ranges only as far as that record supports them; when `close_direction_right` is near 0.5 the median close says nothing about direction, which is no reason to skip, but the ranges still say how far price tends to travel.");
     } else {
         note.push_str(
             " None has been scored against an outcome yet, so their accuracy is unknown.",
@@ -8063,6 +8118,7 @@ mod tests {
             prices: vec![(Symbol::parse("EURUSD").expect("symbol"), 1.9)],
             symbol_specs: Vec::new(),
             equity: None,
+            open_stop_risk: Some(0.0),
             free_margin: None,
             day_drawdown_percent: None,
             peak_drawdown_percent: None,
@@ -8627,7 +8683,7 @@ mod tests {
         assert!(
             request
                 .instructions
-                .contains("Weigh a reading by that record, not by its size."),
+                .contains("no reason to open, and no reason to skip either"),
             "the instructions say what the record is for"
         );
     }
@@ -9320,6 +9376,88 @@ mod tests {
             .find(|event| event.payload()["outcome"] == "close_queued")
             .expect("close recorded");
         assert_eq!(close.payload()["origin"], "autopilot_loss_review");
+    }
+
+    #[actix_web::test]
+    async fn a_loss_checkpoint_closes_by_rule_when_the_judge_reads_against_the_position() {
+        // The model would hold; the judge reads long against this short.
+        let engine = StubEngine::answering(json!({"action": "hold", "rationale": "Hold."}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            Some(StubJudge::responding(judgements_response())),
+            true,
+            true,
+        );
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot_at(
+                10650805,
+                1_758_000_000,
+                1_758_003_600,
+                1.14885,
+            ));
+
+        let outcome = tick(&harness.state).await;
+        assert!(
+            matches!(outcome, TickOutcome::CloseQueued { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            engine
+                .requests()
+                .iter()
+                .all(|request| !request.instructions.contains("loss checkpoint")),
+            "the rule decides without asking the model"
+        );
+        let close = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "close_queued")
+            .expect("close recorded");
+        assert_eq!(close.payload()["origin"], "autopilot_loss_review");
+        let rationale = close.payload()["rationale"]
+            .as_str()
+            .expect("rationale")
+            .to_owned();
+        assert!(
+            rationale.starts_with("Closed by rule at -0.6") && rationale.contains("favours long"),
+            "{rationale}"
+        );
+    }
+
+    #[test]
+    fn the_judge_reads_against_a_position_only_on_the_opposite_side() {
+        let reading = |choice: &str| json!({"direction": {"choice": choice}});
+        assert_eq!(
+            judge_against(Some(&reading("short")), ManagedSide::Buy),
+            Some("short")
+        );
+        assert_eq!(
+            judge_against(Some(&reading("long")), ManagedSide::Sell),
+            Some("long")
+        );
+        assert_eq!(
+            judge_against(Some(&reading("long")), ManagedSide::Buy),
+            None
+        );
+        assert_eq!(
+            judge_against(Some(&reading("flat")), ManagedSide::Sell),
+            None
+        );
+        assert_eq!(judge_against(Some(&json!({})), ManagedSide::Buy), None);
+        assert_eq!(judge_against(None, ManagedSide::Buy), None);
     }
 
     #[actix_web::test]

@@ -136,6 +136,8 @@ export type RiskPolicy = {
   sessionUtc: string | null
   /** Per-trade risk cap as a percentage of equity (0 disables). */
   maxRiskPercent: number
+  /** Cap on what every open stop plus a new one could lose, percent of equity (0 disables). */
+  maxOpenRiskPercent?: number
   /** Daily-loss breaker, percent below the day's opening equity. */
   maxDailyLossPercent: number
   /** Peak-drawdown breaker, percent below the lifetime peak. */
@@ -481,6 +483,7 @@ export type RiskPolicyPatch = {
   duplicateWindowSecs?: number
   sessionUtc?: string
   maxRiskPercent?: number
+  maxOpenRiskPercent?: number
   maxDailyLossPercent?: number
   maxPeakDrawdownPercent?: number
   maxNetFactorLots?: number

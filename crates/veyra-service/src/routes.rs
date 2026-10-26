@@ -533,6 +533,49 @@ pub(crate) async fn account_facts_for_draft(
     Some(facts)
 }
 
+/// What the account loses if every open position's stop is hit from its
+/// current price, valued with each instrument's venue contract (served from
+/// the market cache). `None` when a position has no stop or its contract is
+/// unavailable, so the open-risk cap fails closed instead of guessing.
+async fn open_stop_risk(
+    state: &AppState,
+    positions: &[crate::broker::PositionPayload],
+) -> Option<f64> {
+    if positions.is_empty() {
+        return Some(0.0);
+    }
+    let market = state.market()?;
+    let mut total = 0.0;
+    for position in positions {
+        let symbol = crate::broker::Symbol::parse(&position.symbol).ok()?;
+        let side = match position.kind {
+            crate::broker::PositionKind::Buy
+            | crate::broker::PositionKind::BuyLimit
+            | crate::broker::PositionKind::BuyStop
+            | crate::broker::PositionKind::BuyStopLimit => crate::trading::intent::Side::Buy,
+            crate::broker::PositionKind::Sell
+            | crate::broker::PositionKind::SellLimit
+            | crate::broker::PositionKind::SellStop
+            | crate::broker::PositionKind::SellStopLimit => crate::trading::intent::Side::Sell,
+        };
+        // A pending order has not filled: it is valued from its own price.
+        let current = if position.current > 0.0 {
+            position.current
+        } else {
+            position.price
+        };
+        let spec = market.feed().symbol_spec(&symbol).await.ok()?;
+        total += crate::risk::valuation::stop_loss_money(
+            &spec,
+            side,
+            position.lots,
+            current,
+            position.stop_loss,
+        )?;
+    }
+    Some(total)
+}
+
 /// Assembles gate facts from a fresh link report. Any missing input fails
 /// closed, so a stale heartbeat, a broken link, or a snapshot that has not
 /// landed yet cannot widen behavior. The open-symbol list comes from the
@@ -619,6 +662,11 @@ pub(crate) async fn account_facts(state: &AppState) -> Option<AccountFacts> {
     let account_currency = account
         .as_ref()
         .and_then(|account| account.account_currency());
+    let open_stop_risk = match runtime.link().last_account() {
+        Some(account) => open_stop_risk(state, &account.positions).await,
+        None if open_orders == 0 => Some(0.0),
+        None => None,
+    };
     Some(AccountFacts {
         news: Default::default(),
         session: Default::default(),
@@ -630,6 +678,7 @@ pub(crate) async fn account_facts(state: &AppState) -> Option<AccountFacts> {
         prices,
         symbol_specs: Vec::new(),
         equity,
+        open_stop_risk,
         free_margin,
         day_drawdown_percent,
         peak_drawdown_percent,

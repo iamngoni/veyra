@@ -227,6 +227,37 @@ pub fn risk_percent_with_spec(
     Some(loss / equity * 100.0)
 }
 
+/// What an open position loses, in account currency, if its stop is hit from
+/// `current`, priced with the venue's tick economics. A stop already past
+/// `current` on the profitable side has nothing left to lose and counts as
+/// zero. `None` without a stop or with unusable contract numbers.
+pub fn stop_loss_money(
+    spec: &SymbolSpecPayload,
+    side: Side,
+    lots: f64,
+    current: f64,
+    stop: f64,
+) -> Option<f64> {
+    let usable = spec.tick_size.is_finite()
+        && spec.tick_size > 0.0
+        && spec.tick_value.is_finite()
+        && spec.tick_value > 0.0
+        && lots.is_finite()
+        && lots > 0.0
+        && current.is_finite()
+        && current > 0.0
+        && stop.is_finite()
+        && stop > 0.0;
+    if !usable {
+        return None;
+    }
+    let adverse = match side {
+        Side::Buy => current - stop,
+        Side::Sell => stop - current,
+    };
+    Some(adverse.max(0.0) / spec.tick_size * spec.tick_value * lots)
+}
+
 /// Codes the second half of a six-letter instrument may be for the instrument
 /// to read as two exposures: fiat currencies (the majors and the exotics
 /// brokers list), the metals, and oil. The first half may be any three
@@ -573,6 +604,34 @@ mod tests {
         );
         assert!(!supports_static_valuation(&symbol("BTCUSD")));
         assert!(supports_static_valuation(&symbol("EURUSD")));
+    }
+
+    #[test]
+    fn an_open_stop_is_valued_from_the_current_price() {
+        let spec = venue_spec("NZDCHF", 0.00001, 1.0);
+        // 0.01 lot long at 0.47007 now 0.46900, stop 0.46730: 17 pips left.
+        let left = stop_loss_money(&spec, Side::Buy, 0.01, 0.469, 0.4673).expect("valued");
+        assert!((left - 1.7).abs() < 1e-9, "{left}");
+        let short = stop_loss_money(&spec, Side::Sell, 0.01, 0.469, 0.4707).expect("valued");
+        assert!((short - 1.7).abs() < 1e-9, "{short}");
+        // A stop locked past the current price has nothing left to lose.
+        assert_eq!(
+            stop_loss_money(&spec, Side::Buy, 0.01, 0.469, 0.4695),
+            Some(0.0)
+        );
+        assert_eq!(
+            stop_loss_money(&spec, Side::Buy, 0.01, 0.469, 0.0),
+            None,
+            "no stop"
+        );
+        let broken = SymbolSpecPayload {
+            tick_size: 0.0,
+            ..spec
+        };
+        assert_eq!(
+            stop_loss_money(&broken, Side::Buy, 0.01, 0.469, 0.4673),
+            None
+        );
     }
 
     fn position(name: &str, side: Side, lots: f64) -> PositionFact {

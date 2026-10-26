@@ -38,6 +38,10 @@ const MAX_DUPLICATE_WINDOW_SECS: u64 = 86_400;
 const MAX_SESSION_HOUR: u8 = 23;
 /// Default per-trade risk cap as a percentage of equity (0 disables).
 const DEFAULT_MAX_RISK_PERCENT: f64 = 12.0;
+/// Default cap on what every open stop plus the new one could lose together,
+/// as a percentage of equity (0 disables). On 2026-10-22 seven stops on one
+/// risk-on theme put about 30% of the account at stake at once.
+const DEFAULT_MAX_OPEN_RISK_PERCENT: f64 = 15.0;
 /// Default daily-loss breaker as a percentage below the UTC day's opening
 /// equity (0 disables).
 const DEFAULT_MAX_DAILY_LOSS_PERCENT: f64 = 10.0;
@@ -128,6 +132,9 @@ pub struct RiskPolicyPatch {
     pub max_peak_drawdown_percent: Option<f64>,
     /// Per-currency (or per-asset) net exposure cap in lots (0 disables).
     pub max_net_factor_lots: Option<f64>,
+    /// Cap on the combined loss at every open stop plus the draft's, percent
+    /// of equity (0 disables).
+    pub max_open_risk_percent: Option<f64>,
     /// News blackout either side of a high-impact event, in minutes
     /// (0 disables the check).
     pub calendar_blackout_minutes: Option<u64>,
@@ -389,6 +396,7 @@ pub struct RiskPolicy {
     max_daily_loss_percent: f64,
     max_peak_drawdown_percent: f64,
     max_net_factor_lots: f64,
+    max_open_risk_percent: f64,
     calendar_blackout_minutes: u64,
     min_stop_atr_fraction: f64,
     allow_trading_without_jev: bool,
@@ -424,6 +432,7 @@ impl RiskPolicy {
             max_daily_loss_percent: 0.0,
             max_peak_drawdown_percent: 0.0,
             max_net_factor_lots: 0.0,
+            max_open_risk_percent: 0.0,
             calendar_blackout_minutes: 0,
             min_stop_atr_fraction: 0.0,
             // Degraded inputs stop trading unless the owner says otherwise.
@@ -488,6 +497,13 @@ impl RiskPolicy {
     /// for it to apply.
     pub fn with_calendar_blackout(mut self, minutes: u64) -> Self {
         self.calendar_blackout_minutes = minutes;
+        self
+    }
+
+    /// Sets the cap on the combined loss at every open stop plus a new
+    /// entry's, as a percentage of equity. Zero disables the check.
+    pub fn with_open_risk_cap(mut self, percent: f64) -> Self {
+        self.max_open_risk_percent = percent;
         self
     }
 
@@ -643,6 +659,11 @@ impl RiskPolicy {
             }
         };
 
+        let max_open_risk_percent = percent(
+            &mut source,
+            "VEYRA_RISK_MAX_OPEN_RISK_PERCENT",
+            DEFAULT_MAX_OPEN_RISK_PERCENT,
+        )?;
         let calendar_blackout_minutes =
             match trimmed(&mut source, "VEYRA_RISK_CALENDAR_BLACKOUT_MINUTES") {
                 None => DEFAULT_CALENDAR_BLACKOUT_MINUTES,
@@ -739,6 +760,7 @@ impl RiskPolicy {
             max_net_factor_lots,
         )
         .with_calendar_blackout(calendar_blackout_minutes)
+        .with_open_risk_cap(max_open_risk_percent)
         .with_min_stop_atr_fraction(min_stop_atr_fraction)
         .with_trading_without_jev(allow_trading_without_jev)
         .with_weekend_positions(weekend_positions)
@@ -851,6 +873,10 @@ impl RiskPolicy {
                 });
             }
         };
+        let max_open_risk_percent = match patch.max_open_risk_percent {
+            None => self.max_open_risk_percent,
+            Some(value) => percent_value("maxOpenRiskPercent", value)?,
+        };
         let calendar_blackout_minutes = match patch.calendar_blackout_minutes {
             None => self.calendar_blackout_minutes,
             Some(minutes) if minutes <= MAX_CALENDAR_BLACKOUT_MINUTES => minutes,
@@ -923,6 +949,7 @@ impl RiskPolicy {
             max_net_factor_lots,
         )
         .with_calendar_blackout(calendar_blackout_minutes)
+        .with_open_risk_cap(max_open_risk_percent)
         .with_min_stop_atr_fraction(min_stop_atr_fraction)
         .with_trading_without_jev(allow_trading_without_jev)
         .with_weekend_positions(weekend_positions)
@@ -1023,6 +1050,7 @@ impl RiskPolicy {
             max_daily_loss_percent: Some(self.max_daily_loss_percent),
             max_peak_drawdown_percent: Some(self.max_peak_drawdown_percent),
             max_net_factor_lots: Some(self.max_net_factor_lots),
+            max_open_risk_percent: Some(self.max_open_risk_percent),
             calendar_blackout_minutes: Some(self.calendar_blackout_minutes),
             min_stop_atr_fraction: Some(self.min_stop_atr_fraction),
             allow_trading_without_jev: Some(self.allow_trading_without_jev),
@@ -1087,6 +1115,12 @@ impl RiskPolicy {
             .any(|allowed| allowed.as_str().eq_ignore_ascii_case(symbol))
     }
 
+    /// Cap on the combined loss at every open stop plus a new entry's, as a
+    /// percentage of equity; zero disables.
+    pub fn max_open_risk_percent(&self) -> f64 {
+        self.max_open_risk_percent
+    }
+
     /// News blackout either side of a high-impact event, in minutes; zero
     /// disables the check.
     pub fn calendar_blackout_minutes(&self) -> u64 {
@@ -1132,6 +1166,7 @@ impl RiskPolicy {
             "maxDailyLossPercent": self.max_daily_loss_percent,
             "maxPeakDrawdownPercent": self.max_peak_drawdown_percent,
             "maxNetFactorLots": self.max_net_factor_lots,
+            "maxOpenRiskPercent": self.max_open_risk_percent,
             "calendarBlackoutMinutes": self.calendar_blackout_minutes,
             "minStopAtrFraction": self.min_stop_atr_fraction,
             "allowTradingWithoutJev": self.allow_trading_without_jev,
@@ -1170,6 +1205,7 @@ impl Default for RiskPolicy {
             DEFAULT_MAX_NET_FACTOR_LOTS,
         )
         .with_calendar_blackout(DEFAULT_CALENDAR_BLACKOUT_MINUTES)
+        .with_open_risk_cap(DEFAULT_MAX_OPEN_RISK_PERCENT)
         .with_min_stop_atr_fraction(DEFAULT_MIN_STOP_ATR_FRACTION)
     }
 }
@@ -1730,6 +1766,47 @@ mod tests {
             let error = base.apply_patch(&patch).expect_err(field);
             assert_eq!(error.name, field);
         }
+    }
+
+    #[test]
+    fn the_open_risk_cap_defaults_on_and_is_configurable() {
+        let default = RiskPolicy::from_source(source(&[])).expect("defaults");
+        assert_eq!(
+            default.max_open_risk_percent(),
+            DEFAULT_MAX_OPEN_RISK_PERCENT
+        );
+        assert_eq!(default.summary()["maxOpenRiskPercent"], 15.0);
+        assert_eq!(
+            default.snapshot_patch().max_open_risk_percent,
+            Some(DEFAULT_MAX_OPEN_RISK_PERCENT)
+        );
+
+        let set = RiskPolicy::from_source(source(&[("VEYRA_RISK_MAX_OPEN_RISK_PERCENT", "8")]))
+            .expect("valid");
+        assert_eq!(set.max_open_risk_percent(), 8.0);
+        let error = RiskPolicy::from_source(source(&[("VEYRA_RISK_MAX_OPEN_RISK_PERCENT", "101")]))
+            .expect_err("out of range");
+        assert_eq!(error.name, "VEYRA_RISK_MAX_OPEN_RISK_PERCENT");
+
+        let patched = set
+            .apply_patch(&RiskPolicyPatch {
+                max_open_risk_percent: Some(0.0),
+                ..RiskPolicyPatch::default()
+            })
+            .expect("patch");
+        assert_eq!(patched.max_open_risk_percent(), 0.0, "zero turns it off");
+        assert_eq!(
+            patched.max_risk_percent(),
+            set.max_risk_percent(),
+            "others survive"
+        );
+        let error = set
+            .apply_patch(&RiskPolicyPatch {
+                max_open_risk_percent: Some(-1.0),
+                ..RiskPolicyPatch::default()
+            })
+            .expect_err("negative");
+        assert_eq!(error.name, "maxOpenRiskPercent");
     }
 
     #[test]

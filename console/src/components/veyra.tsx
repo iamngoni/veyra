@@ -736,6 +736,7 @@ type PolicyDraft = {
   duplicateWindowSecs: string
   sessionUtc: string
   maxRiskPercent: string
+  maxOpenRiskPercent: string
   maxDailyLossPercent: string
   maxPeakDrawdownPercent: string
   maxNetFactorLots: string
@@ -750,6 +751,7 @@ type NumericDraftKey =
   | 'maxOpenOrders'
   | 'duplicateWindowSecs'
   | 'maxRiskPercent'
+  | 'maxOpenRiskPercent'
   | 'maxDailyLossPercent'
   | 'maxPeakDrawdownPercent'
   | 'maxNetFactorLots'
@@ -787,6 +789,12 @@ const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer
     label: 'Max risk (% / trade)',
     integer: false,
     help: 'Largest share of equity one trade may put at risk, in percent; 0 turns the cap off.',
+  },
+  {
+    key: 'maxOpenRiskPercent',
+    label: 'Max open risk (%)',
+    integer: false,
+    help: 'Refuses a new trade when it and every open stop together could lose more than this share of equity; 0 turns the cap off.',
   },
   {
     key: 'maxDailyLossPercent',
@@ -854,6 +862,7 @@ function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
     duplicateWindowSecs: String(policy.duplicateWindowSecs),
     sessionUtc: policy.sessionUtc ?? '',
     maxRiskPercent: String(policy.maxRiskPercent),
+    maxOpenRiskPercent: String(policy.maxOpenRiskPercent ?? 0),
     maxDailyLossPercent: String(policy.maxDailyLossPercent),
     maxPeakDrawdownPercent: String(policy.maxPeakDrawdownPercent),
     maxNetFactorLots: String(policy.maxNetFactorLots),
@@ -1138,6 +1147,12 @@ export function RiskPanel({
         <Field
           label="Max risk"
           value={view((current) => offOr(current.maxRiskPercent > 0, `${current.maxRiskPercent}% per trade`))}
+        />
+        <Field
+          label="Max open risk"
+          value={view((current) =>
+            offOr((current.maxOpenRiskPercent ?? 0) > 0, `${current.maxOpenRiskPercent}% across open stops`),
+          )}
         />
         <Field
           label="Loss brakes"

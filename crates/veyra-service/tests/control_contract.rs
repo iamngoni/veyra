@@ -344,6 +344,7 @@ async fn execution_revalidates_the_latest_book_after_an_earlier_approval() {
         prices: Vec::new(),
         symbol_specs: Vec::new(),
         equity: Some(20.57),
+        open_stop_risk: Some(0.0),
         free_margin: Some(20.57),
         day_drawdown_percent: Some(0.0),
         peak_drawdown_percent: Some(0.0),
