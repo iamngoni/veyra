@@ -94,7 +94,7 @@ describe('NotificationsPanel', () => {
     for (const label of ['Breaker tripped', 'Trading halted', 'Service down', 'Trade opened', 'Daily summary']) {
       expect(screen.getByRole('switch', { name: label }).getAttribute('aria-checked')).toBe('true')
     }
-    expect(help('Breaker tripped')).toBe('A daily-loss or peak-drawdown breaker started blocking new entries.')
+    expect(help('Breaker tripped')).toBe('The daily-loss breaker started blocking new entries, or the peak-drawdown breaker started shrinking them to a quarter of the usual risk.')
     expect(help('Daily summary')).toMatch(/Your local time; 18:00 UTC\.$/)
 
     const rows = [...document.querySelectorAll('.notify-channel-row')].map((row) => row.textContent)

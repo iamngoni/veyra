@@ -24,6 +24,10 @@ use crate::trading::intent::{TradeIntent, TradeIntentDraft};
 const APPROVAL_HISTORY: usize = 128;
 /// Slack allowed when comparing summed lot volumes.
 const EXPOSURE_EPSILON: f64 = 1e-9;
+/// Share of the per-trade and open-risk caps a new stop may use while equity
+/// is below the peak-drawdown breaker. Entries continue at reduced size
+/// rather than stopping, because with nothing open equity cannot recover.
+pub const DRAWDOWN_RISK_FRACTION: f64 = 0.25;
 
 /// Scheduled high-impact news for the draft's instrument, as the caller found
 /// it in the economic calendar.
@@ -130,7 +134,9 @@ pub enum RiskCode {
     RiskUnverifiable,
     /// Equity is below the daily-loss breaker.
     DailyLossLimitReached,
-    /// Equity is below the peak-drawdown breaker.
+    /// Equity is below the peak-drawdown breaker and the draft has no stop,
+    /// no per-trade cap applies, or its stop risks more than the reduced caps
+    /// allow (see [`DRAWDOWN_RISK_FRACTION`]).
     PeakDrawdownLimitReached,
     /// The net exposure to one currency or asset would exceed the factor cap.
     FactorExposureAboveLimit,
@@ -196,7 +202,9 @@ impl RiskCode {
                 "the draft price is known but the instrument cannot be valued"
             }
             Self::DailyLossLimitReached => "equity is below the daily-loss breaker",
-            Self::PeakDrawdownLimitReached => "equity is below the peak-drawdown breaker",
+            Self::PeakDrawdownLimitReached => {
+                "equity is below the peak-drawdown breaker, where a stop may risk only a quarter of the usual caps"
+            }
             Self::FactorExposureAboveLimit => {
                 "net exposure to one currency or asset would exceed the factor cap"
             }
@@ -439,13 +447,32 @@ impl RiskGate {
         {
             return Err(RiskCode::DailyLossLimitReached);
         }
-        if policy.max_peak_drawdown_percent() > 0.0
+        // Below the peak-drawdown breaker every entry must carry a stop the
+        // gate can value against a reduced per-trade cap; the risk caps are
+        // scaled down below instead of entries stopping outright.
+        let in_drawdown = policy.max_peak_drawdown_percent() > 0.0
             && account
                 .peak_drawdown_percent
-                .is_some_and(|value| value >= policy.max_peak_drawdown_percent())
+                .is_some_and(|value| value >= policy.max_peak_drawdown_percent());
+        if in_drawdown
+            && (policy.max_risk_percent() <= 0.0
+                || draft.stop_loss().is_none()
+                || account.equity.is_none())
         {
             return Err(RiskCode::PeakDrawdownLimitReached);
         }
+        let scale = if in_drawdown {
+            DRAWDOWN_RISK_FRACTION
+        } else {
+            1.0
+        };
+        let max_risk = policy.max_risk_percent() * scale;
+        let max_open_risk = policy.max_open_risk_percent() * scale;
+        let over_cap = if in_drawdown {
+            RiskCode::PeakDrawdownLimitReached
+        } else {
+            RiskCode::RiskAboveLimit
+        };
         if account
             .open_symbols
             .iter()
@@ -466,7 +493,7 @@ impl RiskGate {
         {
             return Err(RiskCode::ExposureAboveLimit);
         }
-        let caps_risk = policy.max_risk_percent() > 0.0 || policy.max_open_risk_percent() > 0.0;
+        let caps_risk = max_risk > 0.0 || max_open_risk > 0.0;
         if caps_risk && draft.stop_loss().is_some() {
             // Entry price, in order of preference: the draft's own (limit and
             // stop orders), a price the caller vouches for, then the live
@@ -506,13 +533,10 @@ impl RiskGate {
                     &account.prices,
                     spec,
                 ) {
-                    Some(risk)
-                        if policy.max_risk_percent() > 0.0
-                            && risk > policy.max_risk_percent() + EXPOSURE_EPSILON =>
-                    {
-                        return Err(RiskCode::RiskAboveLimit);
+                    Some(risk) if max_risk > 0.0 && risk > max_risk + EXPOSURE_EPSILON => {
+                        return Err(over_cap);
                     }
-                    Some(risk) if policy.max_open_risk_percent() > 0.0 => {
+                    Some(risk) if max_open_risk > 0.0 => {
                         // Positions already open lose this much more if
                         // their stops are hit; a book of correlated trades
                         // can all be hit in the same hour.
@@ -520,10 +544,12 @@ impl RiskGate {
                             return Err(RiskCode::RiskUnverifiable);
                         };
                         let total = open / equity * 100.0 + risk;
-                        if equity <= 0.0
-                            || total > policy.max_open_risk_percent() + EXPOSURE_EPSILON
-                        {
-                            return Err(RiskCode::OpenRiskAboveLimit);
+                        if equity <= 0.0 || total > max_open_risk + EXPOSURE_EPSILON {
+                            return Err(if in_drawdown {
+                                RiskCode::PeakDrawdownLimitReached
+                            } else {
+                                RiskCode::OpenRiskAboveLimit
+                            });
                         }
                     }
                     Some(_) => {}
@@ -870,6 +896,76 @@ mod tests {
         ));
         assert!(matches!(
             off.preview(&draft, Some(with_open(None)), wednesday),
+            RiskDecision::Approved(_)
+        ));
+    }
+
+    #[test]
+    fn below_the_peak_breaker_entries_continue_at_a_quarter_of_the_caps() {
+        let sp = Symbol::parse("SP500m").expect("symbol");
+        let wednesday = UNIX_EPOCH + Duration::from_secs(1_767_787_200);
+        let mut facts = facts_test(0);
+        facts.symbol_specs = vec![venue_spec("SP500m", true)];
+        facts.peak_drawdown_percent = Some(30.0);
+        // The draft risks 1.00 of 1 000 equity (0.1%).
+        let draft = draft_with_stop("SP500m", 0.1, 99_991.0);
+        let gate = |risk: f64, open: f64| {
+            RiskGate::new(
+                policy_with_symbols(policy(), vec![sp.clone()])
+                    .with_limits(risk, 0.0, 25.0, 0.0)
+                    .with_open_risk_cap(open),
+            )
+        };
+
+        // A 0.8% cap shrinks to 0.2%: the 0.1% stop still opens.
+        assert!(matches!(
+            gate(0.8, 0.0).preview(&draft, Some(facts.clone()), wednesday),
+            RiskDecision::Approved(_)
+        ));
+        // A 0.2% cap shrinks to 0.05%: the same stop is refused by the breaker.
+        let over = expect_rejection(gate(0.2, 0.0).preview(&draft, Some(facts.clone()), wednesday));
+        assert_eq!(over.code(), RiskCode::PeakDrawdownLimitReached);
+        assert!(over.code().detail().contains("a quarter"));
+        // The open-risk cap shrinks too: 0.15% open plus 0.1% passes a 1%
+        // cap (0.25%) but not a 0.8% one (0.2%).
+        let open = AccountFacts {
+            open_stop_risk: Some(1.5),
+            ..facts.clone()
+        };
+        assert!(matches!(
+            gate(0.8, 1.0).preview(&draft, Some(open.clone()), wednesday),
+            RiskDecision::Approved(_)
+        ));
+        assert_eq!(
+            expect_rejection(gate(0.8, 0.8).preview(&draft, Some(open), wednesday)).code(),
+            RiskCode::PeakDrawdownLimitReached
+        );
+        // Without a stop, or with no per-trade cap to shrink, entries stay paused.
+        assert_eq!(
+            expect_rejection(gate(0.8, 0.0).preview(
+                &TradeIntentDraft::new(
+                    sp.clone(),
+                    Side::Buy,
+                    OrderKind::Market,
+                    Volume::parse(0.1).expect("volume"),
+                    None,
+                    None,
+                    None,
+                ),
+                Some(facts.clone()),
+                wednesday
+            ))
+            .code(),
+            RiskCode::PeakDrawdownLimitReached
+        );
+        assert_eq!(
+            expect_rejection(gate(0.0, 0.0).preview(&draft, Some(facts.clone()), wednesday)).code(),
+            RiskCode::PeakDrawdownLimitReached
+        );
+        // Above the breaker the full cap applies again.
+        facts.peak_drawdown_percent = Some(5.0);
+        assert!(matches!(
+            gate(0.2, 0.0).preview(&draft, Some(facts), wednesday),
             RiskDecision::Approved(_)
         ));
     }

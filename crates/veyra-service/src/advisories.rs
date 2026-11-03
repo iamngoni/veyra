@@ -291,20 +291,22 @@ fn breaker_items(
         let resume = baselines.peak.map(|peak| peak * (1.0 - peak_limit / 100.0));
         out.push(advisory(
             "breaker_peak",
-            Severity::Critical,
+            Severity::Warning,
             if baselines.fixed_reference {
-                format!("New trades paused: {peak_percent:.1}% below the reference balance")
+                format!("Trading at reduced risk: {peak_percent:.1}% below the reference balance")
             } else {
-                format!("New trades paused: {peak_percent:.1}% below the account's peak")
+                format!("Trading at reduced risk: {peak_percent:.1}% below the account's peak")
             },
             Some(match (resume, baselines.fixed_reference) {
                 (Some(level), false) => format!(
-                    "Limit is {peak_limit:.0}%. Resumes when equity is back above {level:.2}, or when the peak is reset."
+                    "Limit is {peak_limit:.0}%. New stops risk a quarter of the usual caps until equity is back above {level:.2}, or the peak is reset."
                 ),
                 (Some(level), true) => format!(
-                    "Limit is {peak_limit:.0}%. Resumes when equity is back above {level:.2}."
+                    "Limit is {peak_limit:.0}%. New stops risk a quarter of the usual caps until equity is back above {level:.2}."
                 ),
-                (None, _) => format!("Limit is {peak_limit:.0}%."),
+                (None, _) => format!(
+                    "Limit is {peak_limit:.0}%. New stops risk a quarter of the usual caps."
+                ),
             }),
             None,
         ));
@@ -859,11 +861,13 @@ mod tests {
         let items = breaker_items((0.0, 10.0), (0.0, 11.0), fixed, now);
         assert_eq!(
             items[0].title,
-            "New trades paused: 11.0% below the reference balance"
+            "Trading at reduced risk: 11.0% below the reference balance"
         );
         assert_eq!(
             items[0].detail.as_deref(),
-            Some("Limit is 10%. Resumes when equity is back above 900.00.")
+            Some(
+                "Limit is 10%. New stops risk a quarter of the usual caps until equity is back above 900.00."
+            )
         );
     }
 
@@ -875,12 +879,12 @@ mod tests {
         assert_eq!(items[0].id, "breaker_peak");
         assert_eq!(
             items[0].title,
-            "New trades paused: 27.8% below the account's peak"
+            "Trading at reduced risk: 27.8% below the account's peak"
         );
         assert_eq!(
             items[0].detail.as_deref(),
             Some(
-                "Limit is 25%. Resumes when equity is back above 37.44, or when the peak is reset."
+                "Limit is 25%. New stops risk a quarter of the usual caps until equity is back above 37.44, or the peak is reset."
             )
         );
         let daily = breaker_items((20.0, 25.0), (21.0, 5.0), highest(None), now);
@@ -891,7 +895,11 @@ mod tests {
             Some((SATURDAY_NOON + 12 * 3_600) * 1_000)
         );
         let unknown_peak = breaker_items((0.0, 25.0), (0.0, 30.0), highest(None), now);
-        assert_eq!(unknown_peak[0].detail.as_deref(), Some("Limit is 25%."));
+        assert_eq!(
+            unknown_peak[0].detail.as_deref(),
+            Some("Limit is 25%. New stops risk a quarter of the usual caps.")
+        );
+        assert_eq!(unknown_peak[0].severity, Severity::Warning);
         assert!(breaker_items((20.0, 25.0), (1.0, 2.0), highest(Some(40.0)), now).is_empty());
         assert!(
             breaker_items((0.0, 0.0), (99.0, 99.0), highest(Some(40.0)), now).is_empty(),

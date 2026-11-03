@@ -30,6 +30,9 @@ pub const HEALTH_PERIOD: Duration = Duration::from_secs(30);
 
 /// Consecutive stale samples before the broker link is reported stale.
 const STALE_SAMPLES: u32 = 2;
+/// Title of the breaker alert that blocks entries outright; the peak breaker
+/// only shrinks them (see [`crate::risk::gate::DRAWDOWN_RISK_FRACTION`]).
+const DAILY_TRIPPED: &str = "Daily loss limit reached";
 
 /// Consecutive failed decisions before model trouble is reported.
 const MODEL_FAILURES: u32 = 3;
@@ -377,7 +380,7 @@ impl HealthTracker {
         if let Some((day, peak)) = sample.drawdowns {
             let (day_limit, peak_limit) = sample.limits;
             let tripped = if day_limit > 0.0 && day >= day_limit {
-                Some("Daily loss limit reached")
+                Some(DAILY_TRIPPED)
             } else if peak_limit > 0.0 && peak >= peak_limit {
                 Some("Peak drawdown limit reached")
             } else {
@@ -386,17 +389,26 @@ impl HealthTracker {
             match (self.breaker, tripped) {
                 (None, Some(title)) => out.push(Notification::new(
                     NotifyEvent::BreakerTripped,
-                    Severity::Critical,
+                    if title == DAILY_TRIPPED {
+                        Severity::Critical
+                    } else {
+                        Severity::Warning
+                    },
                     title,
                     format!(
-                        "Day drawdown {day:.2}% (limit {day_limit:.2}%), peak drawdown {peak:.2}% (limit {peak_limit:.2}%). New entries are blocked; open positions are still managed."
+                        "Day drawdown {day:.2}% (limit {day_limit:.2}%), peak drawdown {peak:.2}% (limit {peak_limit:.2}%). {} Open positions are still managed.",
+                        if title == DAILY_TRIPPED {
+                            "New entries are blocked."
+                        } else {
+                            "New entries continue, each stop risking a quarter of the usual caps."
+                        }
                     ),
                 )),
                 (Some(_), None) => out.push(Notification::new(
                     NotifyEvent::BreakerTripped,
                     Severity::Info,
                     "Breaker cleared",
-                    "Drawdown is back within limits. New entries are allowed again.",
+                    "Drawdown is back within limits. New entries are back at full size.",
                 )),
                 _ => {}
             }
@@ -840,6 +852,8 @@ mod tests {
         let tripped = tracker.observe(&day);
         assert_eq!(titles(&tripped), vec!["Daily loss limit reached"]);
         assert!(tripped[0].body.contains("Day drawdown 3.20% (limit 3.00%)"));
+        assert!(tripped[0].body.contains("New entries are blocked."));
+        assert_eq!(tripped[0].severity, Severity::Critical);
         assert!(tracker.observe(&day).is_empty());
         assert_eq!(
             titles(&tracker.observe(&healthy())),
@@ -850,10 +864,10 @@ mod tests {
             drawdowns: Some((0.0, 12.0)),
             ..healthy()
         };
-        assert_eq!(
-            titles(&tracker.observe(&peak)),
-            vec!["Peak drawdown limit reached"]
-        );
+        let shrunk = tracker.observe(&peak);
+        assert_eq!(titles(&shrunk), vec!["Peak drawdown limit reached"]);
+        assert!(shrunk[0].body.contains("each stop risking a quarter"));
+        assert_eq!(shrunk[0].severity, Severity::Warning);
         let disabled = HealthSample {
             drawdowns: Some((50.0, 50.0)),
             limits: (0.0, 0.0),

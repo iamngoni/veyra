@@ -65,7 +65,8 @@ const MAX_BODY_CHARS: usize = 1_500;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotifyEvent {
-    /// A daily-loss or peak-drawdown breaker started blocking new entries.
+    /// The daily-loss breaker started blocking new entries, or the
+    /// peak-drawdown breaker started shrinking them.
     BreakerTripped,
     /// Trading was halted: kill switch engaged or execution switched off.
     TradingHalted,

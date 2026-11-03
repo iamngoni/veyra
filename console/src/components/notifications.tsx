@@ -33,7 +33,7 @@ import '../styles/notifications.css'
 
 /** Short label and what each event means, as the service defines it. */
 const EVENTS: Record<NotificationEvent, { label: string; help: string }> = {
-  breaker_tripped: { label: 'Breaker tripped', help: 'A daily-loss or peak-drawdown breaker started blocking new entries.' },
+  breaker_tripped: { label: 'Breaker tripped', help: 'The daily-loss breaker started blocking new entries, or the peak-drawdown breaker started shrinking them to a quarter of the usual risk.' },
   trading_halted: { label: 'Trading halted', help: 'The kill switch engaged or execution was switched off.' },
   broker_link: { label: 'Broker link', help: 'The broker link went stale, or recovered after going stale.' },
   reconciliation_drift: { label: 'Reconciliation drift', help: 'Positions at the broker diverged from what Veyra manages.' },
